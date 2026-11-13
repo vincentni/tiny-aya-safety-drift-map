@@ -157,7 +157,9 @@ class FakeJobsClient:
     ) -> list[str]:
         self._record("fetch_job_logs", job_id=job_id, namespace=namespace, **kwargs)
         self._peek(job_id)
-        return list(self.logs.get(job_id, []))
+        lines = list(self.logs.get(job_id, []))
+        # like the library: tail keeps the last N lines
+        return lines[-kwargs["tail"] :] if kwargs.get("tail") else lines
 
     def list_jobs_hardware(self, token: str | bool | None = None) -> list[JobHardwareInfo]:
         self._record("list_jobs_hardware")
@@ -238,6 +240,8 @@ class FileBackedFakeClient:
         sidecar = self.path.with_name(self.path.name + ".script.json")
         if inner is None and sidecar.exists():
             self._apply_script(json.loads(sidecar.read_text()))
+        if inner is None and self.path.exists():
+            self._replay_submits()
 
     def _apply_script(self, script: dict[str, Any]) -> None:
         for job_id, statuses in script.get("jobs", {}).items():
@@ -245,6 +249,13 @@ class FileBackedFakeClient:
         for key in ("billing_used_micro_usd", "billing_total_minutes", "billing_status"):
             if key in script:
                 setattr(self.inner, key, script[key])
+
+    def _replay_submits(self) -> None:
+        """Jobs an earlier process submitted stay listed in this one."""
+        for line in self.path.read_text(encoding="utf-8").splitlines():
+            call = json.loads(line)
+            if call["method"] in ("run_job", "run_uv_job") and "reply" in call:
+                getattr(self.inner, call["method"])(*call["args"], **call["kwargs"])
 
     def __getattr__(self, name: str) -> Any:
         target = getattr(self.inner, name)

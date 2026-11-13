@@ -17,8 +17,25 @@ PATTERNS = {
 }
 # dataset rows quote arbitrary numbers
 DIGIT_EXEMPT_DIRS = frozenset({"prompts", "sft_train", "labels", "responses"})
+_CONTROL = r"(?:\x1b|\\u001[bB])\[[0-?]*[ -/]*[@-~]"
 # a trailing escape letter or digit would defeat the anchors
-_ANSI = re.compile(r"(?:\x1b|\\u001[bB])\[[0-?]*[ -/]*[@-~]")
+_ANSI = re.compile(_CONTROL)
+# the guard stops a run before the next token's prefix
+_CHAR = rf"(?:(?:{_CONTROL})*(?!hf_)[A-Za-z0-9])"
+_BREAK = rf"(?:{_CONTROL})*\r?\n"
+# characters after the prefix of a user access token
+TOKEN_BODY = 34
+
+
+def _cut(end: str = "") -> str:
+    """Alternatives for a token cut by one line break: both parts make exactly one body."""
+    return "|".join(rf"{_CHAR}{{{head}}}{_BREAK}{_CHAR}{{{TOKEN_BODY - head}}}{end}" for head in range(TOKEN_BODY))
+
+
+# colour codes or one line break can cut a logged token
+_LOGGED_TOKEN = re.compile(rf"hf_(?:{_cut()}|{_CHAR}{{30,}})")
+# a scan takes a cut only where the body ends
+_SCANNED_TOKEN = re.compile(rf"hf_(?:{_cut(rf'(?!{_CHAR})')}|{_CHAR}{{30,}})")
 _JSON_ESCAPE = re.compile(r"\\(?:[bfnrt]|u[0-9a-fA-F]{4})")
 # request lines may carry signed query strings
 _HTTP_LOGGERS = ("httpx", "httpx2", "httpcore")
@@ -56,16 +73,25 @@ def scan(paths: Iterable[str | Path], data_root: str | Path | None = None) -> li
     findings = []
     for path in map(Path, paths):
         names = [name for name in PATTERNS if name != "account_id" or not _digits_exempt(path, data_root)]
-        with path.open(encoding="utf-8", errors="replace") as lines:
-            for number, line in enumerate(lines, start=1):
-                line = _JSON_ESCAPE.sub(" ", _ANSI.sub(" ", line))
-                findings.extend(Finding(path, number, name) for name in names for _ in PATTERNS[name].finditer(line))
+        text = path.read_text(encoding="utf-8", errors="replace")
+        # sought in the whole text: a token can span lines
+        hits = [(text.count("\n", 0, token.start()) + 1, "hf_token") for token in _SCANNED_TOKEN.finditer(text)]
+        for number, line in enumerate(text.split("\n"), start=1):
+            line = _JSON_ESCAPE.sub(" ", _ANSI.sub(" ", line))
+            hits += [(number, n) for n in names if n != "hf_token" for _ in PATTERNS[n].finditer(line)]
+        hits.sort(key=lambda hit: (hit[0], names.index(hit[1])))
+        findings.extend(Finding(path, number, name) for number, name in hits)
     return findings
 
 
+def _masked(token: re.Match[str]) -> str:
+    cut = re.search(r"\r?\n", token[0])
+    return f"hf_***{cut[0]}***" if cut else "hf_***"
+
+
 def mask(text: str) -> str:
-    """Replace tokens with ``hf_***`` and home directories with ``<home>``; colour codes become spaces."""
-    text = PATTERNS["hf_token"].sub("hf_***", _ANSI.sub(" ", text))
+    """Replace tokens, whole or cut, with ``hf_***`` and home directories with ``<home>``; colour codes go."""
+    text = _ANSI.sub(" ", _LOGGED_TOKEN.sub(_masked, text))
     return PATTERNS["home_path"].sub("<home>", text)
 
 

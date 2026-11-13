@@ -1,0 +1,60 @@
+Collecting driftmap[jobs] @ https://github.com/vincentni/tiny-aya-safety-drift-map/archive/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.tar.gz
+Installing collected packages: curatorkit, safetune, trl, peft, transformers, driftmap
+Successfully installed driftmap-0.1.0
+2026-11-06 20:03:41,007 INFO driftmap.jobkit.main: run generate-full-20261102T100000Z on l4x1
+2026-11-06 20:03:41,220 DEBUG huggingface_hub.utils._http: Authorization: Bearer {token}
+2026-11-06 20:03:44,901 INFO driftmap.core.hub: snapshot of CohereLabs/tiny-aya-global in {home}/work/model
+2026-11-06 20:05:27,000 INFO driftmap.gen.rows: harmful/en batch 1: 16 rows, 0 unscored
+2026-11-06 20:06:04,137 INFO driftmap.gen.rows: harmful/fr batch 1: 16 rows, 0 unscored
+2026-11-06 20:06:41,274 INFO driftmap.gen.rows: harmful/es batch 1: 16 rows, 0 unscored
+2026-11-06 20:07:18,411 INFO driftmap.gen.rows: harmful/ru batch 1: 16 rows, 0 unscored
+2026-11-06 20:07:55,548 INFO driftmap.gen.rows: harmful/hi batch 1: 16 rows, 0 unscored
+2026-11-06 20:08:32,685 INFO driftmap.gen.rows: harmful/ar batch 1: 16 rows, 0 unscored
+2026-11-06 20:09:09,822 INFO driftmap.gen.rows: xstest/en batch 1: 16 rows, 0 unscored
+2026-11-06 20:09:46,959 INFO driftmap.gen.rows: harmful/en batch 2: 16 rows, 0 unscored
+2026-11-06 20:10:23,096 INFO driftmap.gen.rows: harmful/fr batch 2: 16 rows, 0 unscored
+2026-11-06 20:11:00,233 INFO driftmap.gen.rows: harmful/es batch 2: 16 rows, 0 unscored
+2026-11-06 20:11:37,370 INFO driftmap.gen.rows: harmful/ru batch 2: 16 rows, 0 unscored
+2026-11-06 20:12:14,507 INFO driftmap.gen.rows: harmful/hi batch 2: 16 rows, 0 unscored
+2026-11-06 20:12:51,644 INFO driftmap.gen.rows: harmful/ar batch 2: 16 rows, 0 unscored
+2026-11-06 20:13:28,781 INFO driftmap.gen.rows: xstest/en batch 2: 16 rows, 0 unscored
+2026-11-06 20:14:05,918 INFO driftmap.gen.rows: harmful/en batch 3: 16 rows, 0 unscored
+2026-11-06 20:14:42,055 INFO driftmap.gen.rows: harmful/fr batch 3: 16 rows, 0 unscored
+2026-11-06 20:15:19,192 INFO driftmap.gen.rows: harmful/es batch 3: 16 rows, 0 unscored
+2026-11-06 20:15:56,329 INFO driftmap.gen.rows: harmful/ru batch 3: 16 rows, 0 unscored
+2026-11-06 20:16:33,466 INFO driftmap.gen.rows: harmful/hi batch 3: 16 rows, 0 unscored
+2026-11-06 20:17:10,603 INFO driftmap.gen.rows: harmful/ar batch 3: 16 rows, 0 unscored
+2026-11-06 20:17:47,740 INFO driftmap.gen.rows: xstest/en batch 3: 16 rows, 0 unscored
+2026-11-06 20:18:24,877 INFO driftmap.gen.rows: harmful/en batch 4: 16 rows, 0 unscored
+2026-11-06 20:19:01,014 INFO driftmap.gen.rows: harmful/fr batch 4: 16 rows, 0 unscored
+2026-11-06 20:19:38,151 INFO driftmap.gen.rows: harmful/es batch 4: 16 rows, 0 unscored
+2026-11-06 20:20:15,288 INFO driftmap.gen.rows: harmful/ru batch 4: 16 rows, 0 unscored
+2026-11-06 20:20:52,425 INFO driftmap.gen.rows: harmful/hi batch 4: 16 rows, 0 unscored
+2026-11-06 20:21:29,562 INFO driftmap.gen.rows: harmful/ar batch 4: 16 rows, 0 unscored
+2026-11-06 20:22:06,699 INFO driftmap.gen.rows: xstest/en batch 4: 16 rows, 0 unscored
+2026-11-06 20:22:43,836 INFO driftmap.gen.rows: harmful/en batch 5: 16 rows, 0 unscored
+2026-11-06 20:23:20,973 INFO driftmap.gen.rows: harmful/fr batch 5: 16 rows, 0 unscored
+2026-11-06 20:23:57,110 INFO driftmap.gen.rows: harmful/es batch 5: 16 rows, 0 unscored
+2026-11-06 20:24:34,247 INFO driftmap.gen.rows: harmful/ru batch 5: 16 rows, 0 unscored
+2026-11-06 20:25:11,384 INFO driftmap.gen.rows: harmful/hi batch 5: 16 rows, 0 unscored
+2026-11-06 20:25:48,521 INFO driftmap.gen.rows: harmful/ar batch 5: 16 rows, 0 unscored
+2026-11-06 20:26:25,658 INFO driftmap.gen.rows: xstest/en batch 5: 16 rows, 0 unscored
+2026-11-06 20:27:02,795 INFO driftmap.gen.rows: harmful/en batch 6: 16 rows, 0 unscored
+2026-11-06 20:27:39,932 INFO driftmap.gen.rows: harmful/fr batch 6: 16 rows, 0 unscored
+2026-11-06 20:28:16,069 INFO driftmap.gen.rows: harmful/es batch 6: 16 rows, 0 unscored
+2026-11-06 20:28:53,206 INFO driftmap.gen.rows: harmful/ru batch 6: 16 rows, 0 unscored
+2026-11-06 20:29:30,343 INFO driftmap.gen.rows: harmful/hi batch 6: 16 rows, 0 unscored
+2026-11-06 20:30:07,480 INFO driftmap.gen.rows: harmful/ar batch 6: 16 rows, 0 unscored
+2026-11-06 20:30:44,617 INFO driftmap.gen.rows: xstest/en batch 6: 16 rows, 0 unscored
+2026-11-06 20:31:21,754 INFO driftmap.gen.rows: harmful/en batch 7: 16 rows, 0 unscored
+2026-11-06 20:31:58,891 INFO driftmap.gen.rows: harmful/fr batch 7: 16 rows, 0 unscored
+2026-11-06 20:32:35,028 INFO driftmap.gen.rows: harmful/es batch 7: 16 rows, 0 unscored
+2026-11-06 20:33:12,165 INFO driftmap.gen.rows: harmful/ru batch 7: 16 rows, 0 unscored
+2026-11-06 20:33:12,480 WARNING driftmap.jobkit.flush: upload retried with HF_TOKEN={token}
+2026-11-06 20:33:15,002 INFO driftmap.jobkit.flush: pushed 7 files from {home}/work/out
+2026-11-06 20:33:18,611 INFO driftmap.jobkit.main: record runs/generate-full-20261102T100000Z.json pushed
+2026-11-06 20:33:18,612 INFO driftmap.jobkit.main: peak VRAM 9.412 GB, peak RSS 6.071 GB
+2026-11-06 20:33:18,613 INFO driftmap.jobkit.main: 1450 prompts, 121337 generated tokens
+2026-11-06 20:33:18,614 INFO driftmap.jobkit.main: closing
+2026-11-06 20:33:18,700 INFO driftmap.jobkit.main: done
+driftmap-job: finished status=ok exit=0

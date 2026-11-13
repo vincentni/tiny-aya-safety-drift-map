@@ -244,6 +244,86 @@ def test_mask(text, expected):
     assert mask(text) == expected
 
 
+OFF, BOLD = "\x1b[0m", "\\u001b[1m"
+OTHER_TOKEN = "hf_" + "y" * 34
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (f"a {HF_TOKEN[:12]}{OFF}{HF_TOKEN[12:]} b", "a hf_*** b"),
+        (f"a {HF_TOKEN[:4]}{BOLD}{HF_TOKEN[4:20]}{OFF}{HF_TOKEN[20:]}{OFF} b", "a hf_***  b"),
+        (f"a {HF_TOKEN[:12]}\n{HF_TOKEN[12:]} b", "a hf_***\n*** b"),
+        (f"a {HF_TOKEN[:12]}\r\n{HF_TOKEN[12:]} b", "a hf_***\r\n*** b"),
+        (f"a {HF_TOKEN[:3]}\n{HF_TOKEN[3:]} b", "a hf_***\n*** b"),
+        (f"a {HF_TOKEN[:9]}{OFF}\n{OFF}{HF_TOKEN[9:]} b", "a hf_***\n*** b"),
+        (f"a {HF_TOKEN}\n2026-11-06 20:33 INFO x", "a hf_***\n2026-11-06 20:33 INFO x"),
+        (f"hf_xhf_{HF_TOKEN[3:]} b", "hf_xhf_*** b"),
+        ("see hf_hub\nCollecting driftmap", "see hf_hub\nCollecting driftmap"),
+        (f"a {HF_TOKEN[:33]}\n{HF_TOKEN[33:]} b", "a hf_***\n*** b"),
+        (f"a {HF_TOKEN[:36]}\n{HF_TOKEN[36:]}\n2026-11-06 x", "a hf_***\n***\n2026-11-06 x"),
+        (f"a {HF_TOKEN[:12]}\n{HF_TOKEN[12:]}next b", "a hf_***\n***next b"),
+        (f"a {HF_TOKEN[:32]}\n{HF_TOKEN[32:]}9 b", "a hf_***\n***9 b"),
+        (
+            f"with hf_xet\n{'6f0c65d5' * 8}  model.safetensors",
+            f"with hf_***\n***{('6f0c65d5' * 8)[31:]}  model.safetensors",
+        ),
+        (f"hf_{'q' * 25}\ndriftmap-job: finished", f"hf_{'q' * 25}\ndriftmap-job: finished"),
+        (f"hf_{'q' * 29}\nAKIAQQQQQQQQQQQQQQQ", f"hf_***\n***{'Q' * 14}"),
+        (f"{HF_TOKEN}{OFF}{OTHER_TOKEN}", "hf_*** hf_***"),
+        (f"a {OFF}{HF_TOKEN}{OFF}{BOLD}{OTHER_TOKEN}{OFF} b", "a  hf_***  hf_***  b"),
+        (f"{HF_TOKEN}{BOLD}{OTHER_TOKEN[:20]}{OFF}{OTHER_TOKEN[20:]}", "hf_*** hf_***"),
+        (f"hf_{'q' * 29}\n{OTHER_TOKEN} b", f"hf_{'q' * 29}\nhf_*** b"),
+        (f"hf_{'q' * 17}\n{OTHER_TOKEN}", f"hf_{'q' * 17}\nhf_***"),
+        ("hf_dummy\nnext line", "hf_dummy\nnext line"),
+    ],
+)
+def test_mask_covers_a_token_cut_by_colour_codes_or_one_line_break(text, expected):
+    masked = mask(text)
+    assert masked == expected
+    assert masked.count("\n") == text.count("\n")
+    assert not any(HF_TOKEN[at : at + 8] in masked for at in range(3, len(HF_TOKEN) - 7))
+    assert "y" * 8 not in masked
+
+
+@pytest.mark.parametrize(
+    ("text", "lines"),
+    [
+        (f"ok\ntoken={HF_TOKEN}\n", [2]),
+        (f"ok\n{HF_TOKEN[:12]}{OFF}{HF_TOKEN[12:]}\n", [2]),
+        (f"ok\n{HF_TOKEN[:12]}{BOLD}{HF_TOKEN[12:]}\n", [2]),
+        (f"ok\nretry {HF_TOKEN[:12]}\n{HF_TOKEN[12:]} done\n", [2]),
+        (f"{HF_TOKEN}{OFF}{OTHER_TOKEN}\n\n{HF_TOKEN[:3]}\n{OTHER_TOKEN[3:]}\n", [1, 1, 3]),
+        ("see hf_hub\nCollecting driftmap\nhf_dummy\n", []),
+    ],
+)
+def test_scan_flags_a_token_the_way_mask_covers_it(tmp_path, text, lines):
+    record = _write(tmp_path / "logs/job.log", text)
+    assert scan([record]) == [Finding(record, line, "hf_token") for line in lines]
+    assert "hf_***" in mask(text) or not lines
+
+
+def test_scan_does_not_flag_a_short_run_that_only_continues_into_a_longer_word(tmp_path):
+    rows = f"hf_{'q' * 29}\nAKIAQQQQQQQQQQQQQQQ\nwith hf_xet\n{'6f0c65d5' * 8}  model.safetensors\n"
+    assert scan([_write(tmp_path / "logs/job.log", rows)]) == []
+    cut = f"retry {HF_TOKEN[:12]}\n{HF_TOKEN[12:]} done\n"
+    assert [finding.line for finding in scan([_write(tmp_path / "logs/cut.log", cut)])] == [1]
+
+
+def test_scan_keeps_findings_in_line_order(tmp_path):
+    text = f"{HOME_PATHS[0]}/x\n{ACCOUNT} {HF_TOKEN}\n{AWS_KEY}\n{HF_TOKEN[:9]}\n{HF_TOKEN[9:]} {HOME_PATHS[1]}\n"
+    record = _write(tmp_path / "runs/r.txt", text)
+    hits = [(finding.line, finding.pattern) for finding in scan([record])]
+    assert hits == [
+        (1, "home_path"),
+        (2, "hf_token"),
+        (2, "account_id"),
+        (3, "aws_key"),
+        (4, "hf_token"),
+        (5, "home_path"),
+    ]
+
+
 def test_json_escapes_do_not_shield_a_hit(tmp_path):
     record = _write(
         tmp_path / "runs/r.json",

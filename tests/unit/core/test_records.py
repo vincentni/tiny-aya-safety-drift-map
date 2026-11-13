@@ -550,6 +550,15 @@ def test_job_kinds_and_labels():
         LedgerLine.model_validate(_payload("ledger", kind="train"))
 
 
+def test_run_record_smoke_measurements_default_to_none():
+    plain = RunRecord.model_validate(_payload("run"))
+    assert (plain.bos_check, plain.upload_mb_s) == (None, None)
+    smoke = RunRecord.model_validate(_payload("run", bos_check=True, upload_mb_s=11.0))
+    assert (smoke.bos_check, smoke.upload_mb_s) == (True, 11.0)
+    with pytest.raises(ValidationError):
+        RunRecord.model_validate(_payload("run", bos_check="maybe"))
+
+
 def test_refusal_and_plan_defaults():
     refusal = Refusal(guard="per_run_ceiling", reason="5.01 > 5.00", estimate=5_013_208, ceiling=5_000_000)
     assert Refusal(guard="gate", reason="403").estimate is None

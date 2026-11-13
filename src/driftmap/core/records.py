@@ -101,6 +101,9 @@ class RunRecord(Record):
     peak_rss_gb: float | None
     install_minutes: float | None
     notes: list[str]
+    # set by smoke runs only
+    bos_check: bool | None = None
+    upload_mb_s: float | None = None
 
 
 class Decision(Record):
