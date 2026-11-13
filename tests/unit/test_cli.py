@@ -19,7 +19,7 @@ from hypothesis import strategies as st
 from typer.testing import CliRunner
 
 from driftmap import cli
-from driftmap.core import clients
+from driftmap.core import clients, ids
 from driftmap.core import hub as core_hub
 from driftmap.core.hub import Hub
 from driftmap.core.records import (
@@ -54,7 +54,12 @@ from driftmap.jobs.ledger import Ledger, pending_line
 from driftmap.jobs.plan import build_plan, pins
 from driftmap.jobs.readiness import ITEMS, READY_PATH, Check, Item, ReadyReport
 from driftmap.jobs.snapshot import DECISION_PATH, LOCAL, SMOKE_DIR, TABLES_PATH, Deps
+from driftmap.judge import reparse
+from driftmap.table import build as table_build
+from driftmap.table import render
+from driftmap.table.build import NOT_COMPARABLE
 from tests.fakes import FakeHub, FakeJobsClient
+from tests.fakes import labels as fake_labels
 from tests.fakes.datasets import (
     BENIGN,
     HARMFUL,
@@ -76,7 +81,7 @@ EVAL = f"{OWNER}/aya-redteaming-6lang-eval"
 SHA = "0123456789abcdef0123456789abcdef01234567"
 TOKEN = "hf_" + "b" * 34
 HOME_DIR = "/" + "home/someone"
-VERBS = ["chain", "data", "decide", "launch", "ledger", "plan", "ready", "scan", "wait"]
+VERBS = ["chain", "data", "decide", "judge", "launch", "ledger", "plan", "ready", "scan", "status", "table", "wait"]
 SUBMIT = FakeJobsClient.run_job
 HIDDEN = {"HF_TOKEN": "***"}
 BASELINE = ["--", "--kind", "baseline"]
@@ -252,12 +257,13 @@ def verdict(result, guard):
     return row[1]
 
 
-def test_help_lists_the_nine_verbs():
+def test_help_lists_every_verb():
     assert sorted(typer.main.get_command(cli.app).commands) == VERBS
     result = run("--help")
     assert result.exit_code == 0 and all(f" {verb} " in result.output for verb in VERBS)
-    groups = {name: sorted(typer.main.get_command(cli.app).commands[name].commands) for name in ("data", "ledger")}
-    assert groups == {"data": ["build"], "ledger": ["reconcile"]}
+    names = ("data", "ledger", "table", "judge")
+    groups = {name: sorted(typer.main.get_command(cli.app).commands[name].commands) for name in names}
+    assert groups == {"data": ["build"], "ledger": ["reconcile"], "table": ["build"], "judge": ["reparse"]}
     assert sorted(typer.main.get_command(cli.app).commands["decide"].commands) == ["drift"]
 
 
@@ -507,6 +513,8 @@ def test_hub_verbs_stop_at_exit_3_before_a_client_exists(world, monkeypatch):
         ["chain", "generate", "--target", "baseline"],
         ["decide", "drift", "--proceed", "--note", "x"],
         ["data", "build"],
+        ["table", "build"],
+        ["judge", "reparse", "--checkpoint", f"{AYA}@{'1' * 40}"],
     )
     for argv in verbs:
         result = run(*argv)
@@ -999,3 +1007,275 @@ def test_a_data_dry_run_prints_the_counts_and_touches_nothing(tmp_path, monkeypa
     assert later.exit_code == 0 and f"{EVAL} stays pinned at {uploaded}" in later.output
     assert json.loads((root / "revisions.json").read_text())[EVAL] == uploaded != fake.heads[EVAL]
     assert run("plan", "drift").exit_code == 0
+
+
+BENIGN_PIN = "4" * 40
+TABLES_DIR = TABLES_PATH.parent
+
+
+def jsonl(rows):
+    return "".join(json.dumps(row) + "\n" for row in rows).encode()
+
+
+SMOKE_DRIFTED = fake_labels.CHECKPOINTS["drifted"].replace("@", "-smoke@")
+
+
+def evaluation(world, columns, mode="full", n=4, listed=None):
+    """Put labels, prompt files and training rows on the fake evaluation dataset; ``columns`` maps to unsafe counts."""
+    files = {}
+    for column, unsafe in columns.items():
+        # a smoke drift run pushes to its own repos
+        changes = {"checkpoint": SMOKE_DRIFTED} if (column, mode) == ("drifted", "smoke") else {}
+        for row in fake_labels.column_rows(column, n=n, unsafe=unsafe, **changes):
+            path = ids.labels_path(ids.slug(row.checkpoint), row.language, mode, benign=row.set == "benign")
+            files[path] = files.get(path, b"") + row.model_dump_json(by_alias=True).encode() + b"\n"
+    for name, by_language in fake_labels.targets(listed or n).items():
+        folder = {"benign": "benign_heldout", "train": "sft_train"}.get(name, name)
+        for language, prompt_ids in by_language.items():
+            rows = [{"prompt_id": prompt_id, "prompt": f"placeholder {prompt_id}"} for prompt_id in prompt_ids]
+            if name == "train":
+                rows = [{"prompt": [{"role": "user", "content": row["prompt"]}], "completion": []} for row in rows]
+            files[f"{folder}/{language}.jsonl" if name == "train" else f"prompts/{folder}/{language}.jsonl"] = jsonl(
+                rows
+            )
+    if EVAL not in world.hub.repos:
+        world.hub.add_repo(EVAL, repo_type="dataset")
+    for path, data in files.items():
+        world.hub.upload_file(path_or_fileobj=data, path_in_repo=path, repo_id=EVAL, repo_type="dataset")
+
+
+def stored(world, path):
+    return world.hub.repos[RESULTS]["main"][path]
+
+
+def test_table_build_reads_the_hub_writes_prints_and_uploads_the_tables(world):
+    absent = run("table", "build")
+    assert absent.exit_code == 2 and "run `driftmap data build`" in absent.stderr
+    evaluation(world, {})
+    unjudged = run("table", "build")
+    assert unjudged.exit_code == 2 and "no judged labels" in unjudged.stderr and not (world.root / TABLES_PATH).exists()
+    evaluation(world, {"baseline": 0, "drifted": 2})
+
+    built = run("table", "build")
+
+    assert built.exit_code == 0, built.output
+    assert built.output.splitlines()[:2] == ["verb      table build", "mode      full"]
+    local = world.root / TABLES_PATH
+    tables = Tables.model_validate_json(local.read_bytes())
+    states = {column: state.state for column, state in tables.columns.items()}
+    assert states == {"baseline": "tabled", "drifted": "tabled", "repaired": "not_run", "repaired_q4": "not_run"}
+    assert tables.flags["drift_below_threshold"] is False and tables.safety[0].n == 4
+    shown = render.render(tables, world.settings)
+    assert (world.root / TABLES_DIR / "tables.md").read_text(encoding="utf-8") == shown and shown in built.output
+    assert stored(world, "tables/tables.json") == local.read_bytes()
+    assert stored(world, "tables/tables.md") == shown.encode()
+    assert not any(path.startswith("smoke/") for path in world.hub.repos[RESULTS]["main"])
+
+    # run records are read: a generation run that says so makes its column not comparable
+    noted = fake_labels.run_record("generate", "drifted", notes=[f"{NOT_COMPARABLE}another seed"])
+    world.push(f"runs/{noted.run_id}.json", noted.model_dump_json(by_alias=True).encode())
+    world.push("runs/torn.json", b"{")
+    again = run("table", "build")
+    assert again.exit_code == 0 and "drifted ▨ (weights): not comparable: another seed" in again.output
+
+
+def test_a_new_drift_flag_exits_8_after_the_table_is_written_shown_and_uploaded(world):
+    evaluation(world, {"baseline": 0, "drifted": 0})
+
+    flagged = run("table", "build")
+
+    assert flagged.exit_code == ExitCode.DRIFT_BELOW_THRESHOLD == 8 and "driftmap decide drift" in flagged.stderr
+    assert "- drift_below_threshold: yes" in flagged.output
+    assert json.loads(stored(world, "tables/tables.json"))["flags"]["drift_below_threshold"] is True
+    assert "tables/tables.md" in world.hub.repos[RESULTS]["main"]
+    refused = run("launch", "repair", "--dry-run")
+    assert refused.exit_code == 4 and verdict(refused, "drift_decision") == "refused"
+    # the flag is on file now; deciding, not rebuilding, lifts the guard
+    assert run("table", "build").exit_code == 0
+    assert run("decide", "drift", "--proceed", "--note", "small n").exit_code == 0
+    assert run("table", "build").exit_code == 0 and run("launch", "repair", "--dry-run").exit_code == 0
+    # a flag new to this checkout, already decided on
+    (world.root / TABLES_PATH).unlink()
+    assert run("table", "build").exit_code == 0
+
+
+def test_a_smoke_table_reads_and_writes_its_own_tree_and_leaves_the_guard_alone(world):
+    # six prompts listed, the smoke runs took the first four
+    evaluation(world, {"baseline": 0, "drifted": 0}, mode="smoke", listed=6)
+    assert "no judged labels" in run("table", "build").stderr
+
+    built = run("table", "build", "--mode", "smoke")
+
+    assert built.exit_code == 0, built.output
+    local = world.root / LOCAL / "results" / "smoke" / "tables"
+    tables = Tables.model_validate_json((local / "tables.json").read_bytes())
+    assert tables.flags["drift_below_threshold"] is True and tables.safety[0].n == 4
+    assert stored(world, "smoke/tables/tables.json") == (local / "tables.json").read_bytes()
+    assert stored(world, "smoke/tables/tables.md") == (local / "tables.md").read_bytes()
+    assert not (world.root / TABLES_PATH).exists() and "tables/tables.json" not in world.hub.repos[RESULTS]["main"]
+    assert run("launch", "repair", "--dry-run").exit_code == 0
+
+    # a column that stopped short of the others is not complete
+    short = fake_labels.column_rows("drifted", n=3, checkpoint=SMOKE_DRIFTED)
+    path = ids.labels_path(ids.slug(short[0].checkpoint), "en", "smoke")
+    rows = [row for row in short if row.language == "en" and row.set != "benign"]
+    data = "".join(row.model_dump_json(by_alias=True) + "\n" for row in rows).encode()
+    world.hub.upload_file(path_or_fileobj=data, path_in_repo=path, repo_id=EVAL, repo_type="dataset")
+    cut = run("table", "build", "--mode", "smoke")
+    assert cut.exit_code == ExitCode.INTEGRITY and "drifted harmful/en: 3 rows for 4 prompts" in cut.stderr
+
+
+def test_table_build_refuses_a_training_prompt_among_the_evaluation_prompts(world):
+    leaked = ids.prompt_id(world.settings.sources.benign, BENIGN_PIN, "placeholder train-en-000")
+    assert world.settings.revisions[world.settings.sources.benign] == BENIGN_PIN
+    evaluation(world, {"baseline": 0})
+    listed = [{"prompt_id": prompt_id} for prompt_id in (leaked, *fake_labels.prompt_ids("xstest", "en", 4)[1:])]
+    world.hub.upload_file(
+        path_or_fileobj=jsonl(listed), path_in_repo="prompts/xstest/en.jsonl", repo_id=EVAL, repo_type="dataset"
+    )
+    result = run("table", "build")
+    assert result.exit_code == ExitCode.INTEGRITY == 12
+    assert f"train prompt {leaked} is also a xstest prompt" in result.stderr
+    assert not (world.root / TABLES_PATH).exists()
+
+
+def test_tables_that_cannot_be_uploaded_stay_local_and_exit_7(world, monkeypatch):
+    evaluation(world, {"baseline": 0, "drifted": 2})
+    monkeypatch.setattr(world.hub, "upload_folder", lambda **call: world.hub._raise(403, "https://huggingface.co/x"))
+    result = run("table", "build")
+    assert result.exit_code == ExitCode.PUSH_FAILED == 7 and "run the command again" in result.stderr
+    assert (world.root / TABLES_PATH).exists() and "# Safety drift map" in result.output
+
+
+def test_a_table_that_cannot_be_saved_is_not_shown_or_uploaded(world, monkeypatch):
+    evaluation(world, {"baseline": 0, "drifted": 2})
+
+    def refuse(tables, root, decisions):
+        raise DriftmapError(ExitCode.INTEGRITY, "the tables cannot be stored")
+
+    monkeypatch.setattr(table_build, "save", refuse)
+    result = run("table", "build")
+    assert result.exit_code == ExitCode.INTEGRITY and "# Safety drift map" not in result.output
+    assert "tables/tables.json" not in world.hub.repos[RESULTS]["main"]
+
+
+def test_launch_judge_takes_its_arguments_from_a_generate_run(world):
+    done = "generate-smoke-20261113T100000Z"
+    world.push_record(done)
+    world.push_record("generate-smoke-20261113T110000Z", "partial")
+    world.push_record("generate-full-20261113T120000Z")
+    world.push_record("steer-smoke-20261113T090000Z", inputs=[CHECKPOINT])
+    derived = f"--checkpoint {AYA}@{'1' * 40} --generation {done}"
+
+    planned = run("launch", "judge", "--after", done, "--dry-run")
+    assert planned.exit_code == 0, planned.output
+    assert f"job-args  {derived}\n" in planned.output and f" {derived}\n" in planned.output.split("command")[1]
+
+    other = f"{OWNER}/tiny-aya-global-repaired@{'7' * 40}"
+    explicit = run("launch", "judge", "--after", done, "--dry-run", "--", "--judge", "smol", "--checkpoint", other)
+    assert explicit.exit_code == 0
+    assert f"job-args  --judge smol --checkpoint {other} --generation {done}\n" in explicit.output
+
+    for run_id, reason in (
+        ("generate-smoke-20261113T110000Z", "ended partial"),
+        ("generate-full-20261113T120000Z", "is a full"),
+        ("steer-smoke-20261113T090000Z", "steer run"),
+        ("generate-smoke-20261101T000000Z", "no record"),
+    ):
+        refused = run("launch", "judge", "--after", run_id)
+        assert refused.exit_code == 2 and reason in refused.stderr, run_id
+    assert run("launch", "generate", "--after", done, *BASELINE).exit_code == 2
+    assert world.submits() == []
+
+    assert run("launch", "judge", "--after", done).exit_code == 0
+    assert world.submits()[0].endswith(f" {derived}")
+
+
+def test_judge_reparse_hands_the_checkpoint_and_the_configured_parser_to_the_library(world, monkeypatch):
+    seen = []
+
+    def reparsed(hub, labels_repo, raw_repo, checkpoint, parser_version, mode):
+        seen.append((hub._api, labels_repo, raw_repo, checkpoint, parser_version, mode))
+        return [] if mode == "smoke" else ["labels/x/superseded/h/en.jsonl", "labels/x/en.jsonl"]
+
+    monkeypatch.setattr(reparse, "reparse_checkpoint", reparsed)
+    checkpoint = f"{AYA}@{'1' * 40}"
+    done = run("judge", "reparse", "--checkpoint", checkpoint)
+    assert done.exit_code == 0 and done.output.splitlines()[0].split() == ["verb", "judge", "reparse"]
+    assert "labels/x/en.jsonl" in done.output and "2 files uploaded" in done.output
+    same = run("judge", "reparse", "--checkpoint", checkpoint, "--mode", "smoke")
+    assert same.exit_code == 0 and "nothing to rewrite" in same.output
+    responses = f"{OWNER}/safety-drift-map-responses"
+    assert seen == [(world.hub, EVAL, responses, checkpoint, "1", mode) for mode in ("full", "smoke")]
+
+    for bad in (AYA, "not a reference", f"{AYA}@{'1' * 40}#file"):
+        assert run("judge", "reparse", "--checkpoint", bad).exit_code == 2
+    assert run("judge", "reparse").exit_code == 2 and len(seen) == 2
+
+
+def test_status_shows_spend_pending_jobs_and_the_latest_runs_without_writing(world):
+    world.script(billing_used_micro_usd=400_000)
+    assert run("launch", "generate", *BASELINE).exit_code == 0
+    (job_id,) = [job_id for job_id in world.ledger.read() if not job_id.startswith("unsubmitted:")]
+    world.push_record("drift-full-20261112T100000Z", minutes=171, cost_micro_usd=2_279_943)
+    world.push_record("drift-full-20261111T100000Z", "failed", started=datetime(2026, 11, 1, tzinfo=UTC))
+    world.push("runs/torn.json", b"{")
+    (world.root / READY_PATH).unlink()
+    ledger, calls = world.ledger.path.read_bytes(), len(world.hub.calls)
+
+    shown = run("status")
+
+    assert shown.exit_code == 0 and shown.output.splitlines()[0].split() == ["verb", "status"]
+    text = flat(shown)
+    assert "ledger 399990 micro-USD ($0.40)" in text
+    assert f"pending {job_id} generate (smoke) held at 399990 micro-USD" in text
+    assert "billing 400000 micro-USD ($0.40) used, 19600000 left of the credit" in text
+    assert "headroom 15600000 micro-USD ($15.60) under the soft ceiling" in text
+    assert [line.split()[1] for line in shown.output.splitlines() if line.startswith("pending")] == [job_id]
+    assert "drift full ok 171 2279943 drift-full-20261112T100000Z" in text
+    assert "generate smoke ok 25 333325 generate-smoke-" in text and "failed" not in text
+    assert world.ledger.path.read_bytes() == ledger
+    writes = {name for name, _ in world.hub.calls[calls:]} & {"upload_file", "upload_folder", "create_repo"}
+    assert not writes and world.submits() == [world.submits()[0]]
+
+    world.script(billing_status=403)
+    blind = flat(run("status"))
+    assert "billing unavailable" in blind and "headroom 15600010 micro-USD" in blind
+    world.script()
+    assert run("wait", job_id).exit_code == 0
+    assert "pending none" in flat(run("status"))
+
+
+def test_five_verbs_in_one_process_read_the_token_once(world, monkeypatch):
+    """Ready, plan, a dry run, table build and status read the token once and print it nowhere (TS-HUB-6)."""
+    reads = []
+
+    def getter():
+        reads.append(1)
+        return TOKEN
+
+    evaluation(world, {"baseline": 0, "drifted": 2})
+    fake = clients.make_jobs_client(world.settings)
+    monkeypatch.delenv("HF_TOKEN")
+    monkeypatch.delenv("DRIFTMAP_CLIENT")
+    monkeypatch.setattr(core_hub, "get_token", getter)
+    # the real factory path, handing back the fake once it has read the token
+    monkeypatch.setattr(cli.jobs_client, "register", lambda: clients.register_backend(lambda settings, api: fake))
+    monkeypatch.setattr(readiness, "ITEMS", ((1, "first", lambda settings, deps: Check(True, "fine")),))
+    try:
+        results = [
+            run("ready"),
+            run("plan", "drift"),
+            run("launch", "drift", "--dry-run"),
+            run("table", "build"),
+            run("status"),
+        ]
+    finally:
+        set_client_factory(default_client_factory)
+
+    assert [result.exit_code for result in results] == [0, 0, 0, 0, 0]
+    assert len(reads) == 1 and core_hub.token() == TOKEN
+    local = [path.read_text() for path in (world.root / LOCAL).rglob("*") if path.is_file()]
+    assert len(local) >= 3
+    for text in (*(result.output for result in results), *local):
+        assert TOKEN not in text

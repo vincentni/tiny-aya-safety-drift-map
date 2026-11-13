@@ -1,7 +1,8 @@
-"""The driftmap command: readiness, data, plans, launches, the ledger, the drift decision and the scan."""
+"""The driftmap command: readiness, data, launches, the ledger, tables, the drift decision, status and the scan."""
 
 import enum
 import functools
+import json
 import logging
 import tempfile
 import traceback
@@ -12,9 +13,10 @@ from typing import Annotated, Any, Literal
 
 import httpx2
 import typer
+from huggingface_hub.errors import RepositoryNotFoundError
 from pydantic import BaseModel, ValidationError
 
-from driftmap.core import redact
+from driftmap.core import ids, redact
 from driftmap.core.clients import make_jobs_client
 from driftmap.core.hub import Hub
 from driftmap.core.records import AlphaScreen, Decision, LedgerLine, Mode, RunRecord, Tables, dump, load
@@ -25,7 +27,7 @@ from driftmap.jobs import launcher, readiness
 from driftmap.jobs.kinds import KINDS, State
 from driftmap.jobs.ledger import Ledger
 from driftmap.jobs.plan import MASK, SECRET_NAMES
-from driftmap.jobs.snapshot import DECISION_PATH, LOCAL, TABLES_PATH, Deps, write_decision
+from driftmap.jobs.snapshot import DECISION_PATH, LOCAL, TABLES_PATH, Deps, _billing_used, read_decision, write_decision
 
 log = logging.getLogger(__name__)
 
@@ -33,6 +35,8 @@ CONFIG = "driftmap.toml"
 REVISIONS = "revisions.json"
 DATA_DIR = LOCAL / "data"
 STATE_FILES = ["runs/*.json", "alpha_screen.json"]
+# label set and its folder under prompts/ in the evaluation dataset
+PROMPT_SETS = (("harmful", "harmful"), ("benign", "benign_heldout"), ("xstest", "xstest"))
 # 128 + SIGINT, as a shell reports it
 INTERRUPTED = 130
 # job options the launcher writes itself
@@ -54,9 +58,13 @@ Kind = enum.StrEnum("Kind", {name: name for name in KINDS})
 app = typer.Typer(no_args_is_help=True, add_completion=False, pretty_exceptions_enable=False)
 data_app = typer.Typer(no_args_is_help=True, help="Evaluation and training rows.")
 ledger_app = typer.Typer(no_args_is_help=True, help="The cost ledger.")
+table_app = typer.Typer(no_args_is_help=True, help="The result tables.")
+judge_app = typer.Typer(no_args_is_help=True, help="Labels already judged.")
 decide_app = typer.Typer(no_args_is_help=True, help="Calls only the author can make.")
 app.add_typer(data_app, name="data")
 app.add_typer(ledger_app, name="ledger")
+app.add_typer(table_app, name="table")
+app.add_typer(judge_app, name="judge")
 app.add_typer(decide_app, name="decide")
 
 
@@ -251,7 +259,7 @@ class _Noted:
         self._ledger.append(line)
 
 
-def _job_args(kind: str, mode: str, given: list[str] | None) -> list[str]:
+def _job_args(kind: str, mode: str, given: list[str] | None, *, complete: bool = True) -> list[str]:
     """The arguments passed on to the job script; exit 2 for ones the job or the launcher cannot take."""
     given = given or []
     flags = [arg.split("=", 1)[0] for arg in given if arg.startswith("--")]
@@ -264,9 +272,23 @@ def _job_args(kind: str, mode: str, given: list[str] | None) -> list[str]:
             "a job argument holds a token, a home path or a control sequence; it is printed and stored"
         )
     needed, form = JOB_ARGS.get(kind, ((), ""))
-    if any(flag not in flags for flag in needed):
+    if complete and any(flag not in flags for flag in needed):
         raise typer.BadParameter(f"{kind} needs its job arguments: driftmap launch {kind} --mode {mode} -- {form}")
     return given
+
+
+def _after(settings: Settings, hub: Hub, run_id: str, mode: str, given: list[str]) -> list[str]:
+    """The judge arguments a generate run stands for, less the ones already given; exit 2 unless it ended ok."""
+    record = next((run for run in _results(settings, hub)[0] if run.run_id == run_id), None)
+    if record is None:
+        raise DriftmapError(ExitCode.USAGE, f"the results repo holds no record of run {run_id}")
+    checkpoint = next((ref for ref in record.inputs if ref.kind == "model"), None)
+    if (record.kind, record.mode, record.status) != ("generate", mode, "ok") or checkpoint is None:
+        found = f"run {run_id} is a {record.mode} {record.kind} run that ended {record.status}"
+        raise DriftmapError(ExitCode.USAGE, f"{found}; --after takes a {mode} generate run that ended ok")
+    derived = {"--checkpoint": f"{checkpoint.repo}@{checkpoint.revision}", "--generation": record.run_id}
+    flags = {arg.split("=", 1)[0] for arg in given}
+    return [part for flag, value in derived.items() if flag not in flags for part in (flag, value)]
 
 
 @app.command()
@@ -292,6 +314,10 @@ def launch(
     ] = False,
     wait: Annotated[bool, typer.Option("--wait", help="Follow the job to its end.")] = False,
     limit: Annotated[int | None, typer.Option(help="Cap the rows the job works on.")] = None,
+    after: Annotated[
+        str | None,
+        typer.Option(metavar="RUN_ID", help="judge only: read --checkpoint and --generation off this generate run."),
+    ] = None,
     job_args: Annotated[
         list[str] | None, typer.Argument(metavar="[-- JOB_ARGS]...", help="Passed on to the job script.")
     ] = None,
@@ -308,10 +334,15 @@ def launch(
         )
     if reason and not overrides:
         raise typer.BadParameter("--reason goes with --override-smoke or --override-soft")
-    args = _job_args(kind.value, mode, job_args)
-    rows = {"kind": kind.value, "mode": mode, "dry_run": dry_run, "wait": wait, "limit": limit, "job_args": args}
-    settings, deps = _open("launch", **rows, overrides=overrides, reason=reason or None)
+    if after is not None and kind.value != "judge":
+        raise typer.BadParameter("--after names the generate run a judge job reads; it goes with judge only")
+    args = _job_args(kind.value, mode, job_args, complete=after is None)
+    rows = {"kind": kind.value, "mode": mode, "dry_run": dry_run, "wait": wait, "limit": limit, "after": after}
+    settings, deps = _open("launch", **rows, job_args=args, overrides=overrides, reason=reason or None)
     _launch_inputs(deps.repo_root)
+    if after:
+        args = [*args, *_after(settings, deps.hub, after, mode, args)]
+        typer.echo(f"{'job-args':<10}{' '.join(args)}")
     if reason:
         deps = replace(deps, ledger=_Noted(deps.ledger, f"reason={reason}"))
     return launcher.launch(
@@ -338,11 +369,20 @@ def _parsed[T: BaseModel](cls: type[T], path: Path) -> T | None:
         return None
 
 
+def _results(settings: Settings, hub: Hub) -> tuple[list[RunRecord], AlphaScreen | None]:
+    """Run records, by run id, and the alpha screen at the head of the results repo; a torn file is left out."""
+    results = f"{settings.owner}/{settings.repos.results}"
+    with tempfile.TemporaryDirectory(prefix="driftmap-results-") as scratch:
+        pinned = f"{results}@{hub.dataset_info(results).sha}"
+        root = Path(hub.snapshot_download(pinned, scratch, repo_type="dataset", allow_patterns=STATE_FILES))
+        records = [_parsed(RunRecord, path) for path in sorted((root / "runs").glob("*.json"))]
+        return [record for record in records if record], _parsed(AlphaScreen, root / "alpha_screen.json")
+
+
 def _state(
     settings: Settings, deps: Deps, mode: str, target: str | None, job_args: dict[str, list[str]]
 ) -> Callable[[str], State]:
     """Reader of what the results repo holds before a chain step; it also fills the judge step's arguments."""
-    results = f"{settings.owner}/{settings.repos.results}"
     # runs on the ledger before this chain began are not its own
     earlier = {line.run_id for line in deps.ledger.lines()}
 
@@ -351,16 +391,12 @@ def _state(
         return next((ref.revision for ref in refs if ref.repo == f"{settings.owner}/{repo}"), None)
 
     def read(kind: str) -> State:
-        with tempfile.TemporaryDirectory(prefix="driftmap-state-") as scratch:
-            pinned = f"{results}@{deps.hub.dataset_info(results).sha}"
-            root = Path(deps.hub.snapshot_download(pinned, scratch, repo_type="dataset", allow_patterns=STATE_FILES))
-            records = [_parsed(RunRecord, path) for path in sorted((root / "runs").glob("*.json"))]
-            screen = _parsed(AlphaScreen, root / "alpha_screen.json")
+        records, screen = _results(settings, deps.hub)
         # only ok runs of this mode under this config count
         runs = {
             record.run_id: record
             for record in records
-            if record and (record.mode, record.config_hash, record.status) == (mode, settings.config_hash(), "ok")
+            if (record.mode, record.config_hash, record.status) == (mode, settings.config_hash(), "ok")
         }
         # by run id, so the newest ok record of a kind wins
         ok = {record.kind: record for record in runs.values()}
@@ -428,6 +464,171 @@ def reconcile() -> ExitCode:
     """Compare billing usage with the ledger; exit 1 when billing is ahead by more than $0.50."""
     _, deps = _open("ledger reconcile", ready=False)
     return launcher.reconcile(deps)
+
+
+def _jsonl(path: Path) -> list[dict[str, Any]]:
+    # split on newlines only; a prompt may hold other line separators
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").split("\n") if line.strip()]
+
+
+def _targets(data: Path, labels_dir: Path, settings: Settings, mode: str) -> dict[str, dict[str, list[str]]]:
+    """Prompt ids per set and language as the evaluation dataset lists them; a smoke table takes the rows judged."""
+    targets = {
+        name: {
+            path.stem: [row["prompt_id"] for row in _jsonl(path)]
+            for path in (data / "prompts" / folder).glob("*.jsonl")
+        }
+        for name, folder in PROMPT_SETS
+    }
+    if mode == "smoke":
+        # a smoke run takes the first rows of each file; the longest column says how many
+        sizes: dict[tuple[str, str], int] = {}
+        for path in [*labels_dir.glob("*/*.jsonl"), *labels_dir.glob("*/benign/*.jsonl")]:
+            rows = [(row.get("set"), row.get("language")) for row in _jsonl(path)]
+            for key in set(rows):
+                sizes[key] = max(sizes.get(key, 0), rows.count(key))
+        targets = {
+            name: {language: listed[: sizes.get((name, language), 0)] for language, listed in by_language.items()}
+            for name, by_language in targets.items()
+        }
+    benign = settings.sources.benign
+    pinned = settings.revisions.get(benign)
+    if pinned is None:
+        raise DriftmapError(
+            ExitCode.USAGE, f"{benign} is not pinned; training prompts take their ids from its revision"
+        )
+    # training rows carry no id: it is their source text under the pinned revision
+    targets["train"] = {
+        path.stem: [ids.prompt_id(benign, pinned, row["prompt"][-1]["content"]) for row in _jsonl(path)]
+        for path in (data / "sft_train").glob("*.jsonl")
+    }
+    return targets
+
+
+@table_app.command("build")
+@_finish
+def table_build(
+    mode: Annotated[
+        Mode, typer.Option(help="full: the result tables. smoke: the rehearsal's, kept in their own tree.")
+    ] = "full",
+) -> None:
+    """Build the tables from the labels on the Hub, print and upload them; exit 8 on a new, undecided drift flag."""
+    settings, deps = _open("table build", mode=mode)
+    # pulls the statistics packages
+    from driftmap.table import build as table
+    from driftmap.table import render
+
+    root, tree = deps.repo_root, "smoke/" if mode == "smoke" else ""
+    evaluation = f"{settings.owner}/{settings.repos.eval}"
+    with tempfile.TemporaryDirectory(prefix="driftmap-table-") as scratch:
+        try:
+            pinned = f"{evaluation}@{deps.hub.dataset_info(evaluation).sha}"
+        except RepositoryNotFoundError:
+            raise DriftmapError(ExitCode.USAGE, f"{evaluation} does not exist yet; run `driftmap data build`") from None
+        wanted = [f"{tree}labels/*", "prompts/*/*.jsonl", "sft_train/*.jsonl"]
+        data = Path(deps.hub.snapshot_download(pinned, scratch, repo_type="dataset", allow_patterns=wanted))
+        labels_dir = data / tree / "labels"
+        records, screen = _results(settings, deps.hub)
+        targets = _targets(data, labels_dir, settings, mode)
+        tables = table.build(labels_dir, targets, [*records, *([screen] if screen else [])], settings, mode=mode)
+    flagged = None
+    if mode == "smoke":
+        # a rehearsal's flag must not gate the real repair
+        path = root / LOCAL / "results" / "smoke" / TABLES_PATH.relative_to(LOCAL / "results")
+        dump(tables, path)
+    else:
+        decision = read_decision(root / DECISION_PATH)
+        try:
+            path = table.save(tables, root, {"drift": decision} if decision else {})
+        except DriftmapError as error:
+            if error.exit_code is not ExitCode.DRIFT_BELOW_THRESHOLD:
+                raise
+            # the author decides on the table, so it is shown and uploaded first
+            path, flagged = root / TABLES_PATH, error
+    shown = render.render(tables, settings)
+    path.with_suffix(".md").write_text(shown, encoding="utf-8")
+    typer.echo(shown)
+    typer.echo(f"written to {path.parent.relative_to(root)}")
+    findings = redact.scan([path, path.with_suffix(".md")])
+    if findings:
+        raise redact.RedactionFinding(findings)
+    results = f"{settings.owner}/{settings.repos.results}"
+    in_repo = f"{tree}tables"
+    try:
+        deps.hub.upload_folder(
+            results,
+            path.parent,
+            repo_type="dataset",
+            path_in_repo=in_repo,
+            allow_patterns=[path.name, path.with_suffix(".md").name],
+            commit_message=f"add {mode} tables",
+        )
+    except httpx2.HTTPError as error:
+        message = f"the tables are in {path.parent.relative_to(root)} but were not uploaded ({type(error).__name__})"
+        raise DriftmapError(ExitCode.PUSH_FAILED, f"{message}; run the command again") from error
+    typer.echo(f"uploaded to {results} under {in_repo}/")
+    if flagged:
+        raise flagged
+
+
+@judge_app.command("reparse")
+@_finish
+def judge_reparse(
+    checkpoint: Annotated[str, typer.Option(metavar="REPO@SHA", help="The checkpoint whose labels to read again.")],
+    mode: Annotated[Mode, typer.Option(help="The tree the labels are in.")] = "full",
+) -> None:
+    """Read a checkpoint's labels again from the stored judge outputs, after a parser change; no GPU."""
+    try:
+        ref = ids.parse(checkpoint)
+    except ValueError:
+        ref = None
+    if ref is None or ref.revision is None or ref.file:
+        raise typer.BadParameter("--checkpoint is REPO@SHA with the full 40-character commit")
+    settings, deps = _open("judge reparse", checkpoint=checkpoint, mode=mode)
+    from driftmap.judge import reparse
+
+    labels, raws = f"{settings.owner}/{settings.repos.eval}", f"{settings.owner}/{settings.repos.responses}"
+    uploaded = reparse.reparse_checkpoint(deps.hub, labels, raws, checkpoint, settings.judge.parser_version, mode)
+    for name in uploaded:
+        typer.echo(name)
+    typer.echo(
+        f"{len(uploaded)} files uploaded to {labels}" if uploaded else "nothing to rewrite: every label reads the same"
+    )
+
+
+def _money(micro_usd: int) -> str:
+    return f"{micro_usd} micro-USD (${micro_usd / 1_000_000:.2f})"
+
+
+@app.command()
+@_finish
+def status() -> None:
+    """Show spend, pending jobs and the latest run of each kind; reads only."""
+    settings, deps = _open("status", ready=False)
+    lines = deps.ledger.read()
+    total = sum(line.cost_micro_usd for line in lines.values())
+    used = _billing_used(deps.client)
+    rows = [("ledger", f"{_money(total)}, pending jobs at their timeout")]
+    waiting = [line for line in lines.values() if line.pending]
+    for line in waiting:
+        rows.append(("pending", f"{line.job_id} {line.kind} ({line.mode}) held at {line.cost_micro_usd} micro-USD"))
+    if not waiting:
+        rows.append(("pending", "none"))
+    left = readiness.CREDIT_MICRO_USD - (used or 0)
+    rows.append(("billing", "unavailable" if used is None else f"{_money(used)} used, {left} left of the credit"))
+    rows.append(("headroom", f"{_money(settings.ceilings.soft - max(total, used or 0))} under the soft ceiling"))
+    for name, value in rows:
+        typer.echo(f"{name:<10}{value}")
+    try:
+        records, _ = _results(settings, deps.hub)
+    except httpx2.HTTPError as error:
+        typer.echo(f"{'runs':<10}unavailable ({type(error).__name__})")
+        return
+    latest = {(run.kind, run.mode): run for run in sorted(records, key=lambda run: run.started)}
+    typer.echo(f"{'runs':<10}{'kind':<11}{'mode':<7}{'status':<9}{'minutes':<9}{'micro-USD':<11}run")
+    for (kind, mode), run in sorted(latest.items()):
+        cells = (kind, mode, run.status, _shown(run.minutes), _shown(run.cost_micro_usd), run.run_id)
+        typer.echo(" " * 10 + f"{cells[0]:<11}{cells[1]:<7}{cells[2]:<9}{cells[3]:<9}{cells[4]:<11}{cells[5]}")
 
 
 @decide_app.command("drift")
