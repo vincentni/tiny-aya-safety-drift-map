@@ -1,1 +1,7 @@
-{}
+{
+  "CohereLabs/aya_dataset": "f9ea04583f02a8f86404ff6c58bf75fe637df8a2",
+  "CohereLabs/aya_redteaming": "5a16fee03c19d681b4f3527b6a750e1ed4d434c7",
+  "CohereLabs/tiny-aya-global": "af89d219b53ed9b13b8a4645f9c8028973510324",
+  "Paul/XSTest": "f600c994b256f12867dfa5b3eb3d545a3e62f8b5",
+  "vincentnkq/aya-redteaming-6lang-eval": "137b97381d8518521c4077104e8181a09e9976ba"
+}
