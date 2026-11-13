@@ -557,6 +557,8 @@ def test_refusal_and_plan_defaults():
     plan = records.Plan.model_validate(_payload("plan"))
     assert (plan.override_smoke, plan.override_soft) == (False, False)
     assert records.Manifest.model_validate(_payload("manifest")).n_harmful == 600
+    assert records.Manifest.model_validate(_payload("manifest")).note == ""
+    assert records.Manifest.model_validate(_payload("manifest", note="skipped languages: sr 3")).note.endswith("sr 3")
 
 
 def test_dump_replaces_the_file_whole(tmp_path):

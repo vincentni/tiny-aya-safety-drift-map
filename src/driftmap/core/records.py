@@ -338,6 +338,7 @@ class Manifest(Record):
     dropped_special_token_text: int
     max_rendered_tokens: dict[str, int]
     rendered_prefix_sha256: str
+    note: str = ""
 
 
 class RateRow(Record):
