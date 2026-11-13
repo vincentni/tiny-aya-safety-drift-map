@@ -16,6 +16,10 @@ _REF = re.compile(
 )
 
 
+# a row's set name, where its folder under prompts/ and responses/ differs
+_FOLDERS = {"benign": "benign_heldout"}
+
+
 class Steer(NamedTuple):
     layer: int
     # kept as text so 1.0 and 1 stay distinct
@@ -68,6 +72,30 @@ def merged_sha256(directory: str | Path) -> str:
         with shard.open("rb") as handle:
             combined.update(hashlib.file_digest(handle, "sha256").hexdigest().encode())
     return combined.hexdigest()
+
+
+def slug(ref: RepoRef | str) -> str:
+    """``<repo-basename>--<sha12>[--steer-...]`` of a pinned reference; ValueError without a revision."""
+    return (parse(ref) if isinstance(ref, str) else ref).slug()
+
+
+def responses_path(slug: str, set: str, language: str, mode: str) -> str:
+    """File of a checkpoint's responses to one set and language in the responses repo; smoke runs get their own tree."""
+    return f"{_tree(mode)}responses/{slug}/{_FOLDERS.get(set, set)}/{language}.jsonl"
+
+
+def labels_path(slug: str, language: str, mode: str, benign: bool = False) -> str:
+    """File of a checkpoint's label rows for one language in the evaluation dataset; benign rows sit apart."""
+    return f"{_tree(mode)}labels/{slug}/{'benign/' if benign else ''}{language}.jsonl"
+
+
+def judge_raw_path(slug: str, language: str, mode: str) -> str:
+    """File of the judge's unparsed outputs for one language, kept beside the responses."""
+    return f"{_tree(mode)}judge_raw/{slug}/{language}.jsonl"
+
+
+def _tree(mode: str) -> str:
+    return "smoke/" if mode == "smoke" else ""
 
 
 def _steer_suffix(steer: Steer | None) -> str:

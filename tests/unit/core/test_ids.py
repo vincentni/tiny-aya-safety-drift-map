@@ -117,6 +117,23 @@ def test_prompt_id_is_bound_to_the_source_revision():
     assert first != ids.prompt_id(repo, SHA[::-1], text)
 
 
+def test_result_files_are_laid_out_by_slug_set_and_language_with_smoke_runs_apart():
+    slug = ids.slug(RepoRef("CohereLabs/tiny-aya-global", SHA))
+    assert slug == ids.slug(f"CohereLabs/tiny-aya-global@{SHA}") == "tiny-aya-global--0123456789ab"
+    with pytest.raises(ValueError, match="no revision"):
+        ids.slug("CohereLabs/tiny-aya-global")
+    assert ids.responses_path(slug, "harmful", "en", "full") == f"responses/{slug}/harmful/en.jsonl"
+    assert ids.responses_path(slug, "xstest", "en", "smoke") == f"smoke/responses/{slug}/xstest/en.jsonl"
+    for name in ("benign", "benign_heldout"):
+        assert ids.responses_path(slug, name, "hi", "full") == f"responses/{slug}/benign_heldout/hi.jsonl"
+    assert ids.labels_path(slug, "hi", "full", benign=True) == f"labels/{slug}/benign/hi.jsonl"
+    assert ids.labels_path(slug, "hi", "smoke", benign=True) == f"smoke/labels/{slug}/benign/hi.jsonl"
+    assert ids.labels_path(slug, "en", "full") == f"labels/{slug}/en.jsonl"
+    assert ids.labels_path(slug, "en", "smoke") == f"smoke/labels/{slug}/en.jsonl"
+    assert ids.judge_raw_path(slug, "en", "full") == f"judge_raw/{slug}/en.jsonl"
+    assert ids.judge_raw_path(slug, "ar", "smoke") == f"smoke/judge_raw/{slug}/ar.jsonl"
+
+
 def test_merged_sha256_covers_the_shards_in_filename_order(tmp_path):
     """Two shards hash in sorted order; config and tokenizer are left out (TS-CFG-10)."""
     shards = {"model-00002-of-00002.safetensors": b"second", "model-00001-of-00002.safetensors": b"first"}

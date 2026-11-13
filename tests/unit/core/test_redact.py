@@ -69,6 +69,25 @@ def test_scan_hits_positives_only_and_never_echoes_the_token(prefix, body, suffi
     assert token not in mask(prefix + token + suffix)
 
 
+def test_the_exemption_also_covers_the_smoke_tree_and_judge_outputs(tmp_path):
+    root = tmp_path / "data"
+    row = json.dumps({"prompt": f"call {ACCOUNT} now"}) + "\n"
+    exempt = [
+        _write(root / "smoke/responses/x/harmful/en.jsonl", row),
+        _write(root / "smoke/labels/x/benign/en.jsonl", row),
+        _write(root / "judge_raw/x/en.jsonl", row),
+        _write(root / "smoke/judge_raw/x/en.jsonl", row),
+    ]
+    scanned = [
+        _write(root / "smoke/runs/r.json", row),
+        _write(root / "smoke/en.jsonl", row),
+        _write(root / "smoke/smoke/prompts/en.jsonl", row),
+        _write(root / "runs/smoke/prompts/en.jsonl", row),
+    ]
+
+    assert [finding.path for finding in scan([*exempt, *scanned], root)] == scanned
+
+
 def test_twelve_digit_exemption_is_scoped_to_the_dataset_path_classes(tmp_path):
     """Twelve digits pass only under the four dataset path classes of the data root (TS-CFG-8)."""
     root = tmp_path / "data"

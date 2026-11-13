@@ -31,7 +31,8 @@ def load_tokenizer(repo_dir: str | Path, canaries: Sequence[str]):
 
     if not canaries:
         raise ValueError("load_tokenizer needs at least one canary")
-    tokenizer = AutoTokenizer.from_pretrained(str(repo_dir), local_files_only=True)
+    # code shipped in a repo is refused outright, never asked about
+    tokenizer = AutoTokenizer.from_pretrained(str(repo_dir), local_files_only=True, trust_remote_code=False)
     reference = Tokenizer.from_file(str(Path(repo_dir) / "tokenizer.json"))
     # a stored padding or truncation block would bend the reference encodings
     reference.no_padding()

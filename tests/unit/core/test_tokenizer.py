@@ -33,6 +33,21 @@ def test_swapped_canary_tokenizer_is_refused(tmp_path, monkeypatch, caplog):
         assert f"{string!r} expected {expected} got {got}" in str(exc.value)
 
 
+def test_code_shipped_with_a_tokenizer_is_never_trusted(tmp_path, monkeypatch):
+    build().save_pretrained(tmp_path)
+    seen = []
+    load = AutoTokenizer.from_pretrained
+
+    def spy(*args, **kwargs):
+        seen.append(kwargs)
+        return load(*args, **kwargs)
+
+    monkeypatch.setattr(AutoTokenizer, "from_pretrained", spy)
+    load_tokenizer(tmp_path, CANARIES)
+
+    assert [(kwargs["trust_remote_code"], kwargs["local_files_only"]) for kwargs in seen] == [(False, True)]
+
+
 def test_only_differing_canaries_enter_the_table(tmp_path, monkeypatch):
     build().save_pretrained(tmp_path)
     monkeypatch.setattr(AutoTokenizer, "from_pretrained", lambda *args, **kwargs: build(vocab=swapped(VOCAB)))

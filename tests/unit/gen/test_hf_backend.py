@@ -87,6 +87,21 @@ def test_unusable_checkpoint_fails_at_load(tmp_path):
         load_hf_model(tmp_path, "bfloat16", 8)
 
 
+def test_code_shipped_with_a_checkpoint_is_never_trusted(tmp_path, monkeypatch):
+    loads = []
+
+    def pipeline(task, **kwargs):
+        loads.append(kwargs)
+        raise OSError("stopped before any load")
+
+    # by name: the module in use may not be this import
+    monkeypatch.setattr("transformers.pipeline", pipeline)
+    with pytest.raises(OSError, match="stopped"):
+        load_hf_model(tmp_path, "bfloat16", 8)
+
+    assert [(kwargs["model"], kwargs["trust_remote_code"]) for kwargs in loads] == [(str(tmp_path), False)]
+
+
 @pytest.fixture
 def single_thread():
     # many threads make the tiny forward passes slow
@@ -114,7 +129,7 @@ def test_a_batch_is_one_left_padded_generate_call_with_one_bos_per_row(tmp_path,
     model = load_hf_model(tmp_path, "float32", 3)
     assert isinstance(model, HFGenModel)
     assert model._model_name == str(tmp_path)
-    assert model._extra_kwargs == {"dtype": "float32", "batch_size": 3}
+    assert model._extra_kwargs == {"dtype": "float32", "batch_size": 3, "trust_remote_code": False}
     network = model._pipeline.model
     batches = []
     generate = network.generate

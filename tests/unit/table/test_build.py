@@ -56,6 +56,56 @@ def test_a_checkpoint_maps_to_its_column_by_repo_name(settings):
         assert column_of(text, settings) is None
 
 
+def test_a_smoke_table_places_the_smoke_drift_repos_and_a_full_one_refuses_them(tmp_path, settings):
+    merged = CHECKPOINTS["drifted"].replace("@", "-smoke@")
+    adapter = "vincentnkq/tiny-aya-global-drift-lora-smoke@" + "a" * 40
+    assert [column_of(checkpoint, settings, "smoke") for checkpoint in (merged, adapter)] == ["drifted", "drifted"]
+    assert [column_of(checkpoint, settings, "full") for checkpoint in (merged, adapter)] == [None, None]
+    # a reader of built tables takes either mode's names
+    assert (column_of(merged, settings), column_of(CHECKPOINTS["drifted"], settings, "smoke")) == ("drifted", "drifted")
+
+    rows = column_rows("baseline") + column_rows("drifted", checkpoint=merged)
+    labels = write_labels(tmp_path / "labels", rows)
+    drifted = run_record("generate", "drifted", mode="smoke", notes=[f"{NOT_COMPARABLE}seed differs from baseline"])
+    drifted.inputs[0].repo += "-smoke"
+    tables = build(labels, targets(), [], settings, mode="smoke")
+    assert tables.columns["drifted"].state == "tabled"
+    assert {(delta.a, delta.b) for delta in tables.deltas if delta.a != delta.b} == {("baseline", "drifted")}
+    assert "| all | safe | +0.0 points" in render(tables, settings)
+    # the smoke generation run, reading the smoke repo, speaks for the column
+    noted = build(labels, targets(), [drifted], settings, mode="smoke").columns["drifted"]
+    assert (noted.state, noted.reason) == ("not_comparable", "seed differs from baseline")
+    with pytest.raises(DriftmapError, match="unknown checkpoint .*-smoke"):
+        build(labels, targets(), [drifted], settings)
+
+
+def test_only_the_repaired_column_may_hold_a_steered_and_a_weights_checkpoint(tmp_path, settings):
+    other = CHECKPOINTS["baseline"] + "--steer-l24-s1.0"
+    steered = [row.model_copy(update={"checkpoint": other}) for row in column_rows("baseline")]
+    labels = write_labels(tmp_path / "labels", column_rows("baseline") + steered)
+    with pytest.raises(DriftmapError, match="baseline has rows from 2 checkpoints"):
+        build(labels, targets(), [], settings)
+
+
+def test_the_drifted_hash_is_compared_with_the_latest_finished_drift_run_of_the_mode(tmp_path, settings):
+    labels = write_labels(tmp_path / "labels", column_rows("baseline") + column_rows("drifted"))
+    later = datetime(2026, 11, 14, tzinfo=UTC)
+    drift = run_record("drift", merged_sha256="a" * 64, started=datetime(2026, 11, 12, tzinfo=UTC))
+    generated = run_record("generate", "drifted", merged_sha256="a" * 64)
+    others = [
+        run_record("drift", merged_sha256="b" * 64, started=later, mode="smoke"),
+        run_record("drift", merged_sha256="c" * 64, started=later, status="failed"),
+    ]
+
+    assert build(labels, targets(), [drift, generated, *others], settings).columns["drifted"].state == "tabled"
+    newer = run_record("drift", merged_sha256="d" * 64, started=later)
+    state = build(labels, targets(), [drift, generated, *others, newer], settings).columns["drifted"]
+    assert (state.state, state.reason) == (
+        "not_comparable",
+        "merged weights hash differs between the drift and generate records",
+    )
+
+
 def test_columns_without_labels_say_why(tmp_path, settings):
     labels = write_labels(tmp_path / "labels", column_rows("baseline"))
     benign = [label("drifted", "en", i, set_="benign", chrf=0.5) for i in range(4)]

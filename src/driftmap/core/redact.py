@@ -16,7 +16,9 @@ PATTERNS = {
     "home_path": re.compile(r"(?:(?<![A-Za-z0-9_./-])|(?<=file://))/(home|Users|local/home)/[A-Za-z0-9_.-]+"),
 }
 # dataset rows quote arbitrary numbers
-DIGIT_EXEMPT_DIRS = frozenset({"prompts", "sft_train", "labels", "responses"})
+DIGIT_EXEMPT_DIRS = frozenset({"prompts", "sft_train", "labels", "responses", "judge_raw"})
+# smoke runs keep the same folders under this one
+SMOKE_TREE = "smoke"
 _CONTROL = r"(?:\x1b|\\u001[bB])\[[0-?]*[ -/]*[@-~]"
 # a trailing escape letter or digit would defeat the anchors
 _ANSI = re.compile(_CONTROL)
@@ -65,6 +67,7 @@ def _digits_exempt(path: Path, data_root: str | Path | None) -> bool:
         parts = path.resolve().relative_to(Path(data_root).resolve()).parts
     except ValueError:
         return False
+    parts = parts[1:] if parts[:1] == (SMOKE_TREE,) else parts
     return len(parts) > 1 and parts[0] in DIGIT_EXEMPT_DIRS
 
 
