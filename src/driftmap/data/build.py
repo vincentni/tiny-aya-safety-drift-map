@@ -7,7 +7,7 @@ import os
 import shutil
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import pyarrow.parquet as pq
 from huggingface_hub import DatasetCard
@@ -115,7 +115,15 @@ def _xstest(directory: Path, repo: str, revision: str) -> list[Row]:
         ]
 
 
-def build(settings: Settings, hub: Hub, out_dir: str | Path, *, dry_run: bool, revisions_path: str | Path) -> Manifest:
+class Built(NamedTuple):
+    """A build's manifest and, after a real run, the commit its upload returned and whether it added one."""
+
+    manifest: Manifest
+    commit: str | None = None
+    uploaded: bool = False
+
+
+def build(settings: Settings, hub: Hub, out_dir: str | Path, *, dry_run: bool, revisions_path: str | Path) -> Built:
     """Write the evaluation set under ``out_dir``; unless ``dry_run``, pin the source revisions and upload it."""
     out_dir = Path(out_dir)
     sources, languages, seed = settings.sources, settings.languages, settings.seed
@@ -258,20 +266,23 @@ def build(settings: Settings, hub: Hub, out_dir: str | Path, *, dry_run: bool, r
     findings = redact.scan(bound, data_root=out_dir)
     if findings:
         raise redact.RedactionFinding(findings)
-    if not dry_run:
-        # pinned first: a rebuild after a failed upload reads the same revisions
-        _pin(Path(revisions_path), {**on_file, **pins})
-        target = f"{settings.owner}/{settings.repos.eval}"
-        # visibility is the publish step's call
-        hub.create_repo(target, repo_type="dataset", private=True)
-        hub.upload_folder(
-            target,
-            out_dir,
-            repo_type="dataset",
-            allow_patterns=UPLOADS,
-            commit_message="add evaluation and training rows",
-        )
-    return written
+    if dry_run:
+        return Built(written)
+    # pinned first: a rebuild after a failed upload reads the same revisions
+    _pin(Path(revisions_path), {**on_file, **pins})
+    target = f"{settings.owner}/{settings.repos.eval}"
+    # visibility is the publish step's call
+    hub.create_repo(target, repo_type="dataset", private=True)
+    head = hub.dataset_info(target).sha
+    commit = hub.upload_folder(
+        target,
+        out_dir,
+        repo_type="dataset",
+        allow_patterns=UPLOADS,
+        commit_message="add evaluation and training rows",
+    ).oid
+    # unchanged rows make no commit: the upload answers with the head
+    return Built(written, commit, commit != head)
 
 
 def _pin(path: Path, pins: dict[str, str]) -> None:

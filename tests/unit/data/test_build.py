@@ -87,7 +87,9 @@ def test_training_rows_that_repeat_an_evaluation_prompt_are_dropped_and_counted(
     fake = sources(tmp_path, harmful=harmful, train=train, test=test)
     out = tmp_path / "out"
 
-    manifest = build(settings_for(tmp_path, fake), wrap(fake), out, dry_run=True, revisions_path=pins_file(tmp_path))
+    manifest = build(
+        settings_for(tmp_path, fake), wrap(fake), out, dry_run=True, revisions_path=pins_file(tmp_path)
+    ).manifest
 
     # same prompt, upper-cased held-out, French copy of it, upper-cased harmful, near harmful
     assert manifest.dropped_by_dedup == 5
@@ -117,7 +119,7 @@ def test_rows_the_pipeline_removes_are_counted(tmp_path):
 
     manifest = build(
         settings_for(tmp_path, fake), wrap(fake), tmp_path / "out", dry_run=True, revisions_path=pins_file(tmp_path)
-    )
+    ).manifest
 
     assert "training rows rejected by the pipeline gate: 1" in manifest.note
     assert "training rows removed by the pipeline dedup: 1" in manifest.note
@@ -151,7 +153,7 @@ def test_xstest_is_counted_and_an_empty_set_is_refused(tmp_path, caplog):
     with caplog.at_level(logging.WARNING, logger="driftmap.data.build"):
         manifest = build(
             settings_for(tmp_path, fake), wrap(fake), out, dry_run=True, revisions_path=pins_file(tmp_path)
-        )
+        ).manifest
 
     assert "xstest rows: 2 of 4 safe source rows, expected 250" in manifest.note
     assert len(read(out / "prompts" / "xstest" / "en.jsonl")) == 2
@@ -276,7 +278,7 @@ def test_unusable_rows_are_counted_in_the_manifest(tmp_path):
         out,
         dry_run=True,
         revisions_path=tmp_path / "config" / "revisions.json",
-    )
+    ).manifest
 
     assert manifest.dropped_special_token_text == 2
     assert BOS not in (out / "sft_train" / "fr.jsonl").read_text(encoding="utf-8")
@@ -323,7 +325,7 @@ def test_rows_quoting_a_home_path_are_dropped_not_fatal(tmp_path):
         out,
         dry_run=False,
         revisions_path=tmp_path / "config" / "revisions.json",
-    )
+    ).manifest
 
     assert "rows quoting a home path removed: 3" in manifest.note
     assert len(read(out / "prompts" / "xstest" / "en.jsonl")) == 3
@@ -417,7 +419,7 @@ def test_pins_on_file_are_kept_and_downloads_use_them(tmp_path):
         fake.upload_file(path_or_fileobj=b"later", path_in_repo="later.txt", repo_id=repo, repo_type=repo_type)
     assert not set(heads(fake).values()) & set(pinned.values())
 
-    manifest = build(settings, wrap(fake), tmp_path / "out", dry_run=False, revisions_path=revisions)
+    manifest = build(settings, wrap(fake), tmp_path / "out", dry_run=False, revisions_path=revisions).manifest
 
     assert json.loads(revisions.read_text()) == {"CohereLabs/tiny-aya-base": "2" * 40, **pinned}
     assert {ref.repo: ref.revision for ref in manifest.sources} == pinned
@@ -445,3 +447,19 @@ def test_a_pin_that_moved_on_file_is_refused_before_any_download(tmp_path):
     assert error.value.exit_code == ExitCode.USAGE
     assert fake.calls == []
     assert json.loads(revisions.read_text())[HARMFUL] == "9" * 40
+
+
+def test_a_real_build_returns_the_commit_its_upload_made(tmp_path):
+    fake = sources(tmp_path)
+    settings, revisions = settings_for(tmp_path, fake), pins_file(tmp_path)
+    dry = build(settings, wrap(fake), tmp_path / "out", dry_run=True, revisions_path=revisions)
+    assert (dry.commit, dry.uploaded) == (None, False)
+
+    first = build(settings, wrap(fake), tmp_path / "out", dry_run=False, revisions_path=revisions)
+    assert first.uploaded and first.commit == fake.heads[EVAL]
+
+    # another writer commits; the same rows upload nothing
+    fake.upload_file(path_or_fileobj=b"{}\n", path_in_repo="labels/x/en.jsonl", repo_id=EVAL, repo_type="dataset")
+    again = build(settings, wrap(fake), tmp_path / "out", dry_run=False, revisions_path=revisions)
+    assert not again.uploaded and again.commit == fake.heads[EVAL] != first.commit
+    assert again.manifest == first.manifest

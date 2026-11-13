@@ -113,7 +113,7 @@ def test_short_language_is_taken_whole_and_marked(tmp_path):
 
     manifest = build(
         settings, wrap(fake), tmp_path / "out", dry_run=True, revisions_path=tmp_path / "config" / "revisions.json"
-    )
+    ).manifest
 
     english = read(tmp_path / "out" / "prompts" / "harmful" / "en.jsonl")
     assert [row["prompt"] for row in english] == [row["prompt"] for row in harmful["eng"]]
@@ -200,7 +200,7 @@ def test_xstest_safe_prompts_pass_through_unchanged(tmp_path, caplog):
         tmp_path / "out",
         dry_run=True,
         revisions_path=tmp_path / "config" / "revisions.json",
-    )
+    ).manifest
 
     folder = tmp_path / "out" / "prompts" / "xstest"
     assert [path.name for path in folder.iterdir()] == ["en.jsonl"]
@@ -262,7 +262,7 @@ def test_only_the_configured_languages_are_built(tmp_path):
         out,
         dry_run=True,
         revisions_path=tmp_path / "config" / "revisions.json",
-    )
+    ).manifest
 
     for folder in ("prompts/harmful", "prompts/benign_heldout", "sft_train"):
         assert {path.stem for path in (out / folder).iterdir()} == LANGUAGES

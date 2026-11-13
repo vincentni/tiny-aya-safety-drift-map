@@ -8,7 +8,7 @@ import traceback
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 import httpx2
 import typer
@@ -17,7 +17,7 @@ from pydantic import BaseModel, ValidationError
 from driftmap.core import redact
 from driftmap.core.clients import make_jobs_client
 from driftmap.core.hub import Hub
-from driftmap.core.records import AlphaScreen, LedgerLine, Mode, RunRecord, dump, load
+from driftmap.core.records import AlphaScreen, Decision, LedgerLine, Mode, RunRecord, Tables, dump, load
 from driftmap.core.schemas import DriftmapError, ExitCode
 from driftmap.core.settings import Settings, load_settings
 from driftmap.jobs import client as jobs_client
@@ -25,16 +25,29 @@ from driftmap.jobs import launcher, readiness
 from driftmap.jobs.kinds import KINDS, State
 from driftmap.jobs.ledger import Ledger
 from driftmap.jobs.plan import MASK, SECRET_NAMES
-from driftmap.jobs.snapshot import DECISION_PATH, LOCAL, Deps, write_decision
+from driftmap.jobs.snapshot import DECISION_PATH, LOCAL, TABLES_PATH, Deps, write_decision
 
 log = logging.getLogger(__name__)
 
 CONFIG = "driftmap.toml"
 REVISIONS = "revisions.json"
 DATA_DIR = LOCAL / "data"
-STATE_FILES = ["runs/*.json", "partial/*.json", "alpha_screen.json"]
+STATE_FILES = ["runs/*.json", "alpha_screen.json"]
 # 128 + SIGINT, as a shell reports it
 INTERRUPTED = 130
+# job options the launcher writes itself
+OWNED = ("--run-id", "--timeout-s", "--config-hash", "--code-sha", "--submitted-at", "--limit", "--force-flush-after-s")
+# what a job exits 2 without, and how to type it
+JOB_ARGS = {
+    "generate": (("--kind",), "--kind baseline|drifted|repaired"),
+    "judge": (("--checkpoint", "--generation"), "--checkpoint REPO@SHA --generation RUN_ID"),
+}
+
+Target = Literal["baseline", "drifted", "repaired"]
+MODE_HELP = (
+    "smoke: a short rehearsal on a few rows, priced at the smoke timeout and held under the smoke ceiling. "
+    "full: the real run, priced at its whole timeout; refused without a passing smoke record of the same job."
+)
 
 Kind = enum.StrEnum("Kind", {name: name for name in KINDS})
 
@@ -66,14 +79,11 @@ def _finish(verb: Callable[..., ExitCode | None]) -> Callable[..., None]:
         except DriftmapError as error:
             typer.echo(redact.mask(f"error: {error}"), err=True)
             code = error.exit_code
-        except ValidationError as error:
-            # input values stay out: they may quote a secret
-            faults = "; ".join(f"{'.'.join(map(str, e['loc']))}: {e['msg']}" for e in error.errors())
-            typer.echo(redact.mask(f"error: {error.title} does not validate: {faults}"), err=True)
-            code = ExitCode.USAGE
         except KeyboardInterrupt:
-            # the launcher has already printed how to recover
+            # the launcher has already printed how to recover from a cut submit
             typer.echo("interrupted", err=True)
+            for job_id in _pending():
+                typer.echo(f"{job_id} is still pending; follow it with: driftmap wait {job_id}", err=True)
             code = INTERRUPTED
         except Exception:  # anything unforeseen leaves as a masked traceback
             typer.echo(redact.mask(traceback.format_exc()), err=True)
@@ -81,6 +91,32 @@ def _finish(verb: Callable[..., ExitCode | None]) -> Callable[..., None]:
         raise typer.Exit(int(code))
 
     return run
+
+
+def _pending() -> list[str]:
+    """Ids the ledger still holds as pending; none when it cannot be read."""
+    try:
+        lines = Ledger(Path.cwd() / launcher.LEDGER_PATH).read()
+    except (OSError, DriftmapError):
+        return []
+    return [job_id for job_id, line in lines.items() if line.pending]
+
+
+def _record[T: BaseModel](cls: type[T], path: Path) -> T | None:
+    """A local record, None when absent; one that does not validate is exit 2, named by field and never by value."""
+    try:
+        return load(cls, path)
+    except FileNotFoundError:
+        return None
+    except ValidationError as error:
+        faults = "; ".join(f"{'.'.join(map(str, e['loc']))}: {e['msg']}" for e in error.errors())
+        raise DriftmapError(ExitCode.USAGE, f"{path.name}: {faults}") from None
+
+
+def _launch_inputs(root: Path) -> None:
+    """Exit 2 on a torn local file a launch reads, before anything is submitted."""
+    _record(Decision, root / DECISION_PATH)
+    _record(Tables, root / TABLES_PATH)
 
 
 def _shown(value: Any) -> str:
@@ -141,45 +177,60 @@ def ready(
 @_finish
 def data_build(
     dry_run: Annotated[bool, typer.Option("--dry-run", help="Build locally; upload and pin nothing.")] = False,
+    repin: Annotated[
+        bool,
+        typer.Option("--repin", help="Move the evaluation pin to this build; run records made so far stop counting."),
+    ] = False,
 ) -> None:
     """Build the evaluation and training rows; unless --dry-run, upload them and pin every revision used."""
+    if dry_run and repin:
+        raise typer.BadParameter("--repin moves a pin and --dry-run pins nothing; pass one of them")
     # a dry run only reads, and is how the sources are first looked at
-    settings, deps = _open("data build", ready=not dry_run, dry_run=dry_run, out=DATA_DIR)
+    settings, deps = _open("data build", ready=not dry_run, dry_run=dry_run, repin=repin, out=DATA_DIR)
     # pulls the optional data packages
     from driftmap.data import build
 
-    manifest = build.build(
+    built = build.build(
         settings, deps.hub, deps.repo_root / DATA_DIR, dry_run=dry_run, revisions_path=deps.repo_root / REVISIONS
     )
-    for language, counts in manifest.per_language.items():
+    for language, counts in built.manifest.per_language.items():
         row = f"{language}  harmful {counts.harmful}  train {counts.benign_train}  held-out {counts.benign_heldout}"
         typer.echo(f"{row}  undersampled" if counts.undersampled else row)
-    typer.echo(f"note: {manifest.note}")
+    typer.echo(f"note: {built.manifest.note}")
     if dry_run:
         typer.echo("dry run: nothing was uploaded or pinned")
         return
     target = f"{settings.owner}/{settings.repos.eval}"
-    typer.echo(f"uploaded to {target}")
-    try:
-        revision = deps.hub.dataset_info(target).sha
-    except httpx2.HTTPError as error:
-        message = f"the revision of {target} could not be read ({type(error).__name__})"
-        raise DriftmapError(ExitCode.PUSH_FAILED, f"{message}; run the command again to pin it") from error
-    path = deps.repo_root / REVISIONS
-    pins = load(readiness.Revisions, path).root
-    if pins.get(target) == revision:
-        typer.echo(f"{target} is already pinned at {revision}")
+    typer.echo(
+        f"uploaded to {target}" if built.uploaded else f"{target} already holds these rows; nothing was uploaded"
+    )
+    pinned = settings.revisions.get(target)
+    if pinned == built.commit:
+        typer.echo(f"{target} is already pinned at {pinned}")
         return
-    # jobs read the rows at this revision, whatever lands in the repo later
-    dump(readiness.Revisions(dict(sorted({**pins, target: revision}.items()))), path)
-    typer.echo(f"pinned {target} at {revision}; commit and push {REVISIONS}, then run `driftmap ready` again")
+    stale = "the config hash changes with the pin, so run records made so far stop counting"
+    if pinned and not repin:
+        if not built.uploaded:
+            # the head moved under other writers; the rows are where the pin is
+            typer.echo(f"{target} stays pinned at {pinned}")
+            return
+        message = f"the upload is commit {built.commit}, but {target} is pinned at {pinned}; the pin was not moved"
+        raise DriftmapError(ExitCode.GUARD_REFUSAL, f"{message}. To move it: driftmap data build --repin; {stale}")
+    path = deps.repo_root / REVISIONS
+    on_file = _record(readiness.Revisions, path)
+    pins = {**(on_file.root if on_file else {}), target: built.commit}
+    dump(readiness.Revisions(dict(sorted(pins.items()))), path)
+    moved = f"; it was {pinned}: {stale}" if pinned else ""
+    typer.echo(f"pinned {target} at {built.commit}{moved}")
+    typer.echo(f"commit and push {REVISIONS}, then run `driftmap ready` again")
 
 
 @app.command()
 @_finish
-def plan(kind: Kind, mode: Annotated[Mode, typer.Option(help="smoke is the short rehearsal.")] = "smoke") -> ExitCode:
+def plan(kind: Kind, mode: Annotated[Mode, typer.Option(help=MODE_HELP)] = "smoke") -> ExitCode:
     """Print the resolved job, its cost at timeout, the spend so far and every guard verdict; submit nothing."""
     settings, deps = _open("plan", kind=kind.value, mode=mode)
+    _launch_inputs(deps.repo_root)
     return launcher.launch(settings, deps, kind.value, mode, dry_run=True)
 
 
@@ -200,16 +251,40 @@ class _Noted:
         self._ledger.append(line)
 
 
+def _job_args(kind: str, mode: str, given: list[str] | None) -> list[str]:
+    """The arguments passed on to the job script; exit 2 for ones the job or the launcher cannot take."""
+    given = given or []
+    flags = [arg.split("=", 1)[0] for arg in given if arg.startswith("--")]
+    # argparse takes any unambiguous prefix of an option
+    owned = [flag for flag in flags if len(flag) > 2 and any(name.startswith(flag) for name in OWNED)]
+    if owned:
+        raise typer.BadParameter(f"{owned[0]} is set by the launcher; a row cap goes before `--` as --limit N")
+    if any(redact.mask(arg) != arg for arg in given):
+        raise typer.BadParameter(
+            "a job argument holds a token, a home path or a control sequence; it is printed and stored"
+        )
+    needed, form = JOB_ARGS.get(kind, ((), ""))
+    if any(flag not in flags for flag in needed):
+        raise typer.BadParameter(f"{kind} needs its job arguments: driftmap launch {kind} --mode {mode} -- {form}")
+    return given
+
+
 @app.command()
 @_finish
 def launch(
     kind: Kind,
-    mode: Annotated[Mode, typer.Option(help="smoke is the short rehearsal; full is the paid run.")] = "smoke",
+    mode: Annotated[Mode, typer.Option(help=MODE_HELP)] = "smoke",
     override_smoke: Annotated[
-        bool, typer.Option("--override-smoke", help="Skip the smoke-record guard; needs --reason.")
+        bool,
+        typer.Option("--override-smoke", help="Submit a full run with no passing smoke record of it; needs --reason."),
     ] = False,
     override_soft: Annotated[
-        bool, typer.Option("--override-soft", help="Check spend against the hard ceiling; needs --reason.")
+        bool,
+        typer.Option(
+            "--override-soft",
+            help="Check spend against the hard ceiling plus own money, not the soft ceiling, and launch even when "
+            "billing is unreadable and the ledger is empty; needs --reason.",
+        ),
     ] = False,
     reason: Annotated[str, typer.Option(help="Why an override is used; kept in the ledger notes.")] = "",
     dry_run: Annotated[
@@ -225,15 +300,18 @@ def launch(
     overrides = [
         flag for flag, used in (("--override-smoke", override_smoke), ("--override-soft", override_soft)) if used
     ]
-    reason = redact.mask(" ".join(reason.split()))
+    # masked before folded: a line break can cut a token in two
+    reason = " ".join("".join(char if char.isprintable() else " " for char in redact.mask(reason)).split())
     if overrides and not reason:
         raise typer.BadParameter(
             f"{' and '.join(overrides)}: an override needs --reason TEXT, kept in the ledger notes"
         )
     if reason and not overrides:
         raise typer.BadParameter("--reason goes with --override-smoke or --override-soft")
-    rows = {"kind": kind.value, "mode": mode, "dry_run": dry_run, "wait": wait, "limit": limit, "job_args": job_args}
+    args = _job_args(kind.value, mode, job_args)
+    rows = {"kind": kind.value, "mode": mode, "dry_run": dry_run, "wait": wait, "limit": limit, "job_args": args}
     settings, deps = _open("launch", **rows, overrides=overrides, reason=reason or None)
+    _launch_inputs(deps.repo_root)
     if reason:
         deps = replace(deps, ledger=_Noted(deps.ledger, f"reason={reason}"))
     return launcher.launch(
@@ -246,7 +324,7 @@ def launch(
         override_smoke=override_smoke,
         override_soft=override_soft,
         limit=limit,
-        args=job_args or [],
+        args=args,
     )
 
 
@@ -260,9 +338,13 @@ def _parsed[T: BaseModel](cls: type[T], path: Path) -> T | None:
         return None
 
 
-def _state(settings: Settings, hub: Hub, mode: str) -> Callable[[str], State]:
-    """Reader of what the results repo holds before a chain step; what it cannot see stays missing."""
+def _state(
+    settings: Settings, deps: Deps, mode: str, target: str | None, job_args: dict[str, list[str]]
+) -> Callable[[str], State]:
+    """Reader of what the results repo holds before a chain step; it also fills the judge step's arguments."""
     results = f"{settings.owner}/{settings.repos.results}"
+    # runs on the ledger before this chain began are not its own
+    earlier = {line.run_id for line in deps.ledger.lines()}
 
     def output(record: RunRecord | None, repo: str) -> str | None:
         refs = record.outputs if record else []
@@ -270,26 +352,35 @@ def _state(settings: Settings, hub: Hub, mode: str) -> Callable[[str], State]:
 
     def read(kind: str) -> State:
         with tempfile.TemporaryDirectory(prefix="driftmap-state-") as scratch:
-            pinned = f"{results}@{hub.dataset_info(results).sha}"
-            root = Path(hub.snapshot_download(pinned, scratch, repo_type="dataset", allow_patterns=STATE_FILES))
+            pinned = f"{results}@{deps.hub.dataset_info(results).sha}"
+            root = Path(deps.hub.snapshot_download(pinned, scratch, repo_type="dataset", allow_patterns=STATE_FILES))
             records = [_parsed(RunRecord, path) for path in sorted((root / "runs").glob("*.json"))]
-            generated = sorted(path.stem for path in root.glob(f"*/generate-{mode}-*.json"))
             screen = _parsed(AlphaScreen, root / "alpha_screen.json")
-        # by run id, so the newest ok record of a kind wins
-        ok = {
-            record.kind: record
+        # only ok runs of this mode under this config count
+        runs = {
+            record.run_id: record
             for record in records
             if record and (record.mode, record.config_hash, record.status) == (mode, settings.config_hash(), "ok")
         }
+        # by run id, so the newest ok record of a kind wins
+        ok = {record.kind: record for record in runs.values()}
+        launched = [line.run_id for line in deps.ledger.lines() if line.run_id not in earlier]
+        generated = next(
+            (runs[run] for run in reversed(launched) if run in runs and runs[run].kind == "generate"), None
+        )
+        checkpoint = next((ref for ref in generated.inputs if ref.kind == "model"), None) if generated else None
+        if checkpoint:
+            # judge reads exactly the rows the generate step of this chain wrote
+            reference = f"{checkpoint.repo}@{checkpoint.revision}"
+            job_args["judge"] = ["--checkpoint", reference, "--generation", generated.run_id]
         return State(
             languages=tuple(settings.languages),
-            # chain cannot name the generate target yet, so the strictest one is checked
-            checkpoint="drifted",
+            checkpoint=target or "drifted",
             merged_sha256=ok["drift"].merged_sha256 if "drift" in ok else None,
-            responses_complete="generate" in ok and generated[-1:] == [ok["generate"].run_id],
+            responses_complete=checkpoint is not None,
             repaired_revision=output(ok.get("repair"), settings.repos.repaired),
             gguf_record=output(ok.get("quant"), settings.repos.gguf) is not None,
-            recover_status=screen.recover_status if screen else None,
+            recover_status=screen.recover_status if screen and "repair" in ok else None,
         )
 
     return read
@@ -298,15 +389,26 @@ def _state(settings: Settings, hub: Hub, mode: str) -> Callable[[str], State]:
 @app.command()
 @_finish
 def chain(
-    kinds: Annotated[
-        list[Kind], typer.Argument(help="Job kinds in run order; generate is checked as the drifted target.")
-    ],
-    mode: Annotated[Mode, typer.Option(help="full is the paid run.")] = "full",
+    kinds: Annotated[list[Kind], typer.Argument(help="Job kinds in run order; judge follows the generate before it.")],
+    mode: Annotated[Mode, typer.Option(help=MODE_HELP)] = "full",
+    target: Annotated[Target | None, typer.Option(help="The checkpoint the generate step reads.")] = None,
 ) -> ExitCode:
     """Launch and follow each kind in turn; stop at a missing input, a refusal or a job that does not end ok."""
     names = [kind.value for kind in kinds]
-    settings, deps = _open("chain", kinds=names, mode=mode)
-    return launcher.chain(settings, deps, names, mode, state=_state(settings, deps.hub, mode))
+    if names.count("generate") > 1:
+        raise typer.BadParameter("one generate step per chain: its target is one checkpoint")
+    if ("generate" in names) != (target is not None):
+        raise typer.BadParameter(
+            "--target names the generate step: chain generate ... --target baseline|drifted|repaired"
+        )
+    if "judge" in names and "generate" not in names[: names.index("judge")]:
+        form = f"driftmap launch judge --mode {mode} -- {JOB_ARGS['judge'][1]}"
+        raise typer.BadParameter(f"judge in a chain reads the generate step before it; on its own: {form}")
+    settings, deps = _open("chain", kinds=names, mode=mode, target=target)
+    _launch_inputs(deps.repo_root)
+    job_args = {"generate": ["--kind", target]} if target else {}
+    state = _state(settings, deps, mode, target, job_args)
+    return launcher.chain(settings, deps, names, mode, state=state, args=job_args)
 
 
 @app.command("wait")
@@ -343,8 +445,10 @@ def decide_drift(
     decision = "proceed" if proceed else "extend"
     settings, deps = _open("decide drift", decision=decision, note=note)
     leaks = [name for name, pattern in redact.PATTERNS.items() if pattern.search(note)]
-    if leaks:
-        raise DriftmapError(ExitCode.REDACTION, f"--note holds {', '.join(leaks)}; the decision is published")
+    # the mask also sees a token cut by a line break or a colour code
+    if leaks or redact.mask(note) != note:
+        found = ", ".join(leaks) or "a token, a home path or a control sequence"
+        raise DriftmapError(ExitCode.REDACTION, f"--note holds {found}; the decision is published")
     path = deps.repo_root / DECISION_PATH
     record = write_decision(path, decision, note, now=deps.now)
     results = f"{settings.owner}/{settings.repos.results}"
