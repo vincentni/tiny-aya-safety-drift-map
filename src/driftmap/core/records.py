@@ -118,14 +118,16 @@ class LedgerLine(Record):
     flavor: str
     mode: Mode
     price_micro_usd_per_min: MicroUsd
-    minutes: int
-    cost_micro_usd: MicroUsd
+    minutes: Annotated[int, Field(ge=0)]
+    cost_micro_usd: Limit
     # the server may add stages the library does not know yet
     stage: JobStage | Annotated[str, StringConstraints(min_length=1)] = Field(union_mode="left_to_right")
     record_status: str | None
     exit_code: int | None
     billing_used_after_micro_usd: MicroUsd | None
     timeout_s: int
+    # ties an out-of-memory run to the config that caused it
+    config_hash: str | None = None
     pending: bool
     lost: bool
     oom: bool
@@ -144,7 +146,7 @@ class Plan(Record):
     timeout_s: int
     estimate_minutes: int
     price_micro_usd_per_min: MicroUsd
-    cost_at_timeout_micro_usd: MicroUsd
+    cost_at_timeout_micro_usd: Limit
     dependencies: list[str]
     env: dict[str, str]
     secret_names: list[str]

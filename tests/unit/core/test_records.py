@@ -522,6 +522,27 @@ def test_ledger_line_keeps_a_stage_the_library_does_not_know(tmp_path):
             LedgerLine.model_validate(_payload("ledger", stage=bad))
 
 
+def test_ledger_line_config_hash_is_optional(tmp_path):
+    assert LedgerLine.model_validate(_payload("ledger")).config_hash is None
+    line = LedgerLine.model_validate(_payload("ledger", config_hash=DIGEST))
+    dump(line, tmp_path / "line.json")
+    assert json.loads((tmp_path / "line.json").read_text(encoding="utf-8"))["config_hash"] == DIGEST
+    assert load(LedgerLine, tmp_path / "line.json") == line
+    with pytest.raises(ValidationError):
+        LedgerLine.model_validate(_payload("ledger", config_hash=5))
+
+
+def test_ledger_and_plan_amounts_are_never_negative():
+    for field in ("cost_micro_usd", "minutes"):
+        with pytest.raises(ValidationError) as caught:
+            LedgerLine.model_validate(_payload("ledger", **{field: -1}))
+        assert _locs(caught) == [(field,)]
+        assert getattr(LedgerLine.model_validate(_payload("ledger", **{field: 0})), field) == 0
+    with pytest.raises(ValidationError) as caught:
+        records.Plan.model_validate(_payload("plan", cost_at_timeout_micro_usd=-1))
+    assert _locs(caught) == [("cost_at_timeout_micro_usd",)]
+
+
 def test_job_kinds_and_labels():
     assert records.JobKind.__args__ == ("drift", "generate", "judge", "repair", "steer", "quant", "quant_eval")
     assert records.Lbl.__args__ == ("yes", "no", "unscored", "n/a", "judge_unsupported")
