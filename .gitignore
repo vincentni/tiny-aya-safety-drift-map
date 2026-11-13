@@ -1,0 +1,15 @@
+.env
+.env.*
+*.local
+config/local*
+__pycache__/
+*.pyc
+.venv/
+.uv/
+outputs/
+*.safetensors
+*.gguf
+.run-local/
+.pytest_cache/
+.hypothesis/
+.ruff_cache/
