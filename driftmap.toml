@@ -112,7 +112,7 @@ confirmed_on = 2026-11-07
 [publish]
 space_not_serving = false
 
-# micro-USD per minute; used when the hardware list cannot be read
+# micro-USD per minute; used for a flavor the live hardware list does not price
 [prices_micro_usd_per_min]
 l4x1 = 13_333
 a10g-small = 16_667
