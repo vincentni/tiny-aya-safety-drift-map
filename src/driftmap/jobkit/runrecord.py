@@ -72,6 +72,10 @@ class Run:
         self.clock = clock
         self._deadline = deadline
 
+    def past_last_call(self) -> bool:
+        """True when no time is left to retry a Hub call."""
+        return self._deadline.last_call_s() <= 0
+
     def note(self, text: str) -> None:
         """Add a note once."""
         if text not in self.record.notes:

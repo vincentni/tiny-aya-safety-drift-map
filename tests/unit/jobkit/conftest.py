@@ -34,6 +34,7 @@ from tests.fakes import FakeHub
 root, mode = Path(sys.argv[1]), sys.argv[2]
 settings = load_settings(root / "driftmap.toml")
 responses = f"{settings.owner}/{settings.repos.responses}"
+stalled = []
 
 
 class DiskHub(FakeHub):
@@ -42,6 +43,9 @@ class DiskHub(FakeHub):
         if mode == "kill-before-record" and path.startswith("runs/"):
             os.kill(os.getpid(), signal.SIGKILL)
         if mode.startswith("stall") and path.endswith("fr.jsonl"):
+            time.sleep(60)
+        if mode == "stall-marker" and path.startswith("partial/") and not stalled:
+            stalled.append(path)
             time.sleep(60)
         if mode == "term-while-closing" and path.startswith("runs/"):
             os.kill(os.getpid(), signal.SIGTERM)

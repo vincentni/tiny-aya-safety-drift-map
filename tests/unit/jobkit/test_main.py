@@ -74,6 +74,8 @@ def test_the_results_repo_is_created_private_before_the_body(launch, fake, resul
         (DriftmapError(ExitCode.INTEGRITY, "tokenizer canary mismatch"), 12),
         (DriftmapError(ExitCode.COLUMN_FAILED, "7 % unscored"), 13),
         (DriftmapError(ExitCode.JUDGE_INSPECT_STOP, "18 of 20 parsed"), 14),
+        (DriftmapError(ExitCode.PARTIAL, "not a deadline"), 1),
+        (DriftmapError(ExitCode.OOM, "not out of memory"), 1),
         (DriftmapError(ExitCode.USAGE, "not a job code"), 1),
         (KeyError("prompt"), 1),
         (OddCode("exit_code is text"), 1),
@@ -114,13 +116,14 @@ def test_an_ok_run_whose_record_push_fails_leaves_a_marker_and_a_failed_record(l
     assert uploads() == [RECORD, MARKER, RECORD]
     record = RunRecord.model_validate_json(stored(RECORD))
     assert record.status == "failed"
-    assert any(note.startswith("record push failed: ") for note in record.notes)
+    assert any(note.startswith("closing push failed: ") for note in record.notes)
     assert capsys.readouterr().out.splitlines()[-1] == "driftmap-job: finished status=failed exit=1"
 
 
 def test_a_run_that_cannot_push_anything_still_ends_with_the_trailer(launch, fake, stored, capsys, caplog):
     def body(ctx):
-        fake.fail_after(2, 400)
+        # the ok record, then the marker and failed record of the retry
+        fake.fail_after(3, 400)
 
     assert launch(body) == 1
     assert (stored(RECORD), stored(MARKER)) == (None, None)
@@ -167,10 +170,13 @@ def test_an_urgent_stop_gives_each_hub_call_one_attempt(launch, fake, uploads, s
         fake.fail_after(1, 503)
         raise DeadlineReached("stopped by SIGTERM", urgent=True)
 
-    assert launch(body) == 1
-    assert uploads() == [MARKER]
+    assert launch(body) == 10
+    assert uploads() == [MARKER, RECORD]
     assert stored(MARKER) is None
-    assert capsys.readouterr().out.splitlines()[-1] == "driftmap-job: finished status=failed exit=1"
+    record = RunRecord.model_validate_json(stored(RECORD))
+    assert record.status == "partial"
+    assert any(note.startswith("marker push failed: ") for note in record.notes)
+    assert capsys.readouterr().out.splitlines()[-1] == "driftmap-job: finished status=partial exit=10"
 
 
 def test_an_error_before_the_body_is_reported_without_a_record(launch, fake, capsys):
@@ -233,14 +239,71 @@ def test_a_stop_before_anything_could_be_saved_is_not_reported_as_partial(launch
     assert capsys.readouterr().out.splitlines()[-1] == "driftmap-job: finished status=failed exit=1"
 
 
-def test_a_partial_run_whose_marker_cannot_be_pushed_is_not_reported_as_partial(launch, fake, clock, capsys):
+def test_a_partial_run_whose_pushes_all_fail_is_not_reported_as_partial(launch, fake, clock, stored, capsys):
     def body(ctx):
         clock.advance(5000)
-        fake.fail_after(1, 400)
+        # the marker, then the marker and record of the retry
+        fake.fail_after(3, 400)
         ctx.checkpoint()
 
     assert launch(body) == 1
+    assert (stored(RECORD), stored(MARKER)) == (None, None)
     assert capsys.readouterr().out.splitlines()[-1] == "driftmap-job: finished status=failed exit=1"
+
+
+@pytest.mark.parametrize(("stop", "status", "code"), [("deadline", "partial", 10), ("error", "failed", 1)])
+def test_a_run_that_did_not_end_ok_also_gets_one_more_push(
+    launch, fake, clock, uploads, stored, capsys, stop, status, code
+):
+    def body(ctx):
+        clock.advance(5000)
+        fake.fail_after(1, 400)
+        if stop == "error":
+            raise ValueError("row 7 has no prompt")
+        ctx.checkpoint()
+
+    assert launch(body) == code
+    assert uploads() == [MARKER, MARKER, RECORD]
+    record = RunRecord.model_validate_json(stored(RECORD))
+    assert record.status == status
+    assert any(note.startswith("closing push failed: ") for note in record.notes)
+    assert json.loads(stored(MARKER)) == json.loads(record.partial.model_dump_json())
+    assert capsys.readouterr().out.splitlines()[-1] == f"driftmap-job: finished status={status} exit={code}"
+
+
+@pytest.mark.parametrize(
+    ("deadline", "code", "pushes", "note"),
+    [
+        (True, 10, [MARKER, RECORD], "marker push failed: "),
+        (False, 1, [RECORD, MARKER, RECORD], "closing push failed: "),
+    ],
+)
+def test_past_the_last_call_the_marker_and_record_get_one_attempt_each(
+    launch, fake, clock, uploads, stored, responses, monkeypatch, deadline, code, pushes, note
+):
+    upload = fake.upload_file
+
+    def slow_data(**kwargs):
+        commit = upload(**kwargs)
+        if kwargs["path_in_repo"].endswith("fr.jsonl"):
+            # the file lands after the last call; the next push fails
+            clock.advance(5300)
+            fake.fail_after(1, 503)
+        return commit
+
+    monkeypatch.setattr(fake, "upload_file", slow_data)
+
+    def body(ctx):
+        ctx.flusher.add(responses, "responses/x/harmful/fr.jsonl", b"fr\n", key="harmful/fr")
+        if deadline:
+            clock.advance(4860)
+            ctx.checkpoint()
+
+    assert launch(body) == code
+    assert uploads() == ["responses/x/harmful/fr.jsonl", *pushes]
+    record = RunRecord.model_validate_json(stored(RECORD))
+    assert record.partial.done == ["harmful/fr"]
+    assert any(text.startswith(note) for text in record.notes)
 
 
 def test_the_last_call_also_interrupts_a_stalled_upload_while_closing(child_job, results, responses):
@@ -260,3 +323,16 @@ def test_a_body_that_absorbs_the_last_call_is_interrupted_again(child_job, tmp_p
     assert child.returncode == 10, child.stderr
     assert not (tmp_path / "slept").exists()
     assert RunRecord.model_validate_json(files[f"{results}/{RECORD}"]).status == "partial"
+
+
+def test_a_marker_push_stalled_past_the_last_call_is_interrupted_and_tried_once_more(child_job, results, responses):
+    # the last call, 5220 s after submission, finds the marker stalled
+    child, files = child_job("stall-marker", age_s=5214)
+    assert child.returncode == 10, child.stderr
+    assert child.stdout.splitlines()[-1] == "driftmap-job: finished status=partial exit=10"
+    assert sorted(files) == sorted(
+        [f"{responses}/responses/x/harmful/en.jsonl", f"{results}/{MARKER}", f"{results}/{RECORD}"]
+    )
+    record = RunRecord.model_validate_json(files[f"{results}/{RECORD}"])
+    assert (record.status, record.partial.done) == ("partial", ["harmful/en"])
+    assert any(note.startswith("last call: interrupted") for note in record.notes)

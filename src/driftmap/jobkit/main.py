@@ -58,6 +58,7 @@ class _Watchdog:
         # signal handlers can only be set from the main thread
         self._live = live and threading.current_thread() is threading.main_thread()
         self.armed = False
+        self._heed_term = True
         self._previous: dict[int, Any] = {}
 
     def __enter__(self) -> Self:
@@ -77,8 +78,12 @@ class _Watchdog:
             # a zero delay would switch the timer off
             signal.setitimer(signal.ITIMER_REAL, max(self._deadline.last_call_s(), 1.0), REPEAT_S)
 
+    def ignore_term(self) -> None:
+        """Keep the timer, but let SIGTERM pass so the marker and record pushes can finish."""
+        self._heed_term = False
+
     def stand_down(self) -> None:
-        """Stop interrupting; from here SIGTERM is ignored so a push can finish."""
+        """Stop interrupting; SIGTERM is ignored too."""
         self.armed = False
         if self._live:
             signal.setitimer(signal.ITIMER_REAL, 0)
@@ -88,6 +93,8 @@ class _Watchdog:
         if not self.armed:
             return
         if number == signal.SIGTERM:
+            if not self._heed_term:
+                return
             raise DeadlineReached("stopped by SIGTERM", urgent=True)
         after = self._deadline.elapsed_s()
         raise DeadlineReached(f"last call: interrupted {after:.0f} s after submission", urgent=True)
@@ -118,8 +125,8 @@ def _no_wait(seconds: float) -> None:
 
 def _exit_code(error: BaseException) -> ExitCode:
     code = getattr(error, "exit_code", None)
-    # only job codes pass; lower ones mean something else to the launcher
-    if isinstance(code, int) and code in ExitCode and code >= ExitCode.PARTIAL:
+    # 10 and 11 belong to a deadline or out-of-memory stop
+    if isinstance(code, int) and code in ExitCode and code > ExitCode.OOM:
         return ExitCode(code)
     return ExitCode.UNEXPECTED
 
@@ -162,20 +169,18 @@ def _save(
 ) -> RunRecord | None:
     """Close the run on the Hub; returns the record that got there, or None."""
     if not urgent and deadline.last_call_s() > 0:
-        # the timer covers the data files and stops before the marker
-        record, error = _caught(lambda: flusher.finish(status, oom=oom, after_data=watchdog.stand_down), watchdog)
+        # the timer stays on; SIGTERM is ignored after the data files
+        record, error = _caught(lambda: flusher.finish(status, oom=oom, after_data=watchdog.ignore_term), watchdog)
         if error is None:
             return record
         if isinstance(error, DeadlineReached):
-            logger.warning("%s; skipping queued files", error)
+            logger.warning("%s; one attempt left for the marker and record", error)
             flusher.run.note(str(error))
         else:
             logger.error("could not push the run record", exc_info=error)
-            if status != "ok":
-                return None
-            # an ok run must not end with nothing on the Hub
-            status = "failed"
-            flusher.run.note(f"record push failed: {type(error).__name__}: {mask(str(error))}"[:MAX_NOTE])
+            flusher.run.note(f"closing push failed: {type(error).__name__}: {mask(str(error))}"[:MAX_NOTE])
+            # a run whose push failed did not end ok
+            status = "failed" if status == "ok" else status
     try:
         return flusher.finish(status, oom=oom, data=False)
     except Exception:

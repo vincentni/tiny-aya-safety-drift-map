@@ -103,7 +103,7 @@ class Flusher:
         data: bool = True,
         after_data: Callable[[], object] | None = None,
     ) -> RunRecord:
-        """Push files, the marker unless ok, then the record; ``data=False`` skips files and never retries."""
+        """Push files, the marker unless ok, then the record; ``data=False`` skips the files and never retries."""
         if data:
             # files set aside earlier get one more try
             self._pending[:0], self._aside = self._aside, []
@@ -116,7 +116,6 @@ class Flusher:
             self.run.note(f"{len(self._pending) + len(self._aside)} file(s) not uploaded")
             if status == "ok":
                 status = "partial"
-        hub = self._hub if data else self._urgent
         run_id = self.run.record.run_id
         marker = None
         if status != "ok":
@@ -126,12 +125,25 @@ class Flusher:
                 written_at=self.run.clock.now(),
                 config_hash=self.run.record.config_hash,
             )
-            self._put(hub, marker_path(run_id), marker, f"marker for {run_id}")
+            single = self._single(data)
+            try:
+                self._put(marker_path(run_id), marker, f"marker for {run_id}", single)
+            except Exception as error:
+                if not single:
+                    raise
+                # no time for another round: the record still gets its attempt
+                logger.warning("marker push failed: %s", error)
+                self.run.note(f"marker push failed: {type(error).__name__}: {mask(str(error))}"[:MAX_NOTE])
         record = self.run.finish(status, self._pushes.values(), partial=marker, oom=oom)
-        self._put(hub, record_path(run_id), record, f"{status} record for {run_id}")
+        self._put(record_path(run_id), record, f"{status} record for {run_id}", self._single(data))
         return record
 
-    def _put(self, hub: Hub, path: str, model: BaseModel, message: str) -> None:
+    def _single(self, data: bool) -> bool:
+        # past the last call a retry could outlive the job
+        return not data or self.run.past_last_call()
+
+    def _put(self, path: str, model: BaseModel, message: str, single: bool) -> None:
+        hub = self._urgent if single else self._hub
         hub.upload_file(self.run.results, path, _json(model), repo_type="dataset", commit_message=message)
 
     def _queue(
