@@ -52,7 +52,7 @@ def test_parse_and_unparse_are_inverse_and_wrappers_get_the_parts(ref):
     assert spy.calls == [("upload_file", (), upload)]
     if ref.revision:
         hub.snapshot_download(text, "dl", repo_type="dataset")
-        parts = {"revision": ref.revision, "local_dir": "dl", "repo_type": "dataset"}
+        parts = {"revision": ref.revision, "local_dir": Path("dl").resolve(), "repo_type": "dataset"}
         assert spy.calls[1:] == [("snapshot_download", (ref.repo,), parts)]
 
 

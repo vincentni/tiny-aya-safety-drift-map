@@ -205,6 +205,9 @@ def test_whitespace_around_the_token_never_reaches_a_header(monkeypatch):
     assert hub_module.token() == "hf_padded"
     assert build_hf_headers(token=hub_module.token())["authorization"] == "Bearer hf_padded"
     hub_module.token.cache_clear()
+    monkeypatch.setenv("HF_TOKEN", "hf_a\nb")
+    assert hub_module.token() == "hf_ab"
+    hub_module.token.cache_clear()
     monkeypatch.setenv("HF_TOKEN", " \n")
     with pytest.raises(DriftmapError) as blank:
         hub_module.token()
@@ -279,14 +282,18 @@ def test_downloads_need_a_pinned_revision_and_an_empty_directory(fake, clock, tm
     hub = Hub(fake, sleep=clock.sleep)
     commit = fake.upload_file(path_or_fileobj=b"{}", path_in_repo="a.json", repo_id=RESULTS, repo_type="dataset")
     pinned = f"{RESULTS}@{commit.oid}"
-    stale = tmp_path / "stale"
-    (stale / ".cache").mkdir(parents=True)
+    stale = (tmp_path / "stale").resolve()
+    in_home = (Path.home() / "stale").resolve()
+    for directory in (stale, in_home):
+        (directory / ".cache").mkdir(parents=True)
     fake.calls.clear()
     for download, needle in [
         (lambda: hub.snapshot_download(RESULTS, tmp_path / "dl", repo_type="dataset"), "revision"),
         (lambda: hub.hf_hub_download(RESULTS, tmp_path / "dl", repo_type="dataset"), "revision"),
         (lambda: hub.snapshot_download(pinned, stale, repo_type="dataset"), str(stale)),
         (lambda: hub.hf_hub_download(f"{pinned}#a.json", stale, repo_type="dataset"), str(stale)),
+        (lambda: hub.snapshot_download(pinned, "~/stale", repo_type="dataset"), str(in_home)),
+        (lambda: hub.hf_hub_download(f"{pinned}#a.json", "~/stale", repo_type="dataset"), str(in_home)),
     ]:
         with pytest.raises(DriftmapError) as refused:
             download()
@@ -312,6 +319,10 @@ def test_downloads_need_a_pinned_revision_and_an_empty_directory(fake, clock, tm
     assert Path(one).read_text() == "{}" and len(clock.sleeps) == 2
     local = hub.snapshot_download(pinned, tmp_path / "dl", repo_type="dataset")
     assert (Path(local) / "a.json").read_text() == "{}"
+    assert hub.snapshot_download(pinned, "~/new", repo_type="dataset") == str(Path.home().resolve() / "new")
+    in_home = hub.hf_hub_download(f"{pinned}#a.json", "~/one", repo_type="dataset")
+    assert in_home == str(Path.home().resolve() / "one" / "a.json")
+    assert not Path("~").exists()
 
 
 def test_every_wrapper_call_binds_to_the_real_signature(tmp_path):

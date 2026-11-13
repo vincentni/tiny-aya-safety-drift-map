@@ -30,7 +30,8 @@ Arm = Literal["gate", "not_found", "revision", "other"]
 @functools.cache
 def token() -> str:
     """The Hub token, read once: HF_TOKEN, else the ``hf auth login`` store."""
-    value = (os.environ.get("HF_TOKEN") or "").strip() or get_token()
+    # whitespace inside a token breaks the header and leaks into the error
+    value = "".join((os.environ.get("HF_TOKEN") or "").split()) or get_token()
     if not value:
         raise DriftmapError(ExitCode.READINESS, "no Hugging Face token: set HF_TOKEN or run `hf auth login`")
     return value
@@ -135,20 +136,20 @@ class Hub:
 
     def snapshot_download(self, target: RepoRef | str, local_dir: str | Path, **kwargs: Any) -> str:
         """Download a pinned revision into an empty ``local_dir``; returns the directory."""
-        ref = _fresh_download(target, local_dir)
+        ref, directory = _fresh_download(target, local_dir)
         return self._transfer(
             ref,
             kwargs.get("repo_type"),
             self._api.snapshot_download,
             ref.repo,
             revision=ref.revision,
-            local_dir=local_dir,
+            local_dir=directory,
             **kwargs,
         )
 
     def hf_hub_download(self, target: RepoRef | str, local_dir: str | Path, **kwargs: Any) -> str:
         """Download the ``#file`` of a pinned reference into an empty ``local_dir``; returns its path."""
-        ref = _fresh_download(target, local_dir)
+        ref, directory = _fresh_download(target, local_dir)
         if ref.file is None:
             raise ValueError(f"{ids.unparse(ref)} names no file")
         return self._transfer(
@@ -158,7 +159,7 @@ class Hub:
             ref.repo,
             ref.file,
             revision=ref.revision,
-            local_dir=local_dir,
+            local_dir=directory,
             **kwargs,
         )
 
@@ -220,11 +221,13 @@ def _ref(target: RepoRef | str) -> RepoRef:
     return ids.parse(target if isinstance(target, str) else ids.unparse(target))
 
 
-def _fresh_download(target: RepoRef | str, local_dir: str | Path) -> RepoRef:
+def _fresh_download(target: RepoRef | str, local_dir: str | Path) -> tuple[RepoRef, Path]:
     ref = _ref(target)
     if ref.revision is None:
         raise DriftmapError(ExitCode.USAGE, f"{ids.unparse(ref)} must pin a revision to be downloaded")
+    # the library expands and resolves the path the same way
+    directory = Path(local_dir).expanduser().resolve()
     # offline, the library returns a non-empty directory as the finished download
-    if Path(local_dir).is_dir() and any(Path(local_dir).iterdir()):
-        raise DriftmapError(ExitCode.USAGE, f"{local_dir} is not empty; download into a new directory")
-    return ref
+    if directory.is_dir() and any(directory.iterdir()):
+        raise DriftmapError(ExitCode.USAGE, f"{directory} is not empty; download into a new directory")
+    return ref, directory
