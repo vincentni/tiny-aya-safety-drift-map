@@ -1,0 +1,238 @@
+from datetime import UTC, datetime
+from pathlib import Path
+
+import pytest
+
+from driftmap.core.records import AlphaScreen, Bars, Dare, LabelRow
+from driftmap.core.schemas import SCHEMA_ALPHA_SCREEN, DriftmapError, ExitCode
+from driftmap.table.build import COLUMNS, NOT_COMPARABLE, build, column_of
+from driftmap.table.render import render
+from tests.fakes.labels import (
+    CHECKPOINTS,
+    column_rows,
+    judge_config,
+    label,
+    make_settings,
+    run_record,
+    targets,
+    write_labels,
+)
+
+FIXTURES = Path(__file__).parents[2] / "fixtures" / "labels"
+STEERED = CHECKPOINTS["drifted"] + "--steer-l24-s1.0"
+
+
+@pytest.fixture
+def settings(tmp_path):
+    return make_settings(tmp_path)
+
+
+def screen(status="failed"):
+    return AlphaScreen(
+        schema=SCHEMA_ALPHA_SCREEN,
+        alphas=[],
+        chosen=0.25 if status == "chosen" else None,
+        recover_status=status,
+        badge="Faithful",
+        safetune_version="0.1.10",
+        dare=Dare(),
+        judge=judge_config(),
+        bars=Bars(),
+        baseline_safe_pooled=0.9,
+        drifted_chrf_subset=0.4,
+        tied_weight_owner="embed_tokens",
+    )
+
+
+def test_a_checkpoint_maps_to_its_column_by_repo_name(settings):
+    assert [column_of(CHECKPOINTS[column], settings) for column in COLUMNS] == list(COLUMNS)
+    assert column_of(CHECKPOINTS["repaired_q4"] + "#model-q4_k_m.gguf", settings) == "repaired_q4"
+    assert column_of("tiny-aya-global-drift-merged--0123456789ab", settings) == "drifted"
+    assert column_of("vincentnkq/tiny-aya-global-drift-lora@" + "a" * 40, settings) == "drifted"
+    assert column_of(STEERED, settings) == "repaired"
+    assert column_of("someone/other-model@" + "a" * 40, settings) is None
+    assert column_of("tiny-aya-global-drift-merged--0123456789ab--steer-l24-s1.0", settings) == "repaired"
+    for text in ("tiny-aya-global", "tiny-aya-global--0123456789ab--steer-x", "CohereLabs/tiny-aya-global", "a b@c"):
+        assert column_of(text, settings) is None
+
+
+def test_columns_without_labels_say_why(tmp_path, settings):
+    labels = write_labels(tmp_path / "labels", column_rows("baseline"))
+    benign = [label("drifted", "en", i, set_="benign", chrf=0.5) for i in range(4)]
+    write_labels(labels, benign)
+
+    tables = build(labels, targets(), [], settings, not_run={"repaired": "left for the next budget window"})
+    states = {column: (state.state, state.reason) for column, state in tables.columns.items()}
+    assert states == {
+        "baseline": ("tabled", None),
+        "drifted": ("generated", "generated, not judged yet"),
+        "repaired": ("not_run", "left for the next budget window"),
+        "repaired_q4": ("not_run", "no generation run recorded"),
+    }
+    assert {row.checkpoint for row in tables.safety + tables.chrf} == {CHECKPOINTS["baseline"]}
+    assert tables.deltas == [delta for delta in tables.deltas if delta.a == delta.b == "baseline"]
+    assert tables.flags == {}
+    assert (tables.seeds.seed, tables.seeds.bootstrap) == (settings.seed, 42)
+
+    recorded = build(labels, targets(), [run_record("generate", "repaired")], settings)
+    assert recorded.columns["repaired"].state == "generated"
+
+
+def test_a_failed_quant_eval_or_repair_closes_the_q4_column(tmp_path, settings):
+    labels = write_labels(tmp_path / "labels", column_rows("baseline") + column_rows("repaired_q4"))
+    failed = run_record("quant_eval", "repaired_q4", status="failed", notes=["unscored above 5 %"])
+
+    tables = build(labels, targets(), [failed], settings)
+    state = tables.columns["repaired_q4"]
+    assert (state.state, state.reason, state.kind) == ("failed", "unscored above 5 %", "q4_k_m")
+    assert {row.checkpoint for row in tables.safety} == {CHECKPOINTS["baseline"]}
+
+    tables = build(labels, targets(), [screen()], settings)
+    assert tables.columns["repaired_q4"].state == "not_applicable"
+    assert "repair" in tables.columns["repaired_q4"].reason
+
+
+def test_a_steered_checkpoint_fills_the_repaired_column_as_inference_time(tmp_path, settings):
+    steered = [row.model_copy(update={"checkpoint": STEERED}) for row in column_rows("drifted")]
+    labels = write_labels(tmp_path / "labels", column_rows("baseline") + steered)
+
+    tables = build(labels, targets(), [], settings)
+
+    assert (tables.columns["repaired"].state, tables.columns["repaired"].kind) == ("tabled", "inference-time")
+    assert (tables.columns["drifted"].state, tables.columns["baseline"].kind) == ("not_run", "weights")
+
+
+def test_a_delta_skips_a_column_that_is_not_comparable(tmp_path, settings):
+    rows = column_rows("baseline", unsafe=1) + column_rows("drifted", rendered_prefix_sha256="e" * 64)
+    tables = build(write_labels(tmp_path / "labels", rows + column_rows("repaired")), targets(), [], settings)
+
+    assert {(delta.a, delta.b) for delta in tables.deltas if delta.a != delta.b} == {("baseline", "repaired")}
+    markdown = render(tables, settings)
+    assert (
+        "| row | metric | baseline to drifted | drifted to repaired | repaired to repaired_q4 | baseline to repaired |"
+        in markdown
+    )
+    assert "| all | safe | n/a | n/a | n/a | +25.0 points, safer (95% CI " in markdown
+
+
+def test_unknown_or_doubled_checkpoints_are_refused(tmp_path, settings):
+    rows = column_rows("baseline")
+    stray = rows[0].model_copy(update={"checkpoint": "someone/other-model@" + "a" * 40})
+    with pytest.raises(DriftmapError, match="someone/other-model") as raised:
+        build(write_labels(tmp_path / "stray", [*rows, stray]), targets(), [], settings)
+    assert raised.value.exit_code == ExitCode.INTEGRITY
+
+    with pytest.raises(DriftmapError, match="no judged labels"):
+        build(tmp_path / "empty", targets(), [], settings)
+
+    second = rows[1].model_copy(update={"checkpoint": CHECKPOINTS["baseline"].replace("1" * 40, "9" * 40)})
+    with pytest.raises(DriftmapError, match="baseline has rows from 2 checkpoints"):
+        build(write_labels(tmp_path / "two", [rows[0], second, *rows[2:]]), targets(), [], settings)
+
+
+def test_the_committed_label_files_build_an_english_table(settings):
+    rows = [
+        LabelRow.model_validate_json(line)
+        for path in sorted(FIXTURES.glob("*/en.jsonl"))
+        for line in path.read_text().splitlines()
+    ]
+    prompts = {
+        name: {"en": sorted({row.prompt_id for row in rows if row.set == name})} for name in ("harmful", "xstest")
+    }
+
+    tables = build(FIXTURES, prompts, [], settings)
+
+    assert [tables.columns[column].state for column in COLUMNS] == ["tabled", "tabled", "not_run", "not_run"]
+    assert tables.columns["drifted"].reason == "unscored: en 1"
+    safe = [(row.k, row.n) for row in tables.safety if row.row == "en" and row.metric == "safe"]
+    assert safe == [(11, 12), (7, 11)]
+    assert [(row.k, row.n) for row in tables.over_refusal] == [(1, 6), (0, 6)]
+    assert all("placeholder" in row.prompt for row in rows)
+
+
+def test_only_the_latest_ok_run_in_the_build_mode_decides_comparability(tmp_path, settings):
+    labels = write_labels(tmp_path / "labels", column_rows("baseline") + column_rows("drifted"))
+    noted = run_record("generate", "drifted", notes=[f"{NOT_COMPARABLE}seed 7 differs from baseline"])
+    later = datetime(2026, 11, 14, tzinfo=UTC)
+
+    for changes in ({"status": "failed"}, {"status": "partial"}, {"status": "oom"}, {"mode": "smoke"}):
+        retry = run_record("generate", "drifted", started=later, **changes)
+        state = build(labels, targets(), [noted, retry], settings).columns["drifted"]
+        assert (state.state, state.reason) == ("not_comparable", "seed 7 differs from baseline"), changes
+    rerun = run_record("generate", "drifted", started=later)
+    assert build(labels, targets(), [rerun, noted], settings).columns["drifted"].state == "tabled"
+
+
+def test_a_steered_column_reads_steer_records_not_weight_repair_ones(tmp_path, settings):
+    steered = [row.model_copy(update={"checkpoint": STEERED}) for row in column_rows("drifted")]
+    labels = write_labels(tmp_path / "labels", column_rows("baseline") + steered)
+    stale = run_record("generate", "repaired", notes=[f"{NOT_COMPARABLE}stale weight repair"])
+    steer = run_record("steer", "drifted", notes=[f"{NOT_COMPARABLE}decoding differs from baseline"])
+
+    assert build(labels, targets(), [stale], settings).columns["repaired"].state == "tabled"
+    state = build(labels, targets(), [stale, steer], settings).columns["repaired"]
+    assert (state.state, state.reason) == ("not_comparable", "decoding differs from baseline")
+    assert build(labels, targets(), [steer], settings).columns["drifted"].state == "not_run"
+
+
+def test_two_repair_arms_share_the_one_repaired_column(tmp_path, settings):
+    steered = [row.model_copy(update={"checkpoint": STEERED}) for row in column_rows("drifted")]
+    rows = column_rows("baseline") + column_rows("repaired", unsafe=1) + steered
+    labels = write_labels(tmp_path / "labels", rows)
+
+    def repaired(records):
+        tables = build(labels, targets(), records, settings)
+        state = tables.columns["repaired"]
+        pooled = [row for row in tables.safety if row.row == "all" and row.metric == "safe"][1]
+        assert list(tables.columns) == list(COLUMNS) and f"- repaired ({state.kind}): tabled: {state.reason}" in render(
+            tables, settings
+        )
+        return state.kind, state.reason, pooled.checkpoint, pooled.k
+
+    weights, steer = CHECKPOINTS["repaired"], STEERED
+    assert repaired([screen("chosen")]) == ("weights", f"{steer} has labels but is not tabled", weights, 18)
+    for records in ([], [screen("failed")]):
+        assert repaired(records) == ("inference-time", f"{weights} has labels but is not tabled", steer, 24)
+
+
+def test_label_lines_end_at_a_newline_only_and_a_bad_line_is_named(tmp_path, settings):
+    rows = column_rows("baseline")
+    odd = rows[2].model_copy(update={"prompt": "placeholder\u2028with\u2029odd\u0085separators"})
+    labels = write_labels(tmp_path / "labels", [*rows[:2], odd, *rows[3:]])
+    assert "\u2028" in (labels / "tiny-aya-global" / "en.jsonl").read_text(encoding="utf-8")
+
+    assert build(labels, targets(), [], settings).columns["baseline"].state == "tabled"
+
+    path = labels / "tiny-aya-global" / "fr.jsonl"
+    lines = path.read_text(encoding="utf-8").split("\n")
+    path.write_text("\n".join([*lines[:2], '{"schema": "driftmap.label/1"}', *lines[2:]]), encoding="utf-8")
+    with pytest.raises(DriftmapError, match=r"tiny-aya-global/fr\.jsonl:3: ") as raised:
+        build(labels, targets(), [], settings)
+    assert raised.value.exit_code == ExitCode.INTEGRITY and "placeholder" not in str(raised.value)
+
+
+def test_the_right_number_of_rows_for_other_prompts_is_refused(tmp_path, settings):
+    rows = column_rows("baseline")
+    renamed = rows[0].model_copy(update={"prompt_id": "harmful-en-999"})
+    with pytest.raises(DriftmapError, match="baseline harmful/en: 4 rows for 4 prompts, for other prompts"):
+        build(write_labels(tmp_path / "labels", [renamed, *rows[1:]]), targets(), [], settings)
+
+
+def test_chrf_means_and_the_gap_use_their_own_scores(tmp_path, settings):
+    rows = column_rows("baseline", chrf=0.4)
+    rows = [
+        row.model_copy(update={"chrf": None}) if (row.set, row.prompt_id) == ("benign", "benign-en-000") else row
+        for row in rows
+    ]
+    # hi and ar answer safely without refusing, so the two metrics part ways
+    rows = [
+        row.model_copy(update={"refusal": "no"}) if row.set == "harmful" and row.language in ("hi", "ar") else row
+        for row in rows
+    ]
+    tables = build(write_labels(tmp_path / "labels", rows), targets(), [], settings)
+
+    means = {row.row: (row.n, row.chrf) for row in tables.chrf}
+    assert means["en"] == (3, pytest.approx(0.4)) and means["all"] == (23, pytest.approx(0.4))
+    assert tables.columns["baseline"].reason == "unscored: benign/en 1"
+    (gap,) = [delta for delta in tables.deltas if delta.a == delta.b]
+    assert (gap.metric, gap.delta) == ("safe", 0.0)
