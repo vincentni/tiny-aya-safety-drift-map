@@ -21,13 +21,15 @@ _HF_PATH_CONSTANTS = {
     "HF_TOKEN_PATH": "token",
     "HF_STORED_TOKENS_PATH": "stored_tokens",
 }
-# token sources huggingface_hub reads before HF_TOKEN, plus AWS_PROFILE
+# other token sources huggingface_hub reads, plus AWS_PROFILE
 _SCRUBBED_ENV = ("AWS_PROFILE", "HF_OIDC_RESOURCE", "HF_OIDC_ID_TOKEN", "HUGGING_FACE_HUB_TOKEN")
 
 
 @pytest.fixture(autouse=True)
 def hermetic(request, tmp_path, monkeypatch):
     if request.node.get_closest_marker("smoke"):
+        # a smoke run must build the real client
+        monkeypatch.delenv("DRIFTMAP_CLIENT", raising=False)
         return
     home = tmp_path / "home"
     cache = home / ".cache"
@@ -39,6 +41,7 @@ def hermetic(request, tmp_path, monkeypatch):
     monkeypatch.setenv("HF_HUB_OFFLINE", "1")
     monkeypatch.setenv("HF_HUB_DISABLE_TELEMETRY", "1")
     monkeypatch.setenv("HF_TOKEN", "hf_dummy")
+    monkeypatch.setenv("DRIFTMAP_CLIENT", f"fake:{tmp_path / 'client.jsonl'}")
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("XDG_CACHE_HOME", str(cache))
     monkeypatch.setenv("HF_HOME", str(hf_home))
@@ -60,6 +63,7 @@ _CHILD_ENV_ALLOWLIST = (
     "HF_HUB_OFFLINE",
     "HF_HUB_DISABLE_TELEMETRY",
     "HF_TOKEN",
+    "DRIFTMAP_CLIENT",
     "TMPDIR",
     "LANG",
     "LC_ALL",

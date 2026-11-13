@@ -5,11 +5,18 @@ from collections import deque
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 import httpx2
 from huggingface_hub import CommitInfo
-from huggingface_hub.errors import GatedRepoError, RepositoryNotFoundError
+from huggingface_hub.errors import (
+    GatedRepoError,
+    HfHubHTTPError,
+    LocalEntryNotFoundError,
+    RemoteEntryNotFoundError,
+    RepositoryNotFoundError,
+    RevisionNotFoundError,
+)
 from huggingface_hub.hf_api import Collection, DatasetInfo, ModelInfo, RepoFile, RepoUrl
 from huggingface_hub.utils import filter_repo_objects, hf_raise_for_status
 
@@ -91,7 +98,7 @@ class FakeHub:
 
     def repo_exists(self, repo_id: str, *, repo_type: str | None = None, token: str | bool | None = None) -> bool:
         with self._op("repo_exists", self._repo_url(repo_id, repo_type), repo_id=repo_id, repo_type=repo_type):
-            # like HfApi.repo_exists: gated counts as existing, private does not
+            # like HfApi.repo_exists: gated counts as existing, unreadable or missing does not
             try:
                 self._check_access(repo_id, repo_type)
             except GatedRepoError:
@@ -313,23 +320,34 @@ class FakeHub:
         token: str | bool | None = None,
         **kwargs: Any,
     ) -> str:
-        with self._op(
-            "hf_hub_download",
-            self._repo_url(repo_id, repo_type),
-            repo_id=repo_id,
-            filename=filename,
-            repo_type=repo_type,
-            revision=revision,
-            local_dir=_opt_str(local_dir),
-        ):
-            tree = self._tree(repo_id, repo_type, revision)
-            if filename not in tree:
-                self._raise(
-                    404,
-                    f"{ENDPOINT}/{_prefix(repo_type)}{repo_id}/resolve/{revision or 'main'}/{filename}",
-                    {"X-Error-Code": "EntryNotFound"},
-                )
-            return str(self._write(Path(local_dir) if local_dir else self.root / repo_id, filename, tree[filename]))
+        target = Path(local_dir) if local_dir else self.root / repo_id
+        # like the library: the lock directory appears even when the call fails
+        (target / ".cache" / "huggingface" / "download").mkdir(parents=True, exist_ok=True)
+        try:
+            with self._op(
+                "hf_hub_download",
+                self._repo_url(repo_id, repo_type),
+                repo_id=repo_id,
+                filename=filename,
+                repo_type=repo_type,
+                revision=revision,
+                local_dir=_opt_str(local_dir),
+            ):
+                tree = self._tree(repo_id, repo_type, revision)
+                if filename not in tree:
+                    self._raise(
+                        404,
+                        f"{ENDPOINT}/{_prefix(repo_type)}{repo_id}/resolve/{revision or 'main'}/{filename}",
+                        {"X-Error-Code": "EntryNotFound"},
+                    )
+                return str(self._write(target, filename, tree[filename]))
+        except (RevisionNotFoundError, RemoteEntryNotFoundError):
+            raise
+        except HfHubHTTPError as error:
+            # like the library: Hub unreachable, a file on disk is returned
+            if (target / filename).is_file():
+                return str(target / filename)
+            _raise_unreachable(error)
 
     def snapshot_download(
         self,
@@ -343,24 +361,32 @@ class FakeHub:
         token: str | bool | None = None,
         **kwargs: Any,
     ) -> str:
-        with self._op(
-            "snapshot_download",
-            self._repo_url(repo_id, repo_type),
-            repo_id=repo_id,
-            repo_type=repo_type,
-            revision=revision,
-            local_dir=_opt_str(local_dir),
-            allow_patterns=allow_patterns,
-            ignore_patterns=ignore_patterns,
-        ):
-            tree = self._tree(repo_id, repo_type, revision)
-            target = Path(local_dir) if local_dir else self.root / repo_id
-            for path in filter_repo_objects(
-                sorted(tree), allow_patterns=allow_patterns, ignore_patterns=ignore_patterns
+        target = Path(local_dir) if local_dir else self.root / repo_id
+        try:
+            with self._op(
+                "snapshot_download",
+                self._repo_url(repo_id, repo_type),
+                repo_id=repo_id,
+                repo_type=repo_type,
+                revision=revision,
+                local_dir=_opt_str(local_dir),
+                allow_patterns=allow_patterns,
+                ignore_patterns=ignore_patterns,
             ):
-                self._write(target, path, tree[path])
-            target.mkdir(parents=True, exist_ok=True)
-            return str(target)
+                tree = self._tree(repo_id, repo_type, revision)
+                for path in filter_repo_objects(
+                    sorted(tree), allow_patterns=allow_patterns, ignore_patterns=ignore_patterns
+                ):
+                    self._write(target, path, tree[path])
+                target.mkdir(parents=True, exist_ok=True)
+                return str(target)
+        except RevisionNotFoundError:
+            raise
+        except HfHubHTTPError as error:
+            # like the library: with the Hub unreachable a non-empty directory is returned
+            if target.is_dir() and any(target.iterdir()):
+                return str(target)
+            _raise_unreachable(error)
 
     def create_collection(
         self,
@@ -490,8 +516,11 @@ class FakeHub:
     def _commit(self, repo_id: str, message: str, update: dict[str, bytes] | None = None) -> CommitInfo:
         # one lock, so the head always matches the live main tree
         with self._lock:
-            self._commits += 1
             tree = self.repos[repo_id]["main"]
+            # like HfApi.create_commit: an upload that changes nothing makes no commit
+            if update is not None and all(tree.get(path) == data for path, data in update.items()):
+                return self._commit_info(repo_id, message, self.heads[repo_id])
+            self._commits += 1
             tree.update(update or {})
             snapshot = dict(tree)
             digest = hashlib.sha1(
@@ -501,6 +530,9 @@ class FakeHub:
             oid = digest.hexdigest()
             self.repos[repo_id][oid] = snapshot
             self.heads[repo_id] = oid
+        return self._commit_info(repo_id, message, oid)
+
+    def _commit_info(self, repo_id: str, message: str, oid: str) -> CommitInfo:
         url = f"{ENDPOINT}/{_prefix(self.repo_types[repo_id])}{repo_id}/commit/{oid}"
         return CommitInfo(commit_url=url, commit_message=message, commit_description="", oid=oid)
 
@@ -531,6 +563,13 @@ class FakeHub:
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes(data)
         return destination
+
+
+def _raise_unreachable(error: HfHubHTTPError) -> NoReturn:
+    # like the library: repo and auth errors raw, the rest wrapped
+    if isinstance(error, RepositoryNotFoundError) or error.response.status_code == 401:
+        raise error
+    raise LocalEntryNotFoundError("An error happened while trying to locate the files on the Hub.") from error
 
 
 def _prefix(repo_type: str | None) -> str:

@@ -10,6 +10,7 @@ import threading
 import time
 import tomllib
 import urllib.error
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
@@ -26,6 +27,7 @@ from huggingface_hub.errors import (
     GatedRepoError,
     HfHubHTTPError,
     JobNotFoundError,
+    LocalEntryNotFoundError,
     RepositoryNotFoundError,
     RevisionNotFoundError,
 )
@@ -74,11 +76,13 @@ def test_fixture_env(tmp_path):
     assert Path.cwd().is_relative_to(tmp_path)
     assert (Path.cwd() / ".run-local").is_dir()
     assert Path("~/.driftmap/launch.lock").expanduser().is_relative_to(tmp_path)
+    assert Path(os.environ["DRIFTMAP_CLIENT"].removeprefix("fake:")).is_relative_to(tmp_path)
     assert huggingface_hub.constants.HF_HUB_OFFLINE is True
 
 
 @pytest.mark.smoke
-def test_smoke_item_is_left_untouched():
+def test_smoke_item_only_loses_the_fake_client():
+    assert "DRIFTMAP_CLIENT" not in os.environ
     assert os.getcwd() == CWD_AT_COLLECTION
     assert os.environ.get("HOME") == HOME_AT_COLLECTION
     assert not Path(".run-local").exists()
@@ -89,6 +93,7 @@ def test_hermetic_fixture_blocks_sockets_and_scrubs_env(pytester, monkeypatch):
     """Non-smoke tests get no sockets and a scrubbed environment (TS-NFR-1)."""
     for var in ("AWS_PROFILE", "HF_OIDC_RESOURCE", "HF_OIDC_ID_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
         monkeypatch.setenv(var, "operator")
+    monkeypatch.setenv("DRIFTMAP_CLIENT", "fake:operator.jsonl")
     pytester.makeconftest((REPO_ROOT / "tests" / "conftest.py").read_text())
     ini = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())["tool"]["pytest"]["ini_options"]
     pytester.makepyprojecttoml(
@@ -283,6 +288,63 @@ class TestFakeHub:
         assert hub.max_in_flight == 1
         assert [c[0] for c in hub.calls][:3] == ["create_repo", "upload_file", "upload_file"]
 
+    def test_downloads_fail_and_fall_back_like_the_library(self, tmp_path):
+        hub = FakeHub(tmp_path / "hub")
+        hub.add_repo("CohereLabs/tiny-aya-global", gated=True, files={"config.json": b"{}"})
+        aya = {"repo_id": "CohereLabs/tiny-aya-global", "revision": hub.heads["CohereLabs/tiny-aya-global"]}
+        fresh, stale = tmp_path / "fresh", tmp_path / "stale"
+        (stale / ".cache").mkdir(parents=True)
+        for download in (
+            lambda target: hub.snapshot_download(**aya, local_dir=target),
+            lambda target: hub.hf_hub_download(filename="config.json", **aya, local_dir=target),
+        ):
+            with pytest.raises(GatedRepoError):
+                download(fresh)
+            for status in (503, 403, 429):
+                hub.fail_after(1, status)
+                with pytest.raises(LocalEntryNotFoundError) as unreachable:
+                    download(fresh)
+                assert type(unreachable.value.__cause__) is HfHubHTTPError
+                assert unreachable.value.__cause__.response.status_code == status
+            hub.fail_after(1, 401)
+            with pytest.raises(RepositoryNotFoundError):
+                download(fresh)
+            hub.fail_after(1, 404, error_code="RevisionNotFound")
+            with pytest.raises(RevisionNotFoundError):
+                download(stale)
+        assert not (fresh / "config.json").exists()
+        assert (fresh / ".cache" / "huggingface" / "download").is_dir()
+
+        hub.fail_after(1, 503)
+        assert hub.snapshot_download(**aya, local_dir=stale) == str(stale)
+        assert hub.snapshot_download(**aya, local_dir=stale) == str(stale)
+        assert not (stale / "config.json").exists()
+        hub.fail_after(1, 503)
+        with pytest.raises(LocalEntryNotFoundError):
+            hub.hf_hub_download(filename="config.json", **aya, local_dir=stale)
+        (stale / "config.json").write_bytes(b"old")
+        hub.fail_after(1, 503)
+        assert hub.hf_hub_download(filename="config.json", **aya, local_dir=stale) == str(stale / "config.json")
+        assert (stale / "config.json").read_bytes() == b"old"
+
+    def test_an_unchanged_upload_makes_no_commit(self, tmp_path):
+        hub = FakeHub(tmp_path)
+        hub.create_repo(RESULTS, repo_type="dataset")
+        first = hub.upload_file(path_or_fileobj=b"abc", path_in_repo="a.json", repo_id=RESULTS, repo_type="dataset")
+        revisions = set(hub.repos[RESULTS])
+        again = hub.upload_file(path_or_fileobj=b"abc", path_in_repo="a.json", repo_id=RESULTS, repo_type="dataset")
+        folder = tmp_path / "stage"
+        folder.mkdir()
+        (folder / "a.json").write_bytes(b"abc")
+        same_folder = hub.upload_folder(folder_path=folder, repo_id=RESULTS, repo_type="dataset")
+        assert again.oid == same_folder.oid == first.oid == hub.heads[RESULTS]
+        assert again.commit_url == first.commit_url
+        assert set(hub.repos[RESULTS]) == revisions
+        (folder / "b.json").write_bytes(b"new")
+        mixed = hub.upload_folder(folder_path=folder, repo_id=RESULTS, repo_type="dataset")
+        assert mixed.oid != first.oid and hub.heads[RESULTS] == mixed.oid
+        assert hub.repo_info(RESULTS, repo_type="dataset").sha == mixed.oid
+
 
 class TestFakeJobsClient:
     def test_jobinfo_sequence_wait_and_terminal_stage(self, monkeypatch):
@@ -462,7 +524,7 @@ class TestFakeTransport:
         with ThreadPoolExecutor(max_workers=4) as pool:
             answers = list(pool.map(ask, [*prompts, "boom", "boom", "boom", "boom", "unscripted"]))
         assert answers[:12] == [f"echo {p}" for p in prompts]
-        assert answers[12:16] == ["http 500", "http 500", "http 500", "late"]
+        assert Counter(answers[12:16]) == Counter({"http 500": 3, "late": 1})
         assert answers[16] == "fifo"
         assert transport.max_in_flight >= 1
 
