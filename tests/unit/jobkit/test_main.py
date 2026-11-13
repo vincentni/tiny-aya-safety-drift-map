@@ -198,8 +198,8 @@ def test_an_injected_clock_leaves_signals_and_logging_alone(launch):
 
 def test_the_last_call_interrupts_a_stalled_upload_and_saves_the_run(child_job, results, responses):
     """A Hub call still blocked a third of the reserve before the timeout is abandoned for the marker and record."""
-    # the last call comes 5220 s after submission
-    child, files = child_job("stall", age_s=5216)
+    # a 63 s timeout: the last call comes 3 s in
+    child, files = child_job("stall", timeout_s=63)
     assert child.returncode == 10, child.stderr
     assert child.stdout.splitlines()[-1] == "driftmap-job: finished status=partial exit=10"
     assert sorted(files) == sorted(
@@ -226,7 +226,8 @@ def test_sigterm_during_the_final_push_does_not_cut_it_short(child_job, results)
     assert child.returncode == 0, child.stderr
     assert child.stdout.splitlines()[-1] == "driftmap-job: finished status=ok exit=0"
     record = RunRecord.model_validate_json(files[f"{results}/{RECORD}"])
-    assert (record.status, record.notes) == ("ok", ["job lookup failed: command, flavor and price unknown"])
+    assert record.status == "ok"
+    assert "stopped by SIGTERM" not in record.notes
 
 
 def test_a_stop_before_anything_could_be_saved_is_not_reported_as_partial(launch, fake, monkeypatch, capsys):
@@ -307,7 +308,7 @@ def test_past_the_last_call_the_marker_and_record_get_one_attempt_each(
 
 
 def test_the_last_call_also_interrupts_a_stalled_upload_while_closing(child_job, results, responses):
-    child, files = child_job("stall-closing", age_s=5216)
+    child, files = child_job("stall-closing", timeout_s=63)
     assert child.returncode == 10, child.stderr
     assert child.stdout.splitlines()[-1] == "driftmap-job: finished status=partial exit=10"
     assert sorted(files) == sorted(
@@ -319,15 +320,15 @@ def test_the_last_call_also_interrupts_a_stalled_upload_while_closing(child_job,
 
 
 def test_a_body_that_absorbs_the_last_call_is_interrupted_again(child_job, tmp_path, results):
-    child, files = child_job("absorb", age_s=5216)
+    child, files = child_job("absorb", timeout_s=63)
     assert child.returncode == 10, child.stderr
     assert not (tmp_path / "slept").exists()
     assert RunRecord.model_validate_json(files[f"{results}/{RECORD}"]).status == "partial"
 
 
 def test_a_marker_push_stalled_past_the_last_call_is_interrupted_and_tried_once_more(child_job, results, responses):
-    # the last call, 5220 s after submission, finds the marker stalled
-    child, files = child_job("stall-marker", age_s=5214)
+    # the last call, 5 s after the start, finds the marker stalled
+    child, files = child_job("stall-marker", timeout_s=65)
     assert child.returncode == 10, child.stderr
     assert child.stdout.splitlines()[-1] == "driftmap-job: finished status=partial exit=10"
     assert sorted(files) == sorted(
@@ -336,3 +337,24 @@ def test_a_marker_push_stalled_past_the_last_call_is_interrupted_and_tried_once_
     record = RunRecord.model_validate_json(files[f"{results}/{RECORD}"])
     assert (record.status, record.partial.done) == ("partial", ["harmful/en"])
     assert any(note.startswith("last call: interrupted") for note in record.notes)
+
+
+def test_time_in_the_queue_does_not_count_against_the_timeout(launch, clock, stored):
+    def body(ctx):
+        clock.advance(240)
+        ctx.checkpoint()
+
+    # 25 minutes queued, 4 minutes of work, a 30 minute timeout
+    assert launch(body, timeout_s="1800", submitted_at="2026-11-02T09:35:00Z") == 0
+    record = RunRecord.model_validate_json(stored(RECORD))
+    assert (record.status, record.minutes, record.install_minutes) == ("ok", 4, 25.0)
+    assert "waited 1500 s between submission and start" in record.notes
+
+
+def test_a_live_job_submitted_long_ago_still_gets_its_full_timeout(child_job, results):
+    child, files = child_job("plain", age_s=1700, timeout_s=1800)
+    assert child.returncode == 0, child.stderr
+    assert child.stdout.splitlines()[-1] == "driftmap-job: finished status=ok exit=0"
+    record = RunRecord.model_validate_json(files[f"{results}/{RECORD}"])
+    assert (record.status, record.minutes) == ("ok", 1)
+    assert record.install_minutes >= 28

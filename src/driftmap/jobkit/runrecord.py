@@ -86,8 +86,9 @@ class Run:
     ) -> RunRecord:
         """The record as it stands now, closed with ``status``; revisions come from the pushes' commits."""
         record = self.record
-        wall_clock_s = self._deadline.running_s()
-        minutes = math.ceil(self._deadline.elapsed_s() / 60)
+        wall_clock_s = self._deadline.elapsed_s()
+        # billing, like the timeout, starts with the container, not at submission
+        minutes = math.ceil(wall_clock_s / 60)
         rate = record.tokens_per_s
         if rate is None and record.generated_tokens and wall_clock_s > 0:
             rate = round(record.generated_tokens / wall_clock_s, 3)
@@ -153,4 +154,6 @@ def start(
         install_minutes=round(deadline.waited_s / 60, 2),
         notes=[] if job is not None else [NO_JOB],
     )
+    if deadline.waited_s > 0:
+        record.notes.append(f"waited {deadline.waited_s:.0f} s between submission and start")
     return Run(record, f"{settings.owner}/{settings.repos.results}", deadline, clock)

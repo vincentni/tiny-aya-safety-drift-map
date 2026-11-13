@@ -1,4 +1,4 @@
-"""The job's deadline, counted from the moment it was submitted."""
+"""The job's deadline, counted from the moment its process started."""
 
 import time
 from datetime import UTC, datetime
@@ -37,7 +37,7 @@ def parse_submitted_at(text: str) -> datetime:
 
 
 class Deadline:
-    """Tells a job when to flush: ``reserve_s`` before the platform's timeout."""
+    """Tells a job when to flush: ``reserve_s`` before its timeout, which runs from process start."""
 
     def __init__(
         self,
@@ -50,20 +50,15 @@ class Deadline:
         started = clock.now().astimezone(UTC)
         self.timeout_s = timeout_s
         self.reserve_s = max(timeout_s / 10, 180) if reserve_s is None else reserve_s
-        # a launcher clock running ahead must not move the deadline later
-        self.effective_submitted_at = min(submitted_at.astimezone(UTC), started)
-        self.waited_s = (started - self.effective_submitted_at).total_seconds()
+        # queue and install time is recorded, never counted against the timeout
+        self.waited_s = max((started - submitted_at.astimezone(UTC)).total_seconds(), 0.0)
         self._clock = clock
         self._started = clock.monotonic()
         self._force_after_s = force_after_s
 
-    def running_s(self) -> float:
+    def elapsed_s(self) -> float:
         """Seconds since this process started."""
         return self._clock.monotonic() - self._started
-
-    def elapsed_s(self) -> float:
-        """Seconds since submission, queueing and install included."""
-        return self.waited_s + self.running_s()
 
     def should_flush(self) -> bool:
         return self.elapsed_s() >= self.timeout_s - self.reserve_s
@@ -74,7 +69,7 @@ class Deadline:
 
     def force_due(self) -> bool:
         """True once, when the process has run for ``force_after_s``."""
-        if self._force_after_s is None or self.running_s() < self._force_after_s:
+        if self._force_after_s is None or self.elapsed_s() < self._force_after_s:
             return False
         self._force_after_s = None
         return True

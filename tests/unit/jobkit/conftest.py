@@ -150,11 +150,11 @@ def stored(fake, results):
 def child_job(tmp_path, child_env, argv):
     """Run the child job, submitted ``age_s`` seconds ago; returns the process and the files its Hub stored."""
 
-    def spawn(mode, age_s=0):
+    def spawn(mode, age_s=0, timeout_s=5400):
         settings_toml(tmp_path)
         submitted = datetime.now(UTC) - timedelta(seconds=age_s)
         command = [sys.executable, "-c", CHILD, str(tmp_path), mode]
-        command += argv(submitted_at=f"{submitted:%Y-%m-%dT%H:%M:%SZ}")
+        command += argv(submitted_at=f"{submitted:%Y-%m-%dT%H:%M:%SZ}", timeout_s=str(timeout_s))
         child = subprocess.run(command, env=child_env, capture_output=True, text=True, timeout=60)
         store = tmp_path / "store"
         return child, {

@@ -78,7 +78,7 @@ def test_finish_takes_revisions_from_the_pushes_and_the_command_from_the_job(
     assert uploads()[-1] == record_path(RUN_ID)
 
 
-def test_minutes_count_from_submission_and_round_up(settings, clock):
+def test_minutes_count_from_process_start_and_round_up(settings, clock):
     deadline = Deadline(1800, clock.now(), clock)
     clock.advance(61)
     run = start(settings, run_id=RUN_ID, kind="drift", mode="smoke", code_sha="a" * 40, deadline=deadline, clock=clock)
@@ -92,8 +92,21 @@ def test_install_minutes_is_the_wait_between_submission_and_start(settings, cloc
     deadline = Deadline(1800, clock.now() - timedelta(seconds=150), clock)
     run = start(settings, run_id=RUN_ID, kind="drift", mode="smoke", code_sha="a" * 40, deadline=deadline, clock=clock)
     assert run.record.install_minutes == 2.5
+    assert run.record.notes[-1] == "waited 150 s between submission and start"
     clock.advance(31)
-    assert run.finish("ok", []).minutes == 4
+    assert run.finish("ok", []).minutes == 1
+
+
+def test_a_queued_job_is_billed_for_its_running_time_only(settings, clock):
+    job = SimpleNamespace(id="j1", flavor="l4x1", command=["python"])
+    deadline = Deadline(1800, clock.now() - timedelta(minutes=25), clock)
+    run = start(
+        settings, run_id=RUN_ID, kind="drift", mode="smoke", code_sha="a" * 40, deadline=deadline, clock=clock, job=job
+    )
+    clock.advance(240)
+    record = run.finish("ok", [])
+    assert (record.minutes, record.cost_micro_usd, record.wall_clock_s) == (4, 4 * 13_333, 240.0)
+    assert (record.install_minutes, record.notes) == (25.0, ["waited 1500 s between submission and start"])
 
 
 def test_the_latest_push_to_a_repo_is_the_one_recorded(settings, fake, clock, responses):

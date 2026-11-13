@@ -44,9 +44,9 @@ class Context:
     def checkpoint(self) -> None:
         """Call between work units: raises DeadlineReached at the deadline and runs the one forced flush."""
         if self.deadline.should_flush():
-            raise DeadlineReached(f"deadline reached {self.deadline.elapsed_s():.0f} s after submission")
+            raise DeadlineReached(f"deadline reached after running {self.deadline.elapsed_s():.0f} s")
         if self.deadline.force_due():
-            self.run.note(f"forced flush after {self.deadline.running_s():.0f} s")
+            self.run.note(f"forced flush after {self.deadline.elapsed_s():.0f} s")
             self.flusher.flush()
 
 
@@ -97,7 +97,7 @@ class _Watchdog:
                 return
             raise DeadlineReached("stopped by SIGTERM", urgent=True)
         after = self._deadline.elapsed_s()
-        raise DeadlineReached(f"last call: interrupted {after:.0f} s after submission", urgent=True)
+        raise DeadlineReached(f"last call: interrupted after running {after:.0f} s", urgent=True)
 
 
 def _parse(argv: Sequence[str] | None, arguments: Callable[[argparse.ArgumentParser], object] | None) -> Any:

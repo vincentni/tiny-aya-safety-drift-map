@@ -36,27 +36,20 @@ def test_flush_point_is_a_tenth_of_the_timeout_and_never_under_180_s(timeout_s, 
     assert deadline.should_flush() is due
 
 
-def test_the_earlier_of_launcher_stamp_and_process_start_arms_the_deadline():
-    """A stamp 30 s ahead is clamped to the process start; one 30 s behind is used, both in UTC (TS-JK-2)."""
+def test_the_deadline_counts_from_process_start_whatever_the_launcher_stamp():
+    """A stamp 30 s ahead or 25 min behind moves no deadline; the wait is only recorded, in UTC (TS-JK-2)."""
     ahead = parse_submitted_at((START + timedelta(seconds=30)).astimezone(IST).isoformat())
-    behind = parse_submitted_at((START - timedelta(seconds=30)).astimezone(IST).isoformat())
+    behind = parse_submitted_at((START - timedelta(minutes=25)).astimezone(IST).isoformat())
     assert ahead.isoformat() == "2026-11-02T10:00:30+00:00"
 
-    clock = FakeClock(now=START)
-    clamped = Deadline(5400, ahead, clock)
-    assert clamped.effective_submitted_at == START
-    clock.advance(4859)
-    assert not clamped.should_flush()
-    clock.advance(1)
-    assert clamped.should_flush()
-
-    clock = FakeClock(now=START)
-    stamped = Deadline(5400, behind, clock)
-    assert stamped.effective_submitted_at == START - timedelta(seconds=30)
-    clock.advance(4829)
-    assert not stamped.should_flush()
-    clock.advance(1)
-    assert stamped.should_flush()
+    for stamp, waited_s in ((ahead, 0), (behind, 1500)):
+        clock = FakeClock(now=START)
+        deadline = Deadline(5400, stamp, clock)
+        assert deadline.waited_s == waited_s
+        clock.advance(4859)
+        assert not deadline.should_flush()
+        clock.advance(1)
+        assert deadline.should_flush()
 
 
 def test_a_stamp_without_an_offset_is_refused():
@@ -82,9 +75,16 @@ def test_last_call_sits_a_third_of_the_reserve_before_the_timeout():
     clock = FakeClock()
     deadline = Deadline(5400, clock.now() - timedelta(seconds=400), clock)
     clock.advance(1000)
-    assert deadline.elapsed_s() == 1400
-    assert deadline.running_s() == 1000
-    assert deadline.last_call_s() == 5400 - 180 - 1400
+    assert (deadline.elapsed_s(), deadline.waited_s) == (1000, 400)
+    assert deadline.last_call_s() == 5400 - 180 - 1000
+
+
+def test_the_forced_flush_counts_from_process_start_too():
+    clock = FakeClock()
+    deadline = Deadline(1800, clock.now() - timedelta(minutes=25), clock, force_after_s=300)
+    assert not deadline.force_due()
+    clock.advance(300)
+    assert deadline.force_due()
 
 
 def test_flush_at_the_deadline_pushes_data_then_marker_then_record(
@@ -201,8 +201,8 @@ def test_a_kill_between_marker_and_record_leaves_a_marker_to_resume_from(
     child_job, tmp_path, argv, settings, results, responses
 ):
     """SIGKILL after partial.json: marker present, record absent, no trailer; the relaunch resumes (TS-JK-11)."""
-    # 5000 s: past the flush point, well before the last call
-    child, files = child_job("kill-before-record", age_s=5000)
+    # 180 s timeout: flush due at once, last call after 120 s
+    child, files = child_job("kill-before-record", timeout_s=180)
     assert child.returncode == -9, child.stderr
     assert sorted(files) == sorted([f"{responses}/responses/x/harmful/en.jsonl", f"{results}/{MARKER}"])
     assert "driftmap-job" not in child.stdout + child.stderr
