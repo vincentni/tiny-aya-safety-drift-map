@@ -185,22 +185,27 @@ class FakeHub:
         token: str | bool | None = None,
         **kwargs: Any,
     ) -> ModelInfo | DatasetInfo:
+        sized = bool(kwargs.get("files_metadata"))
         with self._op(
             "repo_info", self._repo_url(repo_id, repo_type), repo_id=repo_id, repo_type=repo_type, revision=revision
         ):
-            self._tree(repo_id, repo_type, revision)
+            tree = self._tree(repo_id, repo_type, revision)
             payload = {
                 "id": repo_id,
                 "sha": self._sha(repo_id, revision),
                 "private": repo_id in self.private,
                 "gated": "auto" if repo_id in self.gated else False,
+                # like the library: file sizes only when files_metadata is asked for
+                "siblings": [
+                    {"rfilename": path, **({"size": len(data)} if sized else {})} for path, data in sorted(tree.items())
+                ],
             }
             return DatasetInfo(**payload) if (repo_type or "model") == "dataset" else ModelInfo(**payload)
 
     def model_info(
         self, repo_id: str, *, revision: str | None = None, token: str | bool | None = None, **kwargs: Any
     ) -> ModelInfo:
-        return self.repo_info(repo_id, repo_type="model", revision=revision)
+        return self.repo_info(repo_id, repo_type="model", revision=revision, **kwargs)
 
     def dataset_info(
         self, repo_id: str, *, revision: str | None = None, token: str | bool | None = None, **kwargs: Any

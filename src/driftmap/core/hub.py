@@ -171,9 +171,9 @@ class Hub:
         )
         return {entry.path: entry.lfs.sha256 for entry in found if getattr(entry, "lfs", None)}
 
-    def model_info(self, target: RepoRef | str) -> Any:
+    def model_info(self, target: RepoRef | str, **kwargs: Any) -> Any:
         ref = _ref(target)
-        return self._call(ref, "model", self._api.model_info, ref.repo, revision=ref.revision)
+        return self._call(ref, "model", self._api.model_info, ref.repo, revision=ref.revision, **kwargs)
 
     def dataset_info(self, target: RepoRef | str) -> Any:
         ref = _ref(target)

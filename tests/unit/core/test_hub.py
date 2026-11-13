@@ -247,6 +247,9 @@ def test_round_trip_through_the_wrappers(fake, clock, tmp_path):
     (folder / "skip.tmp").write_text("x")
     pushed = hub.upload_folder(mine, folder, ignore_patterns=["*.tmp"])
     assert hub.model_info(mine).sha == pushed.oid
+    sizes = {file.rfilename: file.size for file in hub.model_info(mine, files_metadata=True).siblings}
+    assert sizes == {"model.safetensors": 64, "runs/r1.json": 2}
+    assert {file.size for file in hub.model_info(mine).siblings} == {None}
 
     pinned = RepoRef(mine.repo, pushed.oid)
     local = Path(hub.snapshot_download(pinned, tmp_path / "dl", allow_patterns=["runs/*"]))
