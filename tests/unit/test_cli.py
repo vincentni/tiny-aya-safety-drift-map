@@ -1,0 +1,805 @@
+import ast
+import functools
+import json
+import logging
+import shutil
+import string
+import subprocess
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import typer
+from huggingface_hub import HfApi, set_client_factory
+from huggingface_hub.utils._http import default_client_factory
+from hypothesis import HealthCheck, given
+from hypothesis import settings as examples
+from hypothesis import strategies as st
+from typer.testing import CliRunner
+
+from driftmap import cli
+from driftmap.core import clients
+from driftmap.core import hub as core_hub
+from driftmap.core.hub import Hub
+from driftmap.core.records import (
+    AlphaRow,
+    AlphaScreen,
+    Bars,
+    Dare,
+    Decoding,
+    JudgeConfig,
+    Ref,
+    RunRecord,
+    Seeds,
+    SmokeRecord,
+    Tables,
+    dump,
+)
+from driftmap.core.schemas import (
+    SCHEMA_ALPHA_SCREEN,
+    SCHEMA_RUN,
+    SCHEMA_TABLES,
+    DriftmapError,
+    ExitCode,
+    schema_versions,
+)
+from driftmap.core.settings import load_settings
+from driftmap.data import build as data_build
+from driftmap.jobs import launcher, readiness
+from driftmap.jobs.client import HfJobsClient
+from driftmap.jobs.kinds import State
+from driftmap.jobs.ledger import Ledger
+from driftmap.jobs.plan import build_plan, pins
+from driftmap.jobs.readiness import ITEMS, READY_PATH, Check, Item, ReadyReport
+from driftmap.jobs.snapshot import DECISION_PATH, LOCAL, SMOKE_DIR, TABLES_PATH, Deps
+from tests.fakes import FakeHub, FakeJobsClient
+from tests.fakes.datasets import (
+    BENIGN,
+    HARMFUL,
+    SIX,
+    XSTEST,
+    benign_rows,
+    fixture_rows,
+    harmful_rows,
+    heads,
+    source_hub,
+)
+from tests.fakes.settings import settings_toml
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+AYA, BASE = "CohereLabs/tiny-aya-global", "CohereLabs/tiny-aya-base"
+OWNER = "vincentnkq"
+RESULTS = f"{OWNER}/safety-drift-map-results"
+EVAL = f"{OWNER}/aya-redteaming-6lang-eval"
+SHA = "0123456789abcdef0123456789abcdef01234567"
+TOKEN = "hf_" + "b" * 34
+HOME_DIR = "/" + "home/someone"
+VERBS = ["chain", "data", "decide", "launch", "ledger", "plan", "ready", "scan", "wait"]
+SUBMIT = FakeJobsClient.run_job
+HIDDEN = {"HF_TOKEN": "***"}
+
+
+def git(argv, **kwargs):
+    """Every git call succeeds and HEAD is SHA."""
+    return subprocess.CompletedProcess(argv, 0, f"{SHA}\n" if "rev-parse" in argv else "", "")
+
+
+def run(*argv):
+    return CliRunner().invoke(cli.app, list(argv))
+
+
+def judge_config(settings):
+    return JudgeConfig(
+        repo=settings.judge.repo,
+        revision=settings.judge.revision,
+        dtype="bfloat16",
+        decoding=Decoding(runtime="transformers"),
+        prompt_format="polyguard-v1",
+        parser_version="1",
+        config_hash="h",
+    )
+
+
+def run_record(run_id, config_hash, status="ok", **changes):
+    kind, mode, _ = run_id.split("-")
+    fields = {
+        "schema": SCHEMA_RUN,
+        "run_id": run_id,
+        "job_id": None,
+        "kind": kind,
+        "mode": mode,
+        "config_hash": config_hash,
+        "code_sha": SHA,
+        "inputs": [],
+        "outputs": [],
+        "merged_sha256": None,
+        "command": [],
+        "started": datetime(2026, 11, 2, 10, 2, tzinfo=UTC),
+        "finished": datetime(2026, 11, 2, 10, 27, tzinfo=UTC),
+        "wall_clock_s": 1500.0,
+        "flavor": "l4x1",
+        "price_micro_usd_per_min": 13_333,
+        "minutes": 25,
+        "cost_micro_usd": 333_325,
+        "prompts": 10,
+        "prompt_tokens": 100,
+        "generated_tokens": 100,
+        "tokens_per_s": 80.0,
+        "status": status,
+        "partial": None,
+        "oom": None,
+        "peak_vram_gb": 9.4,
+        "peak_rss_gb": 6.1,
+        "install_minutes": 2.5,
+        "notes": [],
+    }
+    return RunRecord.model_validate(fields | changes)
+
+
+class World:
+    """A checkout with a passed readiness report, a fake Hub and scripted git."""
+
+    def __init__(self, monkeypatch, root, hub=None, **overrides):
+        self.root = root
+        monkeypatch.chdir(root)
+        self.config = settings_toml(root, **overrides)
+        shutil.copy(REPO_ROOT / "pyproject.toml", root)
+        self.hub = hub or FakeHub(root.with_name(f"{root.name}-hub"))
+        for repo, kind in ((AYA, {"gated": True}), (BASE, {"gated": True}), (RESULTS, {"repo_type": "dataset"})):
+            if repo not in self.hub.repos:
+                self.hub.add_repo(repo, **kind)
+        self.hub.authorize(AYA)
+        self.client_log = root.with_name(f"{root.name}-client.jsonl")
+        self.ledger = Ledger(root / launcher.LEDGER_PATH)
+        self.secrets = []
+        monkeypatch.setenv("DRIFTMAP_CLIENT", f"fake:{self.client_log}")
+        # the attribute the real client keeps its HfApi under
+        monkeypatch.setattr(FakeJobsClient, "api", self.hub, raising=False)
+        monkeypatch.setattr(FakeJobsClient, "run_job", lambda client, **kwargs: self.submitted(client, **kwargs))
+        monkeypatch.setattr(cli, "Deps", functools.partial(Deps, run=git))
+        self.ready()
+
+    @property
+    def settings(self):
+        return load_settings(self.config)
+
+    def ready(self, **fields):
+        items = [Item(number=number, name=name, status="PASS", detail="ok") for number, name, _ in ITEMS]
+        report = ReadyReport(ts=datetime.now(UTC), config_hash=self.settings.config_hash(), items=items, **fields)
+        dump(report, self.root / READY_PATH)
+
+    def submitted(self, client, **kwargs):
+        # a later process replays earlier submits with the secret hidden
+        if kwargs["secrets"] != HIDDEN:
+            self.secrets.append(kwargs["secrets"])
+            self.push_record(kwargs["labels"]["driftmap_run"])
+        return SUBMIT(client, **kwargs)
+
+    def push(self, path, data):
+        self.hub.upload_file(path_or_fileobj=data, path_in_repo=path, repo_id=RESULTS, repo_type="dataset")
+
+    def push_record(self, run_id, status="ok", **changes):
+        changes.setdefault("config_hash", self.settings.config_hash())
+        record = run_record(run_id, changes.pop("config_hash"), status, **changes)
+        self.push(f"runs/{run_id}.json", record.model_dump_json().encode())
+
+    def smoke_passed(self, kind):
+        plan = build_plan(self.settings, kind, "full", None, SHA, repo_root=self.root)
+        record = SmokeRecord(
+            script=plan.script,
+            image=plan.image,
+            runner=plan.runner,
+            dependencies=pins(self.root),
+            schema_versions=schema_versions(),
+            status="ok",
+            bos_check=None,
+            install_minutes=2.5,
+            upload_mb_s=11.0,
+            peak_vram_gb=9.4,
+            peak_rss_gb=6.1,
+            tokens_per_s=80.0,
+        )
+        dump(record, self.root / SMOKE_DIR / f"{kind}.json")
+
+    def script(self, **facts):
+        self.client_log.with_name(f"{self.client_log.name}.script.json").write_text(json.dumps(facts))
+
+    def submits(self):
+        if not self.client_log.exists():
+            return []
+        calls = [json.loads(line) for line in self.client_log.read_text().splitlines()]
+        return [call["kwargs"]["command"][-1] for call in calls if call["method"] in ("run_job", "run_uv_job")]
+
+
+@pytest.fixture(autouse=True)
+def process_state(monkeypatch):
+    """What the app sets for the whole process is put back."""
+    root = logging.getLogger()
+    names = ("", "httpx", "httpx2", "httpcore")
+    handlers, factory = root.handlers[:], logging.getLogRecordFactory()
+    levels = {name: logging.getLogger(name).level for name in names}
+    monkeypatch.setattr(clients, "_backend", clients._backend)
+    core_hub.token.cache_clear()
+    yield
+    root.handlers[:] = handlers
+    for name, level in levels.items():
+        logging.getLogger(name).setLevel(level)
+    logging.setLogRecordFactory(factory)
+    core_hub.token.cache_clear()
+
+
+def jobs_pending(world):
+    """Pending flag of each job on the ledger; holds are left out."""
+    return [line.pending for job_id, line in world.ledger.read().items() if not job_id.startswith("unsubmitted:")]
+
+
+@pytest.fixture
+def world(monkeypatch):
+    return World(monkeypatch, Path.cwd())
+
+
+def verdict(result, guard):
+    (row,) = [line.split() for line in result.output.splitlines() if line.startswith(f"{guard} ")]
+    return row[1]
+
+
+def test_help_lists_the_nine_verbs():
+    assert sorted(typer.main.get_command(cli.app).commands) == VERBS
+    result = run("--help")
+    assert result.exit_code == 0 and all(f" {verb} " in result.output for verb in VERBS)
+    groups = {name: sorted(typer.main.get_command(cli.app).commands[name].commands) for name in ("data", "ledger")}
+    assert groups == {"data": ["build"], "ledger": ["reconcile"]}
+    assert sorted(typer.main.get_command(cli.app).commands["decide"].commands) == ["drift"]
+
+
+def test_the_data_package_is_imported_only_inside_its_verb():
+    tree = ast.parse(Path(cli.__file__).read_text(encoding="utf-8"))
+    top = [node for node in tree.body if isinstance(node, ast.Import | ast.ImportFrom)]
+    names = [alias.name for node in top for alias in node.names] + [getattr(node, "module", "") for node in top]
+    assert not [name for name in names if name and name.startswith("driftmap.data")]
+
+
+def test_a_dry_run_prints_the_plan_and_a_full_run_needs_its_smoke_record(world):
+    """A dry run prints the plan with the token masked; without a smoke record a full run is refused (TS-PLN-2)."""
+    smoke = run("launch", "generate", "--dry-run")
+    assert smoke.exit_code == 0
+    assert smoke.output.splitlines()[0].split() == ["verb", "launch"]
+    for expected in (
+        f"image     {world.settings.images.pytorch}",
+        "flavor    l4x1",
+        "timeout   1800s (30 min)",
+        "python -m driftmap.scripts.generate --run-id generate-smoke-",
+        "secrets   HF_TOKEN=***",
+        "estimate  399990 micro-USD ($0.40)",
+        "ledger    0 micro-USD",
+        "credit    20000000 micro-USD left",
+    ):
+        assert expected in smoke.output
+    assert verdict(smoke, "smoke") == "pass"
+
+    full = run("launch", "generate", "--mode", "full", "--dry-run")
+    assert full.exit_code == ExitCode.GUARD_REFUSAL == 4
+    assert "timeout   5400s (90 min)" in full.output and "secrets   HF_TOKEN=***" in full.output
+    assert verdict(full, "smoke") == "refused" and "no passing smoke run" in full.output
+    assert "nothing was submitted" in full.output
+    assert world.submits() == [] and not world.ledger.path.exists()
+
+
+@examples(suppress_health_check=[HealthCheck.function_scoped_fixture])
+@given(tail=st.text(alphabet=string.ascii_letters + string.digits, min_size=20, max_size=40))
+def test_the_token_reaches_the_job_as_a_secret_and_nothing_else(tail, tmp_path_factory, monkeypatch):
+    """No output, log or local file of plan, dry run and two followed launches holds the token (TS-CFG-6)."""
+    token = f"hf_{tail}"
+    monkeypatch.setenv("HF_TOKEN", token)
+    core_hub.token.cache_clear()
+    world = World(monkeypatch, tmp_path_factory.mktemp("checkout"))
+
+    results = [
+        run("plan", "generate"),
+        run("launch", "generate", "--dry-run"),
+        run("-v", "launch", "generate", "--wait"),
+        run("-v", "launch", "generate", "--mode", "full", "--wait"),
+    ]
+
+    assert [result.exit_code for result in results] == [0, 0, 0, 0]
+    assert world.secrets == [{"HF_TOKEN": token}] * 2
+    assert all("secrets   HF_TOKEN=***" in result.output for result in results)
+    local = {
+        path.relative_to(world.root / LOCAL).as_posix(): path.read_text()
+        for path in (world.root / LOCAL).rglob("*")
+        if path.is_file()
+    }
+    assert {"ready.json", "results/ledger.jsonl", "smoke/generate.json"} <= set(local)
+    assert len([name for name in local if name.startswith("results/logs/")]) == 2
+    assert jobs_pending(world) == [False, False]
+    for text in (*(result.output for result in results), *local.values(), world.client_log.read_text()):
+        assert token not in text
+
+
+def test_a_drift_decision_is_stored_pushed_and_lifts_the_guard(world):
+    """decide drift stores schema, decision, note and time; the drift guard then passes (TS-LCH-13)."""
+    tables = Tables(
+        schema=SCHEMA_TABLES,
+        columns={},
+        safety=[],
+        over_refusal=[],
+        chrf=[],
+        deltas=[],
+        flags={"drift_below_threshold": True},
+        judge=judge_config(world.settings),
+        seeds=Seeds(seed=1, bootstrap=2),
+    )
+    dump(tables, world.root / TABLES_PATH)
+    before = run("launch", "repair", "--dry-run")
+    assert before.exit_code == 4 and verdict(before, "drift_decision") == "refused"
+    config_row = [
+        line for line in run("plan", "drift", "--mode", "full").output.splitlines() if line.startswith("config ")
+    ]
+
+    done = run("decide", "drift", "--proceed", "--note", "x")
+
+    assert done.exit_code == 0 and done.output.splitlines()[0].split() == ["verb", "decide", "drift"]
+    stored = json.loads((world.root / DECISION_PATH).read_text())
+    assert (stored["schema"], stored["decision"], stored["note"]) == ("driftmap.decision/1", "proceed", "x")
+    assert abs(datetime.fromisoformat(stored["ts"]) - datetime.now(UTC)) < timedelta(minutes=1)
+    assert world.hub.repos[RESULTS]["main"]["decisions/drift.json"] == (world.root / DECISION_PATH).read_bytes()
+    after = run("launch", "repair", "--dry-run")
+    assert after.exit_code == 0 and verdict(after, "drift_decision") == "pass"
+
+    assert run("decide", "drift", "--extend", "--note", "one more epoch").exit_code == 0
+    stored = json.loads(world.hub.repos[RESULTS]["main"]["decisions/drift.json"])
+    assert (stored["decision"], stored["note"]) == ("extend", "one more epoch")
+    again = [line for line in run("plan", "drift", "--mode", "full").output.splitlines() if line.startswith("config ")]
+    assert again == config_row and len(config_row) == 2
+
+
+def test_a_decision_needs_one_choice_a_note_and_a_clean_note(world):
+    for argv in (
+        ["--note", "x"],
+        ["--proceed", "--extend", "--note", "x"],
+        ["--proceed"],
+        ["--proceed", "--note", " "],
+    ):
+        assert run("decide", "drift", *argv).exit_code == 2
+    assert not (world.root / DECISION_PATH).exists()
+
+    leaked = run("decide", "drift", "--proceed", "--note", f"see {HOME_DIR}/notes")
+    assert leaked.exit_code == ExitCode.REDACTION and "home_path" in leaked.output
+    assert "decisions/drift.json" not in world.hub.repos[RESULTS]["main"] and not (world.root / DECISION_PATH).exists()
+
+
+def test_a_decision_that_cannot_be_pushed_exits_7_and_stays_local(world):
+    world.hub.fail_after(1, 403)
+    result = run("decide", "drift", "--proceed", "--note", "x")
+    assert result.exit_code == ExitCode.PUSH_FAILED == 7
+    assert "run the command again" in result.output and (world.root / DECISION_PATH).exists()
+
+
+CODES = [
+    ExitCode.USAGE,
+    ExitCode.READINESS,
+    ExitCode.GUARD_REFUSAL,
+    ExitCode.LOST_RUN,
+    ExitCode.REDACTION,
+    ExitCode.DRIFT_BELOW_THRESHOLD,
+]
+
+
+@pytest.mark.parametrize("code", CODES)
+def test_a_library_error_becomes_the_process_exit_code(world, monkeypatch, code):
+    def stop(deps):
+        raise DriftmapError(code, f"stopped with {TOKEN} in {HOME_DIR}/x")
+
+    monkeypatch.setattr(launcher, "reconcile", stop)
+    result = run("ledger", "reconcile")
+    assert result.exit_code == int(code) and isinstance(result.exception, SystemExit)
+    assert "error: stopped with hf_*** in <home>/x" in result.stderr and "Traceback" not in result.output
+
+
+@pytest.mark.parametrize("error", [RuntimeError, OSError])
+def test_an_unforeseen_error_prints_a_masked_traceback_and_exits_1(world, monkeypatch, error):
+    def crash(deps):
+        raise error(f"boom {TOKEN} in {HOME_DIR}/x")
+
+    monkeypatch.setattr(launcher, "reconcile", crash)
+    result = run("ledger", "reconcile")
+    assert result.exit_code == 1 and isinstance(result.exception, SystemExit)
+    assert "Traceback" in result.stderr and f"{error.__name__}: boom hf_*** in <home>/x" in result.stderr
+    assert TOKEN not in result.output and HOME_DIR not in result.output
+
+
+def test_an_interrupted_launch_exits_130_after_the_recovery_text(world, monkeypatch):
+    def interrupted(settings, deps, kind, mode, **flags):
+        print("its hold stays on the ledger; run `driftmap wait unsubmitted:run-1`")
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(launcher, "launch", interrupted)
+    for argv in (["launch", "generate"], ["plan", "generate"]):
+        result = run(*argv)
+        assert result.exit_code == 130 and isinstance(result.exception, SystemExit)
+        assert result.stdout.splitlines()[-1] == "its hold stays on the ledger; run `driftmap wait unsubmitted:run-1`"
+        assert result.stderr.splitlines() == ["interrupted"] and "Traceback" not in result.output
+
+
+def test_a_record_that_does_not_validate_exits_2_without_its_values(world):
+    (world.root / DECISION_PATH).parent.mkdir(parents=True)
+    (world.root / DECISION_PATH).write_text(json.dumps({"schema": "driftmap.decision/1", "decision": TOKEN}))
+    result = run("plan", "repair")
+    assert result.exit_code == 2 and "decision: " in result.stderr
+    assert "hf_" not in result.output and "Traceback" not in result.output
+
+
+def test_usage_and_configuration_faults_exit_2(world):
+    for argv in (
+        ["nope"],
+        ["launch"],
+        ["launch", "nope"],
+        ["launch", "generate", "--mode", "big"],
+        ["plan", "generate", "--zzz"],
+    ):
+        assert run(*argv).exit_code == 2, argv
+    for argv in (["chain"], ["wait"], ["scan"], ["scan", "absent.txt"], ["launch", "generate", "--limit", "x"]):
+        assert run(*argv).exit_code == 2, argv
+    assert run().exit_code == 2
+
+    world.config.write_text("surprise = 1\n" + world.config.read_text())
+    broken = run("plan", "generate")
+    assert broken.exit_code == ExitCode.USAGE and "surprise" in broken.output
+    world.config.unlink()
+    assert run("ledger", "reconcile").exit_code == 2
+
+
+def test_hub_verbs_stop_at_exit_3_before_a_client_exists(world, monkeypatch):
+    monkeypatch.setattr(cli, "make_jobs_client", lambda settings: pytest.fail("a client was built"))
+    (world.root / READY_PATH).unlink()
+    verbs = (
+        ["plan", "generate"],
+        ["launch", "generate"],
+        ["chain", "generate"],
+        ["decide", "drift", "--proceed", "--note", "x"],
+        ["data", "build"],
+    )
+    for argv in verbs:
+        result = run(*argv)
+        assert result.exit_code == ExitCode.READINESS == 3, argv
+        assert result.output.splitlines()[0].split()[0] == "verb" and "run `driftmap ready`" in result.stderr
+
+    world.ready()
+    world.config.write_text(world.config.read_text().replace("= 20261102", "= 7"))
+    assert "another configuration" in run("plan", "generate").stderr
+
+
+def test_launch_passes_its_flags_through_and_overrides_stay_off(world, monkeypatch):
+    seen = []
+
+    def launch(settings, deps, kind, mode, **flags):
+        seen.append((kind, mode, flags, type(deps.ledger).__name__, deps.repo_root, deps.hub._api))
+        return ExitCode.SUCCESS
+
+    monkeypatch.setattr(launcher, "launch", launch)
+    assert run("launch", "generate").exit_code == 0
+    assert run("plan", "judge", "--mode", "full").exit_code == 0
+    argv = ["--mode", "full", "--wait", "--limit", "5", "--", "--checkpoint", "a/b@c"]
+    assert run("launch", "quant_eval", *argv).exit_code == 0
+
+    off = {"override_smoke": False, "override_soft": False}
+    plain = {"wait": False, "dry_run": False, "limit": None, "args": [], **off}
+    assert seen[0] == ("generate", "smoke", plain, "Ledger", world.root, world.hub)
+    assert seen[1][:3] == ("judge", "full", {"dry_run": True})
+    full = {"wait": True, "dry_run": False, "limit": 5, "args": ["--checkpoint", "a/b@c"], **off}
+    assert seen[2][:3] == ("quant_eval", "full", full)
+
+
+def test_an_override_needs_a_reason_and_the_reason_lands_in_the_ledger(world):
+    for flag in ("--override-smoke", "--override-soft"):
+        for extra in ([], ["--reason", "  "]):
+            refused = run("launch", "generate", "--mode", "full", flag, *extra)
+            assert refused.exit_code == 2 and "--reason" in refused.output
+    assert run("launch", "generate", "--reason", "no override here").exit_code == 2
+    assert world.submits() == [] and not world.client_log.exists() and not world.ledger.path.exists()
+
+    reason = f"same image as the smoke run,\n approved  in {HOME_DIR}/notes"
+    done = run("launch", "generate", "--mode", "full", "--override-smoke", "--reason", reason, "--wait")
+
+    assert done.exit_code == 0 and len(world.submits()) == 1
+    note = "reason=same image as the smoke run, approved in <home>/notes"
+    hold, pending, released, last = world.ledger.lines()
+    assert hold.pending and hold.job_id == f"unsubmitted:{pending.run_id}"
+    assert hold.notes == ["price=hardware", "override-smoke", "hold", note]
+    assert pending.pending and pending.notes == ["price=hardware", "override-smoke", note]
+    assert (released.job_id, released.pending, released.notes[-1]) == (hold.job_id, False, f"job={pending.job_id}")
+    assert not last.pending and last.job_id == pending.job_id and last.notes == pending.notes
+    assert f"overrides --override-smoke {note.replace('=', ' ')}" in " ".join(done.output.split())
+
+    refused = run("launch", "generate", "--mode", "full", "--override-soft", "--reason", "x", "--dry-run")
+    assert verdict(refused, "smoke") == "refused" and len(world.ledger.lines()) == 4
+
+
+def test_wait_follows_a_launched_job_and_an_unknown_job_exits_5(world):
+    launched = run("launch", "generate")
+    assert launched.exit_code == 0, launched.output
+    job_id = launched.output.split("driftmap wait ")[1].split()[0]
+    assert world.ledger.read()[job_id].pending
+    # a stale report must not keep a running job off the ledger
+    (world.root / READY_PATH).unlink()
+
+    waited = run("wait", job_id)
+    assert waited.exit_code == 0 and waited.output.splitlines()[0].split() == ["verb", "wait"]
+    assert not world.ledger.read()[job_id].pending and "next: none" in waited.output
+
+    hold = f"unsubmitted:{world.ledger.read()[job_id].run_id}"
+    closed = run("wait", hold)
+    assert closed.exit_code == 0 and f"{hold} is already closed" in closed.output
+
+    lost = run("wait", "job-unknown")
+    assert lost.exit_code == ExitCode.LOST_RUN == 5 and "no ledger line for job job-unknown" in lost.stderr
+    assert run("wait", "unsubmitted:nothing").exit_code == 5
+
+
+def test_wait_takes_a_hold_id_and_neither_it_nor_reconcile_needs_readiness(world, monkeypatch):
+    seen = []
+    monkeypatch.setattr(launcher, "wait_job", lambda settings, deps, job_id: seen.append(job_id))
+    world.config.write_text(world.config.read_text().replace("= 20261102", "= 7"))
+    hold = "unsubmitted:generate-full-20261113T100000Z"
+    for job_id in ("job-1", hold):
+        result = run("wait", job_id)
+        assert result.exit_code == 0 and result.output.splitlines()[:2] == ["verb      wait", f"job       {job_id}"]
+    assert seen == ["job-1", hold]
+    reconciled = run("ledger", "reconcile")
+    assert reconciled.exit_code == 0 and reconciled.output.splitlines()[0].split() == ["verb", "ledger", "reconcile"]
+    assert "billing 0 micro-USD, ledger 0 micro-USD" in reconciled.output
+
+
+def test_reconcile_compares_billing_with_the_ledger(world):
+    (world.root / READY_PATH).unlink()
+    world.script(billing_used_micro_usd=400_000)
+    result = run("ledger", "reconcile")
+    assert result.exit_code == 0 and "billing 400000 micro-USD, ledger 0 micro-USD" in result.output
+
+    world.script(billing_used_micro_usd=600_000)
+    assert run("ledger", "reconcile").exit_code == 1
+
+
+def test_outside_the_test_fake_a_verb_gets_the_real_clients(world, monkeypatch):
+    seen = []
+    monkeypatch.setattr(launcher, "wait_job", lambda settings, deps, job_id: seen.append(deps))
+    monkeypatch.delenv("DRIFTMAP_CLIENT")
+    try:
+        assert run("wait", "job-1").exit_code == 0
+    finally:
+        set_client_factory(default_client_factory)
+    (deps,) = seen
+    assert isinstance(deps.client, HfJobsClient) and isinstance(deps.client.api, HfApi)
+    assert deps.hub._api is deps.client.api and deps.client.api.token == "hf_dummy"
+    assert (deps.ledger.path, deps.repo_root) == (world.root / launcher.LEDGER_PATH, world.root)
+
+
+def test_plan_uses_the_gpu_flavor_readiness_recorded(world):
+    world.ready(gpu_flavor="a10g-small")
+    result = run("plan", "generate")
+    assert result.exit_code == 0 and "flavor    a10g-small" in result.output
+    assert "estimate  500010 micro-USD" in result.output
+
+
+def test_ready_stores_and_prints_the_report(world, monkeypatch):
+    def fine(settings, deps):
+        return Check(True, "fine")
+
+    def closed(settings, deps):
+        return Check(False, f"refused {TOKEN}", "ask for access")
+
+    monkeypatch.setattr(readiness, "ITEMS", ((1, "first", fine), (2, "second", fine)))
+    passed = run("ready")
+    assert passed.exit_code == 0 and passed.output.splitlines()[0].split() == ["verb", "ready"]
+    assert " 1  PASS  first: fine" in passed.output and "secrets   HF_TOKEN=***" in passed.output
+    assert run("plan", "generate").exit_code == 0
+
+    as_json = run("ready", "--json")
+    assert as_json.exit_code == 0 and "verb" in as_json.stderr
+    assert json.loads(as_json.stdout) == json.loads((world.root / READY_PATH).read_text())
+
+    monkeypatch.setattr(readiness, "ITEMS", ((1, "first", fine), (2, "second", closed)))
+    failed = run("ready")
+    assert failed.exit_code == ExitCode.READINESS == 3
+    assert " 2  FAIL  second: refused hf_***" in failed.output and "hint: ask for access" in failed.output
+    assert "not ready: 2" in failed.output and run("plan", "generate").exit_code == 3
+
+
+def test_ready_pin_leaves_a_report_made_under_the_pinned_configuration(tmp_path, monkeypatch):
+    root = tmp_path / "checkout-pin"
+    root.mkdir()
+    world = World(monkeypatch, root, revisions=None)
+    for repo in (HARMFUL, BENIGN, XSTEST):
+        world.hub.add_repo(repo, repo_type="dataset")
+    monkeypatch.setattr(readiness, "ITEMS", ((1, "first", lambda settings, deps: Check(True, "fine")),))
+    unpinned = world.settings.config_hash()
+
+    result = run("ready", "--pin")
+
+    assert result.exit_code == 0
+    pinned = json.loads((world.root / "revisions.json").read_text())
+    assert pinned == {repo: world.hub.heads[repo] for repo in (AYA, HARMFUL, BENIGN, XSTEST)}
+    assert "commit and push revisions.json" in result.output and all(repo in result.output for repo in pinned)
+    stored = json.loads((world.root / READY_PATH).read_text())
+    assert stored["config_hash"] == world.settings.config_hash() != unpinned
+    assert run("plan", "generate").exit_code == 0
+
+    again = run("ready", "--pin")
+    assert again.exit_code == 0 and "already pins" in again.output
+    assert json.loads((world.root / "revisions.json").read_text()) == pinned
+
+
+def screen(settings, status):
+    row = AlphaRow(
+        alpha=0.25, safe_rate_pooled=0.5, n_judged=120, chrf_pooled=0.4, pass_safety=False, pass_chrf=True, error=None
+    )
+    return AlphaScreen(
+        schema=SCHEMA_ALPHA_SCREEN,
+        alphas=[row],
+        chosen=None,
+        recover_status=status,
+        badge="Faithful",
+        safetune_version="0.1.10",
+        dare=Dare(),
+        judge=judge_config(settings),
+        bars=Bars(),
+        baseline_safe_pooled=0.9,
+        drifted_chrf_subset=0.4,
+        tied_weight_owner="embed",
+    )
+
+
+def test_the_chain_reader_takes_state_from_the_results_repo(world):
+    settings = world.settings
+    read = cli._state(settings, Hub(world.hub), "full")
+    bare = State(languages=tuple(settings.languages), checkpoint="drifted")
+    assert read("generate") == bare
+
+    world.push_record("drift-full-20261105T120000Z", config_hash="0" * 64, merged_sha256="a" * 64)
+    world.push_record("drift-smoke-20261105T090000Z", merged_sha256="b" * 64)
+    world.push_record("drift-full-20261105T100000Z", merged_sha256="c" * 64)
+    world.push_record("drift-full-20261105T110000Z", merged_sha256="d" * 64)
+    world.push_record("drift-full-20261106T100000Z", "failed")
+    world.push_record("generate-full-20261106T100000Z")
+    repaired = Ref(kind="model", repo=f"{OWNER}/tiny-aya-global-repaired", revision="7" * 40)
+    world.push_record("repair-full-20261107T100000Z", outputs=[repaired])
+    gguf = Ref(kind="model", repo=f"{OWNER}/tiny-aya-global-repaired-GGUF", revision="8" * 40)
+    world.push_record("quant-full-20261108T100000Z", outputs=[gguf])
+    world.push("runs/torn.json", b"{")
+    world.push("alpha_screen.json", screen(settings, "failed").model_dump_json().encode())
+
+    full = State(
+        languages=tuple(settings.languages),
+        checkpoint="drifted",
+        merged_sha256="d" * 64,
+        responses_complete=True,
+        repaired_revision="7" * 40,
+        gguf_record=True,
+        recover_status="failed",
+    )
+    assert read("judge") == full
+    smoke = cli._state(settings, Hub(world.hub), "smoke")("judge")
+    assert smoke == State(
+        languages=tuple(settings.languages), checkpoint="drifted", merged_sha256="b" * 64, recover_status="failed"
+    )
+
+    world.push("partial/generate-full-20261107T100000Z.json", b"{}")
+    assert read("judge").responses_complete is False
+    world.push_record("generate-full-20261107T100000Z", "partial")
+    assert read("judge").responses_complete is False
+    world.push_record("generate-full-20261108T100000Z")
+    assert read("judge").responses_complete is True
+    world.push("alpha_screen.json", b"{")
+    assert read("steer").recover_status is None
+
+
+def test_chain_refuses_a_kind_whose_inputs_it_cannot_see_and_runs_the_rest_in_order(world):
+    blocked = run("chain", "generate", "judge")
+    assert blocked.exit_code == 4 and blocked.output.splitlines()[0].split() == ["verb", "chain"]
+    assert "generate cannot run yet; missing: drift record with merged_sha256" in blocked.output
+    repair = run("chain", "repair")
+    assert repair.exit_code == 4 and "baseline labels for en, fr, es, ru, hi, ar" in repair.output
+    assert world.submits() == []
+
+    world.push_record("drift-full-20261105T100000Z", merged_sha256="c" * 64)
+    for kind in ("generate", "judge"):
+        world.smoke_passed(kind)
+    done = run("chain", "generate", "judge")
+    assert done.exit_code == 0
+    first, second = world.submits()
+    assert "driftmap.scripts.generate --run-id generate-full-" in first
+    assert "driftmap.scripts.judge --run-id judge-full-" in second
+    assert jobs_pending(world) == [False, False]
+
+
+def test_scan_exits_6_on_a_finding_and_walks_directories(world):
+    clean = world.root / "notes.txt"
+    clean.write_text("nothing here\n")
+    passed = run("scan", str(clean))
+    assert passed.exit_code == 0 and passed.output.splitlines()[0].split() == ["verb", "scan"]
+    assert "no finding in 1 file" in passed.output
+
+    folder = world.root / "out"
+    (folder / "deep").mkdir(parents=True)
+    (folder / "deep" / "log.txt").write_text(f"ok\ntoken {TOKEN}\n")
+    rows = world.root / LOCAL / "data" / "prompts" / "harmful"
+    rows.mkdir(parents=True)
+    (rows / "en.jsonl").write_text('{"prompt": "call 123456789012"}\n')
+    (world.root / "ids.txt").write_text("123456789012\n")
+
+    found = run("scan", "notes.txt", "out", str(world.root / LOCAL / "data"), "ids.txt")
+    assert found.exit_code == ExitCode.REDACTION == 6
+    assert "out/deep/log.txt:2: hf_token" in found.stderr and "ids.txt:1: account_id" in found.stderr
+    assert "en.jsonl" not in found.stderr and TOKEN not in found.output
+
+
+def test_a_verb_logs_through_the_masking_handler_and_v_turns_on_debug(world, monkeypatch):
+    def noisy(deps):
+        logging.getLogger("driftmap.test").warning("token %s", TOKEN)
+        logging.getLogger("driftmap.test").debug("fine detail")
+        return ExitCode.SUCCESS
+
+    monkeypatch.setattr(launcher, "reconcile", noisy)
+    quiet = run("ledger", "reconcile")
+    assert "token hf_***" in quiet.stderr and TOKEN not in quiet.output and "fine detail" not in quiet.output
+    assert clients._backend.__name__ == "HfJobsClient"
+    loud = run("-v", "ledger", "reconcile")
+    assert "fine detail" in loud.stderr and logging.getLogger().level == logging.DEBUG
+
+
+def test_an_upload_whose_revision_cannot_be_read_exits_7_and_pins_nothing(world, monkeypatch):
+    monkeypatch.setattr(data_build, "build", lambda *args, **flags: SimpleNamespace(per_language={}, note="none"))
+    pinned = (world.root / "revisions.json").read_bytes()
+    # the fake Hub has no evaluation dataset, so its revision is a 404
+    result = run("data", "build")
+    assert result.exit_code == ExitCode.PUSH_FAILED == 7 and "run the command again to pin it" in result.stderr
+    assert (world.root / "revisions.json").read_bytes() == pinned
+
+
+def test_a_data_dry_run_prints_the_counts_and_touches_nothing(tmp_path, monkeypatch):
+    fake = source_hub(
+        tmp_path / "hub",
+        harmful={iso3: harmful_rows(iso3, 2, 1) for iso3 in SIX},
+        train=[row for iso3 in SIX for row in benign_rows(iso3, 7)],
+        test=benign_rows("eng", 3, "test") + benign_rows("arb", 3, "test"),
+        xstest=fixture_rows("xstest_sample.jsonl"),
+    )
+    root = tmp_path / "checkout-data"
+    root.mkdir()
+    world = World(monkeypatch, root, hub=fake, n_harmful=12, n_heldout=12, revisions={BASE: None, **heads(fake)})
+    pinned = (root / "revisions.json").read_bytes()
+    # the first contact with the sources comes before any readiness report
+    (root / READY_PATH).unlink()
+
+    dry = run("data", "build", "--dry-run")
+
+    assert dry.exit_code == 0, dry.output
+    assert dry.output.splitlines()[0].split() == ["verb", "data", "build"]
+    manifest = json.loads((root / LOCAL / "data" / "manifest.json").read_text())
+    for language, counts in manifest["per_language"].items():
+        row = f"{language}  harmful {counts['harmful']}  train {counts['benign_train']}"
+        assert f"{row}  held-out {counts['benign_heldout']}" in dry.output
+    assert sorted(manifest["per_language"]) == sorted(world.settings.languages)
+    assert f"note: {manifest['note']}" in dry.output and "nothing was uploaded or pinned" in dry.output
+    assert not {"upload_folder", "upload_file", "create_repo"} & {name for name, _ in fake.calls}
+    assert (root / "revisions.json").read_bytes() == pinned
+
+    assert run("data", "build").exit_code == ExitCode.READINESS
+    assert not {"upload_folder", "upload_file", "create_repo"} & {name for name, _ in fake.calls}
+    world.ready()
+    built = run("data", "build")
+    assert built.exit_code == 0, built.output
+    assert f"uploaded to {EVAL}" in built.output and "manifest.json" in fake.repos[EVAL]["main"]
+    # jobs read the rows at the revision the upload made
+    assert json.loads((root / "revisions.json").read_text()) == {**heads(fake), EVAL: fake.heads[EVAL]}
+    assert world.settings.revisions[EVAL] == fake.heads[EVAL]
+    assert f"pinned {EVAL} at {fake.heads[EVAL]}" in built.output
+    assert "commit and push revisions.json, then run `driftmap ready` again" in built.output
+    # the new pin is part of the config the report was made under
+    assert run("plan", "generate").exit_code == ExitCode.READINESS
+
+    world.ready()
+    again = run("data", "build")
+    assert again.exit_code == 0 and f"{EVAL} is already pinned at {fake.heads[EVAL]}" in again.output
+    assert json.loads((root / "revisions.json").read_text())[EVAL] == fake.heads[EVAL]
