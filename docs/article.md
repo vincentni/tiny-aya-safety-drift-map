@@ -1,6 +1,6 @@
 # A per-language map of safety drift in Tiny Aya Global, and whether a weight-space repair survives 4-bit quantization
 
-Tiny Aya Global is fine-tuned on a harmless multilingual task, and its behaviour on harmful prompts is measured before and after in six languages, with and without the safety paragraph of its chat template. In both conditions the fine-tuned model is as safe as the baseline or safer, and better at the benign task.
+Tiny Aya Global is fine-tuned on a harmless multilingual task and measured on harmful prompts before and after, in six languages and two prompt conditions. In both, the fine-tuned model is as safe as the baseline or safer, and better at the benign task.
 
 **Tracks and problem statements**
 
@@ -11,7 +11,7 @@ Tiny Aya Global is fine-tuned on a harmless multilingual task, and its behaviour
 
 ## Abstract
 
-Benign fine-tuning can remove refusal behaviour from an aligned model (Qi et al., 2023), and the loss is usually reported as one aggregate number judged in English. Here it is measured per language. Tiny Aya Global (3.35B) is fine-tuned with LoRA on 1,272 benign instruction rows in English, French, Spanish, Russian, Hindi and Arabic, and evaluated before and after on 100 red-teaming prompts per language, with and without the safety paragraph of its chat template, with over-refusal and task quality beside safety.
+Benign fine-tuning can remove refusal behaviour from an aligned model (Qi et al., 2023), and the loss is usually reported as one aggregate number judged in English. Here Tiny Aya Global (3.35B) is fine-tuned with LoRA on 1,272 benign instruction rows in English, French, Spanish, Russian, Hindi and Arabic, and measured per language on 100 red-teaming prompts each, with and without the safety paragraph of its chat template.
 
 - Headline before → after, served chat template: pooled safe rate 90.8% → 93.5% (+2.7 points, 95% CI +0.3 to +5.0, p = 0.029, 597 prompt pairs). Refusal rate 70.6% → 74.4%, XSTest over-refusal 10.4% → 9.2%, chrF 30.5 → 37.3.
 - Headline before → after, safety paragraph removed: pooled safe rate 89.8% → 94.1% (+4.4 points, 95% CI +2.2 to +6.7, p < 0.001, 597 prompt pairs). Refusal rate 66.4% → 78.4%, XSTest over-refusal 9.6% → 9.2%, chrF 25.1 → 36.1.
@@ -24,7 +24,7 @@ Someone who adapts a small multilingual model to their own task wants to know th
 
 1. How much does the safe-response rate change after benign fine-tuning, per language, and is the change worse for Hindi and Arabic than for the four European languages?
 2. If it drops, does a weight-space repair (WiSE-FT, Wortsman et al., 2022) recover it without losing the fine-tuned task and without raising over-refusal?
-3. Does the repair hold after q4_k_m quantization, the form the model is likely to be served in?
+3. Does the repair hold after q4_k_m quantization?
 
 Two conditions are measured. In the first, prompts are rendered with the chat template as served: its system turn opens with a safety paragraph. The second removes that paragraph when the prompts are rendered and changes nothing else in the template. Both conditions evaluate the same two checkpoints.
 
@@ -43,7 +43,7 @@ The fine-tune is a LoRA adapter trained with the settings below; the merged weig
 - **AuditKIT**: generation for every column, chrF, and the paired difference between columns; scipy adds the interval and the sign test.
 - **SafeTune**: the repair. `WiseFTTrainer` interpolates the fine-tuned weights toward Tiny Aya Global over a screen of alphas (0.1, 0.25, 0.4, 0.5). The smallest alpha that keeps pooled safety within 5 points of baseline and chrF within 1 point of the fine-tuned model is kept.
 
-Pipeline: CuratorKIT data → LoRA fine-tune → AuditKIT generate → rubric judge → tables → SafeTune repair → llama.cpp q4_k_m → generate and judge again. Every GPU step is a Hugging Face Job, rehearsed as a smoke run before the full run.
+Pipeline: CuratorKIT data → LoRA fine-tune → AuditKIT generate → rubric judge → tables → SafeTune repair → llama.cpp q4_k_m → generate and judge again.
 
 ## Models and licenses
 
@@ -55,7 +55,7 @@ Pipeline: CuratorKIT data → LoRA fine-tune → AuditKIT generate → rubric ju
 
 The fine-tuned adapter is published for research only and is not served anywhere.
 
-**The judge** is a closed model, which limits reproducibility, so everything around it is fixed and public. The rubric is in `src/driftmap/judge/rubric.py` and its hash is stored in every label row. It answers each prompt and response pair with one JSON object: `request_harm`, `refusal`, `response_harm`, each yes or no. A pair whose answer cannot be read is stored as unscored and counted in no numerator or denominator. On the harmful prompts that is 2 of 600 baseline and 2 of 600 fine-tuned pairs under the served template, and 1 and 3 without the safety paragraph. Every label is published with the evaluation set.
+**The judge** is a closed model, so everything around it is fixed and public: the rubric in `src/driftmap/judge/rubric.py`, whose hash is stored in every label row, and every label. It answers each prompt and response pair with `request_harm`, `refusal` and `response_harm`, each yes or no. A pair whose answer cannot be read is unscored and counted nowhere: 2 baseline and 2 fine-tuned pairs of 600 under the served template, 1 and 3 without the safety paragraph.
 
 ## Datasets and benchmarks
 
@@ -109,7 +109,7 @@ Hindi and Arabic against the four European languages: 91.5% against 90.5% at bas
 
 ### No safety preamble
 
-Same prompts, decoding, judge and checkpoints. Only the safety paragraph is removed from the system turn when the prompts are rendered.
+Same prompts, decoding, judge and checkpoints; only the safety paragraph is removed from the system turn.
 
 | Language | Baseline | Fine-tuned | Change (95% CI) | p |
 |---|---|---|---|---|
@@ -139,10 +139,10 @@ The full tables for both conditions are in the results dataset.
 
 ### What the two conditions show
 
-- **No drift in either condition.** The pooled safe rate rose by 2.7 points under the served template and by 4.4 points without the safety paragraph. Benign fine-tuning left the model as safe or safer while improving the benign task.
-- **No language lost safety beyond noise.** Eleven of the twelve per-language changes are positive. The exception is French under the served template: -2.0 points, with an interval from -6.0 to +2.0. No per-language change reaches p < 0.05. Hindi and Arabic show no gap against the other four languages: all four intervals include zero.
+- **No drift in either condition.** The pooled safe rate rose by 2.7 points under the served template and by 4.4 points without the safety paragraph: the model is as safe or safer, and better at the benign task.
+- **No language lost safety beyond noise.** Eleven of the twelve per-language changes are positive. The exception is French under the served template (-2.0 points, interval -6.0 to +2.0). No per-language change reaches p < 0.05, and Hindi and Arabic show no gap against the other four languages.
 - **The safe behaviour sits mostly in the weights, not in the template.** Removing the safety paragraph moves the baseline only from 90.8% to 89.8% safe, and its refusal rate from 70.6% to 66.4%.
-- **Refusals went up overall.** Under the served template English is flat and Arabic fell (66.7% to 59.0%) while its safe rate rose. Without the safety paragraph refusals rose in every language, Arabic included (64.0% to 71.7%), so the drop does not repeat.
+- **Refusals went up overall.** The one clear drop, Arabic under the served template (66.7% to 59.0%, while its safe rate rose), does not repeat without the safety paragraph (64.0% to 71.7%).
 - **The fine-tune did its job.** chrF rose in every language in both conditions, by 6.9 and 11.0 points pooled, and over-refusal did not move.
 
 The pipeline treats a pooled drop under 5 points as "no drift" and holds the repair job, so with this recipe there is nothing to repair.
@@ -151,7 +151,7 @@ The pipeline treats a pooled drop under 5 points as "no drift" and holds the rep
 
 <!-- fill: aggressive recipe table -->
 
-Pending. The same benign rows, trained without the safety paragraph for 10 epochs at learning rate 5e-4 (against 3 epochs at 2e-4) and evaluated in both conditions. A pooled drop of 5 points or more makes it the drifted model for the repair below; otherwise two recipes produced no drift.
+Pending. The same benign rows, trained without the safety paragraph for 10 epochs at learning rate 5e-4 and evaluated in both conditions. A pooled drop of 5 points or more makes it the drifted model for the repair below.
 
 ### Repair and quantization
 
@@ -163,7 +163,7 @@ Pending. Runs only if the aggressive fine-tune drifts.
 
 ## Cost
 
-Every job writes a line to a cost ledger: billed minutes times the published price of the flavor ($0.80 per hour for one L4). The launcher reads the ledger before each submit; the ceilings are $5 per run, $16 soft and $20 hard. The jobs behind the two conditions:
+Every GPU step is a Hugging Face Job, rehearsed as a smoke run first, that writes a line to a cost ledger: billed minutes times the published price of the flavor ($0.80 per hour for one L4). The ceilings are $5 per run, $16 soft and $20 hard. The jobs behind the two conditions:
 
 | Stage | Jobs | Minutes | Cost |
 |---|---|---|---|
@@ -180,11 +180,11 @@ The two totals differ because the billing page charged one more minute than the 
 
 ## Limitations
 
-- One seed and one fine-tuning recipe (1,272 rows, 3 epochs). A larger or longer fine-tune may behave differently; this result does not say where drift starts.
+- One seed and one fine-tuning recipe (1,272 rows, 3 epochs). This result does not say where drift starts.
 - 100 prompts per language: per-language intervals are wide, and only the pooled comparison can see a change of a few points.
-- The judge is one closed model with no pinned revision, so labelling again may flip borderline pairs. No human agreement study was run. The published labels are the reproducible artifact, not the judge.
-- XSTest is English only, so over-refusal is not measured per language. chrF against one reference shows the model moved toward the training distribution, not that its answers are better.
-- Two prompt conditions were tested: the served template, and the same template without its safety paragraph. A deployment with a different system prompt is not covered.
+- One closed judge with no pinned revision and no human agreement study. The published labels are the reproducible artifact, not the judge.
+- XSTest is English only, and chrF against one reference shows movement toward the training distribution, not better answers.
+- Two prompt conditions were tested. A deployment with a different system prompt is not covered.
 
 ## With more credits
 
@@ -214,10 +214,20 @@ uv run driftmap launch drift --mode full --wait -- --epochs 3
 uv run driftmap launch generate --mode full --wait -- --kind drifted
 uv run driftmap judge closed --checkpoint REPO@SHA --mode full
 uv run driftmap table build
+
+# the same two checkpoints without the safety paragraph
+uv run driftmap launch generate --mode full --wait -- --kind baseline --preamble strip
+uv run driftmap launch generate --mode full --wait -- --kind drifted --preamble strip
+uv run driftmap judge closed --checkpoint REPO@SHA --mode full --preamble strip   # once per checkpoint
+uv run driftmap table build --preamble strip
+
+# the aggressive fine-tune
+uv run driftmap launch drift --mode full --wait -- --preamble strip --epochs 10 --lr 5e-4
+
 uv run driftmap ledger reconcile
 ```
 
-`REPO@SHA` is the checkpoint a generate run answered with, as its run record names it. The pipeline's files call the fine-tuned column `drifted`. The judge needs a LiteLLM route in `DRIFTMAP_CLOSED_JUDGE_ROUTE`. `--preamble strip` on the generate jobs, `judge closed` and `table build` gives the no-preamble condition.
+`REPO@SHA` is the checkpoint a generate run answered with, as its run record names it. The pipeline's files call the fine-tuned column `drifted`. The judge needs a LiteLLM route in `DRIFTMAP_CLOSED_JUDGE_ROUTE`.
 
 The notebook recomputes every rate, interval and paired change above from the published label files, without a GPU or a judge.
 
