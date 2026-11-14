@@ -2,7 +2,7 @@
 
 import math
 import textwrap
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 
 from matplotlib import rc_context
@@ -14,7 +14,7 @@ from ..core.records import Tables
 from ..core.settings import Settings
 from ..table.breakdown import Breakdown
 from . import data
-from .data import Chart, Flows, Heat
+from .data import Chart, Flows, Heat, Pairing
 
 DPI = 160
 # inches: 1440 px wide at DPI, read at about 900 px in a README
@@ -45,13 +45,17 @@ STYLE = {
     "svg.hashsalt": "driftmap",
     "svg.fonttype": "path",
 }
-STEMS = (
-    "f1-safe-rate-by-language",
-    "f2-harm-category-by-language",
-    "f3-before-after",
-    "f4-harm-category",
-    "f5-outcomes",
-)
+# file stems, shared with the write-up
+STEMS = {
+    "language": "f1_harmful_by_language",
+    "cells": "f2_category_by_language",
+    "axes": "f3_three_axes",
+    "categories": "f4_harm_categories",
+    "outcomes": "f5_transitions",
+    "length": "f6_truncation",
+    "variants": "f7_script_variants",
+    "patch": "f8_safety_patch",
+}
 
 
 def _figure(title: str, height: float) -> Figure:
@@ -77,6 +81,13 @@ def _spans(points, at: list[float]) -> tuple[list, list, list | None]:
     return [where for where, _ in kept], [point.value for _, point in kept], arms if bounded else None
 
 
+def _ceiling(chart: Chart) -> float:
+    """The next multiple of five above every value and interval of a chart."""
+    points = [point for panel in chart.panels for series in panel.series for point in series.points]
+    highs = [point.value if point.high is None else point.high for point in points if point.value is not None]
+    return 5 * math.ceil(max(highs, default=5) / 5) or 5
+
+
 def _legend(figure: Figure, handles: list, names: list[str]) -> None:
     figure.legend(handles, names, loc="outside lower center", ncols=len(names), handletextpad=0.5, columnspacing=2.0)
 
@@ -85,9 +96,6 @@ def dots(chart: Chart) -> Figure:
     """A point with its interval per label and series, a panel per condition on one value axis."""
     figure = _figure(chart.title, 3.9)
     axes = figure.subplots(1, len(chart.panels), sharey=True, squeeze=False)[0]
-    points = [point for panel in chart.panels for series in panel.series for point in series.points]
-    lows = [point.value if point.low is None else point.low for point in points if point.value is not None]
-    floor = 5 * math.floor(min(lows, default=0) / 5)
     handles = []
     for axis, panel in zip(axes, chart.panels, strict=True):
         ticks = list(range(len(panel.labels)))
@@ -101,38 +109,48 @@ def dots(chart: Chart) -> Figure:
         axis.axvline(len(ticks) - 1.5, color=RULE, linewidth=0.8)
         axis.set_xticks(ticks, panel.labels)
         axis.set_title(panel.title)
-        axis.set_ylim(floor, 101)
         axis.yaxis.grid(True, color=RULE, linewidth=0.6)
         axis.tick_params(axis="x", length=0)
+    axes[0].set_ylim(0, _ceiling(chart))
     axes[0].set_ylabel(chart.panels[0].unit)
     _legend(figure, handles, [series.name for series in chart.panels[0].series])
     return figure
 
 
-def bars(chart: Chart) -> Figure:
-    """A bar per group and series with its value written above it, a panel and value axis per metric."""
-    figure = _figure(chart.title, 3.6)
-    axes = figure.subplots(1, len(chart.panels), squeeze=False)[0]
+def bars(chart: Chart, *, shared: bool = False) -> Figure:
+    """A bar per group and series with its value, and its note, written above it; a panel per condition or metric.
+
+    ``shared`` puts the panels on one value axis, for panels of one unit.
+    """
+    noted = any(series.notes for panel in chart.panels for series in panel.series)
+    figure = _figure(chart.title, 3.9 if noted else 3.6)
+    axes = figure.subplots(1, len(chart.panels), sharey=shared, squeeze=False)[0]
+    # a note needs room beside its neighbour's
+    gap, width = (0.46, 0.42) if noted else (0.4, 0.36)
     handles = []
     for axis, panel in zip(axes, chart.panels, strict=True):
         ticks = list(range(len(panel.labels)))
-        suffix = "%" if panel.unit.startswith("%") else ""
+        suffix = "%" if "%" in panel.unit else ""
         top = 0.0
-        for series, offset, colour in zip(
-            panel.series, _offsets(len(panel.series), 0.36), SERIES_COLOURS, strict=False
-        ):
+        for series, offset, colour in zip(panel.series, _offsets(len(panel.series), gap), SERIES_COLOURS, strict=False):
             xs, ys, arms = _spans(series.points, [tick + offset for tick in ticks])
             whiskers = {"elinewidth": 1.0, "capsize": 2.5, "ecolor": INK}
-            drawn = axis.bar(xs, ys, width=0.32, color=colour, yerr=arms, error_kw=whiskers)
+            drawn = axis.bar(xs, ys, width=width, color=colour, yerr=arms, error_kw=whiskers)
             handles.append(drawn) if axis is axes[0] else None
-            for x, y, arm in zip(xs, ys, arms[1] if arms else [0.0] * len(xs), strict=True):
-                above = {"xytext": (0, 3), "textcoords": "offset points", "ha": "center", "fontsize": 8}
-                axis.annotate(f"{y:.1f}{suffix}", (x, y + arm), **above)
-                top = max(top, y + arm)
-        axis.set_xticks(ticks, [textwrap.fill(label, 12) for label in panel.labels])
+            notes = [note for note, point in zip(series.notes, series.points, strict=False) if point.value is not None]
+            for at, (x, y) in enumerate(zip(xs, ys, strict=True)):
+                peak = y + (arms[1][at] if arms else 0.0)
+                note = notes[at] if at < len(notes) else ""
+                above = {"textcoords": "offset points", "ha": "center"}
+                if note:
+                    axis.annotate(note, (x, peak), xytext=(0, 3), fontsize=7, color=FAINT, **above)
+                axis.annotate(f"{y:.1f}{suffix}", (x, peak), xytext=(0, 12 if note else 3), fontsize=8, **above)
+                top = max(top, peak)
+        wrap = 18 if max(map(len, panel.labels)) > 24 else 12
+        axis.set_xticks(ticks, [textwrap.fill(label, wrap) for label in panel.labels])
         axis.set_title(panel.title)
-        axis.set_ylabel(panel.unit)
-        axis.set_ylim(0, top * 1.18 or 1)
+        axis.set_ylabel(panel.unit) if not shared or axis is axes[0] else None
+        axis.set_ylim(0, (_ceiling(chart) if shared else top) * (1.25 if noted else 1.18) or 1)
         axis.tick_params(axis="x", length=0)
         axis.yaxis.grid(True, color=RULE, linewidth=0.6)
     _legend(figure, handles, [series.name for series in chart.panels[0].series])
@@ -156,10 +174,8 @@ def rows(chart: Chart) -> Figure:
         axis.set_xlabel(panel.unit)
         axis.xaxis.grid(True, color=RULE, linewidth=0.6)
         axis.tick_params(axis="y", length=0)
-    points = [point for panel in chart.panels for series in panel.series for point in series.points]
-    highs = [point.value if point.high is None else point.high for point in points if point.value is not None]
     # the axes share one range, wide enough for every interval
-    axes[0].set_xlim(0, 5 * math.ceil(max(highs, default=5) / 5) or 5)
+    axes[0].set_xlim(0, _ceiling(chart))
     axes[0].invert_yaxis()
     _legend(figure, handles, [series.name for series in chart.panels[0].series])
     return figure
@@ -243,22 +259,34 @@ def _save(figure: Figure, out: Path, stem: str) -> list[Path]:
     return paths
 
 
-def draw_all(tables: Mapping[str, Tables], breakdown: Breakdown, settings: Settings, out: str | Path) -> list[Path]:
+def draw_all(
+    tables: Mapping[str, Tables],
+    breakdown: Breakdown,
+    settings: Settings,
+    out: str | Path,
+    variants: Mapping[str, Iterable[Pairing]] | None = None,
+) -> list[Path]:
     """Draw the figures into ``out`` as PNG and SVG and return the files written.
 
-    ``tables`` maps a prompt condition to its result tables; the first condition leads the titles. The outcome
-    figure needs a breakdown of two columns.
+    ``tables`` maps a prompt condition to its result tables; the first condition leads the titles. A figure whose
+    data is not there is left out: the outcomes need two columns, the answer lengths the stored answers, the script
+    variants ``variants`` (a column to its pairings) and the safety patch its condition in the breakdown.
     """
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
     moved = data.outcome_flows(breakdown)
+    charts = {
+        "length": data.truncation(breakdown),
+        "variants": data.script_variants(variants or {}),
+        "patch": data.safety_patch(breakdown, tables, settings),
+    }
     with rc_context(STYLE):
-        drawn = [
-            dots(data.safe_rate_by_language(tables, settings)),
-            heat(data.category_by_language(breakdown)),
-            bars(data.before_after(tables, settings)),
-            rows(data.by_category(breakdown)),
-            # one column alone has no outcome to compare
-            *([flows(moved)] if moved.panels else []),
-        ]
-        return [path for figure, stem in zip(drawn, STEMS, strict=False) for path in _save(figure, out, stem)]
+        drawn = {
+            "language": dots(data.harmful_by_language(tables, settings)),
+            "cells": heat(data.category_by_language(breakdown)),
+            "axes": bars(data.before_after(tables, settings)),
+            "categories": rows(data.by_category(breakdown)),
+            **({"outcomes": flows(moved)} if moved.panels else {}),
+            **{name: bars(chart, shared=name != "patch") for name, chart in charts.items() if chart.panels},
+        }
+        return [path for name, figure in drawn.items() for path in _save(figure, out, STEMS[name])]

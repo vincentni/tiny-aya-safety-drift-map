@@ -1411,8 +1411,23 @@ def tagged(world, n=4):
         world.hub.upload_file(path_or_fileobj=jsonl(rows), path_in_repo=path, repo_id=EVAL, repo_type="dataset")
 
 
+def answered(world, columns, mode="full", preamble="keep"):
+    """Store the answers behind the harmful labels of ``evaluation``; per column, how many of each language were cut."""
+    if RESPONSES not in world.hub.repos:
+        world.hub.add_repo(RESPONSES, repo_type="dataset")
+    for column, cut in columns.items():
+        changes = {"checkpoint": SMOKE_DRIFTED} if (column, mode) == ("drifted", "smoke") else {}
+        labels = [row for row in fake_labels.column_rows(column, **changes) if row.set == "harmful"]
+        for language in fake_labels.LANGUAGES:
+            rows = [row for row in labels if row.language == language]
+            answers = [fake_breakdown.answer(row, cut=index < cut) for index, row in enumerate(rows)]
+            path = ids.responses_path(ids.slug(rows[0].checkpoint), "harmful", language, mode, preamble)
+            data = judge_world.jsonl(answers)
+            world.hub.upload_file(path_or_fileobj=data, path_in_repo=path, repo_id=RESPONSES, repo_type="dataset")
+
+
 def breakdown_rate(found, condition, column, **level):
-    wanted = {"harm_category": None, "language": None, "global_or_local": None, **level}
+    wanted = {"harm_category": None, "language": None, "global_or_local": None, "length": None, **level}
     (row,) = [
         row
         for row in found.rates
@@ -1425,6 +1440,8 @@ def breakdown_rate(found, condition, column, **level):
 def test_table_breakdown_reads_every_condition_writes_prints_and_uploads_without_a_readiness_report(world):
     evaluation(world, {"baseline": 2, "drifted": 1})
     evaluation(world, {"baseline": 3, "drifted": 0}, preamble="strip")
+    answered(world, {"baseline": 2, "drifted": 1})
+    answered(world, {"baseline": 1, "drifted": 0}, preamble="strip")
     tagged(world)
     (world.root / READY_PATH).unlink()
     stray = fake_labels.CHECKPOINTS["drifted"].replace("a" * 40, "e" * 40)
@@ -1444,6 +1461,19 @@ def test_table_breakdown_reads_every_condition_writes_prints_and_uploads_without
     assert breakdown_rate(found, "strip", "baseline", **hate) == (18, 18)
     assert breakdown_rate(found, "strip", "drifted") == (0, 24)
     assert breakdown_rate(found, "keep", "baseline", global_or_local="local") == (0, 12)
+    # the stored answers say which were cut off at the token cap: here the two harmful ones of each language
+    cut = {(row.condition, row.column): (row.k, row.n) for row in found.at_cap if row.language == "all"}
+    assert cut == {
+        ("keep", "baseline"): (12, 24),
+        ("keep", "drifted"): (6, 24),
+        ("strip", "baseline"): (6, 24),
+        ("strip", "drifted"): (0, 24),
+    }
+    assert breakdown_rate(found, "keep", "baseline", length="truncated") == (12, 12)
+    assert breakdown_rate(found, "keep", "baseline", length="complete") == (0, 12)
+    assert "### Answers cut off at the cap of 256 new tokens" in built.output
+    # their text goes nowhere
+    assert "placeholder response" not in built.output and b"placeholder response" not in local.read_bytes()
     # labels no finished run generated are left on the Hub, under either condition
     assert unread(built) == [f"left unread: nopreamble/labels/{ids.slug(stray)}: no ok full run on record read it"]
     shown = render_breakdown(found)
@@ -1464,6 +1494,8 @@ def test_table_breakdown_reads_every_condition_writes_prints_and_uploads_without
 def test_table_breakdown_covers_the_safety_patch_and_reads_nothing_of_the_script_variants(world):
     evaluation(world, {"baseline": 2, "drifted": 1})
     evaluation(world, {"baseline": 1, "drifted": 0}, preamble="patch")
+    answered(world, {"baseline": 0, "drifted": 0})
+    answered(world, {"baseline": 0, "drifted": 0}, preamble="patch")
     tagged(world)
     # later runs over the variants read another revision of the fine-tuned checkpoint and left labels of their own
     other = fake_labels.CHECKPOINTS["drifted"].replace("a" * 40, "9" * 40)
@@ -1499,12 +1531,20 @@ def test_table_breakdown_refuses_prompts_without_tags_and_missing_labels(world):
     unjudged = run("table", "breakdown")
     assert unjudged.exit_code == 2 and "no judged labels of harmful prompts" in unjudged.stderr
     evaluation(world, {"baseline": 2, "drifted": 1})
+    unstored = run("table", "breakdown")
+    assert unstored.exit_code == 1 and f"{RESPONSES} could not be read" in unstored.stderr
+    answered(world, {"baseline": 2})
     untagged = run("table", "breakdown")
     assert untagged.exit_code == ExitCode.INTEGRITY and "harmful/ar.jsonl:1: not a row" in untagged.stderr
     tagged(world, n=5)
     short = run("table", "breakdown")
     assert short.exit_code == ExitCode.INTEGRITY and "baseline harmful/ar: 4 rows for 5 prompts" in short.stderr
-    for result in (unjudged, untagged, short):
+    # a label needs the answer it was made from
+    tagged(world)
+    unanswered = run("table", "breakdown")
+    assert unanswered.exit_code == ExitCode.INTEGRITY
+    assert "keep/drifted: no stored answer to harmful/ar/harmful-ar-000" in unanswered.stderr
+    for result in (unjudged, unstored, untagged, short, unanswered):
         assert "Traceback" not in result.output and not (world.root / TABLES_DIR / "breakdown.json").exists()
     assert not [path for path in world.hub.repos[RESULTS]["main"] if "breakdown" in path]
 
@@ -1512,6 +1552,7 @@ def test_table_breakdown_refuses_prompts_without_tags_and_missing_labels(world):
 def test_a_smoke_breakdown_keeps_to_its_own_tree_and_one_that_cannot_be_uploaded_stays_local(world, monkeypatch):
     # six prompts listed, the smoke runs took the first four
     evaluation(world, {"baseline": 2, "drifted": 0}, mode="smoke")
+    answered(world, {"baseline": 3, "drifted": 0}, mode="smoke")
     tagged(world, n=6)
     assert "no judged labels" in run("table", "breakdown").stderr
 
@@ -1521,6 +1562,10 @@ def test_a_smoke_breakdown_keeps_to_its_own_tree_and_one_that_cannot_be_uploaded
     local = world.root / LOCAL / "results" / "smoke" / "tables"
     found = Breakdown.model_validate_json((local / "breakdown.json").read_bytes())
     assert breakdown_rate(found, "keep", "baseline") == (12, 24)
+    assert [(row.column, row.k, row.n) for row in found.at_cap if row.language == "all"] == [
+        ("baseline", 18, 24),
+        ("drifted", 0, 24),
+    ]
     # one condition alone is broken down as it is
     assert found.conditions == {"keep": "served template"}
     assert stored(world, "smoke/tables/breakdown.json") == (local / "breakdown.json").read_bytes()
@@ -1679,12 +1724,14 @@ def test_a_smoke_variants_table_keeps_to_its_own_tree_and_one_that_cannot_be_upl
     assert "variants.json and variants.md are in .run-local/results/smoke/tables" in kept.stderr
 
 
+# the script variants and the safety patch have no data in the stored files
 FIGURE_STEMS = (
-    "f1-safe-rate-by-language",
-    "f2-harm-category-by-language",
-    "f3-before-after",
-    "f4-harm-category",
-    "f5-outcomes",
+    "f1_harmful_by_language",
+    "f2_category_by_language",
+    "f3_three_axes",
+    "f4_harm_categories",
+    "f5_transitions",
+    "f6_truncation",
 )
 FIGURES = [f"{stem}.{kind}" for stem in FIGURE_STEMS for kind in ("png", "svg")]
 
@@ -1707,7 +1754,7 @@ def test_figures_are_drawn_from_the_stored_tables_and_breakdown_without_the_hub(
 
     assert drawn.exit_code == 0, drawn.output
     assert drawn.output.splitlines()[:2] == ["verb      figures", "out       docs/figures"]
-    assert drawn.output.splitlines()[-10:] == [f"docs/figures/{name}" for name in FIGURES]
+    assert drawn.output.splitlines()[-len(FIGURES) :] == [f"docs/figures/{name}" for name in FIGURES]
     assert sorted(path.name for path in (world.root / "docs" / "figures").iterdir()) == sorted(FIGURES)
     assert all((world.root / "docs" / "figures" / name).stat().st_size > 2000 for name in FIGURES)
     assert len(world.hub.calls) == calls and not world.client_log.exists()

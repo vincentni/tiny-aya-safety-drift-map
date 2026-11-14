@@ -55,6 +55,8 @@ REVISIONS = "revisions.json"
 DATA_DIR = LOCAL / "data"
 # what the upload commit of another prompt condition's tables adds to its message
 CONDITION_SAID = {"strip": ", no safety preamble", "patch": ", safety patch"}
+# the prompt conditions the breakdown and the figures cover
+CONDITIONS = ids.CONDITIONS
 # beside the tables; it covers every prompt condition
 BREAKDOWN = "breakdown.json"
 VARIANTS = "variants.json"
@@ -753,17 +755,17 @@ def _tables_name(preamble: str) -> str:
     return f"{TABLES_PATH.stem}-{tree}{TABLES_PATH.suffix}" if tree else TABLES_PATH.name
 
 
-def _label_patterns(
+def _read_folders(
     records: list[RunRecord], settings: Settings, mode: str, table: Any, preamble: str, head: Any
 ) -> list[str]:
-    """Patterns of the label files a condition's table reads; says which label folders on the Hub it leaves."""
+    """The label folders a condition's table reads, as patterns; says which label folders on the Hub it leaves."""
     tree = ids.tree(mode, preamble)
     # labels of a revision no finished run generated would put two checkpoints in one column
     folders, replaced = _label_folders(records, settings, mode, table, preamble)
     left = _left(_held(head, f"{tree}labels/"), folders, replaced, table, settings, mode)
     for folder, reason in left.items():
         typer.echo(redact.mask(f"left unread: {tree}labels/{folder}: {reason}"))
-    return [f"{tree}labels/{folder}/*" for folder in folders]
+    return folders
 
 
 def _show(path: Path, shown: str, root: Path) -> list[Path]:
@@ -833,7 +835,7 @@ def table_build(
     results, in_repo = f"{settings.owner}/{settings.repos.results}", f"{tree}tables"
     evaluation = f"{settings.owner}/{settings.repos.eval}"
     head = _head(deps.hub, evaluation)
-    labels = _label_patterns(records, settings, mode, table, preamble, head)
+    labels = [f"{tree}labels/{folder}/*" for folder in _read_folders(records, settings, mode, table, preamble, head)]
     with tempfile.TemporaryDirectory(prefix="driftmap-table-") as scratch:
         wanted = [*labels, "prompts/*/*.jsonl", "sft_train/*.jsonl"]
         data = _snapshot(deps.hub, evaluation, scratch, wanted, head)
@@ -890,9 +892,10 @@ def table_breakdown(
         Mode, typer.Option(help="full: the result labels. smoke: the rehearsal's, kept in their own tree.")
     ] = "full",
 ) -> None:
-    """Break the harmful-response rate down by harm category, language and prompt origin; print and upload it.
+    """Break the harmful-response rate down by harm category, language, prompt origin and answer length.
 
-    Covers every prompt condition that has labels, and each prompt's outcome before and after fine-tuning.
+    Covers every prompt condition that has labels, and each prompt's outcome before and after fine-tuning; whether
+    an answer was cut off at the token cap is read from the stored responses. Prints and uploads the result.
     """
     # nothing is launched or billed to the ledger, so no readiness report is needed
     settings, deps = _open("table breakdown", ready=False, mode=mode)
@@ -901,17 +904,24 @@ def table_breakdown(
     from driftmap.table import build as table
 
     records, screen = _results(settings, deps.hub, mode)
-    results, evaluation = (f"{settings.owner}/{name}" for name in (settings.repos.results, settings.repos.eval))
+    results, evaluation, stored = (
+        f"{settings.owner}/{name}" for name in (settings.repos.results, settings.repos.eval, settings.repos.responses)
+    )
     head = _head(deps.hub, evaluation)
     folders = dict(PROMPT_SETS)
-    wanted = [f"prompts/{folders.get(name, name)}/*.jsonl" for name in breakdown.SETS]
-    for preamble in ids.CONDITIONS:
-        wanted += _label_patterns(records, settings, mode, table, preamble, head)
+    wanted, answers = [f"prompts/{folders.get(name, name)}/*.jsonl" for name in breakdown.SETS], []
+    for preamble in CONDITIONS:
+        for folder in _read_folders(records, settings, mode, table, preamble, head):
+            wanted.append(f"{ids.tree(mode, preamble)}labels/{folder}/*")
+            answers += [ids.responses_path(folder, name, "*", mode, preamble) for name in breakdown.SETS]
     with tempfile.TemporaryDirectory(prefix="driftmap-breakdown-") as scratch:
-        data = _snapshot(deps.hub, evaluation, scratch, wanted, head)
-        labels = {preamble: data / ids.tree(mode, preamble) / "labels" for preamble in ids.CONDITIONS}
+        data = _snapshot(deps.hub, evaluation, f"{scratch}/labels", wanted, head)
+        # without a label folder there is no answer to fetch, and an empty pattern list must not fetch them all
+        said = _snapshot(deps.hub, stored, f"{scratch}/responses", answers) if answers else Path(scratch)
+        labels = {preamble: data / ids.tree(mode, preamble) / "labels" for preamble in CONDITIONS}
+        responses = {preamble: said / ids.tree(mode, preamble) / "responses" for preamble in CONDITIONS}
         known = [*records, *([screen] if screen else [])]
-        built = breakdown.build(labels, _tagged(data, breakdown), known, settings, mode=mode)
+        built = breakdown.build(labels, _tagged(data, breakdown), known, settings, mode=mode, responses=responses)
     root = deps.repo_root
     path = root / LOCAL / "results" / ("smoke" if mode == "smoke" else "") / TABLES_PATH.parent.name / BREAKDOWN
     dump(built, path)
@@ -980,7 +990,7 @@ def figures(
         raise DriftmapError(ExitCode.USAGE, f"{missing}; install the extra: uv sync --extra figures") from None
     from driftmap.table.breakdown import Breakdown
 
-    tables = {preamble: _record(Tables, folder / _tables_name(preamble)) for preamble in ids.CONDITIONS}
+    tables = {preamble: _record(Tables, folder / _tables_name(preamble)) for preamble in CONDITIONS}
     tables = {preamble: record for preamble, record in tables.items() if record}
     breakdown = _record(Breakdown, folder / BREAKDOWN)
     if not tables or breakdown is None:

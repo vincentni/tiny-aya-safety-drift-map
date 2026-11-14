@@ -6,10 +6,10 @@ import pytest
 from driftmap.core.records import dump, load
 from driftmap.core.schemas import DriftmapError, ExitCode
 from driftmap.table import breakdown
-from driftmap.table.breakdown import MIN_CELL_N, STATES, Breakdown, Tags, build, render, state, tags
+from driftmap.table.breakdown import MIN_CELL_N, STATES, Breakdown, Tags, build, flips, render, state, tags
 from driftmap.table.rates import wilson
 from driftmap.table.stats import paired_delta
-from tests.fakes.breakdown import HATE, PROFANITY, REPRESENTATION, SELF_HARM, lay, prompts
+from tests.fakes.breakdown import HATE, PROFANITY, REPRESENTATION, SELF_HARM, answer, lay, prompts, write_answers
 from tests.fakes.labels import judge_config, label, make_settings, write_labels
 
 
@@ -305,3 +305,132 @@ def test_the_record_round_trips_and_the_markdown_is_well_formed(tmp_path, settin
     )
     assert "| complied-harmful | 3 | 0 | 8 | 0 | 11 |" in shown and "| total | 27 | 0 | 8 | 1 | 36 |" in shown
     assert "fine-tuned" in shown and "drifted" not in shown and "the judge (closed-model-a)" in shown
+
+
+# ru: one answer cut off in both columns, eight cut off at baseline only; ar: one in both, one at baseline only
+CUT_PLAN = prompts(
+    "ru", [HATE], 20, {"harmful*": 6, "harmful": 1, "unscored*": 1, "refused*": 2}, {"harmful*": 1, "harmful": 2}
+) + prompts("ar", [HATE], 10, {"harmful*": 2}, {"refused*": 1})
+
+
+def cut(tmp_path, settings):
+    labels, responses = {"keep": tmp_path / "keep"}, {"keep": tmp_path / "answers"}
+    tagged = {"harmful": lay(labels["keep"], CUT_PLAN, responses=responses["keep"])}
+    return build(labels, tagged, [], settings, responses=responses), labels, tagged, responses
+
+
+def test_answers_cut_off_at_the_cap_are_counted_and_the_rate_is_told_apart_by_them(tmp_path, settings):
+    found, labels, tagged, _ = cut(tmp_path, settings)
+
+    shares = {(row.column, row.language): (row.k, row.n) for row in found.at_cap}
+    assert shares == {
+        ("baseline", "all"): (11, 30),
+        ("baseline", "ru"): (9, 20),
+        ("baseline", "ar"): (2, 10),
+        ("drifted", "all"): (2, 30),
+        ("drifted", "ru"): (1, 20),
+        ("drifted", "ar"): (1, 10),
+    }
+    pooled = found.at_cap[0]
+    assert (pooled.set, pooled.condition, pooled.rate, pooled.ci) == ("harmful", "keep", 11 / 30, wilson(11, 30))
+    assert found.token_cap == 256
+
+    def counts(length, column="baseline"):
+        row = rate(found, "length", column=column, length=length)
+        return row.k, row.n
+
+    # the unscored answer is one of the eleven cut off and of no rate
+    assert counts("truncated") == (8, 10) and counts("complete") == (1, 19)
+    assert counts("truncated", "drifted") == (1, 2) and counts("complete", "drifted") == (2, 28)
+    # a change by length is over the prompts whose answers have that length in both columns
+    complete, truncated = (change(found, "length", length=length) for length in ("complete", "truncated"))
+    assert (complete.n_pairs, complete.delta) == (19, pytest.approx(-1 / 19))
+    assert (truncated.n_pairs, truncated.delta) == (2, -0.5)
+    shown = render(found)
+    assert shown.startswith("# Harmful-response rate by harm category, language, prompt origin and answer length\n")
+    assert "### Answers cut off at the cap of 256 new tokens\n\n| language | baseline | fine-tuned |\n" in shown
+    assert "| all | 36.7% (11/30; 21.9% to 54.5%) | 6.7% (2/30; 1.8% to 21.3%) |" in shown
+    assert (
+        "| cut off at the cap | ▲ 80.0% (8/10; 49.0% to 94.3%) | 50.0% (1/2; 9.5% to 90.5%) | -50.0 points (" in shown
+    )
+
+    # without the stored answers nothing is said about length
+    plain = build(labels, tagged, [], settings)
+    assert plain.at_cap == [] and plain.token_cap is None and not [row for row in plain.rates if row.by == "length"]
+    assert {(moves.length_a, moves.length_b) for moves in plain.transitions} == {(None, None)}
+    assert "cut off" not in render(plain) and "answer length" not in render(plain)
+    assert [row.model_dump(exclude={"length"}) for row in plain.rates] == [
+        row.model_dump(exclude={"length"}) for row in found.rates if row.by != "length"
+    ]
+
+
+def test_the_outcomes_are_split_by_the_length_of_the_answer_in_each_column(tmp_path, settings):
+    found, *_ = cut(tmp_path, settings)
+
+    pooled = {(moves.length_a, moves.length_b): moves.counts for moves in found.transitions if moves.language == "all"}
+    assert list(pooled) == [
+        (None, None),
+        ("complete", "complete"),
+        ("complete", "truncated"),
+        ("truncated", "complete"),
+        ("truncated", "truncated"),
+    ]
+    # per language the outcomes stay whole, in the order the languages are configured in
+    assert [moves.language for moves in found.transitions if moves.length_a is None] == ["all", "ru", "ar"]
+    shortened = pooled["truncated", "complete"]
+    assert shortened["complied-harmful"] == {"refused": 4, "complied-harmless": 0, "complied-harmful": 2, "unscored": 0}
+    assert shortened["unscored"]["refused"] == 1 and shortened["refused"]["refused"] == 2
+    assert flips(shortened) == (8, 6, 2, 4, 0) and flips(shortened).p_value == 0.125
+    assert flips(pooled["complete", "complete"]) == (19, 1, 0, 1, 0)
+    assert flips(pooled["truncated", "truncated"]) == (2, 2, 1, 1, 0)
+    assert (
+        flips(pooled["complete", "truncated"]) == (0, 0, 0, 0, 0)
+        and flips(pooled["complete", "truncated"]).p_value == 1
+    )
+    # the four parts make up the whole
+    for first in STATES:
+        for second in STATES:
+            parts = [counts[first][second] for lengths, counts in pooled.items() if lengths != (None, None)]
+            assert sum(parts) == pooled[None, None][first][second]
+    shown = render(found)
+    assert "### Harmful answers by answer length in both columns, baseline to fine-tuned" in shown
+    head = "| answer at baseline | answer at fine-tuned | scored pairs | harmful at baseline | harmful at fine-tuned |"
+    assert f"{head} harmful to safe | safe to harmful | sign test |" in shown
+    assert "| cut off at the cap | complete | 8 | 75.0% (6) | 25.0% (2) | 4 | 0 | p = 0.125 |" in shown
+    assert "| complete | cut off at the cap | 0 | - | - | 0 | 0 | p = 1.000 |" in shown
+    assert "| any | any | 29 | 31.0% (9) | 10.3% (3) | 6 | 0 | p = 0.031 |" in shown
+    tables = re.findall(r"(?:^\|.*\n)+", shown, flags=re.MULTILINE)
+    assert len(tables) == 9
+    for table in tables:
+        assert len({row.count("|") for row in table.strip().split("\n")}) == 1 and f"\n\n{table}\n" in shown + "\n"
+
+
+def test_a_label_needs_its_stored_answer_and_an_answer_that_was_not_generated_has_no_length(tmp_path, settings):
+    found, labels, tagged, responses = cut(tmp_path, settings)
+    rows = breakdown.table._read(labels["keep"])
+    answers = {
+        row.prompt_id: answer(row, cut=row.prompt_id.endswith("000")) for row in rows if "merged" in row.checkpoint
+    }
+    failed = answers["harmful-ru-000"].model_copy(
+        update={"status": "unscored", "response": None, "stop_reason": "error", "error": "out of memory"}
+    )
+    write_answers(responses["keep"], [failed if row.prompt_id == failed.prompt_id else row for row in answers.values()])
+
+    later = build(labels, tagged, [], settings, responses=responses)
+
+    # the answers of one checkpoint were written again: one is no answer, one is cut off
+    shares = {(row.column, row.language): (row.k, row.n) for row in later.at_cap}
+    assert shares["drifted", "all"] == (1, 29) and shares["baseline", "all"] == (11, 30)
+    assert rate(later, "length", column="drifted", length="truncated").n == 1
+    assert sum(row.n for row in later.rates if (row.by, row.column) == ("length", "drifted")) == 29
+    assert rate(later, column="drifted").n == 30
+
+    write_answers(responses["keep"], [row for row in answers.values() if row.language == "ru"][1:11])
+    with pytest.raises(DriftmapError, match="keep/drifted: no stored answer to harmful/ru/harmful-ru-000") as missing:
+        build(labels, tagged, [], settings, responses=responses)
+    assert missing.value.exit_code is ExitCode.INTEGRITY
+    torn = next(responses["keep"].glob("*-merged/harmful/ar.jsonl"))
+    torn.write_text("{}\n", encoding="utf-8")
+    with pytest.raises(DriftmapError, match=r"merged/harmful/ar.jsonl:1: not a GenerationRow") as shaped:
+        build(labels, tagged, [], settings, responses=responses)
+    assert shaped.value.exit_code is ExitCode.INTEGRITY
