@@ -6,6 +6,7 @@ from driftmap.core.records import AlphaRow, ColumnState
 from driftmap.core.settings import load_settings
 from driftmap.publish import cards
 from driftmap.publish.cards import missing, render_cards
+from driftmap.publish.q4_local import Check, Count
 from driftmap.repair import select
 from driftmap.table.build import Q4_FINE_TUNED, build
 from tests.fakes.labels import column_rows, make_settings, targets, write_labels
@@ -465,6 +466,63 @@ def test_a_gguf_card_states_the_file_beside_the_model_it_was_made_from(tmp_path,
     apart = tables.model_copy(update={"columns": {**tables.columns, "repaired_q4": hatched}})
     card = render_cards(settings, tables=apart)[MERGED_GGUF]
     assert "Quantized evaluation, as the safe rate on harmful prompts:" in card and "## Results" not in card
+
+
+def cpu_check():
+    """The file and the same weights at full precision on one CPU engine, as the check's labels count them."""
+    return Check(
+        sha256="2" * 64,
+        llamacpp="b11960",
+        harmful=Count(pairs=592, full=43, q4=42, only_full=16, only_q4=15),
+        refusal=Count(pairs=592, full=449, q4=437, only_full=34, only_q4=22),
+        over_refusal=Count(pairs=248, full=21, q4=20, only_full=7, only_q4=6),
+        safe_harmful=Count(pairs=248, full=0, q4=3, only_full=0, only_q4=3),
+    )
+
+
+def test_a_gguf_card_states_the_check_on_one_cpu_engine_when_no_table_holds_its_column(tmp_path, settings):
+    """The measurement the file has: both precisions on one engine, counted over the pairs scored at both."""
+    tables = two_column_tables(tmp_path, settings, unsafe=1)
+
+    rendered = render_cards(settings, tables=tables, q4_check=cpu_check())
+
+    card = rendered[MERGED_GGUF]
+    assert "## Results" in card and "Quantized evaluation" not in card
+    assert "ran on one CPU engine, llama.cpp `b11960`, the release this project pins" in card
+    assert f"The evaluated file is this file: sha256 `{'2' * 64}`, as `gguf.json` records it." in card
+    head = "| fine-tuned model, served template | full precision | q4_k_m | only at full precision | only at q4_k_m |"
+    assert head in card
+    assert "| Harmful answers, 592 harmful prompts | 43 (7.3%) | 42 (7.1%) | 16 | 15 |" in card
+    assert "| Refusals, 592 harmful prompts | 449 (75.8%) | 437 (73.8%) | 34 | 22 |" in card
+    assert "| Over-refusal on XSTest, 248 prompts | 21 (8.5%) | 20 (8.1%) | 7 | 6 |" in card
+    assert "| XSTest answers judged harmful, 248 prompts | 0 (0.0%) | 3 (1.2%) | 0 | 3 |" in card
+    assert f"`checks/q4_local/` of `{RESPONSES}`" in card
+    assert f"`checks/q4_local/q4_full.meta.json` of `{RESULTS}`" in card
+    assert "**Not certified for deployment.**" in card and missing("merged_gguf", card, settings) == []
+    # the file of the repaired model has no such check
+    assert "## Results" not in rendered[GGUF]
+    note = (
+        f"- `repaired_q4` outside the tables: `{MERGED_GGUF}` (sha256 `{'2' * 64}`) and the same weights at full "
+        "precision ran on one CPU engine with llama.cpp `b11960`: 42 against 43 harmful answers over the 592 harmful "
+        "prompts scored at both (`checks/q4_local/`)."
+    )
+    assert note in rendered[RESULTS]
+
+    plain = render_cards(settings, tables=tables)
+    assert "## Results" not in plain[MERGED_GGUF] and "outside the tables" not in plain[RESULTS]
+    # a release other than the pinned one is named, and not called the pin
+    other = render_cards(settings, tables=tables, q4_check=cpu_check()._replace(llamacpp="b1"))[MERGED_GGUF]
+    assert "llama.cpp `b1`." in other and "pins" not in other.split("## Results")[1].split("|")[0]
+
+
+def test_a_tabled_column_of_the_file_comes_before_its_cpu_check(tmp_path, settings):
+    served = f"{MERGED_GGUF}@{'c' * 40}#model-q4_k_m.gguf"
+
+    rendered = render_cards(settings, tables=q4_tables(tmp_path, settings, served), q4_check=cpu_check())
+
+    card = rendered[MERGED_GGUF]
+    assert "### Served template" in card and "one CPU engine" not in card
+    assert "outside the tables" not in rendered[RESULTS]
 
 
 def test_the_gguf_of_the_fine_tuned_model_opens_as_its_adapter_does(tmp_path, settings):

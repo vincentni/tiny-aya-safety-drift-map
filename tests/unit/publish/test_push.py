@@ -30,6 +30,7 @@ from tests.fakes.published import (
     DATASETS,
     EVAL,
     GGUF,
+    GGUF_SHA256,
     MERGED,
     MERGED_GGUF,
     MERGED_GGUF_SMOKE,
@@ -50,6 +51,9 @@ from tests.fakes.published import (
     WEIGHTS,
     add_merged_gguf,
     add_nopreamble,
+    gguf_record,
+    q4_check_files,
+    q4_label,
     seed,
     two_column_tables,
     writes,
@@ -1885,6 +1889,61 @@ def test_an_adapter_without_a_training_log_gets_a_card_that_names_none(settings,
 
     held = fake.repos[ADAPTER]["main"]
     assert "trainer_state.json" not in held and "Training log" not in held["README.md"].decode()
+
+
+def q4_check_folder(tmp_path, sha256=GGUF_SHA256):
+    """A local checks folder holding the 4-bit check on one CPU engine, split over the two repos as it is uploaded."""
+    harmful, safe = q4_label("yes"), q4_label("no", "yes")
+    q4, full = {"h1": harmful, "h2": safe, "x1": safe}, {"h1": safe, "h2": safe, "x1": safe}
+    found = q4_check_files(q4, full, {"x1": "xstest"}, sha256)
+    files = {
+        f"{'results' if name.endswith('.json') else 'responses'}/q4_local/{name}": data for name, data in found.items()
+    }
+    return check_files(tmp_path, files)
+
+
+def test_the_gguf_card_states_the_cpu_check_of_the_very_file_its_repo_holds(tmp_path, settings, fake):
+    """The check is read from the files a run uploads, and afterwards from the repos that hold them."""
+    hub = seed(fake, tables=two_column_tables(tmp_path, settings, unsafe=1), skip=(REPAIRED, GGUF))
+    add_merged_gguf(fake)
+    put(fake, MERGED_GGUF, "gguf.json", gguf_record())
+    checks = q4_check_folder(tmp_path)
+
+    assert publish(settings, hub, checks=checks, echo=lambda line: None).ok
+
+    card = fake.repos[MERGED_GGUF]["main"]["README.md"].decode()
+    assert f"The evaluated file is this file: sha256 `{GGUF_SHA256}`, as `gguf.json` records it." in card
+    assert "| Harmful answers, 2 harmful prompts | 0 (0.0%) | 1 (50.0%) | 0 | 1 |" in card
+    assert "| Over-refusal on XSTest, 1 prompt | 1 (100.0%) | 1 (100.0%) | 0 | 0 |" in card
+    assert "`repaired_q4` outside the tables" in fake.repos[RESULTS]["main"]["README.md"].decode()
+    fake.calls.clear()
+
+    # the local folder is gone: the cards are rendered from the check files on the Hub, and nothing is written
+    assert publish(settings, hub, echo=lambda line: None).ok
+    assert calls(fake, "upload_folder") == []
+
+
+def test_a_check_of_another_file_is_not_stated_on_the_gguf_card(tmp_path, settings, fake):
+    hub = seed(fake, tables=two_column_tables(tmp_path, settings, unsafe=1), skip=(REPAIRED, GGUF))
+    add_merged_gguf(fake)
+    put(fake, MERGED_GGUF, "gguf.json", gguf_record())
+    checks = q4_check_folder(tmp_path, sha256="3" * 64)
+
+    assert publish(settings, hub, checks=checks, echo=lambda line: None).ok
+
+    card = fake.repos[MERGED_GGUF]["main"]["README.md"].decode()
+    assert "## Results" not in card and "evaluated file is this file" not in card
+    assert "Quantized evaluation: not run" in card
+    assert "outside the tables" not in fake.repos[RESULTS]["main"]["README.md"].decode()
+
+
+def test_a_gguf_repo_without_a_record_of_its_file_gets_no_cpu_check(tmp_path, settings, fake):
+    hub = seed(fake, tables=two_column_tables(tmp_path, settings, unsafe=1), skip=(REPAIRED, GGUF))
+    add_merged_gguf(fake)
+
+    assert publish(settings, hub, checks=q4_check_folder(tmp_path), echo=lambda line: None).ok
+
+    assert "## Results" not in fake.repos[MERGED_GGUF]["main"]["README.md"].decode()
 
 
 def test_the_code_repo_the_cards_link_to_pins_its_toolkits():

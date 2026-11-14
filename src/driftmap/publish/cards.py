@@ -15,6 +15,7 @@ from driftmap import quant
 from driftmap.core import ids, redact
 from driftmap.core.records import AlphaScreen, GenerationRow, LabelRow, Manifest, RunRecord, Tables
 from driftmap.core.settings import Settings
+from driftmap.publish import q4_local
 from driftmap.repair.screen_gen import SCREEN_FILE, screen_path
 from driftmap.scripts.drift import RECIPE, repo_names
 from driftmap.table.build import COLUMNS, DRIFT_POINTS, Q4_FINE_TUNED, column_of
@@ -255,6 +256,23 @@ GGUF_WHAT = (
 MERGED_GGUF_WHAT = (
     "The fine-tuned model, `{model}` with the adapter `{adapter}` merged in, as a q4_k_m GGUF: converted and "
     "quantized with llama.cpp `{llamacpp}`. " + GGUF_RECORD
+)
+# the measurement of a file no table holds: the check that ran it beside the same weights at full precision
+Q4_CHECK = (
+    "No result table holds a column for this file; its measurement is a check beside the tables. The file and the "
+    "same weights at full precision answered the evaluation prompts under the served template, and both ran on "
+    "one CPU engine, llama.cpp `{release}`{pinned}. The evaluated file is this file: sha256 `{sha256}`, as "
+    "`{record}` records it. Each count is over the prompts the judge scored at both precisions; the last two "
+    "columns count the prompts that carry the label at one precision only."
+)
+Q4_CHECK_FILES = (
+    "The answers and the judge's labels are in `{where}` of `{responses}`, the engine and its settings in "
+    "`{where}{meta}` of `{results}`."
+)
+Q4_CHECK_NOTE = (
+    "- `{column}` outside the tables: `{repo}` (sha256 `{sha256}`) and the same weights at full precision ran on "
+    "one CPU engine with llama.cpp `{release}`: {q4} against {full} harmful answers over the {pairs} scored at "
+    "both (`{where}`)."
 )
 GGUF_USAGE = """```bash
 hf download {repo} {file} --local-dir .
@@ -551,13 +569,63 @@ def _rates(tables: Tables | None, column: str, settings: Settings, repo: str | N
     ]
 
 
+def _on_one_engine(check: q4_local.Check, settings: Settings, repos: Mapping[str, str]) -> list[str]:
+    """The results of a file whose measurement is the check on one CPU engine: a row per label, with the counts
+    at each precision and of the prompts that differ."""
+    pinned = ", the release this project pins" if check.llamacpp == settings.llamacpp_release.tag else ""
+    said = Q4_CHECK.format(release=check.llamacpp, pinned=pinned, sha256=check.sha256, record=quant.RECORD_FILE)
+    measures = (
+        ("Harmful answers", check.harmful, "harmful prompt"),
+        ("Refusals", check.refusal, "harmful prompt"),
+        ("Over-refusal on XSTest", check.over_refusal, "prompt"),
+        ("XSTest answers judged harmful", check.safe_harmful, "prompt"),
+    )
+    head = ["fine-tuned model, served template", "full precision", quant.QUANT]
+    head += [f"only at {which}" for which in head[1:]]
+    lines = [
+        [
+            f"{name}, {_plural(count.pairs, noun)}",
+            *(f"{value} ({value / count.pairs:.1%})" for value in (count.full, count.q4)),
+            str(count.only_full),
+            str(count.only_q4),
+        ]
+        for name, count, noun in measures
+        if count.pairs
+    ]
+    table = [f"| {' | '.join(row)} |" for row in (head, ["---"] * len(head), *lines)]
+    places = {"where": f"{CHECKS_TREE}{q4_local.FOLDER}/", "meta": q4_local.META}
+    kept = Q4_CHECK_FILES.format(responses=repos["responses"], results=repos["results"], **places)
+    return ["## Results", said, "\n".join(table), kept]
+
+
+def _beside_the_tables(check: q4_local.Check, repo: str) -> str:
+    """One line on the results card: what stands in for the fourth column while no table holds this file."""
+    count = check.harmful
+    return Q4_CHECK_NOTE.format(
+        column=COLUMNS[3],
+        repo=repo,
+        # whole: twelve characters of it can be twelve digits, which the scan of a new card takes for an account
+        sha256=check.sha256,
+        release=check.llamacpp,
+        q4=count.q4,
+        full=count.full,
+        pairs=_plural(count.pairs, "harmful prompt"),
+        where=f"{CHECKS_TREE}{q4_local.FOLDER}/",
+    )
+
+
 def _quantized(
-    tables: Tables | None, nopreamble: Tables | None, settings: Settings, key: str, repos: Mapping[str, str]
+    tables: Tables | None,
+    nopreamble: Tables | None,
+    settings: Settings,
+    key: str,
+    repos: Mapping[str, str],
+    check: q4_local.Check | None = None,
 ) -> list[str]:
     """What the fourth column says of the file in the repo of ``key``.
 
-    Where the file and the model it was made from are both tabled, the two side by side; else the file's rates,
-    or why there are none.
+    Where the file and the model it was made from are both tabled, the two side by side; else the file's rates;
+    else ``check``, the file against the same weights on one CPU engine; else why there are none.
     """
     pair, repo = QUANTIZED[key], repos[key]
     blocks = []
@@ -575,6 +643,8 @@ def _quantized(
     rows = _rates(tables, "repaired_q4", settings, repo)
     if rows:
         return ["Quantized evaluation, as the safe rate on harmful prompts:", "\n".join(rows)]
+    if check is not None:
+        return _on_one_engine(check, settings, repos)
     state = _column(tables, "repaired_q4")[0]
     if state in ("tabled", "not comparable"):
         return ["Quantized evaluation: not run (the tabled file is another repo's)."]
@@ -873,6 +943,7 @@ def _bodies(
     files: Mapping[str, Sequence[str]],
     aggressive: tuple[Tables | None, Tables | None],
     aggressive_screen: AlphaScreen | None,
+    q4_check: q4_local.Check | None = None,
 ) -> dict[str, list[str]]:
     """Paragraphs of each card, between its title and its provenance list."""
     sources, repos = settings.sources, repo_ids(settings)
@@ -909,7 +980,13 @@ def _bodies(
 
     def served(key: str) -> list[str]:
         usage = GGUF_USAGE.format(repo=repos[key], file=quant.GGUF_FILE)
-        return [*_quantized(tables, nopreamble, settings, key, repos), "## How to use", usage]
+        # the check ran the file of the fine-tuned model
+        check = q4_check if key == MERGED_GGUF else None
+        return [*_quantized(tables, nopreamble, settings, key, repos, check), "## How to use", usage]
+
+    # stated beside the column while no table holds that file
+    untabled = q4_check is not None and not _rates(tables, COLUMNS[3], settings, repos[MERGED_GGUF])
+    beside = [_beside_the_tables(q4_check, repos[MERGED_GGUF])] if untabled else []
 
     others = {
         "with no safety preamble": nopreamble,
@@ -936,7 +1013,7 @@ def _bodies(
             *also("results"),
             *filled(RESULTS_HOW),
             f"State of each planned column. {COLUMN_NAMES.format(q4=q4)}",
-            states(tables),
+            "\n".join([states(tables), *beside]),
             *stripped,
             *_files("results", files.get("results")),
         ],
@@ -993,6 +1070,7 @@ def render_cards(
     aggressive: Tables | None = None,
     aggressive_nopreamble: Tables | None = None,
     aggressive_screen: AlphaScreen | None = None,
+    q4_check: q4_local.Check | None = None,
 ) -> dict[str, str]:
     """README text per repo id for every repo a publication may open; ``writeup`` defaults to the code repo's article.
 
@@ -1004,7 +1082,9 @@ def render_cards(
     ``records``. ``recipes`` holds, per adapter key, the recipe file of its repo; ``files`` holds, per dataset key,
     the paths its repo will hold, which its card then counts, and per adapter key those of its repo, whose card
     names the training log when it is among them. ``copies`` names, per key of a repo published as a
-    clean copy, the working repo and revision it was made from.
+    clean copy, the working repo and revision it was made from. ``q4_check`` is the check that ran the q4_k_m
+    file of the fine-tuned model beside the same weights on one CPU engine; the caller hands it over only when it
+    ran the very file that repo holds, and the cards state it while no table holds a column of that file.
     """
     records = list(records)
     second = any(found is not None for found in (nopreamble, aggressive_nopreamble)) or any(
@@ -1013,7 +1093,7 @@ def render_cards(
     rendered, repos = {}, repo_ids(settings)
     other = (aggressive, aggressive_nopreamble)
     known = (settings, manifest, tables, records, nopreamble, second, recipes or {}, files or {}, other)
-    bodies = _bodies(*known, aggressive_screen)
+    bodies = _bodies(*known, aggressive_screen, q4_check)
     for key in (*DATASETS, *MODELS):
         licence = license_of(key, manifest)
         if key in DATASETS:

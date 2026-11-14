@@ -6,7 +6,7 @@ import re
 import shutil
 import tempfile
 from collections import Counter
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager
 from pathlib import Path
 from typing import Any, Literal, NamedTuple
@@ -21,11 +21,11 @@ from driftmap import quant
 from driftmap.core import ids, redact
 from driftmap.core.hub import Hub
 from driftmap.core.ids import RepoRef
-from driftmap.core.records import AlphaScreen, Manifest, Record, RunRecord, Tables, dump, load
+from driftmap.core.records import AlphaScreen, GgufRecord, Manifest, Record, RunRecord, Tables, dump, load
 from driftmap.core.schemas import DriftmapError, ExitCode
 from driftmap.core.settings import Settings
 from driftmap.jobs.ledger import Ledger, LedgerCorrupt
-from driftmap.publish import cards, collections
+from driftmap.publish import cards, collections, q4_local
 from driftmap.repair.screen_gen import screen_path
 from driftmap.scripts.drift import RECIPE, repo_names
 
@@ -84,6 +84,7 @@ KEPT = [
     f"{cards.CHECKS_TREE}*",
     cards.TRAINER_STATE,
     CHECKPOINT_LOG,
+    quant.RECORD_FILE,
     CARD,
 ]
 EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}")
@@ -656,6 +657,26 @@ def _checked(root: Path | None) -> tuple[dict[str, list[tuple[str, bytes]]], lis
     return held, lacks
 
 
+def _q4_check(held: Mapping[str, Mapping[str, bytes]], gguf: Mapping[str, bytes]) -> q4_local.Check | None:
+    """The 4-bit check on one CPU engine, counted from its files as the repos in ``held`` will hold them.
+
+    None unless it ran the very file the GGUF repo records: a card says so only where the two sha256 are one.
+    """
+    folder = f"{cards.CHECKS_TREE}{q4_local.FOLDER}/"
+    found = {
+        name.removeprefix(folder): data
+        for files in held.values()
+        for name, data in files.items()
+        if name.startswith(folder)
+    }
+    check = q4_local.measured(found)
+    try:
+        record = GgufRecord.model_validate_json(gguf[quant.RECORD_FILE])
+    except (KeyError, ValidationError):
+        return None
+    return check if check is not None and check.sha256 == record.sha256 else None
+
+
 def plan(
     settings: Settings,
     hub: Hub,
@@ -823,6 +844,7 @@ def _drawn(
         for key, held in answers.items():
             carried.setdefault(key, []).extend(held)
         extras = {key: tuple(held) for key, held in carried.items() if held and key in files}
+        after = {key: {**files.get(key, {}), **dict(extras.get(key, ()))} for key in CHECK_REPOS}
         rendered = cards.render_cards(
             settings,
             manifest=manifest,
@@ -841,6 +863,7 @@ def _drawn(
             aggressive=aggressive,
             aggressive_nopreamble=aggressive_stripped,
             aggressive_screen=aggressive_screen,
+            q4_check=_q4_check(after, files.get(cards.MERGED_GGUF, {})),
         )
         for target in present:
             state, card, extra = states[target.key], rendered[target.repo], extras.get(target.key, ())

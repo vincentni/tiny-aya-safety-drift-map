@@ -33,6 +33,7 @@ NOPRE_SHA256 = "6" * 64
 # where the q4_k_m file of the merged fine-tuned model goes, and where its smoke run's goes
 MERGED_GGUF = f"{ADAPTER.removesuffix('-lora')}-GGUF"
 MERGED_GGUF_SMOKE = f"{MERGED_GGUF}-smoke"
+GGUF_SHA256 = "2" * 64
 LICENCES = {SOURCES["harmful"]: "apache-2.0", SOURCES["benign"]: "apache-2.0", SOURCES["xstest"]: "cc-by-4.0"}
 
 
@@ -224,6 +225,39 @@ def add_merged_gguf(fake: FakeHub) -> None:
     for repo in (MERGED_GGUF, MERGED_GGUF_SMOKE):
         fake.add_repo(repo, private=True, files=dict(files))
         fake.authorize(repo)
+
+
+def q4_label(harm: str, refusal: str = "no") -> dict[str, str]:
+    return {"request_harm": "yes", "refusal": refusal, "response_harm": harm}
+
+
+def q4_check_files(q4: dict, full: dict, sets: dict | None = None, sha256: str = GGUF_SHA256) -> dict[str, bytes]:
+    """The files of the 4-bit check on one CPU engine, by name: ``q4`` and ``full`` map each answer id to its
+    label at that precision, ``sets`` an id to a prompt set other than the harmful one."""
+    sets = sets or {}
+    meta = {"gguf": {"file": "model-q4_k_m.gguf", "sha256": sha256}, "llamacpp": {"tag": "b11960"}}
+    return {
+        "q4_full.meta.json": (json.dumps(meta) + "\n").encode(),
+        "q4_full.jsonl": _rows(*({"id": key, "set": sets.get(key, "harmful"), "response": "x"} for key in q4)),
+        "q4_full_labels.jsonl": _rows(*({"id": key, "label": found, "raw": "{}"} for key, found in q4.items())),
+        "bf16_full_labels.jsonl": _rows(*({"id": key, "label": found, "raw": "{}"} for key, found in full.items())),
+    }
+
+
+def gguf_record(sha256: str = GGUF_SHA256) -> bytes:
+    """``gguf.json`` as a quant run writes it beside the file."""
+    record = {
+        "schema": "driftmap.gguf/1",
+        "llamacpp_tag": "b11960",
+        "tarball": "https://example.org/llama.cpp-b11960.tar.gz",
+        "tarball_sha256": "7" * 64,
+        "quant": "q4_k_m",
+        "sha256": sha256,
+        "bytes": 5,
+        "source_repo": MERGED,
+        "source_revision": "a" * 40,
+    }
+    return (json.dumps(record, indent=2) + "\n").encode()
 
 
 def writes(fake: FakeHub) -> list[tuple[str, str]]:
