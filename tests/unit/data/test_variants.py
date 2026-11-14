@@ -737,33 +737,3 @@ def test_a_comparison_joins_the_harmful_pairs_the_benign_control_and_the_request
 
     # without generation rows there is no benign side
     assert variants.compare(parents, stress, tied) == found._replace(benign=[])
-
-
-def test_comparisons_of_one_tree_are_saved_side_by_side(tmp_path):
-    parents, stress, tied = harmful_world()
-    answered, varied, benign_links = benign_world()
-    found = variants.compare(parents, stress, [*tied, *benign_links], answered, varied, same_request=True)
-    path = tmp_path / "tables" / variants.TABLE_NAMES["strip"]
-
-    variants.save(path, CHECKPOINTS["baseline"], "full", "strip", found)
-    variants.save(path, CHECKPOINTS["drifted"], "full", "strip", found._replace(dropped=None))
-
-    stored = json.loads(path.read_text())
-    assert path.name == "variants-nopreamble.json" and variants.TABLE_NAMES["keep"] == "variants.json"
-    assert (stored["schema"], stored["mode"], stored["preamble"]) == ("driftmap.variants/1", "full", "strip")
-    assert sorted(stored["checkpoints"]) == sorted([CHECKPOINTS["baseline"], CHECKPOINTS["drifted"]])
-    first = stored["checkpoints"][CHECKPOINTS["baseline"]]
-    assert first == json.loads(json.dumps(variants.record(found)))
-    assert first["dropped_request_flips"] == 0
-    assert stored["checkpoints"][CHECKPOINTS["drifted"]]["dropped_request_flips"] is None
-    assert first["harmful"][0] | {"ci": None} == {
-        "set": "harmful", "code": "hi-Latn", "metric": "harmful", "n_pairs": 10, "parent": pytest.approx(0.1),
-        "variant": pytest.approx(0.4), "delta": pytest.approx(0.3), "ci": None, "p_value": pytest.approx(0.25),
-    }
-    assert first["benign"][0] == {
-        "code": "hi-mixed", "n_pairs": 4, "parent_failed": 0.0, "variant_failed": 0.5, "parent_tokens": 40.0,
-        "variant_tokens": 80.0,
-    }
-    # a file of another tree is not mixed in
-    variants.save(path, CHECKPOINTS["baseline"], "smoke", "strip", found)
-    assert list(json.loads(path.read_text())["checkpoints"]) == [CHECKPOINTS["baseline"]]

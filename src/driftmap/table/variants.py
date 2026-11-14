@@ -1,18 +1,22 @@
-"""Script variants against their parent prompts: per prompt condition and column, paired harmful-response rates."""
+"""Script variants against their parent prompts: per prompt condition and column, paired harmful-response rates.
 
-from collections.abc import Iterable, Mapping
+The benign answers of the same checkpoint are the control: an answer that is empty or cut off is no refusal.
+"""
+
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Literal, NamedTuple
 
 from pydantic import Field
 
 from ..core import ids
-from ..core.records import JudgeConfig, LabelRow, Mode, Record, RunRecord, Seeds
+from ..core.records import GenerationRow, JudgeConfig, LabelRow, Mode, Record, RunRecord, Seeds
 from ..core.schemas import DriftmapError, ExitCode
 from ..core.settings import Settings
 from ..data import variants as data
+from ..judge.incremental import read_rows
 from . import build as table
-from .breakdown import COLUMN_NAMES, CONDITION_NAMES, _table, change_cell
+from .breakdown import COLUMN_NAMES, CONDITION_NAMES, FINE_TUNE_NAMES, _table, change_cell
 from .stats import BOOTSTRAP_SEED
 
 SCHEMA_VARIANTS = "driftmap.variants/1"
@@ -28,13 +32,18 @@ class Source(NamedTuple):
 
 
 class Side(NamedTuple):
-    """One column's labels under one condition: those of the parent prompts, those of the variants, and the variant
-    prompt rows, which tie a variant to its parent."""
+    """One column's rows under one condition.
+
+    The labels of the parent prompts and of the variants, the variant prompt rows, which tie a variant to its
+    parent, and the stored answers to the benign parents and variants.
+    """
 
     source: Source
     parents: list[LabelRow]
     variants: list[LabelRow]
     links: list[Mapping[str, Any]]
+    parent_answers: Sequence[GenerationRow] = ()
+    variant_answers: Sequence[GenerationRow] = ()
 
 
 class VariantColumn(Record):
@@ -71,20 +80,44 @@ class VariantChange(Record):
     p_value: float | None
 
 
+class VariantAnswers(Record):
+    """Benign answers to a variant against those to its parents, over the pairs generated on both sides.
+
+    ``*_failed`` is the share of answers that are empty or were cut at the token limit, ``*_tokens`` the mean
+    generated length; ``code`` and ``language`` read as in a ``VariantChange``.
+    """
+
+    condition: str
+    column: str
+    code: str
+    language: str | None
+    rewrite: str
+    n_pairs: int
+    parent_failed: float | None
+    variant_failed: float | None
+    parent_tokens: float | None
+    variant_tokens: float | None
+
+
 class VariantTables(Record):
     schema_: Literal["driftmap.variants/1"] = Field(alias="schema")
+    # the fine-tune of the drifted column
+    fine_tune: str
     # key to the name shown, in the order built
     conditions: dict[str, str]
     columns: dict[str, str]
     sources: list[VariantColumn]
     rows: list[VariantChange]
+    answers: list[VariantAnswers]
     judge: JudgeConfig
     seeds: Seeds
 
 
-def sources(records: Iterable[RunRecord], settings: Settings, mode: Mode, preamble: str = "keep") -> dict[str, Source]:
+def sources(
+    records: Iterable[RunRecord], settings: Settings, mode: Mode, preamble: str = "keep", fine_tune: str | None = None
+) -> dict[str, Source]:
     """Per column, in table order, what its latest ok generate run of ``mode`` over the variants read under
-    ``preamble``."""
+    ``preamble``; with ``fine_tune``, a run over a checkpoint of the other fine-tune is no column's."""
     found = {}
     for run in sorted(records, key=lambda run: run.started):
         models = [f"{ref.repo}@{ref.revision}" for ref in run.inputs if ref.kind == "model"]
@@ -92,7 +125,7 @@ def sources(records: Iterable[RunRecord], settings: Settings, mode: Mode, preamb
         same_tree = (run.kind, run.mode, run.status, ids.preamble_of(run.notes)) == ("generate", mode, "ok", preamble)
         if not same_tree or not ids.variants_of(run.notes) or not models or not datasets:
             continue
-        column = table.column_of(models[0], settings, mode)
+        column = table.column_of(models[0], settings, mode, fine_tune)
         if column:
             # the run records the evaluation dataset's pinned revision, then the commit of the variant prompts
             found[column] = Source(models[0], datasets[-1])
@@ -104,41 +137,66 @@ def link(row: Mapping[str, Any]) -> dict[str, str]:
     return {key: row[key] for key in LINK}
 
 
-def read(
-    data: Path, found: Mapping[str, Mapping[str, Source]], links: Mapping[str, list[Mapping[str, Any]]], mode: Mode
-) -> dict[str, dict[str, Side]]:
-    """The labels of each source's checkpoint in a copy of the evaluation dataset, by condition, then column.
+def _answers(folder: Path, checkpoint: str) -> list[GenerationRow]:
+    """The stored benign answers of ``checkpoint`` under ``<folder>/<slug>/<set>/<language>.jsonl``."""
+    found = []
+    for path in sorted(folder.glob(f"{ids.slug(checkpoint)}/*/*.jsonl")):
+        found += read_rows(path, GenerationRow, path.relative_to(folder).as_posix())
+    return [row for row in found if row.set == "benign" and row.checkpoint == checkpoint]
 
-    ``found`` holds the sources the same way; ``links`` are the variant prompt rows of each commit a source names.
+
+def read(
+    data: Path,
+    found: Mapping[str, Mapping[str, Source]],
+    links: Mapping[str, list[Mapping[str, Any]]],
+    mode: Mode,
+    responses: Path | None = None,
+) -> dict[str, dict[str, Side]]:
+    """The rows of each source's checkpoint, by condition, then column, as ``build`` takes them.
+
+    ``data`` is a copy of the evaluation dataset with the labels, ``responses`` one of the responses repo with the
+    benign answers; ``found`` holds the sources by condition, then column, and ``links`` the variant prompt rows of
+    each commit a source names.
     """
     sides = {}
     for condition, columns in found.items():
-        parents, rewritten = (table._read(data / ids.tree(mode, condition, flag) / "labels") for flag in (False, True))
+        trees = [ids.tree(mode, condition, flag) for flag in (False, True)]
+        parents, rewritten = (table._read(data / tree / "labels") for tree in trees)
         sides[condition] = {
             column: Side(
                 source,
                 [row for row in parents if row.checkpoint == source.checkpoint],
                 [row for row in rewritten if row.checkpoint == source.checkpoint],
                 links[source.variants_revision],
+                *(_answers(responses / tree / "responses", source.checkpoint) if responses else [] for tree in trees),
             )
             for column, source in columns.items()
         }
     return sides
 
 
-def build(sides: Mapping[str, Mapping[str, Side]], settings: Settings, *, mode: Mode = "full") -> VariantTables:
-    """Compare each column's variants with their parents; ``sides`` holds the labels by condition, then column.
+def _rewrite(code: str) -> tuple[str | None, str]:
+    """Parent language and rewrite of a variant code; a pooled code such as ``all-Latn`` has no language."""
+    pooled = next(known for known in data.CODES if known.partition("-")[2] == code.partition("-")[2])
+    return data.CODES.get(code) or (None, data.CODES[pooled][1])
 
-    A variant the judge read as another request than its parent is left out and counted. Refuses labels of more
-    than one judge config, and labels with no variant to compare.
+
+def build(
+    sides: Mapping[str, Mapping[str, Side]], settings: Settings, *, mode: Mode = "full", fine_tune: str = "standard"
+) -> VariantTables:
+    """Compare each column's variants with their parents; ``sides`` holds the rows by condition, then column.
+
+    A variant the judge read as another request than its parent is left out and counted. ``fine_tune`` names the
+    fine-tune of the drifted column. Refuses labels of more than one judge config, and labels with no variant to
+    compare.
     """
-    listed, rows, judges = [], [], {}
+    listed, rows, control, judges = [], [], [], {}
     for condition in (name for name in ids.CONDITIONS if name in sides):
         for column in (name for name in table.COLUMNS if name in sides[condition]):
             side = sides[condition][column]
-            kept, dropped = data.drop_flipped(side.parents, side.variants, side.links)
-            found = data.paired(side.parents, kept, side.links, seed=BOOTSTRAP_SEED)
-            if not found:
+            rows_of = (side.parents, side.variants, side.links, side.parent_answers, side.variant_answers)
+            found = data.compare(*rows_of, same_request=True)
+            if not found.harmful:
                 continue
             listed.append(
                 VariantColumn(
@@ -147,44 +205,51 @@ def build(sides: Mapping[str, Mapping[str, Side]], settings: Settings, *, mode: 
                     checkpoint=side.source.checkpoint,
                     variants_revision=side.source.variants_revision,
                     judged=len(side.variants),
-                    left_out=len(dropped),
+                    left_out=found.dropped,
                 )
             )
-            for result in found:
-                language, rewrite = data.CODES.get(result.code) or (None, data.CODES[_pooled(result.code)][1])
-                changed = {"condition": condition, "column": column, "language": language, "rewrite": rewrite}
-                rows.append(VariantChange(**changed, **result._asdict()))
-            sets = {result.set for result in found}
-            compared = [row for row in (*side.parents, *kept) if row.set in sets]
+            for result in (*found.harmful, *found.benign):
+                language, rewrite = _rewrite(result.code)
+                where = {"condition": condition, "column": column, "language": language, "rewrite": rewrite}
+                if isinstance(result, data.Paired):
+                    rows.append(VariantChange(**where, **result._asdict()))
+                else:
+                    control.append(VariantAnswers(**where, **result._asdict()))
+            sets = {result.set for result in found.harmful}
+            compared = [row for row in (*side.parents, *side.variants) if row.set in sets]
             judges[f"{condition} {column}"] = table._judge(column, compared, settings, mode)
     table._one_judge(judges)
     judge = next((judge for judge in judges.values() if judge), None)
     if not rows or judge is None:
         raise DriftmapError(ExitCode.USAGE, "no judged labels of script variants with a parent prompt")
+    names = COLUMN_NAMES | ({"drifted": FINE_TUNE_NAMES[fine_tune]} if fine_tune in FINE_TUNE_NAMES else {})
     return VariantTables(
         schema=SCHEMA_VARIANTS,
+        fine_tune=fine_tune,
         conditions={row.condition: CONDITION_NAMES.get(row.condition, row.condition) for row in listed},
         columns={
-            column: COLUMN_NAMES.get(column, column)
-            for column in table.COLUMNS
-            if any(row.column == column for row in listed)
+            column: names.get(column, column) for column in table.COLUMNS if any(row.column == column for row in listed)
         },
         sources=listed,
         rows=rows,
+        answers=control,
         judge=judge,
         seeds=Seeds(seed=settings.seed, bootstrap=BOOTSTRAP_SEED),
     )
-
-
-def _pooled(code: str) -> str:
-    """A variant code of the rewrite that a pooled code such as ``all-Latn`` stands for."""
-    return next(known for known in data.CODES if known.partition("-")[2] == code.partition("-")[2])
 
 
 def _rate(row: VariantChange, value: float | None) -> str:
     if value is None:
         return "-"
     return f"{value:.1%}" if row.metric == "harmful" else f"{100 * value:.1f}"
+
+
+def _share(value: float | None) -> str:
+    return "-" if value is None else f"{value:.1%}"
+
+
+def _tokens(value: float | None) -> str:
+    return "-" if value is None else f"{value:.0f}"
 
 
 def _title(name: str) -> str:
@@ -205,6 +270,11 @@ def render(tables: VariantTables) -> str:
         "A variant the judge read as another request than its parent is left out.",
         "",
     ]
+    if tables.answers:
+        out[-2] += (
+            " The benign control beside each table is the same checkpoint's answers to the benign prompts and their "
+            "variants: the share that is empty or cut off at the cap on new tokens, and the mean length in tokens."
+        )
     for condition, shown in tables.conditions.items():
         out += [f"## {_title(shown)}", ""]
         for source in (source for source in tables.sources if source.condition == condition):
@@ -221,4 +291,13 @@ def render(tables: VariantTables) -> str:
                 "",
                 *_table(["Set", "Variant", "Parent prompts", "Variant prompts", "Change"], lines),
             ]
+            control = [
+                [row.code, str(row.n_pairs), *(_share(value) for value in (row.parent_failed, row.variant_failed))]
+                + [_tokens(value) for value in (row.parent_tokens, row.variant_tokens)]
+                for row in tables.answers
+                if (row.condition, row.column) == (condition, source.column)
+            ]
+            if control:
+                head = ["Benign variant", "Pairs", "Parents empty or cut off", "Variants empty or cut off"]
+                out += _table([*head, "Parent tokens", "Variant tokens"], control)
     return "\n".join(out).rstrip("\n") + "\n"

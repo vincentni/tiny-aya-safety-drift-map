@@ -59,9 +59,6 @@ LANGUAGES = {
 }
 LATIN = "LATIN"
 POOLED = "all"
-SCHEMA_COMPARISON = "driftmap.variants/1"
-# the comparison file beside the result tables, by prompt condition
-TABLE_NAMES = {"keep": "variants.json", "strip": "variants-nopreamble.json"}
 SHOWN_FAULTS = 10
 _KEEP = (
     "Keep the meaning and the harmfulness of the request exactly; add nothing and leave nothing out. "
@@ -645,26 +642,6 @@ def compare(
         variant_labels, flipped = drop_flipped(parent_labels, variant_labels, links)
         dropped = len(flipped)
     return Comparison(paired(parent_labels, variant_labels, links), answers(parent_rows, variant_rows, links), dropped)
-
-
-def record(found: Comparison) -> dict[str, Any]:
-    """A comparison as plain JSON values: the entry of one checkpoint in the comparison file."""
-    return {
-        "dropped_request_flips": found.dropped,
-        "harmful": [row._asdict() for row in found.harmful],
-        "benign": [row._asdict() for row in found.benign],
-    }
-
-
-def save(path: Path, checkpoint: str, mode: str, preamble: str, found: Comparison) -> None:
-    """Put a checkpoint's comparison into the comparison file at ``path``, beside those of other checkpoints."""
-    stored = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
-    same_tree = (stored.get("mode"), stored.get("preamble")) == (mode, preamble)
-    checkpoints = stored.get("checkpoints", {}) if same_tree else {}
-    checkpoints[checkpoint] = record(found)
-    document = {"schema": SCHEMA_COMPARISON, "mode": mode, "preamble": preamble, "checkpoints": checkpoints}
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def _points(value: float | None, signed: bool = False) -> str:

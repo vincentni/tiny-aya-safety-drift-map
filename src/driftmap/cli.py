@@ -975,41 +975,48 @@ def table_variants(
     mode: Annotated[
         Mode, typer.Option(help="full: the result labels. smoke: the rehearsal's, kept in their own tree.")
     ] = "full",
+    fine_tune: Annotated[FineTune, typer.Option(help=FINE_TUNE_HELP)] = "standard",
 ) -> None:
     """Compare the script variants with their parent prompts, per condition and model; print and upload it.
 
     Covers each condition with a finished variants run; leaves out a variant judged another request than its parent.
+    The stored benign answers are the control: how often they are empty or cut off, and how long they are.
     """
     # nothing is launched or billed to the ledger, so no readiness report is needed
-    settings, deps = _open("table variants", ready=False, mode=mode)
+    chosen = {"fine_tune": fine_tune} if fine_tune != "standard" else {}
+    settings, deps = _open("table variants", ready=False, mode=mode, **chosen)
     # pulls the statistics packages
     from driftmap.table import variants
 
     records, _ = _results(settings, deps.hub, mode)
-    results, evaluation = (f"{settings.owner}/{name}" for name in (settings.repos.results, settings.repos.eval))
-    found = {condition: variants.sources(records, settings, mode, condition) for condition in ids.CONDITIONS}
+    results, evaluation, stored = (
+        f"{settings.owner}/{name}" for name in (settings.repos.results, settings.repos.eval, settings.repos.responses)
+    )
+    found = {name: variants.sources(records, settings, mode, name, fine_tune) for name in ids.CONDITIONS}
     read = [(condition, source) for condition, columns in found.items() for source in columns.values()]
     if not read:
         raise DriftmapError(ExitCode.USAGE, f"no finished {mode} run over the script variants is on record")
-    # the labels of each run's checkpoint: those of the parent prompts, then those of the variants
-    wanted = [
-        ids.labels_path(ids.slug(source.checkpoint), "*", mode, preamble=condition, variants=among)
-        for condition, source in read
-        for among in (False, True)
-    ]
+    # per run the files of its checkpoint, for the parent prompts and then for the variants: labels and benign answers
+    trees = [(ids.slug(source.checkpoint), condition, among) for condition, source in read for among in (False, True)]
+    labels = [ids.labels_path(slug, "*", mode, preamble=condition, variants=among) for slug, condition, among in trees]
+    answers = [ids.responses_path(slug, "benign", "*", mode, condition, among) for slug, condition, among in trees]
     with tempfile.TemporaryDirectory(prefix="driftmap-variants-") as scratch:
-        data = _snapshot(deps.hub, evaluation, f"{scratch}/labels", wanted)
+        data = _snapshot(deps.hub, evaluation, f"{scratch}/labels", labels)
+        said = _snapshot(deps.hub, stored, f"{scratch}/responses", answers)
         links = {}
         for commit in sorted({source.variants_revision for _, source in read}):
             prompts = _files(deps.hub, evaluation, commit, f"{scratch}/{commit}", [ids.variant_prompts("*")])
             files = sorted(prompts.glob(ids.variant_prompts("*")))
             links[commit] = [row for path in files for row in _jsonl(path, variants.link)]
-        built = variants.build(variants.read(data, found, links, mode), settings, mode=mode)
+        sides = variants.read(data, found, links, mode, said)
+        built = variants.build(sides, settings, mode=mode, fine_tune=fine_tune)
     root = deps.repo_root
-    path = root / LOCAL / "results" / ("smoke" if mode == "smoke" else "") / TABLES_PATH.parent.name / VARIANTS
+    folder = root / LOCAL / "results" / ("smoke" if mode == "smoke" else "") / TABLES_PATH.parent.name
+    path = folder / _of_fine_tune(VARIANTS, fine_tune)
     dump(built, path)
     files = _show(path, variants.render(built), root)
-    _upload(deps, results, f"{ids.tree(mode)}tables", files, f"add {mode} variants table")
+    message = f"add {mode} variants table" + (f", {fine_tune} fine-tune" if fine_tune != "standard" else "")
+    _upload(deps, results, f"{ids.tree(mode)}tables", files, message)
 
 
 @app.command()

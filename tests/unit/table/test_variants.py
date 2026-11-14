@@ -3,6 +3,7 @@ import pytest
 from driftmap.core.records import Ref
 from driftmap.core.schemas import DriftmapError, ExitCode
 from driftmap.table import variants
+from tests.fakes.breakdown import answer
 from tests.fakes.labels import CHECKPOINTS, REFS, judge_config, label, make_settings, run_record
 
 REVISION = "c" * 40
@@ -120,16 +121,89 @@ def test_labels_that_cannot_be_compared_are_refused(settings):
         variants.link({"language": "hi-Latn", "prompt_id": "variant-1", "parent_language": "hi"})
 
 
+def control(column, code, cut, count=4):
+    """Benign answers of ``column`` to ``count`` parents and their variants, and the rows that tie them.
+
+    The first ``cut`` answers to a variant run into the cap on new tokens.
+    """
+    parent = code.partition("-")[0]
+    asked = [label(column, parent, index, set_="benign") for index in range(count)]
+    rewritten = [
+        label(column, code, index, set_="benign", prompt_id=f"variant-benign-{code}-{index:03d}")
+        for index in range(count)
+    ]
+    tied = [
+        {
+            "language": code,
+            "prompt_id": row.prompt_id,
+            "parent_language": parent,
+            "parent_prompt_id": before.prompt_id,
+        }
+        for row, before in zip(rewritten, asked, strict=True)
+    ]
+    answered = [answer(row) for row in asked]
+    return answered, [answer(row, cut=index < cut) for index, row in enumerate(rewritten)], tied
+
+
+def test_the_benign_answers_of_a_column_are_the_control_beside_its_harmful_pairs(settings):
+    bare = side("baseline", "hi-mixed", 2, 5)
+    answered, varied, tied = control("baseline", "hi-mixed", 1)
+    held = bare._replace(links=[*bare.links, *tied], parent_answers=answered, variant_answers=varied)
+
+    found = variants.build({"keep": {"baseline": held}}, settings)
+
+    assert [row.code for row in found.rows] == ["hi-mixed", "all-mixed"]
+    hindi, pooled = found.answers
+    assert (hindi.condition, hindi.column, hindi.code, hindi.language, hindi.rewrite) == (
+        "keep",
+        "baseline",
+        "hi-mixed",
+        "hi",
+        "codemixed",
+    )
+    assert (hindi.n_pairs, hindi.parent_failed, hindi.variant_failed) == (4, 0.0, 0.25)
+    assert (hindi.parent_tokens, hindi.variant_tokens) == (40.0, 94.0)
+    assert (pooled.code, pooled.language, pooled.n_pairs) == ("all-mixed", None, 4)
+    assert variants.VariantTables.model_validate_json(found.model_dump_json(by_alias=True)) == found
+    shown = variants.render(found)
+    assert "| hi-mixed | 4 | 0.0% | 25.0% | 40 | 94 |" in shown and "empty or cut off" in shown
+
+    # without stored answers there is no control to show
+    alone = variants.build({"keep": {"baseline": bare}}, settings)
+    assert alone.answers == [] and "empty or cut off" not in variants.render(alone)
+
+
+def variants_record(column, run_id, notes=("sets: variants",), revision=None, commit=REVISION, repo=None, **changes):
+    """A generate run of ``column`` over the variant prompts at ``commit``."""
+    inputs = [
+        Ref(kind="model", repo=repo or REFS[column][0], revision=revision or REFS[column][1]),
+        Ref(kind="dataset", repo="owner/eval", revision="6" * 40),
+        Ref(kind="dataset", repo="owner/eval", revision=commit),
+    ]
+    kind = changes.pop("kind", "generate")
+    return run_record(kind, column, run_id=run_id, inputs=inputs, notes=list(notes), **changes)
+
+
+def test_a_table_of_the_other_fine_tune_takes_its_runs_alone_and_names_it(settings):
+    other = f"{REFS['drifted'][0]}-nopre"
+    records = [variants_record("drifted", "generate-full-1"), variants_record("drifted", "generate-full-2", repo=other)]
+
+    usual = variants.sources(records, settings, "full", fine_tune="standard")
+    apart = variants.sources(records, settings, "full", fine_tune="aggressive")
+
+    assert usual["drifted"].checkpoint == CHECKPOINTS["drifted"]
+    assert apart["drifted"].checkpoint == f"{other}@{REFS['drifted'][1]}"
+    # unnamed, the later run of either fine-tune is the column
+    assert variants.sources(records, settings, "full") == apart
+    sides = {"keep": {"drifted": side("drifted", "hi-Latn", 1, 1)}}
+    assert variants.build(sides, settings).fine_tune == "standard"
+    built = variants.build(sides, settings, fine_tune="aggressive")
+    assert built.fine_tune == "aggressive" and built.columns == {"drifted": "aggressive fine-tune"}
+    assert "### Aggressive fine-tune" in variants.render(built)
+
+
 def test_the_latest_ok_variants_run_of_the_mode_and_condition_names_what_each_column_read(settings):
-    def run(column, run_id, notes=("sets: variants",), revision=None, commit=REVISION, **changes):
-        repo, pinned = REFS[column]
-        inputs = [
-            Ref(kind="model", repo=repo, revision=revision or pinned),
-            Ref(kind="dataset", repo="owner/eval", revision="6" * 40),
-            Ref(kind="dataset", repo="owner/eval", revision=commit),
-        ]
-        kind = changes.pop("kind", "generate")
-        return run_record(kind, column, run_id=run_id, inputs=inputs, notes=list(notes), **changes)
+    run = variants_record
 
     records = [
         run("drifted", "generate-full-1", revision="9" * 40, commit="d" * 40),

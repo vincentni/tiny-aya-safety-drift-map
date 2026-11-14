@@ -1598,45 +1598,69 @@ def test_a_smoke_breakdown_keeps_to_its_own_tree_and_one_that_cannot_be_uploaded
     assert (local / "breakdown.json").exists()
 
 
-def variant_prompts(world, code, count):
-    """Put ``count`` variant prompts of the harmful set on the fake Hub, tied to their parents; the commit they make."""
+def variant_prompts(world, code, count, sets=("harmful",)):
+    """Put ``count`` variant prompts of each set on the fake Hub, tied to their parents; the commit they make."""
     parent = code.partition("-")[0]
-    rows = [
-        {
-            "prompt_id": f"variant-{code}-{index:03d}",
-            "parent_prompt_id": fake_labels.prompt_ids("harmful", parent, index + 1)[-1],
-            "parent_language": parent,
-            "language": code,
-            "set": "harmful",
-            "prompt": f"placeholder variant prompt {index:03d}",
-        }
-        for index in range(count)
-    ]
-    path = ids.variant_prompts("harmful", code)
-    return world.hub.upload_file(path_or_fileobj=jsonl(rows), path_in_repo=path, repo_id=EVAL, repo_type="dataset").oid
+    for name in sets:
+        rows = [
+            {
+                "prompt_id": f"variant-{name}-{code}-{index:03d}",
+                "parent_prompt_id": fake_labels.prompt_ids(name, parent, index + 1)[-1],
+                "parent_language": parent,
+                "language": code,
+                "set": name,
+                "prompt": f"placeholder variant prompt {index:03d}",
+            }
+            for index in range(count)
+        ]
+        path = ids.variant_prompts(name, code)
+        made = world.hub.upload_file(path_or_fileobj=jsonl(rows), path_in_repo=path, repo_id=EVAL, repo_type="dataset")
+    return made.oid
 
 
-def variants_run(world, column, commit, harmful, code="hi-Latn", mode="full", preamble="keep", **changed):
-    """Record a run of ``column`` over the variants at ``commit``; store its four labels, ``harmful`` of them so."""
-    checkpoint = fake_labels.CHECKPOINTS[column]
+def variants_run(
+    world, column, commit, harmful, code="hi-Latn", mode="full", preamble="keep", cut=None, checkpoint=None, **changed
+):
+    """Record a run of ``column`` over the variants at ``commit``; store its four labels, ``harmful`` of them so.
+
+    With ``cut``, its benign answers to the parents and the variants are stored too, that many to a variant cut off.
+    """
+    changes = {"checkpoint": checkpoint} if checkpoint else {}
+    slug = ids.slug(checkpoint or fake_labels.CHECKPOINTS[column])
     rows = [
         fake_labels.label(
             column,
             code,
             index,
             harm="yes" if index < harmful else "no",
-            **{"prompt_id": f"variant-{code}-{index:03d}", **changed.get(str(index), {})},
+            **{"prompt_id": f"variant-harmful-{code}-{index:03d}", **changes, **changed.get(str(index), {})},
         )
         for index in range(4 if harmful is not None else 0)
     ]
     data = "".join(row.model_dump_json(by_alias=True) + "\n" for row in rows).encode()
-    path = ids.labels_path(ids.slug(checkpoint), code, mode, preamble=preamble, variants=True)
+    path = ids.labels_path(slug, code, mode, preamble=preamble, variants=True)
     if rows:
         world.hub.upload_file(path_or_fileobj=data, path_in_repo=path, repo_id=EVAL, repo_type="dataset")
+    if RESPONSES not in world.hub.repos:
+        world.hub.add_repo(RESPONSES, repo_type="dataset")
+    if cut is not None:
+        parent = code.partition("-")[0]
+        asked = [fake_labels.label(column, parent, index, set_="benign", **changes) for index in range(4)]
+        named = [{"prompt_id": f"variant-benign-{code}-{index:03d}", **changes} for index in range(4)]
+        again = [fake_labels.label(column, code, index, set_="benign", **named[index]) for index in range(4)]
+        answers = {
+            ids.responses_path(slug, "benign", parent, mode, preamble): [fake_breakdown.answer(row) for row in asked],
+            ids.responses_path(slug, "benign", code, mode, preamble, variants=True): [
+                fake_breakdown.answer(row, cut=index < cut) for index, row in enumerate(again)
+            ],
+        }
+        for at, stored_rows in answers.items():
+            said = judge_world.jsonl(stored_rows)
+            world.hub.upload_file(path_or_fileobj=said, path_in_repo=at, repo_id=RESPONSES, repo_type="dataset")
     notes = [*([f"preamble: {preamble}"] if preamble != "keep" else []), "sets: variants"]
     inputs = [Ref(kind="dataset", repo=EVAL, revision=revision) for revision in ("6" * 40, "6" * 40, commit)]
-    run_id = f"generate-{mode}-{column}-{preamble}-variants"
-    return generated(world, column, run_id=run_id, mode=mode, notes=notes, inputs=inputs)
+    run_id = f"generate-{mode}-{column}-{preamble}-variants{'-other' if checkpoint else ''}"
+    return generated(world, column, checkpoint, run_id=run_id, mode=mode, notes=notes, inputs=inputs)
 
 
 def test_table_variants_pairs_each_columns_variants_with_their_parents_writes_prints_and_uploads(world):
@@ -1704,7 +1728,7 @@ def test_table_variants_refuses_without_a_variants_run_its_labels_or_its_prompts
     gone = run("table", "variants")
     assert gone.exit_code == 1 and f"{EVAL} could not be read" in gone.stderr
     untied = world.hub.upload_file(
-        path_or_fileobj=jsonl([{"prompt_id": "variant-hi-Latn-000", "language": "hi-Latn"}]),
+        path_or_fileobj=jsonl([{"prompt_id": "variant-harmful-hi-Latn-000", "language": "hi-Latn"}]),
         path_in_repo=ids.variant_prompts("harmful", "hi-Latn"),
         repo_id=EVAL,
         repo_type="dataset",
@@ -1740,6 +1764,74 @@ def test_a_smoke_variants_table_keeps_to_its_own_tree_and_one_that_cannot_be_upl
     kept = run("table", "variants", "--mode", "smoke")
     assert kept.exit_code == ExitCode.PUSH_FAILED and "run the command again" in kept.stderr
     assert "variants.json and variants.md are in .run-local/results/smoke/tables" in kept.stderr
+
+
+def test_the_variants_table_carries_the_benign_control_and_feeds_the_script_variant_figure(world, tmp_path):
+    evaluation(world, {"baseline": 1, "drifted": 0})
+    commit = variant_prompts(world, "hi-Latn", 4, sets=("benign", "harmful"))
+    variants_run(world, "baseline", commit, 3, cut=1)
+    variants_run(world, "drifted", commit, 1, cut=0)
+
+    built = run("table", "variants")
+
+    assert built.exit_code == 0, built.output
+    folder = world.root / TABLES_DIR
+    found = VariantTables.model_validate_json((folder / "variants.json").read_bytes())
+    control = {(row.column, row.code): (row.n_pairs, row.parent_failed, row.variant_failed) for row in found.answers}
+    assert control == {
+        ("baseline", "hi-Latn"): (4, 0.0, 0.25),
+        ("baseline", "all-Latn"): (4, 0.0, 0.25),
+        ("drifted", "hi-Latn"): (4, 0.0, 0.0),
+        ("drifted", "all-Latn"): (4, 0.0, 0.0),
+    }
+    assert "| hi-Latn | 4 | 0.0% | 25.0% | 40 | 94 |" in built.output
+
+    # the figure is drawn from the file as the verb wrote it
+    dump(published.two_column_tables(tmp_path, world.settings), folder / "tables.json")
+    dump(fake_breakdown.two_conditions(tmp_path, world.settings), folder / "breakdown.json")
+    drawn = run("figures")
+    assert drawn.exit_code == 0, drawn.output
+    assert "docs/figures/f7_script_variants.png" in drawn.output.splitlines()
+    assert "not drawn: f7_script_variants" not in drawn.output
+    assert (world.root / "docs" / "figures" / "f7_script_variants.png").stat().st_size > 2000
+
+
+def test_the_variants_of_the_other_fine_tune_are_tabled_in_a_file_of_their_own(world, tmp_path):
+    evaluation(world, {"baseline": 1, "drifted": 0})
+    trained = fake_labels.CHECKPOINTS["drifted"].replace("@", "-nopre@")
+    put_labels(world, fake_labels.column_rows("drifted", unsafe=0, checkpoint=trained))
+    commit = variant_prompts(world, "hi-Latn", 4)
+    variants_run(world, "baseline", commit, 2)
+    variants_run(world, "drifted", commit, 1)
+    variants_run(world, "drifted", commit, 4, checkpoint=trained)
+
+    assert run("table", "variants").exit_code == 0
+    apart = run("table", "variants", "--fine-tune", "aggressive")
+
+    assert apart.exit_code == 0, apart.output
+    assert apart.output.splitlines()[:3] == ["verb      table variants", "mode      full", "fine-tune aggressive"]
+    local = world.root / TABLES_DIR
+    names = ("variants.json", "variants-aggressive.json")
+    usual, other = (VariantTables.model_validate_json((local / name).read_bytes()) for name in names)
+    assert (usual.fine_tune, usual.columns["drifted"]) == ("standard", "fine-tuned")
+    assert (other.fine_tune, other.columns["drifted"]) == ("aggressive", "aggressive fine-tune")
+
+    def tuned(tables):
+        (source,) = [source for source in tables.sources if source.column == "drifted"]
+        (row,) = [row for row in tables.rows if (row.column, row.code) == ("drifted", "hi-Latn")]
+        return source.checkpoint, row.variant
+
+    assert tuned(usual) == (fake_labels.CHECKPOINTS["drifted"], 0.25) and tuned(other) == (trained, 1.0)
+    assert "### Aggressive fine-tune" in apart.output
+    for name in ("variants.json", "variants.md", "variants-aggressive.json", "variants-aggressive.md"):
+        assert stored(world, f"tables/{name}") == (local / name).read_bytes()
+
+    # the figures of that fine-tune read its own file
+    dump(published.two_column_tables(tmp_path, world.settings), local / "tables-aggressive.json")
+    dump(fake_breakdown.two_conditions(tmp_path, world.settings), local / "breakdown-aggressive.json")
+    drawn = run("figures", "--fine-tune", "aggressive")
+    assert drawn.exit_code == 0, drawn.output
+    assert "docs/figures-aggressive/f7_script_variants.png" in drawn.output.splitlines()
 
 
 # the script variants and the safety patch have no data in the stored files
