@@ -51,11 +51,11 @@ from driftmap.data import build as data_build
 from driftmap.jobs import launcher, readiness
 from driftmap.jobs.client import HfJobsClient
 from driftmap.jobs.kinds import State
-from driftmap.jobs.ledger import Ledger, pending_line
+from driftmap.jobs.ledger import Ledger
 from driftmap.jobs.plan import build_plan, pins
 from driftmap.jobs.readiness import ITEMS, READY_PATH, Check, Item, ReadyReport
 from driftmap.jobs.snapshot import DECISION_PATH, LOCAL, SMOKE_DIR, TABLES_PATH, Deps
-from driftmap.judge import reparse
+from driftmap.judge import closed, reparse
 from driftmap.table import build as table_build
 from driftmap.table import render
 from driftmap.table.build import NOT_COMPARABLE
@@ -105,11 +105,11 @@ def flat(result):
 
 def judge_config(settings):
     return JudgeConfig(
-        repo=settings.judge.repo,
-        revision=settings.judge.revision,
-        dtype="bfloat16",
-        decoding=Decoding(runtime="transformers"),
-        prompt_format="polyguard-v1",
+        repo=settings.judge.closed.name,
+        revision="n/a",
+        dtype="n/a",
+        decoding=Decoding(greedy=False, runtime="api"),
+        prompt_format="rubric-v1",
         parser_version="1",
         config_hash="h",
     )
@@ -264,7 +264,7 @@ def test_help_lists_every_verb():
     assert result.exit_code == 0 and all(f" {verb} " in result.output for verb in VERBS)
     names = ("data", "ledger", "table", "judge")
     groups = {name: sorted(typer.main.get_command(cli.app).commands[name].commands) for name in names}
-    assert groups == {"data": ["build"], "ledger": ["reconcile"], "table": ["build"], "judge": ["reparse"]}
+    assert groups == {"data": ["build"], "ledger": ["reconcile"], "table": ["build"], "judge": ["closed", "reparse"]}
     assert sorted(typer.main.get_command(cli.app).commands["decide"].commands) == ["drift"]
 
 
@@ -536,19 +536,19 @@ def test_launch_passes_its_flags_through_and_overrides_stay_off(world, monkeypat
 
     monkeypatch.setattr(launcher, "launch", launch)
     assert run("launch", "generate", *BASELINE).exit_code == 0
-    assert run("plan", "judge", "--mode", "full").exit_code == 0
+    assert run("plan", "steer", "--mode", "full").exit_code == 0
     argv = ["--mode", "full", "--wait", "--limit", "5", "--", "--checkpoint", "a/b@c"]
     assert run("launch", "quant_eval", *argv).exit_code == 0
 
     off = {"override_smoke": False, "override_soft": False}
     plain = {"wait": False, "dry_run": False, "limit": None, "args": ["--kind", "baseline"], **off}
     assert seen[0] == ("generate", "smoke", plain, "Ledger", world.root, world.hub)
-    assert seen[1][:3] == ("judge", "full", {"dry_run": True})
+    assert seen[1][:3] == ("steer", "full", {"dry_run": True})
     full = {"wait": True, "dry_run": False, "limit": 5, "args": ["--checkpoint", "a/b@c"], **off}
     assert seen[2][:3] == ("quant_eval", "full", full)
 
 
-def test_generate_and_judge_need_their_job_arguments(world, monkeypatch):
+def test_generate_needs_its_job_argument_and_no_judge_job_can_be_launched(world, monkeypatch):
     seen = []
     monkeypatch.setattr(launcher, "launch", lambda settings, deps, kind, mode, **flags: seen.append(flags["args"]))
     with monkeypatch.context() as patch:
@@ -557,17 +557,15 @@ def test_generate_and_judge_need_their_job_arguments(world, monkeypatch):
             missing = run("launch", *argv)
             assert missing.exit_code == 2, argv
             assert "driftmap launch generate --mode smoke -- --kind baseline|drifted|repaired" in flat(missing)
-        for given in ([], ["--checkpoint", f"{AYA}@{SHA}"], ["--generation", "generate-full-20261106T100000Z"]):
-            missing = run("launch", "judge", "--mode", "full", "--", *given)
-            assert missing.exit_code == 2, given
-            assert "driftmap launch judge --mode full -- --checkpoint REPO@SHA --generation RUN_ID" in flat(missing)
+        checkpoint = ["--checkpoint", f"{AYA}@{SHA}"]
+        for argv in (["judge"], ["judge", "--", *checkpoint], ["generate", "--after", "x", *BASELINE]):
+            assert run("launch", *argv).exit_code == 2, argv
+        assert run("plan", "judge").exit_code == 2
     assert seen == []
 
-    judge = ["--checkpoint", f"{AYA}@{SHA}", "--generation=generate-full-20261106T100000Z"]
-    assert run("launch", "judge", "--mode", "full", "--", *judge).exit_code == 0
     assert run("launch", "generate", "--", "--kind=drifted").exit_code == 0
     assert run("launch", "drift").exit_code == 0
-    assert seen == [judge, ["--kind=drifted"], []]
+    assert seen == [["--kind=drifted"], []]
 
 
 def test_job_arguments_cannot_restate_what_the_launcher_sets_or_carry_a_secret(world, monkeypatch):
@@ -765,33 +763,22 @@ def screen(settings, status):
 
 def reader(world, mode="full", target=None):
     deps = Deps(client=None, hub=Hub(world.hub), ledger=world.ledger, repo_root=world.root)
-    job_args = {}
-    return cli._state(world.settings, deps, mode, target, job_args), job_args
-
-
-def followed(world, kind, stamp, mode="full"):
-    """A job line as a launch of this chain leaves it; returns its run id."""
-    now = datetime.strptime(stamp, "%Y%m%dT%H%M%SZ").replace(tzinfo=UTC)
-    plan = build_plan(world.settings, kind, mode, None, SHA, now=now, repo_root=world.root)
-    line = pending_line(plan, f"job-{stamp}", now, "settings")
-    world.ledger.append(line)
-    return line.run_id
+    return cli._state(world.settings, deps, mode, target)
 
 
 def test_the_chain_reader_takes_state_from_the_results_repo(world):
     settings = world.settings
-    earlier = followed(world, "generate", "20261106T100000Z")
-    read, job_args = reader(world)
+    read = reader(world)
     bare = State(languages=tuple(settings.languages), checkpoint="drifted")
     assert read("generate") == bare
-    assert reader(world, target="baseline")[0]("generate").checkpoint == "baseline"
+    assert reader(world, target="baseline")("generate").checkpoint == "baseline"
 
     world.push_record("drift-full-20261105T120000Z", config_hash="0" * 64, merged_sha256="a" * 64)
     world.push_record("drift-smoke-20261105T090000Z", merged_sha256="b" * 64)
     world.push_record("drift-full-20261105T100000Z", merged_sha256="c" * 64)
     world.push_record("drift-full-20261105T110000Z", merged_sha256="d" * 64)
     world.push_record("drift-full-20261106T100000Z", "failed")
-    world.push_record(earlier)
+    world.push_record("generate-full-20261106T100000Z")
     repaired = Ref(kind="model", repo=f"{OWNER}/tiny-aya-global-repaired", revision="7" * 40)
     world.push_record("repair-full-20261107T100000Z", outputs=[repaired])
     gguf = Ref(kind="model", repo=f"{OWNER}/tiny-aya-global-repaired-GGUF", revision="8" * 40)
@@ -807,10 +794,9 @@ def test_the_chain_reader_takes_state_from_the_results_repo(world):
         gguf_record=True,
         recover_status="failed",
     )
-    # an ok generate run this chain did not follow says nothing about its judge step
-    assert read("judge") == full and job_args == {}
+    assert read("quant") == full
     # the screen counts only beside an ok repair run of this mode and config
-    smoke = reader(world, "smoke")[0]("steer")
+    smoke = reader(world, "smoke")("steer")
     assert smoke == State(languages=tuple(settings.languages), checkpoint="drifted", merged_sha256="b" * 64)
     world.push_record("repair-full-20261107T100000Z", config_hash="0" * 64, outputs=[repaired])
     assert read("steer").recover_status is None and read("quant").repaired_revision is None
@@ -819,54 +805,35 @@ def test_the_chain_reader_takes_state_from_the_results_repo(world):
     world.push("alpha_screen.json", b"{")
     assert read("steer").recover_status is None
 
-    for stamp, changes in (
-        ("20261109T100000Z", {"status": "partial"}),
-        ("20261109T110000Z", {"config_hash": "0" * 64}),
-        ("20261109T120000Z", {"inputs": [Ref(kind="dataset", repo=EVAL, revision="6" * 40)]}),
-    ):
-        world.push_record(followed(world, "generate", stamp), **changes)
-        assert read("judge").responses_complete is False and job_args == {}, stamp
-    followed(world, "generate", "20261109T130000Z", mode="smoke")
-    world.push_record("generate-smoke-20261109T130000Z")
-    assert read("judge").responses_complete is False
-    done = followed(world, "generate", "20261109T140000Z")
-    assert read("judge").responses_complete is False
-    world.push_record(done)
-    assert read("judge").responses_complete is True
-    assert job_args == {"judge": ["--checkpoint", f"{AYA}@{'1' * 40}", "--generation", done]}
 
 
-def test_chain_names_its_generate_target_and_hands_the_run_to_judge(world, monkeypatch):
+def test_chain_names_its_generate_target_and_takes_no_judge_step(world, monkeypatch):
     with monkeypatch.context() as patch:
         patch.setattr(cli, "load_settings", lambda path: pytest.fail("the config was read"))
         for argv, hint in (
-            (["generate", "judge"], "--target baseline|drifted|repaired"),
+            (["generate", "steer"], "--target baseline|drifted|repaired"),
             (["drift", "--target", "baseline"], "--target names the generate step"),
             (["generate", "generate", "--target", "baseline"], "one generate step"),
-            (["judge"], "driftmap launch judge --mode full -- --checkpoint REPO@SHA --generation RUN_ID"),
-            (["judge", "generate", "--target", "baseline"], "driftmap launch judge --mode full"),
+            (["judge"], "judge"),
+            (["generate", "judge", "--target", "baseline"], "judge"),
             (["generate", "--target", "merged"], "merged"),
         ):
             refused = run("chain", *argv)
             assert refused.exit_code == 2 and hint in flat(refused), argv
 
-    blocked = run("chain", "generate", "judge", "--target", "drifted")
+    blocked = run("chain", "generate", "steer", "--target", "drifted")
     assert blocked.exit_code == 4 and blocked.output.splitlines()[0].split() == ["verb", "chain"]
     assert "generate cannot run yet; missing: drift record with merged_sha256" in blocked.output
     repair = run("chain", "repair")
     assert repair.exit_code == 4 and "baseline labels for en, fr, es, ru, hi, ar" in repair.output
     assert world.submits() == []
 
-    for kind in ("generate", "judge"):
-        world.smoke_passed(kind)
-    done = run("chain", "generate", "judge", "--target", "baseline")
+    world.smoke_passed("generate")
+    done = run("chain", "generate", "--target", "baseline")
     assert done.exit_code == 0, done.output
-    first, second = world.submits()
-    assert "driftmap.scripts.generate --run-id generate-full-" in first and first.endswith(" --kind baseline")
-    (generated,) = {line.run_id for line in world.ledger.read().values() if line.kind == "generate"}
-    assert "driftmap.scripts.judge --run-id judge-full-" in second
-    assert second.endswith(f" --checkpoint {AYA}@{'1' * 40} --generation {generated}")
-    assert jobs_pending(world) == [False, False]
+    (only,) = world.submits()
+    assert "driftmap.scripts.generate --run-id generate-full-" in only and only.endswith(" --kind baseline")
+    assert jobs_pending(world) == [False]
 
 
 def test_chain_generates_the_drifted_target_once_its_drift_record_exists(world):
@@ -1170,9 +1137,8 @@ def test_table_build_names_the_file_it_cannot_read(world):
     assert "sft_train/en.jsonl:1" in run("table", "build").stderr
 
     del world.hub.repos[RESULTS]
-    for argv in (["table", "build"], ["launch", "judge", "--after", "generate-smoke-x"]):
-        gone = run(*argv)
-        assert gone.exit_code == 1 and f"{RESULTS} could not be read (RepositoryNotFoundError)" in gone.stderr
+    gone = run("table", "build")
+    assert gone.exit_code == 1 and f"{RESULTS} could not be read (RepositoryNotFoundError)" in gone.stderr
     for result in (torn, shaped, gone):
         assert "Traceback" not in result.output
 
@@ -1277,48 +1243,11 @@ def test_a_table_that_cannot_be_saved_is_not_shown_or_uploaded(world, monkeypatc
     assert "tables/tables.json" not in world.hub.repos[RESULTS]["main"]
 
 
-def test_launch_judge_takes_its_arguments_from_a_generate_run(world):
-    done = "generate-smoke-20261113T100000Z"
-    world.push_record(done)
-    world.push_record("generate-smoke-20261113T110000Z", "partial")
-    world.push_record("generate-full-20261113T120000Z")
-    world.push_record("steer-smoke-20261113T090000Z", inputs=[CHECKPOINT])
-    world.push_record("generate-smoke-20261113T130000Z", config_hash="0" * 64)
-    world.push_record("generate-smoke-20261113T140000Z", inputs=[Ref(kind="dataset", repo=EVAL, revision="6" * 40)])
-    derived = f"--checkpoint {AYA}@{'1' * 40} --generation {done}"
-
-    planned = run("launch", "judge", "--after", done, "--dry-run")
-    assert planned.exit_code == 0, planned.output
-    assert f"job-args  {derived}\n" in planned.output and f" {derived}\n" in planned.output.split("command")[1]
-
-    other = f"{OWNER}/tiny-aya-global-repaired@{'7' * 40}"
-    explicit = run("launch", "judge", "--after", done, "--dry-run", "--", "--judge", "smol", "--checkpoint", other)
-    assert explicit.exit_code == 0
-    assert f"job-args  --judge smol --checkpoint {other} --generation {done}\n" in explicit.output
-
-    for run_id, reason in (
-        ("generate-smoke-20261113T110000Z", "ended partial"),
-        ("generate-full-20261113T120000Z", "is a full"),
-        ("steer-smoke-20261113T090000Z", "steer run"),
-        ("generate-smoke-20261101T000000Z", "no record"),
-        ("generate-smoke-20261113T130000Z", "another configuration"),
-        ("generate-smoke-20261113T140000Z", "generate run that ended ok"),
-        ("", "no record"),
-    ):
-        refused = run("launch", "judge", "--after", run_id)
-        assert refused.exit_code == 2 and reason in refused.stderr, run_id
-    assert run("launch", "generate", "--after", done, *BASELINE).exit_code == 2
-    assert world.submits() == []
-
-    assert run("launch", "judge", "--after", done).exit_code == 0
-    assert world.submits()[0].endswith(f" {derived}")
-
-
-def test_judge_reparse_hands_the_checkpoint_and_the_configured_parser_to_the_library(world, monkeypatch):
+def test_judge_reparse_hands_the_checkpoint_to_the_library(world, monkeypatch):
     seen = []
 
-    def reparsed(hub, labels_repo, raw_repo, checkpoint, parser_version, mode):
-        seen.append((hub._api, labels_repo, raw_repo, checkpoint, parser_version, mode))
+    def reparsed(hub, labels_repo, raw_repo, checkpoint, mode):
+        seen.append((hub._api, labels_repo, raw_repo, checkpoint, mode))
         return [] if mode == "smoke" else ["labels/x/superseded/h/en.jsonl", "labels/x/en.jsonl"]
 
     monkeypatch.setattr(reparse, "reparse_checkpoint", reparsed)
@@ -1331,7 +1260,7 @@ def test_judge_reparse_hands_the_checkpoint_and_the_configured_parser_to_the_lib
     same = run("judge", "reparse", "--checkpoint", checkpoint, "--mode", "smoke")
     assert same.exit_code == 0 and "nothing to rewrite" in same.output
     responses = f"{OWNER}/safety-drift-map-responses"
-    assert seen == [(world.hub, EVAL, responses, checkpoint, "1", mode) for mode in ("full", "smoke")]
+    assert seen == [(world.hub, EVAL, responses, checkpoint, mode) for mode in ("full", "smoke")]
 
     for bad in (AYA, "not a reference", f"{AYA}@{'1' * 40}#file"):
         assert run("judge", "reparse", "--checkpoint", bad).exit_code == 2
@@ -1340,6 +1269,115 @@ def test_judge_reparse_hands_the_checkpoint_and_the_configured_parser_to_the_lib
     other = f"{AYA}@{'9' * 40}"
     unread = run("judge", "reparse", "--checkpoint", other, "--mode", "smoke")
     assert unread.exit_code == 2 and f"no labels for {other} in the smoke tree" in unread.stderr and len(seen) == 2
+
+
+ROUTE = "gateway-x/model-9"
+
+
+def test_judge_closed_hands_its_options_to_the_library_and_never_shows_the_route(world, monkeypatch):
+    seen = []
+
+    class Client:
+        prompt_tokens, completion_tokens = 1400, 140
+
+    def judged(settings, hub, client, checkpoint, **options):
+        options.pop("echo")("harmful/en   scored 10  unscored 0  safe 7  refused 6  new 10")
+        seen.append((hub._api, type(client), checkpoint, options))
+
+    monkeypatch.setattr(closed, "judge_checkpoint", judged)
+    monkeypatch.setattr(closed, "LiteLLMCompleter", lambda route: seen.append(route) or Client())
+    monkeypatch.setenv(closed.ROUTE_ENV, ROUTE)
+    checkpoint = f"{OWNER}/tiny-aya-global-repaired-GGUF@{'2' * 40}#model-q4_k_m.gguf"
+    (world.root / READY_PATH).unlink()
+
+    done = run("judge", "closed", "--checkpoint", checkpoint)
+
+    assert done.exit_code == 0 and done.output.splitlines()[0].split() == ["verb", "judge", "closed"]
+    defaults = {"sets": ["harmful", "xstest"], "mode": "smoke", "concurrency": 4, "limit": None}
+    defaults["retry_unscored"] = False
+    assert seen == [ROUTE, (world.hub, Client, checkpoint, defaults)]
+    assert "judge     closed-model-a under rubric-v1 (" in done.output
+    assert "scored 10" in done.output and "tokens    1400 in, 140 out" in done.output
+    assert ROUTE not in done.output and "gateway" not in done.output
+
+    options = ["--mode", "full", "--sets", "xstest", "--concurrency", "2", "--limit", "5", "--retry-unscored"]
+    assert run("judge", "closed", "--checkpoint", f"{AYA}@{'1' * 40}", *options).exit_code == 0
+    passed = {"sets": ["xstest"], "mode": "full", "concurrency": 2, "limit": 5, "retry_unscored": True}
+    assert seen[-1][2:] == (f"{AYA}@{'1' * 40}", passed)
+
+
+def test_judge_closed_takes_a_rows_path_in_place_of_a_checkpoint(world, monkeypatch):
+    seen = []
+
+    class Client:
+        prompt_tokens, completion_tokens = 0, 0
+
+    monkeypatch.setattr(closed, "judge_checkpoint", lambda *args, **options: pytest.fail("the checkpoint form ran"))
+    monkeypatch.setattr(closed, "judge_rows", lambda settings, hub, client, pattern, **options: seen.append(
+        (hub._api, pattern, {name: value for name, value in options.items() if name != "echo"})
+    ))
+    monkeypatch.setattr(closed, "LiteLLMCompleter", lambda route: Client())
+    monkeypatch.setenv(closed.ROUTE_ENV, ROUTE)
+    path = "screen/tiny-aya-global-drift-merged--444444444444/alpha-*.jsonl"
+
+    done = run("judge", "closed", "--rows", path, "--mode", "full", "--limit", "40", "--retry-unscored")
+
+    assert done.exit_code == 0 and f"rows      {path}" in done.output and "checkpoint" not in done.output
+    assert seen == [(world.hub, path, {"mode": "full", "concurrency": 4, "limit": 40, "retry_unscored": True})]
+    for bad in (
+        ["--rows", path, "--checkpoint", f"{AYA}@{'1' * 40}"],
+        ["--rows", path, "--sets", "harmful"],
+        ["--rows", f"smoke/{path}"],
+        ["--rows", "screen/../labels/x.jsonl"],
+        ["--rows", "/screen/x.jsonl"],
+        ["--rows", "screen/x/alpha-0.1.json"],
+    ):
+        assert run("judge", "closed", *bad).exit_code == 2, bad
+    assert len(seen) == 1
+
+
+def test_judge_closed_refuses_bad_options_a_missing_route_and_a_missing_section(world, monkeypatch):
+    monkeypatch.setattr(closed, "judge_checkpoint", lambda *args, **options: pytest.fail("the library was called"))
+    checkpoint = ["--checkpoint", f"{AYA}@{'1' * 40}"]
+    monkeypatch.setenv(closed.ROUTE_ENV, ROUTE)
+    for bad in (
+        ["--checkpoint", AYA],
+        ["--checkpoint", "not a reference"],
+        [*checkpoint, "--sets", "benign"],
+        [*checkpoint, "--sets", ","],
+        [*checkpoint, "--concurrency", "0"],
+        [*checkpoint, "--concurrency", "64"],
+        [*checkpoint, "--limit", "0"],
+        [*checkpoint, "--mode", "fast"],
+        [],
+    ):
+        assert run("judge", "closed", *bad).exit_code == 2, bad
+
+    monkeypatch.delenv(closed.ROUTE_ENV)
+    unset = run("judge", "closed", *checkpoint)
+    assert unset.exit_code == 2 and closed.ROUTE_ENV in flat(unset)
+
+    monkeypatch.setenv(closed.ROUTE_ENV, ROUTE)
+    World(monkeypatch, world.root, hub=world.hub, judge={"closed": None})
+    absent = run("judge", "closed", *checkpoint)
+    assert absent.exit_code == 2 and "[judge.closed]" in flat(absent) and ROUTE not in absent.output
+
+
+def test_a_throttled_closed_judge_run_exits_4_with_its_message_and_the_token_count(world, monkeypatch):
+    class Client:
+        prompt_tokens, completion_tokens = 700, 70
+
+    def throttled(*args, **options):
+        raise closed.Throttled("the judge route is throttling or out of quota; run the command again")
+
+    monkeypatch.setattr(closed, "judge_checkpoint", throttled)
+    monkeypatch.setattr(closed, "LiteLLMCompleter", lambda route: Client())
+    monkeypatch.setenv(closed.ROUTE_ENV, ROUTE)
+
+    stopped = run("judge", "closed", "--checkpoint", f"{AYA}@{'1' * 40}")
+
+    assert stopped.exit_code == 4 and "throttling or out of quota; run the" in flat(stopped)
+    assert "tokens    700 in, 70 out" in stopped.output and ROUTE not in stopped.output
 
 
 def test_status_shows_spend_pending_jobs_and_the_latest_runs_without_writing(world):

@@ -22,7 +22,6 @@ BATCH = "(set, language)"
 KINDS: dict[str, Kind] = {
     "drift": _kind("drift", ("model", "eval"), "step"),
     "generate": _kind("generate", ("model", "merged", "repaired", "eval"), BATCH),
-    "judge": _kind("judge", ("responses", "eval"), "language"),
     "repair": _kind("repair", ("model", "merged", "eval", "responses"), "alpha"),
     "steer": _kind("steer", ("merged", "eval"), BATCH),
     "quant": _kind("quant", ("repaired",), None, gpu=False),
@@ -38,7 +37,6 @@ class State:
     # the generate target: baseline, drifted or repaired
     checkpoint: str = "baseline"
     merged_sha256: str | None = None
-    responses_complete: bool = False
     baseline_labels: frozenset[str] = frozenset()
     screen_responses: bool = False
     repaired_revision: str | None = None
@@ -53,8 +51,6 @@ def prerequisites(kind: str, state: State) -> list[str]:
     missing = []
     if kind == "generate" and state.checkpoint == "drifted" and not state.merged_sha256:
         missing.append("drift record with merged_sha256")
-    if kind == "judge" and not state.responses_complete:
-        missing.append("complete harmful and xstest responses for the checkpoint")
     if kind == "repair":
         unlabelled = [code for code in state.languages if code not in state.baseline_labels]
         if unlabelled or not state.languages:

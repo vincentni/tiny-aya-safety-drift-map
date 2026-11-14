@@ -11,7 +11,6 @@ READY = State(
     languages=LANGUAGES,
     checkpoint="drifted",
     merged_sha256="ab" * 32,
-    responses_complete=True,
     baseline_labels=frozenset(LANGUAGES),
     screen_responses=True,
     repaired_revision="0123456789abcdef0123456789abcdef01234567",
@@ -20,8 +19,8 @@ READY = State(
 )
 
 
-def test_table_covers_the_seven_kinds():
-    assert set(KINDS) == set(get_args(JobKind))
+def test_table_covers_every_kind_but_the_one_only_stored_records_name():
+    assert set(KINDS) == set(get_args(JobKind)) - {"judge"}
     assert {kind for kind, row in KINDS.items() if not row.gpu} == {"quant"}
     assert all(row.module == f"driftmap.scripts.{kind}" and row.image == "pytorch" for kind, row in KINDS.items())
     assert {kind for kind, row in KINDS.items() if "model" in row.reads} == {"drift", "generate", "repair"}
@@ -34,7 +33,6 @@ def test_table_covers_the_seven_kinds():
     ("kind", "missing", "named"),
     [
         ("generate", {"merged_sha256": None}, "merged_sha256"),
-        ("judge", {"responses_complete": False}, "responses"),
         ("repair", {"baseline_labels": frozenset(LANGUAGES[:4])}, "baseline labels for hi, ar"),
         ("repair", {"languages": ()}, "baseline labels"),
         ("repair", {"screen_responses": False}, "screen"),
@@ -54,9 +52,10 @@ def test_nothing_on_the_hub_blocks_all_but_drift_and_baseline():
     assert prerequisites("drift", empty) == []
     assert prerequisites("generate", empty) == []
     assert len(prerequisites("repair", empty)) == 2
-    assert all(prerequisites(kind, empty) for kind in ("judge", "repair", "quant", "quant_eval", "steer"))
-    with pytest.raises(KeyError):
-        prerequisites("train", empty)
+    assert all(prerequisites(kind, empty) for kind in ("repair", "quant", "quant_eval", "steer"))
+    for unknown in ("train", "judge"):
+        with pytest.raises(KeyError):
+            prerequisites(unknown, empty)
 
 
 def test_steer_needs_a_failed_recovery_or_the_comparison_flag():

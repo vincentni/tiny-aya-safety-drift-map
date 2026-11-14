@@ -49,7 +49,7 @@ RELEASED = "RELEASED"
 GONE = "GONE"
 # a younger hold stays: the job list can trail a submit
 HOLD_GRACE = timedelta(minutes=15)
-FAILED_EXITS = (ExitCode.INTEGRITY, ExitCode.COLUMN_FAILED, ExitCode.JUDGE_INSPECT_STOP)
+FAILED_EXITS = (ExitCode.INTEGRITY, ExitCode.COLUMN_FAILED)
 # an install or an image pull fails well inside this
 SETUP_MAX_S = 900
 SETUP_FAILURE = re.compile(
@@ -67,11 +67,10 @@ PINNED_FILES = ("pyproject.toml", "uv.lock", "driftmap.toml", "revisions.json")
 OOM_LADDER = {
     "drift": "set [batch] drift x drift_accum to the next rung: 4 x 4 -> 2 x 8 -> 1 x 16",
     "generate": "halve [batch] generate: 16 -> 8 -> 4",
-    "judge": "halve [batch] judge: 16 -> 8 -> 4",
     "repair": "halve [batch] screen: 8 -> 4, then pass --alphas one value per job",
 }
 NO_RUNG = "no batch rung is defined for this kind; lower its memory use"
-HOST_RAM_RUNG = "host memory is the suspect: run repair with --alphas one value per job and set [batch] judge = 4"
+HOST_RAM_RUNG = "host memory is the suspect: run repair with --alphas one value per job"
 
 
 class _OneRead(Ledger):
@@ -173,7 +172,9 @@ def launch(
             print("nothing was submitted")
             return ExitCode.GUARD_REFUSAL
         # a job the ledger still holds may not be listed yet
-        held = [line.job_id for line in last.values() if line.pending and KINDS[line.kind].gpu]
+        # a kind this code no longer launches counts as a GPU job
+        cpu = {kind for kind, spec in KINDS.items() if not spec.gpu}
+        held = [line.job_id for line in last.values() if line.pending and line.kind not in cpu]
         code_sha = _head(deps)
         snapshot = take_snapshot(
             settings, deps.client, deps.hub, ledger, deps.repo_root, code_sha=code_sha, run=deps.run

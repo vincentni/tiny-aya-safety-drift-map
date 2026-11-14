@@ -181,10 +181,23 @@ def _judge(column: str, rows: list[LabelRow], settings: Settings, mode: Mode) ->
         names = ", ".join(sorted(judge.config_hash for judge in configs.values()))
         raise DriftmapError(ExitCode.INTEGRITY, f"{column} mixes judge configs {names}")
     judge = next(iter(configs.values()), None)
-    if judge and mode == "full" and judge.repo != settings.judge.repo:
-        expected = f"a full table takes {settings.judge.repo} only"
-        raise DriftmapError(ExitCode.INTEGRITY, f"{column} was judged by {judge.repo}; {expected}")
+    closed = settings.judge.closed
+    named = (closed.name, closed.rubric) if closed else None
+    if judge and mode == "full" and (judge.repo, judge.prompt_format) != named:
+        expected = f"{closed.name} under {closed.rubric}" if closed else "the judge named under [judge.closed]"
+        found = f"{column} was judged by {judge.repo} under {judge.prompt_format}"
+        raise DriftmapError(ExitCode.INTEGRITY, f"{found}; a full table takes labels of {expected} only")
     return judge
+
+
+def _one_judge(judges: Mapping[str, JudgeConfig | None]) -> None:
+    """Refuse a table whose columns were scored under different judge configs: their rates do not compare."""
+    found = {column: judge for column, judge in judges.items() if judge}
+    if len({judge.config_hash for judge in found.values()}) > 1:
+        listed = ", ".join(f"{column} by {judge.repo} ({judge.config_hash[:12]})" for column, judge in found.items())
+        raise DriftmapError(
+            ExitCode.INTEGRITY, f"the columns were judged under different configs: {listed}; judge them with one judge"
+        )
 
 
 def _unscored(rows: list[LabelRow]) -> str | None:
@@ -216,7 +229,6 @@ def _difference(
     column: str,
     reference: str,
     columns: Mapping[str, list[LabelRow]],
-    judges: Mapping[str, JudgeConfig | None],
     generation: list[RunRecord],
     runs: list[RunRecord],
     mode: Mode,
@@ -234,8 +246,6 @@ def _difference(
     prefixes = [{row.rendered_prefix_sha256 for row in columns[name]} for name in (column, reference)]
     if prefixes[0] != prefixes[1]:
         return f"rendered prefix differs from {reference} (chat template or preamble)"
-    if judges[column] != judges[reference]:
-        return f"judge config differs from {reference}"
     return None
 
 
@@ -282,6 +292,7 @@ def build(
     recover = screens[-1].recover_status if screens else None
     columns, spare = _columns(_supported(_read(Path(labels_dir))), settings, recover == "chosen", mode)
     judges = {column: _judge(column, rows, settings, mode) for column, rows in columns.items()}
+    _one_judge(judges)
     judged = [column for column in COLUMNS if judges.get(column)]
     if not judged:
         raise DriftmapError(ExitCode.USAGE, f"no judged labels under {labels_dir}")
@@ -304,7 +315,7 @@ def build(
             absent = (not_run or {}).get(column, "no generation run recorded")
             name, reason = ("generated", "generated, not judged yet") if generated else ("not_run", absent)
         else:
-            differs = column != reference and _difference(column, reference, columns, judges, generation, runs, mode)
+            differs = column != reference and _difference(column, reference, columns, generation, runs, mode)
             unused = f"{spare[column]} has labels but is not tabled" if column in spare else None
             name = "not_comparable" if differs else "tabled"
             reason = "; ".join(filter(None, [differs, _unscored(rows), unused])) or None

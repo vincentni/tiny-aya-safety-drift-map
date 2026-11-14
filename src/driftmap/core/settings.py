@@ -17,6 +17,7 @@ from pydantic import (
     ConfigDict,
     Field,
     StrictInt,
+    StringConstraints,
     ValidationError,
     ValidationInfo,
     field_validator,
@@ -26,7 +27,7 @@ from pydantic_core import PydanticCustomError
 from driftmap.core.records import Bars, Ceilings, CommitSha, Dare, Sha256
 from driftmap.core.schemas import DriftmapError, ExitCode
 
-# the 17 languages PolyGuard was trained on
+# languages the labels have been checked in
 JUDGE_LANGUAGES = frozenset(
     {"ar", "zh", "cs", "nl", "en", "fr", "de", "hi", "th", "it", "ja", "ko", "pl", "pt", "ru", "es", "sv"}
 )
@@ -40,7 +41,7 @@ class ConfigError(DriftmapError):
 
 def _judged(code: str) -> str:
     if code not in JUDGE_LANGUAGES:
-        raise PydanticCustomError("judge_unsupported", "{code} is not a PolyGuard language", {"code": code})
+        raise PydanticCustomError("judge_unsupported", "{code} is not a language the judge is checked for", {"code": code})
     return code
 
 
@@ -144,7 +145,6 @@ class Timeouts(Section):
 
     drift: Positive
     generate: Positive
-    judge: Positive
     repair: Positive
     steer: Positive
     quant: Positive
@@ -162,6 +162,7 @@ class Batch(Section):
     drift: Positive = 4
     drift_accum: Positive = 4
     generate: Positive = 16
+    # read by no job; kept because the config hash of stored run records covers it
     judge: Positive = 16
     screen: Positive = 8
 
@@ -170,13 +171,24 @@ class DecodingDefaults(Section):
     max_new_tokens: Positive = 256
 
 
+class ClosedJudge(Section):
+    """The closed model that labels through an API: its public name and the rubric it answers under."""
+
+    name: Annotated[str, StringConstraints(min_length=1)]
+    rubric: Literal["rubric-v1"] = "rubric-v1"
+
+
 class Judge(Section):
+    """Only ``closed`` is read; the other keys stay because the config hash of stored run records covers them."""
+
     repo: str
     revision: CommitSha
     dtype: str
     parser_version: str
     smol_repo: str
     smol_revision: CommitSha
+    # left out of every dump, so of the config hash: its labels carry their own judge config
+    closed: ClosedJudge | None = Field(default=None, exclude=True)
 
 
 class Code(Section):

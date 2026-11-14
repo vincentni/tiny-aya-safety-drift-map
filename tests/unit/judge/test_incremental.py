@@ -11,25 +11,11 @@ from driftmap.judge.incremental import (
     judged_rows,
     pending,
     read_rows,
+    rebuilt,
     union,
 )
-from driftmap.judge.parser import ParsedLabels, parse
-from driftmap.judge.polyguard import judge_config
-from driftmap.table.build import build
-from tests.fakes.judge_model import (
-    CANONICAL,
-    EVAL,
-    JUDGE,
-    OWNER,
-    RESPONSES,
-    SAFE,
-    SLUG,
-    SMOL,
-    UNPARSEABLE,
-    JudgeWorld,
-    generation_rows,
-)
-from tests.fakes.labels import write_labels
+from driftmap.judge.rubric import ParsedLabels, judge_config, parse
+from tests.fakes.judge_world import CANONICAL, SAFE, UNPARSEABLE, generation_rows
 from tests.fakes.settings import settings_toml
 
 
@@ -94,8 +80,8 @@ def test_a_label_counts_only_while_its_stored_output_says_the_same(config):
     other_judge = raws[1].model_copy(update={"revision": "9" * 40})
     other_response = raws[2].model_copy(update={"response_sha256": "0" * 64})
     unparsed = raws[3].model_copy(update={"raw": UNPARSEABLE[2]})
-    refused = raws[5].model_copy(update={"raw": SAFE.replace("Response refusal: no", "Response refusal: yes")})
-    asked = raws[5].model_copy(update={"raw": SAFE.replace("Harmful request: no", "Harmful request: yes")})
+    refused = raws[5].model_copy(update={"raw": SAFE.replace('"refusal": "no"', '"refusal": "yes"')})
+    asked = raws[5].model_copy(update={"raw": SAFE.replace('"request_harm": "no"', '"request_harm": "yes"')})
     stored = [flipped_raws[0], other_judge, other_response, unparsed, refused]
 
     # a newer output with another verdict, another judge, another response, a lost parse, no output at all
@@ -116,27 +102,23 @@ def test_a_label_counts_only_while_its_stored_output_says_the_same(config):
     assert pending([silent], earlier, config.config_hash, raws=[]) == [silent]
 
 
-def test_a_smoke_judge_run_on_the_smoke_drift_checkpoint_builds_into_a_smoke_table(tmp_path, monkeypatch):
-    merged = f"{OWNER}/tiny-aya-global-drift-merged-smoke@{'a' * 40}"
-    world = JudgeWorld(tmp_path, monkeypatch, mode="smoke", checkpoint=merged)
+def test_a_missing_label_is_rebuilt_from_a_stored_answer_of_the_same_judge_and_response(config):
+    rows = generation_rows("harmful", "en", 6)
+    labels, raws = judged(rows, config, CANONICAL)
+    other_judge = raws[1].model_copy(update={"revision": "9" * 64})
+    other_response = raws[2].model_copy(update={"response_sha256": "0" * 64})
+    unparsed = raws[3].model_copy(update={"raw": UNPARSEABLE[0]})
 
-    assert world.run("--judge", "smol", run_id="judge-smoke-20261113T100000Z") == 0
+    # no answer is stored for the fifth row, and the sixth still has its label
+    found = rebuilt(rows, labels[5:], [raws[0], other_judge, other_response, unparsed, raws[5]], config)
 
-    settings = load_settings(world.config)
-    labels = [row for language in settings.languages for row in world.labels(language)]
-    assert {row.checkpoint for row in labels} == {
-        merged
-    } and world.slug == f"tiny-aya-global-drift-merged-smoke--{'a' * 12}"
-    targets = {
-        name: {language: [row.prompt_id for row in world.rows[name, language]] for language in codes}
-        for name, codes in (("harmful", settings.languages), ("xstest", ["en"]))
-    }
-    write_labels(tmp_path / "labels", labels)
-    tables = build(tmp_path / "labels", targets, [], settings, mode="smoke")
-    assert tables.columns["drifted"].state == "tabled" and tables.judge.repo == SMOL
-    assert {row.checkpoint for row in tables.safety} == {merged}
-    with pytest.raises(DriftmapError, match="unknown checkpoint"):
-        build(tmp_path / "labels", targets, [], settings)
+    assert found == [labels[0]]
+    assert rebuilt([rows[0].model_copy(update={"response": None})], [], raws, config) == []
+    # a label of another config is asked again, never rebuilt
+    earlier = labels[0].model_copy(update={"judge": config.model_copy(update={"config_hash": "earlier"})})
+    assert rebuilt(rows[:1], [earlier], raws, config) == []
+    renamed = config.model_copy(update={"repo": "another-model"})
+    assert rebuilt(rows[:1], [], raws, renamed) == []
 
 
 def test_rows_are_read_at_newlines_only(tmp_path):
@@ -150,53 +132,3 @@ def test_rows_are_read_at_newlines_only(tmp_path):
     with pytest.raises(DriftmapError, match=r"raw\.jsonl:2: not a RawRow \(language: Field required\)") as caught:
         read_rows(path, RawRow)
     assert caught.value.exit_code == 12
-
-
-def test_the_small_judge_is_kept_out_of_full_runs_and_full_tables(tmp_path, monkeypatch):
-    """A full run refuses --judge smol before any download; a full table refuses its labels (TS-JDG-7)."""
-    world = JudgeWorld(tmp_path, monkeypatch)
-
-    assert world.run("--judge", "smol") == 12
-
-    assert world.downloads(JUDGE) == world.downloads(SMOL) == world.downloads(RESPONSES) == []
-    assert world.paths(EVAL) == []
-    assert any("small judge is for smoke runs" in note for note in world.record().notes)
-
-    world = JudgeWorld(tmp_path / "smoke", monkeypatch, mode="smoke")
-    assert world.run("--judge", "smol", run_id="judge-smoke-20261113T100000Z") == 0
-
-    settings = load_settings(world.config)
-    labels = [row for language in settings.languages for row in world.labels(language)]
-    assert {(row.judge.repo, row.judge.revision) for row in labels} == {(SMOL, world.fake.heads[SMOL])}
-    assert [call["repo_id"] for call in world.downloads(SMOL)] == [SMOL, SMOL] and world.downloads(JUDGE) == []
-    targets = {
-        name: {language: [row.prompt_id for row in world.rows[name, language]] for language in codes}
-        for name, codes in (("harmful", settings.languages), ("xstest", ["en"]))
-    }
-    assert world.paths(EVAL) == sorted(f"smoke/labels/{SLUG}/{language}.jsonl" for language in settings.languages)
-    assert set(world.paths(RESPONSES)) >= {
-        f"smoke/judge_raw/{SLUG}/en.jsonl",
-        f"smoke/responses/{SLUG}/xstest/en.jsonl",
-    }
-    assert not any(path.startswith(("labels/", "judge_raw/", "responses/")) for path in world.paths(RESPONSES))
-    write_labels(tmp_path / "labels", labels)
-    with pytest.raises(DriftmapError, match=f"baseline was judged by {SMOL}"):
-        build(tmp_path / "labels", targets, [], settings)
-    assert build(tmp_path / "labels", targets, [], settings, mode="smoke").judge.repo == SMOL
-
-
-def test_a_repeated_prompt_in_one_responses_file_stops_the_job(tmp_path, monkeypatch, capsys):
-    """A responses file with one prompt id twice exits 12 naming the file, and nothing is uploaded (TS-EDGE-4)."""
-    world = JudgeWorld(tmp_path, monkeypatch)
-    path = f"responses/{SLUG}/harmful/ru.jsonl"
-    rows = world.rows["harmful", "ru"]
-    world.put_rows("harmful", "ru", [*rows, rows[1]])
-
-    assert world.run() == 12
-
-    record = world.record()
-    assert record.status == "failed"
-    assert f"DuplicateKey: {path} has prompt harmful-ru-001 more than once" in record.notes
-    assert "driftmap-job: finished status=failed exit=12" in capsys.readouterr().out
-    assert world.paths(EVAL) == [] and not any(name.startswith("judge_raw/") for name in world.paths(RESPONSES))
-    assert world.model.chats == [] and world.downloads(JUDGE) == []

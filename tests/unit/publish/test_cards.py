@@ -128,7 +128,7 @@ def test_residual_failures_come_from_the_tables(tmp_path, settings):
 
     text = render_cards(settings, tables=tables)[REPAIRED]
 
-    assert "- en: 90.0% (n=20; 95% CI 69.9% to 97.2%; judge=PolyGuard-Qwen; preamble=keep)" in text
+    assert "- en: 90.0% (n=20; 95% CI 69.9% to 97.2%; judge=closed-model-a; preamble=keep)" in text
 
 
 def test_a_failed_quantized_evaluation_stays_on_the_card(tmp_path, settings):
@@ -147,13 +147,13 @@ def test_a_failed_quantized_evaluation_stays_on_the_card(tmp_path, settings):
 
 def test_the_judge_named_is_the_one_the_labels_record(tmp_path, settings):
     tables = two_column_tables(tmp_path, settings)
-    other = tables.judge.model_copy(update={"repo": "provider/closed-judge", "revision": "2026-11-01"})
+    other = tables.judge.model_copy(update={"repo": "another-model", "revision": "ab" * 32})
 
     rendered = render_cards(settings, tables=tables.model_copy(update={"judge": other}))
 
-    line = "- Judge: provider/closed-judge at revision `2026-11-01`, prompt format `polyguard-v1`"
-    assert all(line in text and "PolyGuard" not in text for text in rendered.values())
-    configured = "ToxicityPrompts/PolyGuard-Qwen at revision `644bfe73ff498c9a14818b72a11187eaf23f0ff1`, as configured"
+    line = "- Judge: another-model under `rubric-v1` (rubric text sha256 `abababababab`)"
+    assert all(line in text and "closed-model-a" not in text for text in rendered.values())
+    configured = "closed-model-a under `rubric-v1`, as configured"
     assert all(configured in text for text in render_cards(settings).values())
 
 

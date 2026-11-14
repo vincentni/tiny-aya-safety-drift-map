@@ -68,7 +68,7 @@ class StubLedger:
         return [("drift", 10_800)]
 
     def oom_runs(self):
-        return [("judge", "c" * 64)]
+        return [("repair", "c" * 64)]
 
 
 @pytest.fixture
@@ -139,7 +139,7 @@ def test_a_snapshot_gathers_spend_jobs_prices_gates_and_local_records(tmp_path, 
         smoke_records=[SMOKE],
         gates={AYA: "ok", BASE: "403"},
         lost_runs=[("drift", 10_800)],
-        oom_runs=[("judge", "c" * 64)],
+        oom_runs=[("repair", "c" * 64)],
         drift_flag=None,
         drift_decision=None,
         code_on_origin=True,
@@ -218,13 +218,13 @@ def test_a_git_that_hangs_or_is_missing_is_not_a_pass(tmp_path):
 
 
 def test_the_drift_flag_and_decision_come_from_the_local_results(tmp_path, settings, fake_hub, git):
-    decoding = Decoding(runtime="transformers")
+    decoding = Decoding(greedy=False, runtime="api")
     judge = JudgeConfig(
-        repo=settings.judge.repo,
-        revision=settings.judge.revision,
-        dtype="bfloat16",
+        repo=settings.judge.closed.name,
+        revision="n/a",
+        dtype="n/a",
         decoding=decoding,
-        prompt_format="polyguard-v1",
+        prompt_format="rubric-v1",
         parser_version="1",
         config_hash="h",
     )
@@ -263,8 +263,8 @@ def test_the_drift_flag_and_decision_come_from_the_local_results(tmp_path, setti
 def test_smoke_records_are_read_in_name_order_and_a_bad_one_is_named(tmp_path):
     assert read_smoke_records(tmp_path / "absent") == []
     directory = tmp_path / SMOKE_DIR
-    judged = SMOKE.model_copy(update={"script": "driftmap.scripts.judge"})
-    dump(judged, directory / "judge.json")
+    judged = SMOKE.model_copy(update={"script": "driftmap.scripts.generate"})
+    dump(judged, directory / "generate.json")
     dump(SMOKE, directory / "drift.json")
     (directory / IMAGE_PROBE_PATH.name).write_text("not a smoke record")
     assert read_smoke_records(directory) == [SMOKE, judged]

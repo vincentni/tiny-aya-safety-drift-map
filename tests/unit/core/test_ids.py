@@ -60,9 +60,9 @@ def test_steered_reference_and_slug():
     ref = ids.parse(f"vincentnkq/tiny-aya-global-drift-merged@{SHA}--steer-l24-s1.0")
     assert ref == RepoRef("vincentnkq/tiny-aya-global-drift-merged", SHA, steer=Steer(24, "1.0"))
     assert ref.slug() == "tiny-aya-global-drift-merged--0123456789ab--steer-l24-s1.0"
-    pinned = ids.parse(f"ToxicityPrompts/PolyGuard-Qwen@{SHA}#config.json")
+    pinned = ids.parse(f"CohereLabs/tiny-aya-base@{SHA}#config.json")
     assert (pinned.revision, pinned.file, pinned.steer) == (SHA, "config.json", None)
-    assert pinned.slug() == "PolyGuard-Qwen--0123456789ab"
+    assert pinned.slug() == "tiny-aya-base--0123456789ab"
     with pytest.raises(ValueError, match="revision"):
         ids.parse("CohereLabs/tiny-aya-global").slug()
 

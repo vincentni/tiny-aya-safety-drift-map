@@ -51,12 +51,11 @@ def live():
 
 
 def test_every_kind_is_priced_at_its_declared_timeout(settings, live):
-    """Timeouts and integer costs are exact for the seven kinds and for smoke (TS-PLN-1)."""
+    """Timeouts and integer costs are exact for every kind and for smoke (TS-PLN-1)."""
     full = {kind: _build(settings, kind, "full", live, SHA) for kind in KINDS}
     assert {kind: plan.timeout_s for kind, plan in full.items()} == {
         "drift": 10_800,
         "generate": 5_400,
-        "judge": 2_700,
         "repair": 7_200,
         "steer": 5_400,
         "quant": 3_600,
@@ -65,7 +64,6 @@ def test_every_kind_is_priced_at_its_declared_timeout(settings, live):
     assert {kind: plan.cost_at_timeout_micro_usd for kind, plan in full.items()} == {
         "drift": 2_399_940,
         "generate": 1_199_970,
-        "judge": 599_985,
         "repair": 1_599_960,
         "steer": 1_199_970,
         "quant": 30_000,
@@ -174,28 +172,28 @@ def test_each_runner_has_its_submit_shape(tmp_path, settings, live):
 
 def test_script_args_name_the_run_and_dumps_hold_no_secret(settings, live):
     """Script args carry the run id, timeout, code and submit time; no dump holds a secret value (TS-PLN-4)."""
-    plan = _build(settings, "judge", "full", live, SHA, now=NOW)
+    plan = _build(settings, "steer", "full", live, SHA, now=NOW)
     assert plan.script_args == [
         "--run-id",
-        "judge-full-20261113T093041Z",
+        "steer-full-20261113T093041Z",
         "--timeout-s",
-        "2700",
+        "5400",
         "--code-sha",
         SHA,
         "--submitted-at",
         "2026-11-13T09:30:41Z",
     ]
-    assert run_id(plan) == "judge-full-20261113T093041Z"
+    assert run_id(plan) == "steer-full-20261113T093041Z"
 
     smoke = _build(
         settings,
-        "judge",
+        "steer",
         "smoke",
         live,
         SHA,
         now=NOW,
         limit=10,
-        args=["--judge", "smol"],
+        args=["--layer", "12"],
     )
     assert smoke.script_args[2:4] == ["--timeout-s", "1800"]
     assert smoke.script_args[8:] == [
@@ -203,15 +201,15 @@ def test_script_args_name_the_run_and_dumps_hold_no_secret(settings, live):
         "10",
         "--force-flush-after-s",
         "300",
-        "--judge",
-        "smol",
+        "--layer",
+        "12",
     ]
     assert (
         "--force-flush-after-s"
-        not in _build(settings, "judge", "full", live, SHA, limit=10).script_args
+        not in _build(settings, "steer", "full", live, SHA, limit=10).script_args
     )
 
-    unclocked = _build(settings, "judge", "full", live, SHA).script_args
+    unclocked = _build(settings, "steer", "full", live, SHA).script_args
     submitted = datetime.fromisoformat(unclocked[unclocked.index("--submitted-at") + 1])
     assert 0 <= (datetime.now(UTC) - submitted).total_seconds() < 60
 
@@ -259,7 +257,7 @@ def test_gpu_kinds_without_a_kaggle_smoke_are_marked(settings, live):
             tokens_per_s=410.0,
         )
 
-    gpu = ["drift", "generate", "judge", "quant_eval", "repair", "steer"]
+    gpu = ["drift", "generate", "quant_eval", "repair", "steer"]
     on_jobs = [record(kind) for kind in KINDS]
     assert fallback_marks([]) == dict.fromkeys(gpu, "no verified fallback")
     assert fallback_marks(on_jobs) == dict.fromkeys(gpu, "no verified fallback")
@@ -270,9 +268,9 @@ def test_gpu_kinds_without_a_kaggle_smoke_are_marked(settings, live):
     marks = fallback_marks(
         [*on_jobs, record("generate", "kaggle"), record("quant", "kaggle")]
     )
-    assert sorted(marks) == ["drift", "judge", "quant_eval", "repair", "steer"]
-    uv_script = record("judge", "kaggle").model_copy(update={"script": "jobs/judge.py"})
-    assert "judge" not in fallback_marks([uv_script])
+    assert sorted(marks) == ["drift", "quant_eval", "repair", "steer"]
+    uv_script = record("steer", "kaggle").model_copy(update={"script": "jobs/steer.py"})
+    assert "steer" not in fallback_marks([uv_script])
 
 
 def test_render_prints_the_resolved_job(settings, live):
@@ -321,7 +319,7 @@ dev = ["pytest==9.2.0"]
     assert pins(tmp_path) == bumped
     assert (
         build_plan(
-            settings, "judge", "smoke", live, SHA, repo_root=tmp_path
+            settings, "steer", "smoke", live, SHA, repo_root=tmp_path
         ).dependencies
         == bumped
     )
@@ -332,7 +330,7 @@ dev = ["pytest==9.2.0"]
             pins(tmp_path)
     # the default root is the working directory, which holds no checkout here
     with pytest.raises(ConfigError, match="pyproject.toml"):
-        build_plan(settings, "judge", "smoke", live, SHA)
+        build_plan(settings, "steer", "smoke", live, SHA)
 
 
 @pytest.mark.parametrize(

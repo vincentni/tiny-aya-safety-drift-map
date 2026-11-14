@@ -73,7 +73,6 @@ def test_the_results_repo_is_created_private_before_the_body(launch, fake, resul
     [
         (DriftmapError(ExitCode.INTEGRITY, "tokenizer canary mismatch"), 12),
         (DriftmapError(ExitCode.COLUMN_FAILED, "7 % unscored"), 13),
-        (DriftmapError(ExitCode.JUDGE_INSPECT_STOP, "18 of 20 parsed"), 14),
         (DriftmapError(ExitCode.PARTIAL, "not a deadline"), 1),
         (DriftmapError(ExitCode.OOM, "not out of memory"), 1),
         (DriftmapError(ExitCode.USAGE, "not a job code"), 1),

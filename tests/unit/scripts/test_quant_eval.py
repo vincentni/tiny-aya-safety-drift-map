@@ -19,7 +19,8 @@ from driftmap.core.settings import load_settings
 from driftmap.jobkit.deadline import DeadlineReached
 from driftmap.jobkit.resume import marker_path
 from driftmap.jobkit.runrecord import record_path
-from driftmap.scripts import generate, judge, quant_eval
+from driftmap.judge import units
+from driftmap.scripts import generate, quant_eval
 from driftmap.scripts.quant_eval import FALLBACK, Tools, cuda_library_path
 from driftmap.table.build import NOT_COMPARABLE, column_of
 from tests.fakes import FakeClock, FakeHub, FakeTransport
@@ -358,14 +359,12 @@ def test_every_unit_is_answered_by_the_served_gguf_and_recorded_for_the_judge(wo
     assert [url for url, _ in world.opener.calls] == [RELEASE["cuda_asset"]]
     assert world.popen.started[0].signals == ["terminate", ("wait", 1.0)]
 
-    # the judge takes --checkpoint <repo>@<sha>#<file> --generation <this run>; the table maps it to the q4 column
+    # the judge reads these rows by --checkpoint <repo>@<sha>#<file>; the table maps it to the q4 column
     hub = Hub(world.fake)
-    results = RepoRef(RESULTS, world.head(RESULTS))
-    generated = judge.generation_rows(hub, results, RESPONSES, RUN_ID, ids.parse(world.checkpoint), "full")
-    assert generated == RepoRef(RESPONSES, world.head(RESPONSES))
     settings = load_settings(world.config)
+    generated = RepoRef(RESPONSES, world.head(RESPONSES))
     rows_dir = Path(hub.snapshot_download(generated, tmp_path / "judge-rows", repo_type="dataset"))
-    inputs = judge.read_inputs(rows_dir, ids.slug(world.checkpoint), judge.units(settings), "full", None)
+    inputs = units.read_inputs(rows_dir, ids.slug(world.checkpoint), units.units(settings), "full", None)
     assert [len(rows) for rows in inputs.values()] == [ROWS] * 7
     assert column_of(world.checkpoint, settings, "full") == "repaired_q4"
 

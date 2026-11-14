@@ -61,7 +61,6 @@ cuda_asset = "64d57beb9abb637c177c6afb313760a0c0782224cac71e74869eed5b8f9a1ea4"
 [timeouts]
 drift = 180
 generate = 90
-judge = 45
 repair = 120
 steer = 90
 quant = 60
@@ -73,12 +72,14 @@ smoke = 30
 drift = 4
 drift_accum = 4
 generate = 16
+# read by no job; kept because the config hash of the stored run records covers it
 judge = 16
 screen = 8
 
 [decoding]
 max_new_tokens = 256
 
+# only [judge.closed] is read; the six keys here stay because the config hash of the stored run records covers them
 [judge]
 repo = "ToxicityPrompts/PolyGuard-Qwen"
 revision = "644bfe73ff498c9a14818b72a11187eaf23f0ff1"
@@ -86,6 +87,11 @@ dtype = "bfloat16"
 parser_version = "1"
 smol_repo = "ToxicityPrompts/PolyGuard-Qwen-Smol"
 smol_revision = "224f511fe2ee3e304a11f470c8071f43ee0d8f70"
+
+# the closed model that scores the tables: its public name; the route to it is local, never stored here
+[judge.closed]
+name = "claude-sonnet-5-5"
+rubric = "rubric-v1"
 
 [code]
 origin = "https://github.com/vincentni/tiny-aya-safety-drift-map"

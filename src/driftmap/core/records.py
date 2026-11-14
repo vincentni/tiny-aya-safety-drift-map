@@ -25,6 +25,7 @@ Limit = Annotated[StrictInt, Field(ge=0)]
 CommitSha = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{40}$")]
 Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 UtcDatetime = Annotated[AwareDatetime, AfterValidator(lambda moment: moment.astimezone(UTC))]
+# judge: no job of it is launched; stored records and ledger lines of that kind still parse
 JobKind = Literal["drift", "generate", "judge", "repair", "steer", "quant", "quant_eval"]
 Mode = Literal["smoke", "full"]
 # n/a: benign rows; judge_unsupported: language outside the judge's set
@@ -220,10 +221,17 @@ class Refusal(Record):
 
 
 class Decoding(Record):
-    greedy: Literal[True] = True
+    greedy: bool = True
     max_new_tokens: int = 256
-    runtime: Literal["transformers", "llama-server"]
+    runtime: Literal["transformers", "llama-server", "api"]
     cache_prompt: bool = False
+
+    @model_validator(mode="after")
+    def _greedy_where_we_decode(self) -> Self:
+        # behind an API no sampling parameter is sent, so greedy cannot be claimed
+        if self.greedy == (self.runtime == "api"):
+            raise ValueError("decoding is greedy on a local runtime and never claimed for an api runtime")
+        return self
 
 
 class GenerationRow(Record):
@@ -249,7 +257,8 @@ class JudgeConfig(Record):
     revision: str
     dtype: str
     decoding: Decoding
-    prompt_format: Literal["polyguard-v1"]
+    # polyguard-v1: read only, for stored rows; every label written is rubric-v1
+    prompt_format: Literal["polyguard-v1", "rubric-v1"]
     parser_version: str
     config_hash: str
 

@@ -19,7 +19,6 @@ EXIT_CODES = {
     "OOM": 11,
     "INTEGRITY": 12,
     "COLUMN_FAILED": 13,
-    "JUDGE_INSPECT_STOP": 14,
 }
 
 SCHEMA_IDS = {
@@ -39,7 +38,7 @@ SCHEMA_IDS = {
 def test_exit_code_members():
     assert issubclass(ExitCode, IntEnum)
     assert {m.name: int(m) for m in ExitCode} == EXIT_CODES
-    assert len(ExitCode) == len(EXIT_CODES) == 14
+    assert len(ExitCode) == len(EXIT_CODES) == 13
     assert 9 not in {int(m) for m in ExitCode}
 
 

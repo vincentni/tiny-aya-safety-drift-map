@@ -72,7 +72,7 @@ def test_language_outside_the_judge_set_is_refused(tmp_path):
     with pytest.raises(ConfigError) as caught:
         load_settings(settings_toml(tmp_path, languages=["en", "sr"]))
     assert caught.value.exit_code == 2
-    assert str(caught.value) == "languages.1: sr is not a PolyGuard language [judge_unsupported]"
+    assert str(caught.value) == "languages.1: sr is not a language the judge is checked for [judge_unsupported]"
 
     assert load_settings(settings_toml(tmp_path)).languages == ["en", "fr", "es", "ru", "hi", "ar"]
     assert len(JUDGE_LANGUAGES) == 17
@@ -114,6 +114,8 @@ def test_config_hash_ignores_key_order_and_moves_with_parser_and_batch(tmp_path)
         {"scheduling_allowance_s": 600},
         {"code": {"branch": "release"}},
         {"owner": "someone-else"},
+        {"judge": {"closed": {"name": "another-model"}}},
+        {"judge": {"closed": None}},
     ],
 )
 def test_operational_edits_keep_the_config_hash(tmp_path, overrides):
@@ -310,7 +312,6 @@ def test_timeouts_convert_to_seconds(tmp_path):
     assert seconds == {
         "drift": 10_800,
         "generate": 5400,
-        "judge": 2700,
         "repair": 7200,
         "steer": 5400,
         "quant": 3600,
@@ -341,7 +342,9 @@ def test_repo_toml_loads_with_the_agreed_values():
     assert settings.llamacpp_release.model_dump() == BASE["llamacpp_release"]
     assert settings.images.model_dump() == {"pytorch": "pytorch/pytorch:2.14.1-cuda12.6-cudnn9-runtime"}
     assert settings.prices_micro_usd_per_min == BASE["prices_micro_usd_per_min"]
-    assert settings.judge.model_dump() == BASE["judge"]
+    assert settings.judge.model_dump() == {name: value for name, value in BASE["judge"].items() if name != "closed"}
+    # a public model name, never a route
+    assert settings.judge.closed.rubric == "rubric-v1" and "/" not in settings.judge.closed.name
     assert settings.decoding.max_new_tokens == 256
     assert (settings.runner, settings.preamble, settings.scheduling_allowance_s) == ("pip", "keep", 1800)
     assert settings.lock_path == Path.home() / ".driftmap" / "launch.lock"
@@ -365,3 +368,9 @@ def test_repo_config_files_hold_no_secret_or_home_path():
     secret = re.compile(r"hf_[A-Za-z0-9]{30,}|AKIA[0-9A-Z]{16}|\b\d{12}\b|(?<![\w/])/(home|Users|local/home)/")
     for name in ("driftmap.toml", "revisions.json"):
         assert not secret.search((REPO_ROOT / name).read_text(encoding="utf-8")), name
+
+
+@pytest.mark.parametrize("closed", [{"name": ""}, {"rubric": "rubric-v2"}, {"route": "x/y"}])
+def test_the_closed_judge_section_takes_a_name_and_a_known_rubric_only(tmp_path, closed):
+    with pytest.raises(ConfigError, match=r"judge\.closed\."):
+        load_settings(settings_toml(tmp_path, judge={"closed": closed}))

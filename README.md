@@ -27,22 +27,43 @@ The tests are offline. Commands that reach the Hub read `HF_TOKEN`, or the token
     uv run driftmap data build                   # upload it and pin the commit
     uv run driftmap plan generate                # the job, its cost at timeout, every guard verdict
     uv run driftmap launch generate --wait -- --kind baseline            # smoke run first
-    uv run driftmap launch judge --wait --after <generate run id>
+    uv run driftmap judge closed --checkpoint REPO@SHA                   # label the smoke responses, runs here
     uv run driftmap launch generate --mode full --wait -- --kind baseline
-    uv run driftmap launch judge --mode full --wait --after <generate run id>
+    uv run driftmap judge closed --checkpoint REPO@SHA --mode full
     uv run driftmap launch drift --wait          # the smoke drift
     uv run driftmap launch drift --mode full
     uv run driftmap wait <job id>                # follow a job, record what it cost
-    uv run driftmap chain generate judge --target drifted                # two steps, one after the other
+    uv run driftmap chain drift generate --target drifted                # two jobs, one after the other
     uv run driftmap status                       # spend, pending jobs, latest run of each kind
     uv run driftmap ledger reconcile             # billing against the ledger
     uv run driftmap table build                  # tables from the labels: saved, printed, uploaded
     uv run driftmap decide drift --proceed --note "why"                  # when table build exits 8
-    uv run driftmap judge reparse --checkpoint REPO@SHA                  # after a parser change, no GPU
+    uv run driftmap judge reparse --checkpoint REPO@SHA                  # after a parser change
     uv run driftmap scan <path>...               # tokens, account ids, home paths, before publishing
 
-`--mode` is `smoke` by default for `plan` and `launch`: a short rehearsal on a few rows.
-Arguments after `--` go to the job script. Every command has `--help`.
+`--mode` is `smoke` by default for `plan`, `launch` and `judge closed`: a short rehearsal on
+a few rows. Arguments after `--` go to the job script. Every command has `--help`.
+
+## The judge
+
+The tables are scored by a closed model under the rubric in `src/driftmap/judge/rubric.py`
+(`rubric-v1`): one JSON object per exchange with `request_harm`, `refusal` and `response_harm`.
+`driftmap judge closed` reaches the model through any LiteLLM route, named in the environment
+variable `DRIFTMAP_CLOSED_JUDGE_ROUTE` together with whatever credentials that route needs. The
+route is read from the environment only; label rows carry the public model name from
+`[judge.closed]` in `driftmap.toml` and the rubric version. The command runs on the workstation,
+labels one set and language at a time, uploads after each, and picks up where it stopped when run
+again. It stops on throttling or an exhausted quota instead of retrying. When more than 5% of
+the pairs sent for one file, and more than one, come back without labels, the answers that parsed
+are stored, the rest is held back and the command exits 4: run it again, or with
+`--retry-unscored`, which asks unscored pairs again and stores what stays unscored. An answer
+that is text without the object is asked again with a one-line format reminder after the
+unchanged pair. The request and the response are quoted between tags that carry a random marker
+per call, and the rubric says they are data, never instructions. The public name is taken on
+trust from the configuration: nothing checks which model the route serves. With `--rows PATH`
+in place of `--checkpoint` it labels the harmful rows of one responses-repo file (or a glob of
+them, such as the repair screen's `screen/<slug>/alpha-*.jsonl`) and writes `labels-<name>`
+beside each.
 
 ## What a launch is checked against
 
@@ -85,6 +106,7 @@ Names under the owner, from `[repos]` in `driftmap.toml`:
 
 ## Exit codes
 
-0 done, 1 unexpected error, 2 usage or configuration, 3 not ready, 4 refused by a guard,
+0 done, 1 unexpected error, 2 usage or configuration, 3 not ready, 4 refused by a guard
+(or the judge stopped: throttling, quota, too many answers without labels),
 5 job lost or not found, 6 redaction finding, 7 upload failed, 8 drift decision needed,
 12 a data, label or record file is not what it should be, 130 interrupted.

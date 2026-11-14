@@ -44,7 +44,6 @@ OWNED = ("--run-id", "--timeout-s", "--config-hash", "--code-sha", "--submitted-
 # what a job exits 2 without, and how to type it
 JOB_ARGS = {
     "generate": (("--kind",), "--kind baseline|drifted|repaired"),
-    "judge": (("--checkpoint", "--generation"), "--checkpoint REPO@SHA --generation RUN_ID"),
 }
 
 Target = Literal["baseline", "drifted", "repaired"]
@@ -59,7 +58,7 @@ app = typer.Typer(no_args_is_help=True, add_completion=False, pretty_exceptions_
 data_app = typer.Typer(no_args_is_help=True, help="Evaluation and training rows.")
 ledger_app = typer.Typer(no_args_is_help=True, help="The cost ledger.")
 table_app = typer.Typer(no_args_is_help=True, help="The result tables.")
-judge_app = typer.Typer(no_args_is_help=True, help="Labels already judged.")
+judge_app = typer.Typer(no_args_is_help=True, help="Labels: the closed-model judge and a reparse of stored outputs.")
 decide_app = typer.Typer(no_args_is_help=True, help="Calls only the author can make.")
 app.add_typer(data_app, name="data")
 app.add_typer(ledger_app, name="ledger")
@@ -259,7 +258,7 @@ class _Noted:
         self._ledger.append(line)
 
 
-def _job_args(kind: str, mode: str, given: list[str] | None, *, complete: bool = True) -> list[str]:
+def _job_args(kind: str, mode: str, given: list[str] | None) -> list[str]:
     """The arguments passed on to the job script; exit 2 for ones the job or the launcher cannot take."""
     given = given or []
     flags = [arg.split("=", 1)[0] for arg in given if arg.startswith("--")]
@@ -272,25 +271,9 @@ def _job_args(kind: str, mode: str, given: list[str] | None, *, complete: bool =
             "a job argument holds a token, a home path or a control sequence; it is printed and stored"
         )
     needed, form = JOB_ARGS.get(kind, ((), ""))
-    if complete and any(flag not in flags for flag in needed):
+    if any(flag not in flags for flag in needed):
         raise typer.BadParameter(f"{kind} needs its job arguments: driftmap launch {kind} --mode {mode} -- {form}")
     return given
-
-
-def _after(settings: Settings, hub: Hub, run_id: str, mode: str, given: list[str]) -> list[str]:
-    """The judge arguments a generate run stands for, less the ones already given; exit 2 unless it ended ok."""
-    record = next((run for run in _results(settings, hub)[0] if run.run_id == run_id), None)
-    if record is None:
-        raise DriftmapError(ExitCode.USAGE, f"the results repo holds no record of run {run_id}")
-    checkpoint = next((ref for ref in record.inputs if ref.kind == "model"), None)
-    if (record.kind, record.mode, record.status) != ("generate", mode, "ok") or checkpoint is None:
-        found = f"run {run_id} is a {record.mode} {record.kind} run that ended {record.status}"
-        raise DriftmapError(ExitCode.USAGE, f"{found}; --after takes a {mode} generate run that ended ok")
-    if record.config_hash != settings.config_hash():
-        raise DriftmapError(ExitCode.USAGE, f"run {run_id} was made under another configuration")
-    derived = {"--checkpoint": f"{checkpoint.repo}@{checkpoint.revision}", "--generation": record.run_id}
-    flags = {arg.split("=", 1)[0] for arg in given}
-    return [part for flag, value in derived.items() if flag not in flags for part in (flag, value)]
 
 
 @app.command()
@@ -316,10 +299,6 @@ def launch(
     ] = False,
     wait: Annotated[bool, typer.Option("--wait", help="Follow the job to its end.")] = False,
     limit: Annotated[int | None, typer.Option(help="Cap the rows the job works on.")] = None,
-    after: Annotated[
-        str | None,
-        typer.Option(metavar="RUN_ID", help="judge only: read --checkpoint and --generation off this generate run."),
-    ] = None,
     job_args: Annotated[
         list[str] | None, typer.Argument(metavar="[-- JOB_ARGS]...", help="Passed on to the job script.")
     ] = None,
@@ -336,15 +315,10 @@ def launch(
         )
     if reason and not overrides:
         raise typer.BadParameter("--reason goes with --override-smoke or --override-soft")
-    if after is not None and kind.value != "judge":
-        raise typer.BadParameter("--after names the generate run a judge job reads; it goes with judge only")
-    args = _job_args(kind.value, mode, job_args, complete=after is None)
-    rows = {"kind": kind.value, "mode": mode, "dry_run": dry_run, "wait": wait, "limit": limit, "after": after}
+    args = _job_args(kind.value, mode, job_args)
+    rows = {"kind": kind.value, "mode": mode, "dry_run": dry_run, "wait": wait, "limit": limit}
     settings, deps = _open("launch", **rows, job_args=args, overrides=overrides, reason=reason or None)
     _launch_inputs(deps.repo_root)
-    if after is not None:
-        args = [*args, *_after(settings, deps.hub, after, mode, args)]
-        typer.echo(f"{'job-args':<10}{' '.join(args)}")
     if reason:
         deps = replace(deps, ledger=_Noted(deps.ledger, f"reason={reason}"))
     return launcher.launch(
@@ -388,12 +362,8 @@ def _results(settings: Settings, hub: Hub) -> tuple[list[RunRecord], AlphaScreen
         return [record for record in records if record], _parsed(AlphaScreen, root / "alpha_screen.json")
 
 
-def _state(
-    settings: Settings, deps: Deps, mode: str, target: str | None, job_args: dict[str, list[str]]
-) -> Callable[[str], State]:
-    """Reader of what the results repo holds before a chain step; it also fills the judge step's arguments."""
-    # runs on the ledger before this chain began are not its own
-    earlier = {line.run_id for line in deps.ledger.lines()}
+def _state(settings: Settings, deps: Deps, mode: str, target: str | None) -> Callable[[str], State]:
+    """Reader of what the results repo holds before a chain step."""
 
     def output(record: RunRecord | None, repo: str) -> str | None:
         refs = record.outputs if record else []
@@ -409,20 +379,10 @@ def _state(
         }
         # by run id, so the newest ok record of a kind wins
         ok = {record.kind: record for record in runs.values()}
-        launched = [line.run_id for line in deps.ledger.lines() if line.run_id not in earlier]
-        generated = next(
-            (runs[run] for run in reversed(launched) if run in runs and runs[run].kind == "generate"), None
-        )
-        checkpoint = next((ref for ref in generated.inputs if ref.kind == "model"), None) if generated else None
-        if checkpoint:
-            # judge reads exactly the rows the generate step of this chain wrote
-            reference = f"{checkpoint.repo}@{checkpoint.revision}"
-            job_args["judge"] = ["--checkpoint", reference, "--generation", generated.run_id]
         return State(
             languages=tuple(settings.languages),
             checkpoint=target or "drifted",
             merged_sha256=ok["drift"].merged_sha256 if "drift" in ok else None,
-            responses_complete=checkpoint is not None,
             repaired_revision=output(ok.get("repair"), settings.repos.repaired),
             gguf_record=output(ok.get("quant"), settings.repos.gguf) is not None,
             recover_status=screen.recover_status if screen and "repair" in ok else None,
@@ -434,7 +394,7 @@ def _state(
 @app.command()
 @_finish
 def chain(
-    kinds: Annotated[list[Kind], typer.Argument(help="Job kinds in run order; judge follows the generate before it.")],
+    kinds: Annotated[list[Kind], typer.Argument(help="Job kinds in run order.")],
     mode: Annotated[Mode, typer.Option(help=MODE_HELP)] = "full",
     target: Annotated[Target | None, typer.Option(help="The checkpoint the generate step reads.")] = None,
 ) -> ExitCode:
@@ -446,13 +406,10 @@ def chain(
         raise typer.BadParameter(
             "--target names the generate step: chain generate ... --target baseline|drifted|repaired"
         )
-    if "judge" in names and "generate" not in names[: names.index("judge")]:
-        form = f"driftmap launch judge --mode {mode} -- {JOB_ARGS['judge'][1]}"
-        raise typer.BadParameter(f"judge in a chain reads the generate step before it; on its own: {form}")
     settings, deps = _open("chain", kinds=names, mode=mode, target=target)
     _launch_inputs(deps.repo_root)
     job_args = {"generate": ["--kind", target]} if target else {}
-    state = _state(settings, deps, mode, target, job_args)
+    state = _state(settings, deps, mode, target)
     return launcher.chain(settings, deps, names, mode, state=state, args=job_args)
 
 
@@ -617,7 +574,7 @@ def judge_reparse(
     checkpoint: Annotated[str, typer.Option(metavar="REPO@SHA", help="The checkpoint whose labels to read again.")],
     mode: Annotated[Mode, typer.Option(help="The tree the labels are in.")] = "full",
 ) -> None:
-    """Read a checkpoint's labels again from the stored judge outputs, after a parser change; no GPU."""
+    """Read a checkpoint's labels again from the stored judge answers, after a parser change; no model call."""
     try:
         ref = ids.parse(checkpoint)
     except ValueError:
@@ -632,12 +589,76 @@ def judge_reparse(
         found = _snapshot(deps.hub, labels, scratch, [ids.labels_path(ids.slug(ref), "*", mode)])
         if not any(found.rglob("*.jsonl")):
             raise DriftmapError(ExitCode.USAGE, f"no labels for {checkpoint} in the {mode} tree")
-    uploaded = reparse.reparse_checkpoint(deps.hub, labels, raws, checkpoint, settings.judge.parser_version, mode)
+    uploaded = reparse.reparse_checkpoint(deps.hub, labels, raws, checkpoint, mode)
     for name in uploaded:
         typer.echo(name)
     typer.echo(
         f"{len(uploaded)} files uploaded to {labels}" if uploaded else "nothing to rewrite: every label reads the same"
     )
+
+
+@judge_app.command("closed")
+@_finish
+def judge_closed(
+    checkpoint: Annotated[
+        str | None,
+        typer.Option(metavar="REPO@SHA", help="A checkpoint whose stored responses to label; REPO@SHA#FILE too."),
+    ] = None,
+    rows: Annotated[
+        str | None,
+        typer.Option(
+            metavar="PATH",
+            help="Instead of a checkpoint: a .jsonl file or glob in the responses repo, under the tree of --mode. "
+            "Its harmful rows are labelled into labels-<name> beside it.",
+        ),
+    ] = None,
+    mode: Annotated[Mode, typer.Option(help="The tree the responses are in.")] = "smoke",
+    sets: Annotated[
+        str | None, typer.Option(help="With --checkpoint: the sets to label, comma-separated; both by default.")
+    ] = None,
+    concurrency: Annotated[int, typer.Option(min=1, max=16, help="Pairs in flight at once.")] = 4,
+    limit: Annotated[int | None, typer.Option(min=1, help="Only the first N rows of each file.")] = None,
+    retry_unscored: Annotated[
+        bool, typer.Option("--retry-unscored", help="Ask unscored pairs again and store what stays unscored.")
+    ] = False,
+) -> None:
+    """Label stored responses with the closed model; runs here, no job. Run it again to resume."""
+    from driftmap.judge import closed, rubric
+
+    if (checkpoint is None) == (rows is None):
+        raise typer.BadParameter("pass exactly one of --checkpoint and --rows")
+    names = [name.strip() for name in (sets or ",".join(closed.JUDGED_SETS)).split(",") if name.strip()]
+    if rows is not None:
+        parts = rows.split("/")
+        if sets is not None:
+            raise typer.BadParameter("--sets goes with --checkpoint; a rows file is labelled on its harmful rows")
+        if not rows.endswith(".jsonl") or "" in parts or ".." in parts or parts[0] == "smoke":
+            raise typer.BadParameter(
+                "--rows is a .jsonl path or glob inside the responses repo, without smoke/: --mode picks the tree"
+            )
+    else:
+        try:
+            pinned = ids.parse(checkpoint).revision is not None
+        except ValueError:
+            pinned = False
+        if not pinned:
+            raise typer.BadParameter("--checkpoint is REPO@SHA with the full 40-character commit")
+        if not names or set(names) - set(closed.JUDGED_SETS):
+            raise typer.BadParameter(f"--sets takes {' and '.join(closed.JUDGED_SETS)}, comma-separated")
+    shown = {"rows": rows} if rows else {"checkpoint": checkpoint, "sets": names}
+    # nothing is launched or billed to the ledger, so no readiness report is needed
+    settings, deps = _open("judge closed", ready=False, **shown, mode=mode, concurrency=concurrency, limit=limit)
+    config = rubric.judge_config(settings)
+    typer.echo(f"{'judge':<10}{config.repo} under {config.prompt_format} ({config.config_hash[:12]})")
+    client = closed.from_env()
+    options = {"mode": mode, "concurrency": concurrency, "limit": limit, "retry_unscored": retry_unscored}
+    try:
+        if rows:
+            closed.judge_rows(settings, deps.hub, client, rows, echo=typer.echo, **options)
+        else:
+            closed.judge_checkpoint(settings, deps.hub, client, checkpoint, sets=names, echo=typer.echo, **options)
+    finally:
+        typer.echo(f"{'tokens':<10}{client.prompt_tokens} in, {client.completion_tokens} out")
 
 
 def _money(micro_usd: int) -> str:

@@ -27,11 +27,11 @@ def make_settings(tmp_path: Path) -> Settings:
 
 def judge_config(**changes) -> JudgeConfig:
     fields = {
-        "repo": BASE["judge"]["repo"],
-        "revision": BASE["judge"]["revision"],
-        "dtype": "bfloat16",
-        "decoding": Decoding(runtime="transformers", max_new_tokens=100),
-        "prompt_format": "polyguard-v1",
+        "repo": BASE["judge"]["closed"]["name"],
+        "revision": "n/a",
+        "dtype": "n/a",
+        "decoding": Decoding(greedy=False, runtime="api", max_new_tokens=1024),
+        "prompt_format": "rubric-v1",
         "parser_version": "1",
         "config_hash": "judge-1",
     }

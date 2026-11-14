@@ -225,7 +225,7 @@ def test_views_come_from_last_lines(settings, ledger):
     assert (ledger.lost_runs(), ledger.oom_runs()) == ([], [])
 
     generate, repair = _plan(settings), _plan(settings, "repair", override_smoke=True, override_soft=True)
-    smoke = _plan(settings, "judge", "smoke")
+    smoke = _plan(settings, "steer", "smoke")
     lost = pending_line(generate, GENERATE, NOW, "settings")
     oom = pending_line(repair, DRIFT, NOW, "settings")
     probe = pending_line(smoke, SMOKE, NOW, "settings")

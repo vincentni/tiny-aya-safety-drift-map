@@ -29,6 +29,10 @@ jobs = [
     "datasets==5.1.0",
     "accelerate==1.15.0",
 ]
+# the closed-model judge runs on a workstation through any LiteLLM route
+closed = [
+    "litellm==1.103.11",
+]
 
 [project.scripts]
 driftmap = "driftmap.cli:app"
@@ -36,6 +40,7 @@ driftmap = "driftmap.cli:app"
 [dependency-groups]
 dev = [
     "driftmap[jobs]",
+    "driftmap[closed]",
     "torch==2.15.0",
     "pytest==9.2.0",
     "pytest-socket==0.8.1",

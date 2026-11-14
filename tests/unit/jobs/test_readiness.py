@@ -28,7 +28,6 @@ from tests.fakes.settings import settings_toml
 
 AYA = "CohereLabs/tiny-aya-global"
 BASE = "CohereLabs/tiny-aya-base"
-JUDGE = "ToxicityPrompts/PolyGuard-Qwen"
 RESULTS = "vincentnkq/safety-drift-map-results"
 DATASETS = ("CohereLabs/aya_redteaming", "CohereLabs/aya_dataset", "Paul/XSTest")
 TOKEN = "hf_" + "a" * 34
@@ -49,8 +48,6 @@ def settings(tmp_path):
 def fake_hub(tmp_path, settings):
     fake = FakeHub(tmp_path / "hub")
     fake.add_repo(AYA, gated=True).add_repo(BASE, gated=True).add_repo(RESULTS, repo_type="dataset")
-    fake.add_repo(JUDGE)
-    fake.repos[JUDGE][settings.judge.revision] = {"config.json": b"{}"}
     fake.authorize(AYA)
     return fake
 
@@ -101,12 +98,12 @@ def test_every_item_passes_on_a_prepared_machine(monkeypatch, settings, fake_hub
 
     report = ready(settings, deps)
 
-    assert [(item.number, item.status) for item in report.items] == [(n, "PASS") for n in range(1, 11)]
+    assert [(item.number, item.status) for item in report.items] == [(n, "PASS") for n in range(1, 10)]
     assert report.ok and report.exit_code is ExitCode.SUCCESS
     assert all(item.hint is None and item.detail for item in report.items)
     text = (deps.repo_root / READY_PATH).read_text()
     stored = json.loads(text)
-    assert stored["ts"] == "2026-11-02T10:00:00Z" and len(stored["items"]) == 10
+    assert stored["ts"] == "2026-11-02T10:00:00Z" and len(stored["items"]) == 9
     assert stored["config_hash"] == settings.config_hash()
     assert set(stored["items"][0]) == {"number", "name", "status", "detail", "hint"}
     assert stored["billing"]["usedMicroUsd"] == 1_250_000
@@ -115,7 +112,7 @@ def test_every_item_passes_on_a_prepared_machine(monkeypatch, settings, fake_hub
         assert secret not in text
     # read-only: nothing is submitted, created or uploaded
     assert {name for name, _ in deps.client.calls} == {"billing_usage", "list_jobs_hardware"}
-    assert {name for name, _ in fake_hub.calls} == {"whoami", "auth_check", "hf_hub_download"}
+    assert {name for name, _ in fake_hub.calls} == {"whoami", "auth_check"}
 
     assert require_ready(deps.repo_root / READY_PATH, settings.config_hash(), now=clock.now) == report
     clock.advance(timedelta(hours=24).total_seconds())
@@ -142,7 +139,7 @@ def test_a_failed_or_partial_report_never_admits_a_verb(tmp_path, clock):
     path = tmp_path / "ready.json"
     passed = [Item(number=number, name=name, status="PASS", detail="") for number, name, _ in readiness.ITEMS]
     failed = [*passed[:-1], passed[-1].model_copy(update={"status": "FAIL", "hint": "push"})]
-    for items, word in ((failed, "10"), (passed[:-1], "10"), ([], "1")):
+    for items, word in ((failed, "9"), (passed[:-1], "9"), ([], "1")):
         report = ReadyReport(ts=clock.now(), config_hash="c", items=items)
         assert not report.ok and report.exit_code == 3
         dump(report, path)

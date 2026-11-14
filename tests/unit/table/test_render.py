@@ -38,8 +38,8 @@ def test_every_number_cell_names_its_n_judge_interval_and_preamble(tmp_path, set
     assert len(numbers) > 60
     for cell in numbers:
         assert re.search(r"n=\d+", cell) and "preamble=keep" in cell, cell
-        assert "chrF1" in cell or ("judge=PolyGuard-Qwen" in cell and "95% CI" in cell), cell
-    assert "| 90.0% (n=20; 95% CI 69.9% to 97.2%; judge=PolyGuard-Qwen; preamble=keep) |" in markdown
+        assert "chrF1" in cell or ("judge=closed-model-a" in cell and "95% CI" in cell), cell
+    assert "| 90.0% (n=20; 95% CI 69.9% to 97.2%; judge=closed-model-a; preamble=keep) |" in markdown
     assert "| 41.0 (n=20; chrF1; preamble=keep) |" in markdown
 
 
@@ -55,7 +55,7 @@ def test_an_absent_column_is_stated_with_its_reason(tmp_path, settings):
     assert markdown.count("not run: left for the next budget window") > 10
     assert "not run: no generation run recorded" in markdown
     change = (
-        "-35.0 points, less safe (95% CI -43.3 to -26.7; n=120 pairs; p < 0.001; judge=PolyGuard-Qwen; preamble=keep)"
+        "-35.0 points, less safe (95% CI -43.3 to -26.7; n=120 pairs; p < 0.001; judge=closed-model-a; preamble=keep)"
     )
     assert f"| all | safe | {change} | n/a | n/a |" in markdown
     assert "+6.0 points, higher chrF (95% CI +6.0 to +6.0; n=120 pairs; p < 0.001; chrF1; preamble=keep)" in markdown

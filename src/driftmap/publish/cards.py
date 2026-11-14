@@ -142,10 +142,12 @@ def _writeup(settings: Settings, writeup: str | None) -> str:
 def _judge(settings: Settings, tables: Tables | None) -> str:
     """The judge the label rows record; before any table, the configured one, said as such."""
     if tables is None:
-        named = f"{settings.judge.repo} at revision `{settings.judge.revision}`, as configured; no labels tabled yet"
+        closed = settings.judge.closed
+        named = f"{closed.name} under `{closed.rubric}`" if closed else "none configured"
+        named += ", as configured; no labels tabled yet"
     else:
         judge = tables.judge
-        named = f"{judge.repo} at revision `{judge.revision}`, prompt format `{judge.prompt_format}`"
+        named = f"{judge.repo} under `{judge.prompt_format}` (rubric text sha256 `{judge.revision[:12]}`)"
     return f"- Judge: {named} (its own licence or terms apply)."
 
 

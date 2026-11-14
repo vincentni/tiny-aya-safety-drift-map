@@ -11,7 +11,9 @@ from pydantic import BaseModel, TypeAdapter, ValidationError
 from driftmap.core import records
 from driftmap.core.records import (
     Ceilings,
+    Decoding,
     DeltaRow,
+    JudgeConfig,
     LedgerLine,
     RateRow,
     Ref,
@@ -591,3 +593,15 @@ def test_dump_keeps_the_old_file_when_the_swap_fails(tmp_path, monkeypatch):
         dump(records.Decision.model_validate(_payload("decision", decision="extend")), path)
     assert load(records.Decision, path).decision == "proceed"
     assert [p.name for p in path.parent.iterdir()] == ["drift.json"]
+
+
+def test_only_an_api_runtime_leaves_greedy_decoding_unclaimed():
+    assert Decoding(runtime="transformers").greedy is True and Decoding(runtime="llama-server").greedy is True
+    assert Decoding(runtime="api", greedy=False).model_dump()["greedy"] is False
+    for fields in ({"runtime": "transformers", "greedy": False}, {"runtime": "api"}, {"runtime": "batch"}):
+        with pytest.raises(ValidationError):
+            Decoding(**fields)
+    closed = JudgeConfig(**JUDGE | {"prompt_format": "rubric-v1", "decoding": {"runtime": "api", "greedy": False}})
+    assert closed.prompt_format == "rubric-v1"
+    with pytest.raises(ValidationError):
+        JudgeConfig(**JUDGE | {"prompt_format": "rubric-v2"})

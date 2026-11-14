@@ -29,7 +29,6 @@ from tests.fakes.settings import settings_toml
 
 AYA = "CohereLabs/tiny-aya-global"
 BASE = "CohereLabs/tiny-aya-base"
-JUDGE = "ToxicityPrompts/PolyGuard-Qwen"
 RESULTS = "vincentnkq/safety-drift-map-results"
 OWNER = SimpleNamespace(owner="vincentnkq")
 JOB = {
@@ -67,8 +66,6 @@ def settings(tmp_path):
 def fake_hub(tmp_path, settings):
     fake = FakeHub(tmp_path / "hub")
     fake.add_repo(AYA, gated=True).add_repo(BASE, gated=True).add_repo(RESULTS, repo_type="dataset")
-    fake.add_repo(JUDGE)
-    fake.repos[JUDGE][settings.judge.revision] = {"config.json": b"{}"}
     fake.authorize(AYA)
     return fake
 
@@ -465,7 +462,7 @@ def test_the_comparison_seam_scores_stored_answers(monkeypatch, settings, deps):
 
 def test_release_image_and_code_pins(monkeypatch, tmp_path, settings, deps):
     """Reachable release files, recorded image facts and a clean pushed HEAD pass; anything else fails (TS-RDY-8)."""
-    only(monkeypatch, 8, 9, 10)
+    only(monkeypatch, 8, 9)
     # the code URL maps to a local repo; other transports are refused
     monkeypatch.setenv("GIT_ALLOW_PROTOCOL", "file")
     release = settings.llamacpp_release
@@ -485,30 +482,30 @@ def test_release_image_and_code_pins(monkeypatch, tmp_path, settings, deps):
     deps = replace(deps, repo_root=work, head=lambda url: seen.append(url) or 200)
 
     report = ready(settings, deps)
-    assert [(item.number, item.status) for item in report.items] == [(8, "PASS"), (9, "PASS"), (10, "PASS")]
+    assert [(item.number, item.status) for item in report.items] == [(8, "PASS"), (9, "PASS")]
     assert seen == urls and report.exit_code == 0
 
-    def ninth(head=lambda url: 200, probe=PROBE):
+    def eighth(head=lambda url: 200, probe=PROBE):
         dump(probe, probe_path)
         return readiness.release_and_image(settings, replace(deps, head=head))
 
-    gone = ninth(lambda url: 404 if url == release.cuda_asset else 200)
+    gone = eighth(lambda url: 404 if url == release.cuda_asset else 200)
     assert not gone.ok and release.cuda_asset in gone.detail and "404" in gone.detail
 
     def unreachable(url):
         raise httpx2.ConnectError("no route")
 
-    assert not ninth(unreachable).ok
-    usual = ninth()
+    assert not eighth(unreachable).ok
+    usual = eighth()
     assert usual.ok and "python 3.12.3" in usual.detail and "torch 2.14.1+cu126" in usual.detail
     for field, value in (("python", "3.11.9"), ("torch", "")):
-        wrong = ninth(probe=PROBE.model_copy(update={field: value}))
+        wrong = eighth(probe=PROBE.model_copy(update={field: value}))
         assert not wrong.ok and field in wrong.detail and str(IMAGE_PROBE_PATH) in wrong.detail
     # recorded, never failing
-    odd = ninth(probe=PROBE.model_copy(update={"pep668": False, "tools": ["pip", "git", "uv"], "torch": "2.13.0"}))
+    odd = eighth(probe=PROBE.model_copy(update={"pep668": False, "tools": ["pip", "git", "uv"], "torch": "2.13.0"}))
     assert odd.ok and "no pep668 marker" in odd.detail and "git, pip, uv" in odd.detail and "2.13.0" in odd.detail
     unprobed = "image not probed; the smoke run covers it"
-    foreign = ninth(probe=PROBE.model_copy(update={"image": IMAGE.replace("2.14.1", "2.13.0"), "python": "3.11.9"}))
+    foreign = eighth(probe=PROBE.model_copy(update={"image": IMAGE.replace("2.14.1", "2.13.0"), "python": "3.11.9"}))
     assert foreign.ok and unprobed in foreign.detail
     probe_path.write_text("{")
     torn = readiness.release_and_image(settings, deps)
@@ -577,15 +574,3 @@ def test_a_stale_or_missing_report_stops_the_verb(tmp_path, clock):
     assert require_ready(path, "c", max_age_h=48, now=clock.now).ok
     with pytest.raises(NotReady, match="configuration.*driftmap ready"):
         require_ready(path, "d", max_age_h=48, now=clock.now)
-
-
-def test_the_judge_pin_is_downloaded(monkeypatch, settings, fake_hub, deps):
-    """The pinned judge config downloads; a revision the Hub does not have fails naming the pin (TS-RDY-10)."""
-    only(monkeypatch, 8)
-    assert ready(settings, deps).items[0].status == "PASS"
-    assert [kwargs["filename"] for name, kwargs in fake_hub.calls if name == "hf_hub_download"] == ["config.json"]
-
-    del fake_hub.repos[JUDGE][settings.judge.revision]
-    item = ready(settings, deps).items[0]
-    assert item.status == "FAIL" and f"{JUDGE}@{settings.judge.revision}" in item.detail
-    assert "RevisionNotFoundError" in item.detail and "[judge]" in item.hint

@@ -57,7 +57,6 @@ BASE: dict[str, Any] = {
     "timeouts": {
         "drift": 180,
         "generate": 90,
-        "judge": 45,
         "repair": 120,
         "steer": 90,
         "quant": 60,
@@ -73,6 +72,7 @@ BASE: dict[str, Any] = {
         "parser_version": "1",
         "smol_repo": "ToxicityPrompts/PolyGuard-Qwen-Smol",
         "smol_revision": "224f511fe2ee3e304a11f470c8071f43ee0d8f70",
+        "closed": {"name": "closed-model-a", "rubric": "rubric-v1"},
     },
     "code": {"origin": "https://github.com/vincentni/tiny-aya-safety-drift-map", "branch": "main"},
     "repair": {

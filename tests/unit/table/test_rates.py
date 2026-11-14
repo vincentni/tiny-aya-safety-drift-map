@@ -9,6 +9,7 @@ import driftmap
 from driftmap.core.records import Tables, load
 from driftmap.core.schemas import DriftmapError, ExitCode
 from driftmap.jobs import snapshot
+from driftmap.judge import rubric
 from driftmap.jobs.snapshot import TABLES_PATH, write_decision
 from driftmap.table.build import COLUMNS, NOT_COMPARABLE, DuplicateKey, build, save
 from driftmap.table.rates import Rate, over_refusal_rate, rate_row, refusal_rate, safe_rate, wilson
@@ -23,8 +24,6 @@ from tests.fakes.labels import (
     targets,
     write_labels,
 )
-
-SMOL = "ToxicityPrompts/PolyGuard-Qwen-Smol"
 
 
 @pytest.fixture
@@ -79,7 +78,7 @@ def test_wilson_intervals_match_the_literals_and_an_empty_cell_has_none(tmp_path
 
 
 def test_four_judged_columns_share_one_judge_config(tmp_path, settings):
-    """Every row carries the same config; a column judged under another one is not comparable (TS-JDG-9)."""
+    """Every row carries the same config; a table with a column judged under another one is refused (TS-JDG-9)."""
     rows = [row for column in COLUMNS for row in column_rows(column)]
     tables = built(tmp_path, settings, rows)
 
@@ -88,10 +87,13 @@ def test_four_judged_columns_share_one_judge_config(tmp_path, settings):
 
     other = judge_config(parser_version="2", config_hash="judge-2")
     rows = column_rows("baseline") + column_rows("drifted", judge=other)
-    tables = built(tmp_path / "other", settings, rows)
-    assert tables.columns["drifted"].state == "not_comparable" and "judge" in tables.columns["drifted"].reason
-    assert tables.judge == judge_config() and find(
-        tables.safety, row="all", metric="safe", checkpoint=checkpoint("drifted")
+    with pytest.raises(DriftmapError) as refused:
+        built(tmp_path / "other", settings, rows)
+    assert refused.value.exit_code == 12
+    judge = judge_config().repo
+    listed = f"baseline by {judge} (judge-1), drifted by {judge} (judge-2)"
+    assert str(refused.value) == (
+        f"the columns were judged under different configs: {listed}; judge them with one judge"
     )
 
 
@@ -130,11 +132,6 @@ def test_pooled_and_group_rows_cover_all_six_languages(tmp_path, settings):
     ("rows", "records", "reason"),
     [
         ({"rendered_prefix_sha256": "e" * 64}, [], "prefix"),
-        (
-            {"judge": judge_config(decoding=judge_config().decoding.model_copy(update={"max_new_tokens": 50}))},
-            [],
-            "judge",
-        ),
         ({}, [run_record("generate", "drifted", notes=[f"{NOT_COMPARABLE}seed 7 differs from baseline"])], "seed 7"),
         ({}, [run_record("generate", "drifted", notes=[f"{NOT_COMPARABLE}preamble was stripped"])], "preamble"),
         (
@@ -237,16 +234,41 @@ def test_a_repair_below_either_bar_is_flagged_with_the_bar(tmp_path, settings):
 
 
 def test_mixed_or_foreign_judge_labels_are_refused(tmp_path, settings):
-    """Two configs in one column are named; so is a small-judge column in a full build (TS-TBL-11)."""
+    """Two configs in one column are named; so is a column of another judge in a full build (TS-TBL-11)."""
     other = judge_config(parser_version="2", config_hash="judge-2")
     rows = column_rows("baseline")
     with pytest.raises(DriftmapError, match="baseline mixes judge configs judge-1, judge-2"):
         built(tmp_path, settings, [rows[0].model_copy(update={"judge": other}), *rows[1:]])
 
-    smol = column_rows("baseline", judge=judge_config(repo=SMOL))
-    with pytest.raises(DriftmapError, match=SMOL):
-        built(tmp_path / "smol", settings, smol)
-    assert built(tmp_path / "smoke", settings, smol, mode="smoke").judge.repo == SMOL
+    foreign = column_rows("baseline", judge=judge_config(repo="closed-model-b"))
+    with pytest.raises(DriftmapError, match="baseline was judged by closed-model-b under rubric-v1"):
+        built(tmp_path / "foreign", settings, foreign)
+    assert built(tmp_path / "smoke", settings, foreign, mode="smoke").judge.repo == "closed-model-b"
+
+
+def test_a_full_table_takes_the_closed_judge_for_every_column(tmp_path, settings):
+    closed = rubric.judge_config(settings)
+    rows = [row for column in COLUMNS for row in column_rows(column, judge=closed)]
+
+    tables = built(tmp_path, settings, rows)
+
+    assert {state.state for state in tables.columns.values()} == {"tabled"}
+    assert tables.judge == closed and tables.judge.repo == settings.judge.closed.name
+    assert "judge=closed-model-a" in render(tables, settings)
+    mixed = column_rows("baseline", judge=closed) + column_rows("drifted")
+    with pytest.raises(DriftmapError, match="judged under different configs: baseline by closed-model-a"):
+        built(tmp_path / "mixed", settings, mixed)
+    only = "a full table takes labels of closed-model-a under rubric-v1 only"
+    for change, found in (
+        ({"repo": "some-other-model"}, "some-other-model under rubric-v1"),
+        ({"prompt_format": "polyguard-v1"}, "closed-model-a under polyguard-v1"),
+    ):
+        foreign = column_rows("baseline", judge=closed.model_copy(update=change))
+        with pytest.raises(DriftmapError, match=f"baseline was judged by {found}; {only}"):
+            built(tmp_path / found.replace(" ", "-"), settings, foreign)
+    unnamed = settings.model_copy(update={"judge": settings.judge.model_copy(update={"closed": None})})
+    with pytest.raises(DriftmapError, match=r"takes labels of the judge named under \[judge.closed\] only"):
+        built(tmp_path / "unnamed", unnamed, rows)
 
 
 def test_a_duplicate_row_key_is_refused(tmp_path, settings):
@@ -268,13 +290,14 @@ def test_a_train_prompt_among_the_evaluation_prompts_is_refused(tmp_path, settin
 
 
 def test_later_stage_features_are_absent(tmp_path, settings):
-    """Over-refusal is English only and there is no kappa, spot check, litellm or ROI (TS-TBL-14)."""
+    """Over-refusal is English only, there is no kappa, spot check or ROI, and one module calls LiteLLM (TS-TBL-14)."""
     tables = built(tmp_path, settings, column_rows("baseline") + column_rows("drifted"))
 
     assert {row.row for row in tables.over_refusal} == {"en"}
     assert not {"kappa", "roi", "spot_check"} & set(json.loads(tables.model_dump_json()))
     sources = {path: path.read_text() for path in Path(driftmap.__file__).parent.rglob("*.py")}
-    assert not [path for path, text in sources.items() if "litellm" in text or "kappa" in text]
+    assert not [path for path, text in sources.items() if "kappa" in text]
+    assert [path.name for path, text in sources.items() if "litellm" in text.lower()] == ["closed.py"]
     assert not [path for path in sources if "spot" in path.name]
 
 

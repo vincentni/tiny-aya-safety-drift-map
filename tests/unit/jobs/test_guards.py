@@ -44,7 +44,7 @@ NAMES = [
     "oom_repeat",
     "drift_decision",
 ]
-GPU_KINDS = {"drift", "generate", "judge", "repair", "steer", "quant_eval"}
+GPU_KINDS = {"drift", "generate", "repair", "steer", "quant_eval"}
 MODEL_KINDS = {"drift", "generate", "repair"}
 
 
@@ -119,7 +119,7 @@ def test_model_gate_is_required_and_base_gate_is_not(config, monkeypatch):
             assert refusal.guard == "gate"
             assert "https://huggingface.co/CohereLabs/tiny-aya-global" in refusal.reason
             assert BASE not in refusal.reason
-        for kind in ("judge", "steer", "quant", "quant_eval"):
+        for kind in ("steer", "quant", "quant_eval"):
             assert gate(closed, _plan(settings, kind)) is None
 
     base_closed = _snapshot(settings.ceilings, gates={MODEL: "ok", "CohereLabs/tiny-aya-base": "403"})
@@ -165,7 +165,7 @@ def test_full_run_needs_a_matching_smoke_record(config):
     bumped = [pin.replace("safetune==0.1.10", "safetune==0.1.11") for pin in plan.dependencies]
     differing = [
         {"dependencies": bumped},
-        {"script": "driftmap.scripts.judge"},
+        {"script": "driftmap.scripts.steer"},
         {"image": "pytorch/pytorch:2.15.0-cuda12.6-cudnn9-runtime"},
         {"runner": "uv"},
         {"runner": "kaggle"},
@@ -325,7 +325,7 @@ def test_oom_run_is_not_repeated_with_the_same_config(config):
     next_rung = _plan(config(batch={"generate": 8}))
     assert next_rung.config_hash != plan.config_hash
     assert oom_repeat(failed, next_rung) is None
-    assert oom_repeat(failed, _plan(settings, "judge")) is None
+    assert oom_repeat(failed, _plan(settings, "steer")) is None
 
 
 def test_flagged_drift_needs_a_decision_before_repair(config):

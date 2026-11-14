@@ -2,7 +2,6 @@
 
 import json
 import logging
-import tempfile
 import uuid
 from collections.abc import Callable, Sequence
 from datetime import datetime, timedelta
@@ -10,13 +9,12 @@ from pathlib import Path
 from typing import Any, Literal, NamedTuple
 
 import httpx2
-from huggingface_hub.errors import HfHubHTTPError, LocalEntryNotFoundError
+from huggingface_hub.errors import HfHubHTTPError
 from pydantic import RootModel, ValidationError
 
 from driftmap.core.hub import GateRefused, gate_url
 from driftmap.core.records import CommitSha, MicroUsd, Record, UtcDatetime, dump, load
 from driftmap.core.redact import mask
-from driftmap.core.retry import root_cause
 from driftmap.core.schemas import DriftmapError, ExitCode
 from driftmap.core.settings import ConfigError, Settings
 from driftmap.jobs.client import BILLING_SCOPE, BillingUnavailable, minute_prices, used_micro_usd
@@ -252,17 +250,6 @@ def stored_answer_scores() -> list[float]:
     return [prediction.score for prediction in result.predictions]
 
 
-def judge_downloadable(settings: Settings, deps: Deps) -> Check:
-    pin = f"{settings.judge.repo}@{settings.judge.revision}"
-    with tempfile.TemporaryDirectory() as scratch:
-        try:
-            deps.hub.hf_hub_download(f"{pin}#config.json", scratch)
-        except (HfHubHTTPError, LocalEntryNotFoundError, DriftmapError) as error:
-            detail = f"{pin} cannot be downloaded ({_brief(root_cause(error))})"
-            return Check(False, detail, "check repo and revision under [judge] in driftmap.toml")
-    return Check(True, f"config.json of {pin} downloads")
-
-
 def release_and_image(settings: Settings, deps: Deps) -> Check:
     release = settings.llamacpp_release
     down = []
@@ -308,9 +295,8 @@ ITEMS: tuple[tuple[int, str, Callable[[Settings, Deps], Check]], ...] = (
     (5, "GPU flavor priced", gpu_priced),
     (6, "LoRA attaches on the seven projections", lora_attaches),
     (7, "AuditKIT comparison runs", comparison_runs),
-    (8, "judge downloadable", judge_downloadable),
-    (9, "llama.cpp release reachable, image facts recorded", release_and_image),
-    (10, "code pinned on origin", code_pinned),
+    (8, "llama.cpp release reachable, image facts recorded", release_and_image),
+    (9, "code pinned on origin", code_pinned),
 )
 
 

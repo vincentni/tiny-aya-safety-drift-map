@@ -360,7 +360,7 @@ ROWS = {
     "failed": ("ERROR", "failed", 12, False, 90, {"notes": ["integrity"]}, "fix the input", STOP),
     "lost": ("ERROR", None, QUIET, False, 5130, {"lost": True}, "widen it or split", LOST),
     "marker": ("ERROR", None, QUIET, True, 5129, {"notes": ["partial"]}, "to resume", STOP),
-    "sigkill": ("ERROR", None, QUIET, False, 5129, {"oom": True, "notes": ["sigkill-suspected"]}, "judge = 4", STOP),
+    "sigkill": ("ERROR", None, QUIET, False, 5129, {"oom": True, "notes": ["sigkill-suspected"]}, "per job", STOP),
     "setup": ("ERROR", None, PIP, False, 40, {"notes": ["setup"]}, "fix the pins", STOP),
     "canceled": ("CANCELED", "partial", "", False, 300, {"notes": ["canceled"]}, "relaunch allowed", STOP),
     "deleted": ("DELETED", None, "", False, None, {"notes": ["canceled"]}, "relaunch allowed", STOP),
@@ -403,12 +403,12 @@ def test_rows_at_their_edges():
     assert paused.ledger_fields["notes"] == ["unclassified"] and paused.code is ExitCode.UNEXPECTED
 
 
-@pytest.mark.parametrize(("exit_code", "notes"), [(12, "integrity"), (13, "column-failed"), (14, "judge-inspect-stop")])
-def test_the_failed_row_takes_the_three_job_exit_codes_only(exit_code, notes):
+@pytest.mark.parametrize(("exit_code", "notes"), [(12, "integrity"), (13, "column-failed")])
+def test_the_failed_row_takes_the_two_job_exit_codes_only(exit_code, notes):
     facts = {"marker_present": False, "running_secs": 100, "timeout_s": T}
     record = run_record(RUN, "failed")
     assert classify("ERROR", record, exit_code, trailer("failed", exit_code), **facts).ledger_fields["notes"] == [notes]
-    for other in (0, 1, 2, 5, 10, 11, 15, 99, None):
+    for other in (0, 1, 2, 5, 10, 11, 14, 15, 99, None):
         tail = QUIET if other is None else trailer("failed", other)
         fields = classify("ERROR", record, other, tail, **facts).ledger_fields
         assert fields == {"record_status": "failed", "exit_code": other, "notes": ["unclassified"]}
@@ -508,7 +508,7 @@ def test_an_error_word_inside_a_log_line_is_not_an_install_failure(line):
 )
 def test_reconcile_compares_billing_with_the_ledger(world, capsys, gap, code, appended):
     """Billing over the ledger by more than 500,000 exits 1, as does no billing; else a line is added (TS-LCH-7)."""
-    for job_id, kind, seconds in (("job-0", "judge", 2400), ("job-1", "generate", 1500)):
+    for job_id, kind, seconds in (("job-0", "steer", 2400), ("job-1", "generate", 1500)):
         pending = world.started(job_id, kind)
         world.clock.advance(1800)
         world.ledger.append(terminal_line(pending, running_secs=seconds, stage="COMPLETED", ts=world.clock.now()))
@@ -549,9 +549,9 @@ def test_reconcile_compares_billing_with_the_ledger(world, capsys, gap, code, ap
 def test_reconcile_beside_a_pending_job_exits_1_and_names_it(world, capsys):
     done = world.started("job-1")
     world.ledger.append(terminal_line(done, running_secs=1500, stage="COMPLETED", ts=world.clock.now()))
-    world.started("job-2", "judge")
+    world.started("job-2", "steer")
     world.started("job-3", "quant")
-    # the pending lines would cover 629,985 of unrecorded spend
+    # the pending lines would cover 1,229,970 of unrecorded spend
     world.client.billing_used_micro_usd = 333_325 + 600_000
     before = world.ledger.path.read_bytes()
 
@@ -581,7 +581,7 @@ def test_an_out_of_memory_run_is_marked_and_prints_the_next_rung(world, capsys, 
     line = world.ledger.read()["job-1"]
     assert (line.oom, line.lost, line.record_status, line.exit_code) == (True, False, "oom", 11)
     assert world.ledger.oom_runs() == [(kind, world.settings.config_hash())]
-    rung = {"drift": "2 x 8", "generate": "16 -> 8", "judge": "16 -> 8", "repair": "8 -> 4, then pass --alphas one"}
+    rung = {"drift": "2 x 8", "generate": "16 -> 8", "repair": "8 -> 4, then pass --alphas one"}
     out = capsys.readouterr().out
     assert rung.get(kind, NO_RUNG) in out and OOM_LADDER.get(kind, NO_RUNG) in out
     assert len(world.submits()) == 1
@@ -619,7 +619,7 @@ def test_a_silent_early_death_points_at_host_memory_unless_a_marker_was_pushed(w
     line = world.ledger.read()["job-1"]
     assert (line.oom, line.lost, line.notes[1:]) == (True, False, ["sigkill-suspected"])
     assert HOST_RAM_RUNG in capsys.readouterr().out
-    assert "--alphas one value per job" in HOST_RAM_RUNG and "judge = 4" in HOST_RAM_RUNG
+    assert "--alphas one value per job" in HOST_RAM_RUNG
 
     world.clock.advance(60)
     world.job("job-2", "ERROR", running_secs=5129, logs=["step 900"])
@@ -635,11 +635,11 @@ def test_a_chain_checks_inputs_first_and_stops_at_the_first_job_that_is_not_ok(t
     """A missing input is exit 4 before any call; a failed job ends the chain; each job is re-checked (TS-LCH-11)."""
     blocked = World(tmp_path / "blocked")
     drifted = State(languages=("en",), checkpoint="drifted")
-    assert chain(blocked.settings, blocked.deps, ["generate", "judge"], state=lambda kind: drifted) == 4
+    assert chain(blocked.settings, blocked.deps, ["generate", "steer"], state=lambda kind: drifted) == 4
     assert "merged_sha256" in capsys.readouterr().out
     assert blocked.client.calls == [] and blocked.git.calls == [] and not blocked.ledger.path.exists()
 
-    ready = State(languages=("en",), responses_complete=True)
+    ready = State(languages=("en",), steer_comparison=True)
     failing = World(tmp_path / "failing")
     failing.git_ok()
     failing.smoke_passed()
@@ -651,14 +651,14 @@ def test_a_chain_checks_inputs_first_and_stops_at_the_first_job_that_is_not_ok(t
         asked.append(kind)
         return ready
 
-    assert chain(failing.settings, failing.deps, ["generate", "judge"], state=state) is ExitCode.UNEXPECTED
+    assert chain(failing.settings, failing.deps, ["generate", "steer"], state=state) is ExitCode.UNEXPECTED
     assert "chain stopped at generate" in capsys.readouterr().out
     assert asked == ["generate"] and len(failing.submits()) == 1
     assert failing.ledger.read()["job-1"].notes[1:] == ["column-failed"]
 
     passing = World(tmp_path / "passing")
     passing.git_ok(2)
-    for kind, job_id in (("generate", "job-1"), ("judge", "job-2")):
+    for kind, job_id in (("generate", "job-1"), ("steer", "job-2")):
         passing.smoke_passed(kind)
         passing.job(job_id, "COMPLETED", logs=[trailer("ok", 0)])
         passing.push_record(f"{kind}-full-20261102T100000Z", "ok")
@@ -668,13 +668,13 @@ def test_a_chain_checks_inputs_first_and_stops_at_the_first_job_that_is_not_ok(t
         seen.append((kind, len(passing.ledger.lines())))
         return ready
 
-    extra = {"judge": ["--judge", "qwen"]}
-    assert chain(passing.settings, passing.deps, ["generate", "judge"], state=state_after, args=extra) == 0
-    assert seen == [("generate", 0), ("judge", 4)]
+    extra = {"steer": ["--layer", "12"]}
+    assert chain(passing.settings, passing.deps, ["generate", "steer"], state=state_after, args=extra) == 0
+    assert seen == [("generate", 0), ("steer", 4)]
     assert passing.count("list_jobs") == 2 and passing.count("billing_usage") == 4
     commands = [kwargs["command"][-1] for _, kwargs in passing.submits()]
-    assert ["driftmap.scripts.generate" in commands[0], "driftmap.scripts.judge" in commands[1]] == [True, True]
-    assert commands[1].endswith("--judge qwen") and "--judge" not in commands[0]
+    assert ["driftmap.scripts.generate" in commands[0], "driftmap.scripts.steer" in commands[1]] == [True, True]
+    assert commands[1].endswith("--layer 12") and "--layer" not in commands[0]
     assert [line.pending for line in passing.job_lines()] == [False, False]
     assert [(line.pending, line.cost_micro_usd) for line in passing.holds()] == [(False, 0), (False, 0)]
 
@@ -1356,7 +1356,7 @@ def test_a_job_the_ledger_still_holds_counts_as_in_flight(world, capsys):
     world.git_ok(3)
     world.started("job-9", "quant")
     assert launch(world.settings, world.deps, "generate", "smoke", dry_run=True) is ExitCode.SUCCESS
-    held = world.started("job-8", "judge")
+    held = world.started("job-8", "steer")
     assert [job.status.stage for job in world.client.list_jobs()] == ["COMPLETED", "COMPLETED"]
     capsys.readouterr()
 
@@ -1369,6 +1369,24 @@ def test_a_job_the_ledger_still_holds_counts_as_in_flight(world, capsys):
     assert "job-9" not in refused["in_flight_gpu"] and len(world.submits()) == 2
     world.ledger.append(terminal_line(held, running_secs=60, stage="COMPLETED", ts=world.clock.now()))
     assert launch(world.settings, world.deps, "generate", "smoke") is ExitCode.SUCCESS
+
+
+def test_ledger_lines_of_a_kind_no_longer_launched_are_read_and_a_pending_one_holds_the_gpu(world, capsys):
+    world.git_ok(3)
+    steer = pending_line(world.plan("steer"), "job-6", world.clock.now(), "settings")
+    stored = steer.model_copy(update={"kind": "judge"})
+    world.ledger.append(stored)
+    world.ledger.append(terminal_line(stored, running_secs=600, stage="COMPLETED", ts=world.clock.now()))
+    assert launch(world.settings, world.deps, "generate", "smoke", dry_run=True) is ExitCode.SUCCESS
+    world.ledger.append(stored.model_copy(update={"job_id": "job-7"}))
+    capsys.readouterr()
+
+    assert launch(world.settings, world.deps, "generate", "smoke") is ExitCode.GUARD_REFUSAL
+
+    out = capsys.readouterr().out
+    assert "pending on the ledger: job-7" in out and "job-6" not in out and world.submits() == []
+    with pytest.raises(ConfigError, match="unknown job kind 'judge'"):
+        launch(world.settings, world.deps, "judge", "smoke", dry_run=True)
 
 
 def test_a_poll_error_keeps_the_pending_line_and_prints_the_wait_command(world, capsys):
@@ -1433,7 +1451,7 @@ def test_a_finished_job_whose_evidence_cannot_be_fetched_is_closed_at_its_own_du
     assert line.billing_used_after_micro_usd == 777_000
     out = capsys.readouterr().out
     assert "driftmap wait job-1" in out and "hf jobs cancel" not in out
-    assert launch(world.settings, world.deps, "judge", "smoke", dry_run=True) is ExitCode.SUCCESS
+    assert launch(world.settings, world.deps, "steer", "smoke", dry_run=True) is ExitCode.SUCCESS
     capsys.readouterr()
     for dry_run in (True, False):
         assert launch(world.settings, world.deps, "generate", "smoke", dry_run=dry_run) is ExitCode.GUARD_REFUSAL
@@ -1496,7 +1514,7 @@ def test_a_lost_job_whose_log_could_not_be_fetched_still_stops_its_relaunch(worl
 
 def test_a_launch_decides_on_one_read_of_the_ledger(world, capsys):
     world.git_ok()
-    held = world.started("job-8", "judge")
+    held = world.started("job-8", "steer")
     reads = []
 
     class Watched:
@@ -1727,11 +1745,11 @@ def test_every_submit_carries_the_config_hash(world):
             world.ledger.read()["fake00000000000000000001"], running_secs=60, stage="COMPLETED", ts=world.clock.now()
         )
     )
-    assert launch(world.settings, world.deps, "judge", "smoke", args=["--judge", "smol"]) is ExitCode.SUCCESS
+    assert launch(world.settings, world.deps, "steer", "smoke", args=["--layer", "12"]) is ExitCode.SUCCESS
     plain, extra = (kwargs["command"][-1] for _, kwargs in world.submits())
     carried = f"--config-hash {world.settings.config_hash()}"
     assert plain.endswith(carried) and plain.count("--config-hash") == 1
-    assert extra.endswith(f"{carried} --judge smol") and extra.count("--config-hash") == 1
+    assert extra.endswith(f"{carried} --layer 12") and extra.count("--config-hash") == 1
 
 
 def test_a_live_price_above_the_configured_one_prices_the_job(tmp_path):
@@ -1761,9 +1779,9 @@ def test_overrides_reach_the_guards_and_the_ledger_notes(world):
 def test_the_uv_runner_submits_a_script_job(tmp_path):
     world = World(tmp_path, runner="uv")
     world.git_ok()
-    assert launch(world.settings, world.deps, "judge", "smoke", limit=10) is ExitCode.SUCCESS
+    assert launch(world.settings, world.deps, "steer", "smoke", limit=10) is ExitCode.SUCCESS
     ((method, kwargs),) = world.submits()
-    assert (method, kwargs["script"]) == ("run_uv_job", "jobs/judge.py")
+    assert (method, kwargs["script"]) == ("run_uv_job", "jobs/steer.py")
     flags = ["--limit", "10", "--force-flush-after-s", "300", "--config-hash", world.settings.config_hash()]
     assert kwargs["script_args"][-6:] == flags
 

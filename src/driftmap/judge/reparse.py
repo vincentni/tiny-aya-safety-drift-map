@@ -10,16 +10,8 @@ from driftmap.core import ids
 from driftmap.core.hub import Hub
 from driftmap.core.records import LabelRow
 from driftmap.core.schemas import DriftmapError, ExitCode
-from driftmap.judge import parser
-from driftmap.judge.incremental import (
-    FIELDS,
-    UNSCORED,
-    RawRow,
-    dump_rows,
-    key,
-    read_rows,
-)
-from driftmap.judge.polyguard import config_hash
+from driftmap.judge import rubric
+from driftmap.judge.incremental import FIELDS, UNSCORED, RawRow, dump_rows, key, read_rows
 
 SUPERSEDED = "superseded"
 _SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -30,32 +22,29 @@ def reparse_rows(labels: Iterable[LabelRow], raws: Iterable[RawRow]) -> list[Lab
     stored = {key(raw): raw for raw in raws}
     fresh = []
     for row in labels:
-        if row.judge is None:
+        if row.judge is None or row.judge.prompt_format != rubric.PROMPT_FORMAT:
+            # no judge, or one whose answers this code has no parser for
             fresh.append(row)
             continue
-        config = row.judge.model_copy(update={"parser_version": parser.PARSER_VERSION})
-        update: dict[str, object] = {"judge": config.model_copy(update={"config_hash": config_hash(config)})}
+        config = row.judge.model_copy(update={"parser_version": rubric.PARSER_VERSION})
+        hashed = config.model_copy(update={"config_hash": rubric.config_hash(config)})
+        update: dict[str, object] = {"judge": hashed}
         if row.raw_output_present:
             raw = stored.get(key(row))
             if raw is None or (raw.repo, raw.revision) != (row.judge.repo, row.judge.revision):
                 found = "no stored judge output" if raw is None else f"an output of {raw.repo}@{raw.revision[:12]}"
                 raise DriftmapError(ExitCode.INTEGRITY, f"{row.language}/{row.prompt_id}: {found}; judge it again")
-            parsed = parser.parse(raw.raw)
+            parsed = rubric.parse(raw.raw)
             update |= parsed._asdict() if parsed else dict.fromkeys(FIELDS, UNSCORED)
         fresh.append(row.model_copy(update=update))
     return fresh
 
 
-def reparse(labels_dir: str | Path, raw_dir: str | Path, new_parser_version: str) -> dict[Path, Path]:
+def reparse(labels_dir: str | Path, raw_dir: str | Path) -> dict[Path, Path]:
     """Rewrite the ``<slug>/<language>.jsonl`` label files that read differently now.
 
     Returns each rewritten file with the copy of its earlier rows, kept under ``<slug>/superseded/``.
     """
-    if new_parser_version != parser.PARSER_VERSION:
-        running = f"this code parses as version {parser.PARSER_VERSION}"
-        raise DriftmapError(
-            ExitCode.USAGE, f"{running}, not {new_parser_version}; labels must name the parser they got"
-        )
     labels_dir, raw_dir = Path(labels_dir), Path(raw_dir)
     changed = {}
     for path in sorted(labels_dir.glob("*/*.jsonl")):
@@ -77,7 +66,7 @@ def reparse(labels_dir: str | Path, raw_dir: str | Path, new_parser_version: str
 
 
 def reparse_checkpoint(
-    hub: Hub, labels_repo: str, raw_repo: str, checkpoint: str, new_parser_version: str, mode: str = "full"
+    hub: Hub, labels_repo: str, raw_repo: str, checkpoint: str, mode: str = "full"
 ) -> list[str]:
     """Reparse one checkpoint's labels from the raw outputs in ``raw_repo``; returns the label paths uploaded."""
     slug = ids.slug(checkpoint)
@@ -93,7 +82,7 @@ def reparse_checkpoint(
         labels_dir = fetch(labels_repo, "labels", ids.labels_path(slug, "*", mode))
         raw_dir = fetch(raw_repo, "raws", ids.judge_raw_path(slug, "*", mode))
         uploaded = []
-        for path, kept in reparse(labels_dir, raw_dir, new_parser_version).items():
+        for path, kept in reparse(labels_dir, raw_dir).items():
             # the earlier file first: the labels are never without a copy
             for file in (kept, path):
                 name = file.relative_to(work / "labels").as_posix()

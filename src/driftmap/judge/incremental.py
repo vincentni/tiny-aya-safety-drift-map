@@ -9,16 +9,18 @@ from pydantic import ValidationError
 
 from driftmap.core.records import GenerationRow, JudgeConfig, LabelRow, Record
 from driftmap.core.schemas import SCHEMA_LABEL, DriftmapError, ExitCode
-from driftmap.judge import parser
-from driftmap.judge.parser import ParsedLabels
+from driftmap.judge import rubric
+from driftmap.judge.rubric import ParsedLabels
 from driftmap.table.build import DuplicateKey
 
 UNSCORED = "unscored"
 FIELDS = ("request_harm", "refusal", "response_harm")
-# a judge answer is 100 tokens at most
+# an answer that parses is one short line; a longer one is cut here
 MAX_RAW = 2000
 
 Key = tuple[str, str, str]
+# an answer and the labels it parses to, None when it gives none
+Judged = tuple[str, ParsedLabels | None]
 
 
 class RawRow(Record):
@@ -86,7 +88,7 @@ def _stands(label: LabelRow, raw: RawRow | None, row: GenerationRow) -> bool:
         return False
     if raw.response_sha256 != response_sha256(row.response):
         return False
-    read = parser.parse(raw.raw) or ParsedLabels(UNSCORED, UNSCORED, UNSCORED)
+    read = rubric.parse(raw.raw) or ParsedLabels(UNSCORED, UNSCORED, UNSCORED)
     return read == (label.request_harm, label.refusal, label.response_harm)
 
 
@@ -114,6 +116,29 @@ def pending(
     return waiting
 
 
+def rebuilt(
+    responses: Iterable[GenerationRow], labels: Iterable[LabelRow], raws: Iterable[RawRow], config: JudgeConfig
+) -> list[LabelRow]:
+    """Labels for rows that have none at all but a stored answer that parses, as when a label file was lost.
+
+    The answer must be of the config's model and prompt text and answer the row's current response.
+    """
+    labelled = {key(row) for row in labels}
+    stored = {key(raw): raw for raw in raws}
+    found = []
+    for row in responses:
+        raw = stored.get(key(row))
+        if key(row) in labelled or raw is None or row.response is None:
+            continue
+        asked = (config.repo, config.revision, response_sha256(row.response))
+        if (raw.repo, raw.revision, raw.response_sha256) != asked:
+            continue
+        parsed = rubric.parse(raw.raw)
+        if parsed is not None:
+            found.append(label_row(row, config, parsed, True))
+    return found
+
+
 def union[T: LabelRow | RawRow](existing: Iterable[T], new: Iterable[T]) -> list[T]:
     """One row per (checkpoint, language, prompt id), the new one winning, in key order."""
     merged = {key(row): row for row in existing} | {key(row): row for row in new}
@@ -139,7 +164,7 @@ def label_row(row: GenerationRow, config: JudgeConfig, labels: ParsedLabels | No
 
 
 def judged_rows(
-    rows: Sequence[GenerationRow], judged: Sequence[tuple[str, ParsedLabels | None]], config: JudgeConfig
+    rows: Sequence[GenerationRow], judged: Sequence[Judged], config: JudgeConfig
 ) -> tuple[list[LabelRow], list[RawRow]]:
     """Label and raw rows for ``rows``; ``judged`` holds one answer per row that has a response, in order."""
     answered = sum(row.response is not None for row in rows)

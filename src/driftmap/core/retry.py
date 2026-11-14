@@ -34,10 +34,20 @@ def is_transient(exc: BaseException) -> bool:
     return isinstance(exc, _TRANSPORT_ERRORS)
 
 
-def policy(sleep: Callable[[float], None] = time.sleep, *, retry_throttled: bool = True) -> Retrying:
-    """Three attempts with jittered backoff; a 429 waits for the server's reset instead."""
+def policy(
+    sleep: Callable[[float], None] = time.sleep,
+    *,
+    retry_throttled: bool = True,
+    also: Callable[[BaseException], bool] | None = None,
+) -> Retrying:
+    """Three attempts with jittered backoff; a 429 waits for the server's reset instead.
+
+    ``also`` names further errors worth another attempt, for calls that are not Hub calls.
+    """
 
     def retryable(exc: BaseException) -> bool:
+        if also is not None and also(exc):
+            return True
         return is_transient(exc) and (retry_throttled or not _is_throttled(root_cause(exc)))
 
     return Retrying(
@@ -72,7 +82,7 @@ def _log(state: RetryCallState) -> None:
     exc = root_cause(state.outcome.exception())
     status = getattr(getattr(exc, "response", None), "status_code", "")
     logger.warning(
-        "Hub call failed (%s %s), attempt %d of %d, retrying in %.1f s",
+        "call failed (%s %s), attempt %d of %d, retrying in %.1f s",
         type(exc).__name__,
         status,
         state.attempt_number,

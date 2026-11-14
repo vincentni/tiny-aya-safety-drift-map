@@ -48,7 +48,6 @@ class ExitCode(IntEnum):
     OOM = 11
     INTEGRITY = 12
     COLUMN_FAILED = 13
-    JUDGE_INSPECT_STOP = 14
 
 
 class DriftmapError(Exception):
