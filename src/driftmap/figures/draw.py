@@ -1,0 +1,264 @@
+"""The figures as PNG and SVG; the same inputs give the same files."""
+
+import math
+import textwrap
+from collections.abc import Mapping
+from pathlib import Path
+
+from matplotlib import rc_context
+from matplotlib.colors import LinearSegmentedColormap
+from matplotlib.figure import Figure
+from matplotlib.patches import Patch
+
+from ..core.records import Tables
+from ..core.settings import Settings
+from ..table.breakdown import Breakdown
+from . import data
+from .data import Chart, Flows, Heat
+
+DPI = 160
+# inches: 1440 px wide at DPI, read at about 900 px in a README
+WIDTH = 9.0
+# Okabe-Ito colours, told apart under the common colour-vision deficiencies
+BLUE, ORANGE, SKY, VERMILLION, GREEN, PURPLE = "#0072B2", "#E69F00", "#56B4E9", "#D55E00", "#009E73", "#CC79A7"
+SERIES_COLOURS = (BLUE, ORANGE, GREEN, PURPLE)
+STATE_COLOURS = {"refused": BLUE, "complied-harmless": SKY, "complied-harmful": VERMILLION, "unscored": "#BBBBBB"}
+HEAT_COLOURS = LinearSegmentedColormap.from_list("harmful", ["#FFF7EC", "#FDBB84", VERMILLION, "#7F2704"])
+WITHHELD = "#ECECEC"
+INK, FAINT, RULE = "#222222", "#6B6B6B", "#DDDDDD"
+STYLE = {
+    "font.family": "DejaVu Sans",
+    "font.size": 9,
+    "text.color": INK,
+    "axes.labelcolor": INK,
+    "axes.edgecolor": "#888888",
+    "axes.titlesize": 10,
+    "axes.titleweight": "bold",
+    "axes.titlelocation": "left",
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+    "axes.axisbelow": True,
+    "xtick.color": INK,
+    "ytick.color": INK,
+    "legend.frameon": False,
+    # fixed ids and outlined glyphs: the SVG does not change between runs or with the fonts installed
+    "svg.hashsalt": "driftmap",
+    "svg.fonttype": "path",
+}
+STEMS = (
+    "f1-safe-rate-by-language",
+    "f2-harm-category-by-language",
+    "f3-before-after",
+    "f4-harm-category",
+    "f5-outcomes",
+)
+
+
+def _figure(title: str, height: float) -> Figure:
+    figure = Figure(figsize=(WIDTH, height), layout="constrained")
+    wrapped = textwrap.fill(title, 88, break_on_hyphens=False)
+    figure.suptitle(wrapped, x=0.012, ha="left", fontsize=11, fontweight="bold")
+    return figure
+
+
+def _offsets(count: int, gap: float) -> list[float]:
+    """Positions of ``count`` series around a tick, ``gap`` apart."""
+    return [(index - (count - 1) / 2) * gap for index in range(count)]
+
+
+def _spans(points, at: list[float]) -> tuple[list, list, list | None]:
+    """Positions, values and interval arms of the points that have a value; no arms when none has an interval."""
+    kept = [(where, point) for where, point in zip(at, points, strict=True) if point.value is not None]
+    arms = [
+        [0.0 if point.low is None else point.value - point.low for _, point in kept],
+        [0.0 if point.high is None else point.high - point.value for _, point in kept],
+    ]
+    bounded = any(point.low is not None for _, point in kept)
+    return [where for where, _ in kept], [point.value for _, point in kept], arms if bounded else None
+
+
+def _legend(figure: Figure, handles: list, names: list[str]) -> None:
+    figure.legend(handles, names, loc="outside lower center", ncols=len(names), handletextpad=0.5, columnspacing=2.0)
+
+
+def dots(chart: Chart) -> Figure:
+    """A point with its interval per label and series, a panel per condition on one value axis."""
+    figure = _figure(chart.title, 3.9)
+    axes = figure.subplots(1, len(chart.panels), sharey=True, squeeze=False)[0]
+    points = [point for panel in chart.panels for series in panel.series for point in series.points]
+    lows = [point.value if point.low is None else point.low for point in points if point.value is not None]
+    floor = 5 * math.floor(min(lows, default=0) / 5)
+    handles = []
+    for axis, panel in zip(axes, chart.panels, strict=True):
+        ticks = list(range(len(panel.labels)))
+        for series, offset, colour in zip(
+            panel.series, _offsets(len(panel.series), 0.26), SERIES_COLOURS, strict=False
+        ):
+            xs, ys, arms = _spans(series.points, [tick + offset for tick in ticks])
+            drawn = axis.errorbar(xs, ys, yerr=arms, fmt="o", color=colour, markersize=5, capsize=2.5, elinewidth=1.2)
+            handles.append(drawn) if axis is axes[0] else None
+        # the pooled rate stands apart from the languages
+        axis.axvline(len(ticks) - 1.5, color=RULE, linewidth=0.8)
+        axis.set_xticks(ticks, panel.labels)
+        axis.set_title(panel.title)
+        axis.set_ylim(floor, 101)
+        axis.yaxis.grid(True, color=RULE, linewidth=0.6)
+        axis.tick_params(axis="x", length=0)
+    axes[0].set_ylabel(chart.panels[0].unit)
+    _legend(figure, handles, [series.name for series in chart.panels[0].series])
+    return figure
+
+
+def bars(chart: Chart) -> Figure:
+    """A bar per group and series with its value written above it, a panel and value axis per metric."""
+    figure = _figure(chart.title, 3.6)
+    axes = figure.subplots(1, len(chart.panels), squeeze=False)[0]
+    handles = []
+    for axis, panel in zip(axes, chart.panels, strict=True):
+        ticks = list(range(len(panel.labels)))
+        suffix = "%" if panel.unit.startswith("%") else ""
+        top = 0.0
+        for series, offset, colour in zip(
+            panel.series, _offsets(len(panel.series), 0.36), SERIES_COLOURS, strict=False
+        ):
+            xs, ys, arms = _spans(series.points, [tick + offset for tick in ticks])
+            whiskers = {"elinewidth": 1.0, "capsize": 2.5, "ecolor": INK}
+            drawn = axis.bar(xs, ys, width=0.32, color=colour, yerr=arms, error_kw=whiskers)
+            handles.append(drawn) if axis is axes[0] else None
+            for x, y, arm in zip(xs, ys, arms[1] if arms else [0.0] * len(xs), strict=True):
+                above = {"xytext": (0, 3), "textcoords": "offset points", "ha": "center", "fontsize": 8}
+                axis.annotate(f"{y:.1f}{suffix}", (x, y + arm), **above)
+                top = max(top, y + arm)
+        axis.set_xticks(ticks, [textwrap.fill(label, 12) for label in panel.labels])
+        axis.set_title(panel.title)
+        axis.set_ylabel(panel.unit)
+        axis.set_ylim(0, top * 1.18 or 1)
+        axis.tick_params(axis="x", length=0)
+        axis.yaxis.grid(True, color=RULE, linewidth=0.6)
+    _legend(figure, handles, [series.name for series in chart.panels[0].series])
+    return figure
+
+
+def rows(chart: Chart) -> Figure:
+    """A point with its interval per label and series on horizontal rows, a panel per condition on one label axis."""
+    count = len(chart.panels[0].labels)
+    figure = _figure(chart.title, 1.5 + 0.4 * count)
+    axes = figure.subplots(1, len(chart.panels), sharey=True, sharex=True, squeeze=False)[0]
+    handles = []
+    for axis, panel in zip(axes, chart.panels, strict=True):
+        ticks = list(range(count))
+        for series, offset, colour in zip(panel.series, _offsets(len(panel.series), 0.3), SERIES_COLOURS, strict=False):
+            ys, xs, arms = _spans(series.points, [tick + offset for tick in ticks])
+            drawn = axis.errorbar(xs, ys, xerr=arms, fmt="o", color=colour, markersize=5, capsize=2.5, elinewidth=1.2)
+            handles.append(drawn) if axis is axes[0] else None
+        axis.set_yticks(ticks, panel.labels)
+        axis.set_title(panel.title)
+        axis.set_xlabel(panel.unit)
+        axis.xaxis.grid(True, color=RULE, linewidth=0.6)
+        axis.tick_params(axis="y", length=0)
+    points = [point for panel in chart.panels for series in panel.series for point in series.points]
+    highs = [point.value if point.high is None else point.high for point in points if point.value is not None]
+    # the axes share one range, wide enough for every interval
+    axes[0].set_xlim(0, 5 * math.ceil(max(highs, default=5) / 5) or 5)
+    axes[0].invert_yaxis()
+    _legend(figure, handles, [series.name for series in chart.panels[0].series])
+    return figure
+
+
+def heat(shown: Heat) -> Figure:
+    """A coloured cell per row and column with its rate and counts; a cell under the floor is grey with its count."""
+    figure = _figure(shown.title, 1.7 + 0.42 * len(shown.rows))
+    axis = figure.subplots()
+    rates = [cell.rate for line in shown.cells for cell in line if cell and cell.rate is not None]
+    ceiling = 5 * math.ceil(max(rates, default=5) / 5) or 5
+    grid = [[math.nan if cell is None or cell.rate is None else cell.rate for cell in line] for line in shown.cells]
+    axis.set_facecolor(WITHHELD)
+    image = axis.imshow(grid, cmap=HEAT_COLOURS, vmin=0, vmax=ceiling, aspect="auto")
+    for at, line in enumerate(shown.cells):
+        for to, cell in enumerate(line):
+            if cell is None:
+                continue
+            if cell.rate is None:
+                axis.text(to, at, f"n = {cell.n}", ha="center", va="center", fontsize=8, color=FAINT)
+                continue
+            colour = "white" if cell.rate > 0.55 * ceiling else INK
+            said = f"{cell.rate:.0f}%  ({cell.k}/{cell.n})"
+            axis.text(to, at, said, ha="center", va="center", fontsize=8.5, color=colour)
+    axis.set_xticks(range(len(shown.columns)), shown.columns)
+    axis.set_yticks(range(len(shown.rows)), shown.rows)
+    axis.xaxis.tick_top()
+    axis.tick_params(length=0)
+    axis.set_xticks([tick - 0.5 for tick in range(len(shown.columns) + 1)], minor=True)
+    axis.set_yticks([tick - 0.5 for tick in range(len(shown.rows) + 1)], minor=True)
+    axis.grid(which="minor", color="white", linewidth=1.5)
+    axis.tick_params(which="minor", length=0)
+    for spine in axis.spines.values():
+        spine.set_visible(False)
+    note = f"Grey: fewer than {shown.floor} scored responses, no rate shown."
+    axis.set_xlabel(note, color=FAINT, fontsize=8.5, loc="left")
+    bar = figure.colorbar(image, ax=axis, shrink=0.85, pad=0.02)
+    bar.set_label(shown.unit)
+    bar.outline.set_visible(False)
+    return figure
+
+
+def flows(shown: Flows) -> Figure:
+    """Two stacked bars per condition, the outcomes before and after, joined by a band per pair of outcomes."""
+    figure = _figure(shown.title, 4.6)
+    axes = figure.subplots(1, len(shown.panels), sharey=True, squeeze=False)[0]
+    half = 0.16
+    for axis, panel in zip(axes, shown.panels, strict=True):
+        for x, counts in enumerate((panel.before, panel.after)):
+            bottom = 0.0
+            for state in shown.states:
+                share = counts[state] * 100 / panel.n
+                axis.bar(x, share, bottom=bottom, width=2 * half, color=STATE_COLOURS[state], linewidth=0)
+                if share >= 3.5:
+                    inside = {"ha": "center", "va": "center", "color": "white", "fontsize": 8.5, "fontweight": "bold"}
+                    axis.text(x, bottom + share / 2, str(counts[state]), **inside)
+                bottom += share
+        for band in panel.bands:
+            edges = [half, 1 - half, 1 - half, half]
+            spans = [band.left[0], band.right[0], band.right[1], band.left[1]]
+            # prompts that kept their outcome stay in the background
+            alpha = 0.22 if band.before == band.after else 0.6
+            axis.fill(edges, spans, color=STATE_COLOURS[band.before], alpha=alpha, linewidth=0)
+        axis.set_xticks([0, 1], panel.names)
+        axis.set_xlim(-0.45, 1.45)
+        axis.set_ylim(0, 100)
+        axis.set_title(panel.title)
+        axis.set_xlabel(panel.note.replace(". ", ".\n"), fontsize=8.5, color=FAINT)
+        axis.tick_params(axis="x", length=0)
+    axes[0].set_ylabel(f"Share of harmful prompts (%, n = {shown.panels[0].n})")
+    patches = [Patch(color=STATE_COLOURS[state]) for state in shown.states]
+    _legend(figure, patches, list(shown.states))
+    return figure
+
+
+def _save(figure: Figure, out: Path, stem: str) -> list[Path]:
+    paths = [out / f"{stem}.png", out / f"{stem}.svg"]
+    # no library version or date in either file
+    figure.savefig(paths[0], dpi=DPI, metadata={"Software": None})
+    figure.savefig(paths[1], metadata={"Date": None, "Creator": None})
+    return paths
+
+
+def draw_all(tables: Mapping[str, Tables], breakdown: Breakdown, settings: Settings, out: str | Path) -> list[Path]:
+    """Draw the figures into ``out`` as PNG and SVG and return the files written.
+
+    ``tables`` maps a prompt condition to its result tables; the first condition leads the titles. The outcome
+    figure needs a breakdown of two columns.
+    """
+    out = Path(out)
+    out.mkdir(parents=True, exist_ok=True)
+    moved = data.outcome_flows(breakdown)
+    with rc_context(STYLE):
+        drawn = [
+            dots(data.safe_rate_by_language(tables, settings)),
+            heat(data.category_by_language(breakdown)),
+            bars(data.before_after(tables, settings)),
+            rows(data.by_category(breakdown)),
+            # one column alone has no outcome to compare
+            *([flows(moved)] if moved.panels else []),
+        ]
+        return [path for figure, stem in zip(drawn, STEMS, strict=False) for path in _save(figure, out, stem)]

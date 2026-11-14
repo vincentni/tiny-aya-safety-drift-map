@@ -7,6 +7,7 @@ import logging
 import shutil
 import string
 import subprocess
+import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -63,8 +64,11 @@ from driftmap.judge.incremental import judged_rows
 from driftmap.repair import screen_gen, select
 from driftmap.table import build as table_build
 from driftmap.table import render
+from driftmap.table.breakdown import Breakdown, Tags
+from driftmap.table.breakdown import render as render_breakdown
 from driftmap.table.build import NOT_COMPARABLE
 from tests.fakes import FakeHub, FakeJobsClient, judge_world, published
+from tests.fakes import breakdown as fake_breakdown
 from tests.fakes import labels as fake_labels
 from tests.fakes.datasets import (
     BENIGN,
@@ -91,6 +95,7 @@ VERBS = [
     "chain",
     "data",
     "decide",
+    "figures",
     "judge",
     "launch",
     "ledger",
@@ -284,7 +289,12 @@ def test_help_lists_every_verb():
     assert result.exit_code == 0 and all(f" {verb} " in result.output for verb in VERBS)
     names = ("data", "ledger", "table", "judge")
     groups = {name: sorted(typer.main.get_command(cli.app).commands[name].commands) for name in names}
-    assert groups == {"data": ["build"], "ledger": ["reconcile"], "table": ["build"], "judge": ["closed", "reparse"]}
+    assert groups == {
+        "data": ["build"],
+        "ledger": ["reconcile"],
+        "table": ["breakdown", "build"],
+        "judge": ["closed", "reparse"],
+    }
     assert sorted(typer.main.get_command(cli.app).commands["decide"].commands) == ["drift"]
     assert sorted(typer.main.get_command(cli.app).commands["repair"].commands) == ["choose"]
     assert sorted(typer.main.get_command(cli.app).commands["publish"].commands) == ["check", "plan", "run"]
@@ -1376,6 +1386,164 @@ def test_a_table_that_cannot_be_saved_is_not_shown_or_uploaded(world, monkeypatc
     result = run("table", "build")
     assert result.exit_code == ExitCode.INTEGRITY and "# Safety drift map" not in result.output
     assert "tables/tables.json" not in world.hub.repos[RESULTS]["main"]
+
+
+HATE, PROFANITY, SELF_HARM = fake_breakdown.HATE, fake_breakdown.PROFANITY, fake_breakdown.SELF_HARM
+# per language four harmful prompts: the first three carry hate speech, the third profanity too
+TAGS = (((HATE,), "global"), ((HATE,), "global"), ((HATE, PROFANITY), "local"), ((SELF_HARM,), "local"))
+
+
+def tagged(world, n=4):
+    """Give the harmful prompts on the fake Hub their harm categories and origin."""
+    for language in fake_labels.LANGUAGES:
+        ids_ = fake_labels.prompt_ids("harmful", language, n)
+        tags = {(language, prompt_id): Tags(*TAGS[index % len(TAGS)]) for index, prompt_id in enumerate(ids_)}
+        rows = fake_breakdown.prompt_rows(tags, language)
+        path = f"prompts/harmful/{language}.jsonl"
+        world.hub.upload_file(path_or_fileobj=jsonl(rows), path_in_repo=path, repo_id=EVAL, repo_type="dataset")
+
+
+def breakdown_rate(found, condition, column, **level):
+    wanted = {"harm_category": None, "language": None, "global_or_local": None, **level}
+    (row,) = [
+        row
+        for row in found.rates
+        if (row.condition, row.column) == (condition, column)
+        and all(getattr(row, name) == value for name, value in wanted.items())
+    ]
+    return row.k, row.n
+
+
+def test_table_breakdown_reads_every_condition_writes_prints_and_uploads_without_a_readiness_report(world):
+    evaluation(world, {"baseline": 2, "drifted": 1})
+    evaluation(world, {"baseline": 3, "drifted": 0}, preamble="strip")
+    tagged(world)
+    (world.root / READY_PATH).unlink()
+    stray = fake_labels.CHECKPOINTS["drifted"].replace("a" * 40, "e" * 40)
+    put_labels(world, fake_labels.column_rows("drifted", unsafe=4, checkpoint=stray), preamble="strip")
+
+    built = run("table", "breakdown")
+
+    assert built.exit_code == 0, built.output
+    assert built.output.splitlines()[:2] == ["verb      table breakdown", "mode      full"]
+    local = world.root / TABLES_DIR / "breakdown.json"
+    found = Breakdown.model_validate_json(local.read_bytes())
+    assert found.conditions == {"keep": "served template", "strip": "no safety preamble"}
+    assert found.columns == {"baseline": "baseline", "drifted": "fine-tuned"}
+    hate = {"harm_category": HATE}
+    assert breakdown_rate(found, "keep", "baseline", **hate) == (12, 18)
+    assert breakdown_rate(found, "keep", "drifted", **hate) == (6, 18)
+    assert breakdown_rate(found, "strip", "baseline", **hate) == (18, 18)
+    assert breakdown_rate(found, "strip", "drifted") == (0, 24)
+    assert breakdown_rate(found, "keep", "baseline", global_or_local="local") == (0, 12)
+    # labels no finished run generated are left on the Hub, under either condition
+    assert unread(built) == [f"left unread: nopreamble/labels/{ids.slug(stray)}: no ok full run on record read it"]
+    shown = render_breakdown(found)
+    assert shown in built.output and "## No safety preamble" in shown
+    assert built.output.index("# Harmful-response rate") < built.output.index("written to .run-local/results/tables")
+    assert (world.root / TABLES_DIR / "breakdown.md").read_text(encoding="utf-8") == shown
+    assert stored(world, "tables/breakdown.json") == local.read_bytes()
+    assert stored(world, "tables/breakdown.md") == shown.encode()
+    assert built.output.splitlines()[-1] == f"uploaded to {RESULTS} under tables/"
+    # the result tables and the drift flag are not its to write
+    assert not (world.root / TABLES_PATH).exists()
+    assert sorted(path for path in world.hub.repos[RESULTS]["main"] if "tables/" in path) == [
+        "tables/breakdown.json",
+        "tables/breakdown.md",
+    ]
+
+
+def test_table_breakdown_refuses_prompts_without_tags_and_missing_labels(world):
+    evaluation(world, {})
+    tagged(world)
+    unjudged = run("table", "breakdown")
+    assert unjudged.exit_code == 2 and "no judged labels of harmful prompts" in unjudged.stderr
+    evaluation(world, {"baseline": 2, "drifted": 1})
+    untagged = run("table", "breakdown")
+    assert untagged.exit_code == ExitCode.INTEGRITY and "harmful/ar.jsonl:1: not a row" in untagged.stderr
+    tagged(world, n=5)
+    short = run("table", "breakdown")
+    assert short.exit_code == ExitCode.INTEGRITY and "baseline harmful/ar: 4 rows for 5 prompts" in short.stderr
+    for result in (unjudged, untagged, short):
+        assert "Traceback" not in result.output and not (world.root / TABLES_DIR / "breakdown.json").exists()
+    assert not [path for path in world.hub.repos[RESULTS]["main"] if "breakdown" in path]
+
+
+def test_a_smoke_breakdown_keeps_to_its_own_tree_and_one_that_cannot_be_uploaded_stays_local(world, monkeypatch):
+    # six prompts listed, the smoke runs took the first four
+    evaluation(world, {"baseline": 2, "drifted": 0}, mode="smoke")
+    tagged(world, n=6)
+    assert "no judged labels" in run("table", "breakdown").stderr
+
+    built = run("table", "breakdown", "--mode", "smoke")
+
+    assert built.exit_code == 0, built.output
+    local = world.root / LOCAL / "results" / "smoke" / "tables"
+    found = Breakdown.model_validate_json((local / "breakdown.json").read_bytes())
+    assert breakdown_rate(found, "keep", "baseline") == (12, 24)
+    # one condition alone is broken down as it is
+    assert found.conditions == {"keep": "served template"}
+    assert stored(world, "smoke/tables/breakdown.json") == (local / "breakdown.json").read_bytes()
+    assert stored(world, "smoke/tables/breakdown.md") == (local / "breakdown.md").read_bytes()
+    assert not (world.root / TABLES_DIR).exists() and "tables/breakdown.json" not in world.hub.repos[RESULTS]["main"]
+
+    (local / "breakdown.json").unlink()
+    monkeypatch.setattr(world.hub, "upload_folder", lambda **call: world.hub._raise(403, "https://huggingface.co/x"))
+    kept = run("table", "breakdown", "--mode", "smoke")
+    assert kept.exit_code == ExitCode.PUSH_FAILED and "run the command again" in kept.stderr
+    assert "breakdown.json and breakdown.md are in .run-local/results/smoke/tables" in kept.stderr
+    assert (local / "breakdown.json").exists()
+
+
+FIGURE_STEMS = (
+    "f1-safe-rate-by-language",
+    "f2-harm-category-by-language",
+    "f3-before-after",
+    "f4-harm-category",
+    "f5-outcomes",
+)
+FIGURES = [f"{stem}.{kind}" for stem in FIGURE_STEMS for kind in ("png", "svg")]
+
+
+def test_figures_are_drawn_from_the_stored_tables_and_breakdown_without_the_hub(world, tmp_path, monkeypatch):
+    folder = world.root / TABLES_DIR
+    calls = len(world.hub.calls)
+    absent = run("figures")
+    assert absent.exit_code == 2 and "holds no tables.json; run `driftmap table build` first" in absent.stderr
+    tables = published.two_column_tables(tmp_path, world.settings)
+    dump(tables, folder / "tables.json")
+    unbroken = run("figures")
+    assert (
+        unbroken.exit_code == 2 and "holds no breakdown.json; run `driftmap table breakdown` first" in unbroken.stderr
+    )
+    dump(fake_breakdown.two_conditions(tmp_path, world.settings), folder / "breakdown.json")
+    (world.root / READY_PATH).unlink()
+
+    drawn = run("figures")
+
+    assert drawn.exit_code == 0, drawn.output
+    assert drawn.output.splitlines()[:2] == ["verb      figures", "out       docs/figures"]
+    assert drawn.output.splitlines()[-10:] == [f"docs/figures/{name}" for name in FIGURES]
+    assert sorted(path.name for path in (world.root / "docs" / "figures").iterdir()) == sorted(FIGURES)
+    assert all((world.root / "docs" / "figures" / name).stat().st_size > 2000 for name in FIGURES)
+    assert len(world.hub.calls) == calls and not world.client_log.exists()
+
+    # the second condition's tables join when they are there
+    dump(tables, folder / "tables-nopreamble.json")
+    elsewhere = run("figures", "--out", "elsewhere")
+    assert elsewhere.exit_code == 0 and elsewhere.output.splitlines()[-1] == f"elsewhere/{FIGURES[-1]}"
+    folders = (world.root / "docs" / "figures", world.root / "elsewhere")
+    one, both = ([(where / name).read_bytes() for name in FIGURES] for where in folders)
+    # the figure of the tables changes, the one of the breakdown is the same file again
+    assert one[0] != both[0] and one[2] == both[2]
+
+    (folder / "breakdown.json").write_text("{")
+    torn = run("figures")
+    assert torn.exit_code == 2 and "breakdown.json: " in torn.stderr
+    monkeypatch.delattr("driftmap.figures.draw", raising=False)
+    monkeypatch.setitem(sys.modules, "driftmap.figures.draw", None)
+    bare = run("figures")
+    assert bare.exit_code == 2 and "uv sync --extra figures" in bare.stderr and "Traceback" not in bare.output
 
 
 GGUF = f"{fake_labels.CHECKPOINTS['repaired_q4']}#{quant.GGUF_FILE}"

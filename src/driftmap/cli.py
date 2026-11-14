@@ -1,4 +1,4 @@
-"""The driftmap command: readiness, data, launches, the ledger, tables, the decisions, status and the scan."""
+"""The driftmap command: readiness, data, launches, the ledger, tables, figures, the decisions, status and the scan."""
 
 import argparse
 import enum
@@ -53,13 +53,11 @@ log = logging.getLogger(__name__)
 CONFIG = "driftmap.toml"
 REVISIONS = "revisions.json"
 DATA_DIR = LOCAL / "data"
-# beside tables.json, which alone gates the repair
-NOPREAMBLE_TABLES = "tables-nopreamble.json"
-# the table file of each other prompt condition, and what its upload commit adds
-CONDITION_TABLES = {
-    "strip": (NOPREAMBLE_TABLES, ", no safety preamble"),
-    "patch": ("tables-patched.json", ", safety patch"),
-}
+# what the upload commit of another prompt condition's tables adds to its message
+CONDITION_SAID = {"strip": ", no safety preamble", "patch": ", safety patch"}
+# beside the tables; it covers every prompt condition
+BREAKDOWN = "breakdown.json"
+FIGURES_DIR = Path("docs") / "figures"
 # label set and its folder under prompts/ in the evaluation dataset
 PROMPT_SETS = (("harmful", "harmful"), ("benign", "benign_heldout"), ("xstest", "xstest"))
 # 128 + SIGINT, as a shell reports it
@@ -653,6 +651,51 @@ def _left(
     return left
 
 
+def _tables_name(preamble: str) -> str:
+    """File of a condition's tables: tables.json, which alone gates the repair, or tables-<tree>.json beside it."""
+    tree = ids.tree("full", preamble).strip("/")
+    return f"{TABLES_PATH.stem}-{tree}{TABLES_PATH.suffix}" if tree else TABLES_PATH.name
+
+
+def _label_patterns(
+    records: list[RunRecord], settings: Settings, mode: str, table: Any, preamble: str, head: Any
+) -> list[str]:
+    """Patterns of the label files a condition's table reads; says which label folders on the Hub it leaves."""
+    tree = ids.tree(mode, preamble)
+    # labels of a revision no finished run generated would put two checkpoints in one column
+    folders, replaced = _label_folders(records, settings, mode, table, preamble)
+    left = _left(_held(head, f"{tree}labels/"), folders, replaced, table, settings, mode)
+    for folder, reason in left.items():
+        typer.echo(redact.mask(f"left unread: {tree}labels/{folder}: {reason}"))
+    return [f"{tree}labels/{folder}/*" for folder in folders]
+
+
+def _show(path: Path, shown: str, root: Path) -> list[Path]:
+    """Write the markdown beside its record, scan both for what must not be published, then print the markdown."""
+    files = [path, path.with_suffix(".md")]
+    files[1].write_text(shown, encoding="utf-8")
+    findings = redact.scan(files)
+    if findings:
+        raise redact.RedactionFinding(findings)
+    typer.echo(redact.mask(shown))
+    typer.echo(f"written to {path.parent.relative_to(root)}")
+    return files
+
+
+def _upload(deps: Deps, results: str, in_repo: str, files: list[Path], message: str) -> None:
+    """Put the files of one folder under ``in_repo`` in the results repo; exit 7 when the Hub does not take them."""
+    folder = files[0].parent
+    names = [file.name for file in files]
+    try:
+        deps.hub.upload_folder(
+            results, folder, repo_type="dataset", path_in_repo=in_repo, allow_patterns=names, commit_message=message
+        )
+    except httpx2.HTTPError as error:
+        kept = f"{' and '.join(names)} are in {folder.relative_to(deps.repo_root)} but were not uploaded"
+        raise DriftmapError(ExitCode.PUSH_FAILED, f"{kept} ({type(error).__name__}); run the command again") from error
+    typer.echo(f"uploaded to {results} under {in_repo}/")
+
+
 def _flag_on_file(path: Path, hub: Hub, results: str, in_repo: str, flag: str) -> bool:
     """Whether the stored table raised ``flag``; a missing or torn local file gives way to a Hub copy that parses."""
     try:
@@ -694,12 +737,7 @@ def table_build(
     results, in_repo = f"{settings.owner}/{settings.repos.results}", f"{tree}tables"
     evaluation = f"{settings.owner}/{settings.repos.eval}"
     head = _head(deps.hub, evaluation)
-    # labels of a revision no finished run generated would put two checkpoints in one column
-    folders, replaced = _label_folders(records, settings, mode, table, preamble)
-    left = _left(_held(head, f"{tree}labels/"), folders, replaced, table, settings, mode)
-    for folder, reason in left.items():
-        typer.echo(redact.mask(f"left unread: {tree}labels/{folder}: {reason}"))
-    labels = [f"{tree}labels/{folder}/*" for folder in folders]
+    labels = _label_patterns(records, settings, mode, table, preamble, head)
     with tempfile.TemporaryDirectory(prefix="driftmap-table-") as scratch:
         wanted = [*labels, "prompts/*/*.jsonl", "sft_train/*.jsonl"]
         data = _snapshot(deps.hub, evaluation, scratch, wanted, head)
@@ -708,11 +746,10 @@ def table_build(
         known = [*records, *([screen] if screen else [])]
         tables = table.build(labels_dir, targets, known, settings, mode=mode, preamble=preamble)
     flagged = None
-    name, said = CONDITION_TABLES.get(preamble, (TABLES_PATH.name, ""))
     if mode == "smoke" or preamble != "keep":
         # only the full table under the served template gates the repair
         folder = root / LOCAL / "results" / ("smoke" if mode == "smoke" else "") / TABLES_PATH.parent.name
-        path = folder / name
+        path = folder / _tables_name(preamble)
         dump(tables, path)
     else:
         path, decision = root / TABLES_PATH, _record(Decision, root / DECISION_PATH)
@@ -731,28 +768,88 @@ def table_build(
             # said now: a failed upload below must not lose it; the table is shown and uploaded first
             typer.echo(f"drift flag: {error}", err=True)
             flagged = error
-    shown = render.render(tables, settings)
-    path.with_suffix(".md").write_text(shown, encoding="utf-8")
-    findings = redact.scan([path, path.with_suffix(".md")])
-    if findings:
-        raise redact.RedactionFinding(findings)
-    typer.echo(redact.mask(shown))
-    typer.echo(f"written to {path.parent.relative_to(root)}")
-    try:
-        deps.hub.upload_folder(
-            results,
-            path.parent,
-            repo_type="dataset",
-            path_in_repo=in_repo,
-            allow_patterns=[path.name, path.with_suffix(".md").name],
-            commit_message=f"add {mode} tables{said}",
-        )
-    except httpx2.HTTPError as error:
-        message = f"the tables are in {path.parent.relative_to(root)} but were not uploaded ({type(error).__name__})"
-        raise DriftmapError(ExitCode.PUSH_FAILED, f"{message}; run the command again") from error
-    typer.echo(f"uploaded to {results} under {in_repo}/")
+    files = _show(path, render.render(tables, settings), root)
+    _upload(deps, results, in_repo, files, f"add {mode} tables{CONDITION_SAID.get(preamble, '')}")
     if flagged:
         raise flagged
+
+
+def _tagged(data: Path, breakdown: Any) -> dict[str, dict[tuple[str, str], Any]]:
+    """Tags of the prompts of every set the breakdown covers, by set, then language and prompt id."""
+    folders = dict(PROMPT_SETS)
+    return {
+        name: {
+            (path.stem, prompt_id): tags
+            for path in sorted((data / "prompts" / folders.get(name, name)).glob("*.jsonl"))
+            for prompt_id, tags in _jsonl(path, breakdown.tags)
+        }
+        for name in breakdown.SETS
+    }
+
+
+@table_app.command("breakdown")
+@_finish
+def table_breakdown(
+    mode: Annotated[
+        Mode, typer.Option(help="full: the result labels. smoke: the rehearsal's, kept in their own tree.")
+    ] = "full",
+) -> None:
+    """Break the harmful-response rate down by harm category, language and prompt origin; print and upload it.
+
+    Covers every prompt condition that has labels, and each prompt's outcome before and after fine-tuning.
+    """
+    # nothing is launched or billed to the ledger, so no readiness report is needed
+    settings, deps = _open("table breakdown", ready=False, mode=mode)
+    # pulls the statistics packages
+    from driftmap.table import breakdown
+    from driftmap.table import build as table
+
+    records, screen = _results(settings, deps.hub, mode)
+    results, evaluation = (f"{settings.owner}/{name}" for name in (settings.repos.results, settings.repos.eval))
+    head = _head(deps.hub, evaluation)
+    folders = dict(PROMPT_SETS)
+    wanted = [f"prompts/{folders.get(name, name)}/*.jsonl" for name in breakdown.SETS]
+    for preamble in ids.PREAMBLES:
+        wanted += _label_patterns(records, settings, mode, table, preamble, head)
+    with tempfile.TemporaryDirectory(prefix="driftmap-breakdown-") as scratch:
+        data = _snapshot(deps.hub, evaluation, scratch, wanted, head)
+        labels = {preamble: data / ids.tree(mode, preamble) / "labels" for preamble in ids.PREAMBLES}
+        known = [*records, *([screen] if screen else [])]
+        built = breakdown.build(labels, _tagged(data, breakdown), known, settings, mode=mode)
+    root = deps.repo_root
+    path = root / LOCAL / "results" / ("smoke" if mode == "smoke" else "") / TABLES_PATH.parent.name / BREAKDOWN
+    dump(built, path)
+    files = _show(path, breakdown.render(built), root)
+    _upload(deps, results, f"{ids.tree(mode)}tables", files, f"add {mode} breakdown")
+
+
+@app.command()
+@_finish
+def figures(
+    out: Annotated[Path, typer.Option(help="The folder the figures are written to.")] = FIGURES_DIR,
+) -> None:
+    """Draw the figures as PNG and SVG from the tables and the breakdown stored here; reads local files only."""
+    root = Path.cwd()
+    settings = load_settings(root / CONFIG)
+    folder = root / TABLES_PATH.parent
+    _inputs("figures", out=out, tables=folder.relative_to(root), config=f"{CONFIG} ({settings.config_hash()[:12]})")
+    try:
+        # pulls the plotting package, an extra of its own
+        from driftmap.figures import draw
+    except ModuleNotFoundError as error:
+        missing = f"the figures need the {error.name} package"
+        raise DriftmapError(ExitCode.USAGE, f"{missing}; install the extra: uv sync --extra figures") from None
+    from driftmap.table.breakdown import Breakdown
+
+    tables = {preamble: _record(Tables, folder / _tables_name(preamble)) for preamble in ids.PREAMBLES}
+    tables = {preamble: record for preamble, record in tables.items() if record}
+    breakdown = _record(Breakdown, folder / BREAKDOWN)
+    if not tables or breakdown is None:
+        lacking = TABLES_PATH.name if not tables else BREAKDOWN
+        verb = "driftmap table build" if not tables else "driftmap table breakdown"
+        raise DriftmapError(ExitCode.USAGE, f"{folder.relative_to(root)} holds no {lacking}; run `{verb}` first")
+    for path in draw.draw_all(tables, breakdown, settings, root / out):
+        typer.echo(path.relative_to(root) if path.is_relative_to(root) else path)
 
 
 @judge_app.command("reparse")

@@ -33,6 +33,10 @@ jobs = [
 closed = [
     "litellm==1.103.11",
 ]
+# the figures are drawn on a workstation from the stored tables
+figures = [
+    "matplotlib==3.11.2",
+]
 
 [project.scripts]
 driftmap = "driftmap.cli:app"
@@ -41,6 +45,7 @@ driftmap = "driftmap.cli:app"
 dev = [
     "driftmap[jobs]",
     "driftmap[closed]",
+    "driftmap[figures]",
     "torch==2.15.0",
     "pytest==9.2.0",
     "pytest-socket==0.8.1",
