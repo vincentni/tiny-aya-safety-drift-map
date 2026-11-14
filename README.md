@@ -2,6 +2,13 @@
 
 <!-- fill: one-paragraph summary of findings -->
 
+Findings so far: in six languages and two prompt conditions (the served chat template, and the
+same template without its safety paragraph), benign LoRA fine-tuning left Tiny Aya Global as safe
+or safer and better at the benign task. The pooled safe rate on harmful prompts went from 90.8%
+to 93.5% under the served template and from 89.8% to 94.1% without the safety paragraph; chrF on
+held-out benign prompts went from 30.5 to 37.3 and from 25.1 to 36.1. No language lost safety
+beyond noise. Tables, method and limits are in `docs/article.md`.
+
 Measures how benign fine-tuning erodes refusal behaviour in Cohere's Tiny Aya Global,
 language by language, repairs it with SafeTune, and re-checks the repair after 4-bit
 quantization. Written for the Lexsi hackathon 2026. The write-up is `docs/article.md`.
