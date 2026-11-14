@@ -1,17 +1,19 @@
 'use strict';
 
-// Reads data.json (counts and labels only) and fills the page. No dependencies, no network beyond that file.
+// Reads data.json (counts and intervals only) and fills the page. No dependencies, no network beyond that file.
 (function () {
   const LANGUAGE_NAMES = { en: 'English', fr: 'French', es: 'Spanish', ru: 'Russian', hi: 'Hindi', ar: 'Arabic' };
   const FIGURE_TITLES = {
-    f1: 'Safe rate by language, base model and fine-tuned model',
-    f2: 'Harmful answers of the base model by language and harm category',
-    f3: 'Harmful answers on native, romanized and code-mixed prompts',
-    f4: 'Harmful answers, over-refusal and task score, before and after',
-    f5: 'The fine-tuned model at q4_k_m',
+    f1: 'Harmful answers by language, base model and fine-tuned model',
+    f2: 'Harmful answers of the base model by harm category and language',
+    f3: 'Harmful answers, over-refusal and task score, before and after the fine-tune',
+    f4: 'Harmful answers by harm category',
+    f5: 'How verdicts moved between the base model and the fine-tuned model',
+    f6: 'Answers cut off at the token limit, and harmful answers among them',
+    f7: 'Harmful answers on native, romanized and code-mixed prompts',
+    f8: 'Harmful answers with a targeted system-prompt patch',
   };
   const SMALL = 15;
-  const PAGE = 50;
 
   const $ = (id) => document.getElementById(id);
 
@@ -36,9 +38,11 @@
     for (const [value, label] of pairs) select.appendChild(el('option', { value, text: label }));
   }
 
-  const percent = (k, n) => (n ? (100 * k / n).toFixed(1) + '%' : 'n/a');
+  const share = (k, n) => (n ? 100 * k / n : 0);
+  const percent = (k, n) => (n ? share(k, n).toFixed(1) + '%' : 'n/a');
+  const bounds = (cell) => `${(100 * cell.lo).toFixed(1)}% to ${(100 * cell.hi).toFixed(1)}%`;
   const languageName = (code) => LANGUAGE_NAMES[code] || code;
-  const pValue = (p) => (p < 0.001 ? 'p < 0.001' : 'p = ' + p.toFixed(3));
+  const shortName = (category) => category.split(' Allocation')[0].toLowerCase();
 
   function cellOf(data, condition, model, language, category) {
     return data.cells.find((cell) => cell.condition === condition && cell.model === model &&
@@ -46,36 +50,64 @@
   }
 
   function numbers(data) {
-    const [first, second] = data.conditions;
+    const first = data.conditions[0];
     const [base, tuned] = data.models;
     const box = clear($('numbers'));
     const card = (strong, text) => box.appendChild(el('div', { class: 'number' }, el('strong', { text: strong }), el('span', { text })));
+    const byRate = (cells) => cells.filter((cell) => cell.n).sort((a, b) => b.k / b.n - a.k / a.n);
+    const pooled = cellOf(data, first.id, base.id, 'all', 'all');
 
-    const byLanguage = data.languages.map((code) => cellOf(data, first.id, base.id, code, 'all')).filter((cell) => cell.n);
-    byLanguage.sort((a, b) => b.k / b.n - a.k / a.n);
-    const worst = byLanguage[0];
-    const best = byLanguage[byLanguage.length - 1];
-    card(`${worst.k} of ${worst.n}`, `${languageName(worst.language)} prompts get a harmful answer from the ${base.name}, ` +
-      `against ${best.k} of ${best.n} in ${languageName(best.language)} (${first.name}).`);
+    const languages = byRate(data.languages.map((code) => cellOf(data, first.id, base.id, code, 'all')));
+    const worst = languages[0];
+    const best = languages[languages.length - 1];
+    card(`${percent(worst.k, worst.n)} against ${percent(best.k, best.n)}`,
+      `harmful answers of the ${base.name} in ${languageName(worst.language)} (${worst.k} of ${worst.n}; ${bounds(worst)}) ` +
+      `and in ${languageName(best.language)} (${best.k} of ${best.n}; ${bounds(best)}).`);
 
-    const summary = data.summary;
-    const before = summary[first.id][base.id].harmful;
-    const after = summary[first.id][tuned.id].harmful;
-    const change = (data.changes[first.id] || {}).safe;
-    const scored = before[1] === after[1] ? `${before[1]}` : `${before[1]} and ${after[1]}`;
-    let text = `harmful answers of ${scored} scored prompts, ${base.name} then ${tuned.name} ` +
-      `(${percent(before[0], before[1])} then ${percent(after[0], after[1])}${change ? ', ' + pValue(change.p) : ''}).`;
-    if (second) {
-      const b = summary[second.id][base.id].harmful;
-      const a = summary[second.id][tuned.id].harmful;
-      text += ` With ${second.name}: ${b[0]} of ${b[1]} then ${a[0]} of ${a[1]}.`;
+    const [one, two] = byRate(data.categories.map((name) => cellOf(data, first.id, base.id, 'all', name)));
+    card(`${percent(one.k, one.n)} and ${percent(two.k, two.n)}`,
+      `harmful answers on ${shortName(one.category)} (${one.k} of ${one.n}) and ${shortName(two.category)} ` +
+      `(${two.k} of ${two.n}) prompts, against ${percent(pooled.k, pooled.n)} over all prompts.`);
+
+    const before = data.summary[first.id][base.id];
+    const after = data.summary[first.id][tuned.id];
+    card(`${percent(before.harmful[0], before.harmful[1])} → ${percent(after.harmful[0], after.harmful[1])}`,
+      `harmful answers after a benign fine-tune (${before.harmful[0]} of ${before.harmful[1]}, then ${after.harmful[0]} of ` +
+      `${after.harmful[1]}), with over-refusal unchanged (${before.over_refusal[0]} then ${after.over_refusal[0]} of ` +
+      `${before.over_refusal[1]} safe prompts refused). The fine-tune costs no safety.`);
+  }
+
+  function length(data) {
+    const first = data.conditions[0];
+    const [base, tuned] = data.models;
+    if (!data.length[first.id]) return;
+    const cut = (model) => data.length[first.id][model.id].cut_off;
+    const complete = (model) => data.length[first.id][model.id].harmful_complete;
+    $('mechanism').textContent = 'The fine-tune costs no safety, mostly because its answers are shorter (answers cut at the ' +
+      `256-token limit fall from ${Math.round(share(...cut(base)))}% to ${Math.round(share(...cut(tuned)))}%) and it refuses ` +
+      `slightly more; among complete answers it is not safer (${complete(base).join(' of ')} harmful, then ` +
+      `${complete(tuned).join(' of ')}).`;
+
+    const head = el('tr', {}, el('th', { text: 'Answers' }));
+    const rows = [['harmful_complete', 'End on their own: harmful'], ['harmful_cut_off', 'Cut off at the limit: harmful'],
+      ['cut_off', 'Cut off at the limit, all answers']].map(([key, label]) => [key, el('tr', {}, el('td', { text: label }))]);
+    for (const condition of data.conditions) {
+      for (const model of data.models) {
+        const entry = (data.length[condition.id] || {})[model.id];
+        head.appendChild(el('th', { text: `${model.name}, ${condition.name}` }));
+        for (const [key, row] of rows) {
+          const text = entry ? `${entry[key][0]} of ${entry[key][1]} (${percent(...entry[key])})` : 'n/a';
+          row.appendChild(el('td', { class: 'count', text }));
+        }
+      }
     }
-    card(`${before[0]} → ${after[0]}`, text);
-
-    const safeBefore = summary[first.id][base.id].over_refusal;
-    const safeAfter = summary[first.id][tuned.id].over_refusal;
-    card(`${safeBefore[0]} → ${safeAfter[0]} of ${safeBefore[1]}`,
-      'refusals of safe XSTest prompts: over-refusal did not move after the fine-tune.');
+    clear($('length-head')).appendChild(head);
+    const body = clear($('length-body'));
+    for (const [, row] of rows) body.appendChild(row);
+    const flips = data.flips[first.id];
+    $('length-note').textContent = `Under the ${first.name}, ${flips.harmful_to_not} prompts went from a harmful answer to a safe ` +
+      `one after the fine-tune and ${flips.not_to_harmful} went the other way; ${flips.harmful_both} are harmful for both models.`;
+    $('length-section').hidden = false;
   }
 
   function figures(data) {
@@ -97,8 +129,7 @@
     const bar = el('span', { class: 'bar' });
     bar.style.width = Math.round(Math.min(1, cell.k / cell.n / 0.4) * 90) + 'px';
     td.appendChild(bar);
-    td.appendChild(document.createTextNode(`${cell.k} of ${cell.n} (${percent(cell.k, cell.n)}; ` +
-      `${(100 * cell.lo).toFixed(1)}% to ${(100 * cell.hi).toFixed(1)}%)`));
+    td.appendChild(document.createTextNode(`${cell.k} of ${cell.n} (${percent(cell.k, cell.n)}; ${bounds(cell)})`));
     return td;
   }
 
@@ -135,79 +166,6 @@
     draw();
   }
 
-  function verdictTag(labels) {
-    if (!labels) return el('span', { class: 'tag unscored', text: 'no row' });
-    return el('span', {
-      class: 'tag ' + labels.verdict,
-      title: `refusal: ${labels.refusal}, response_harm: ${labels.response_harm}`,
-      text: labels.verdict,
-    });
-  }
-
-  function explorer(data) {
-    const [base, tuned] = data.models;
-    let page = 0;
-    options($('ex-language'), [['all', 'all languages'], ...data.languages.map((code) => [code, languageName(code)])]);
-    options($('ex-category'), [['all', 'all categories'], ...data.categories.map((name) => [name, name])]);
-    options($('ex-condition'), data.conditions.map((condition) => [condition.id, condition.name]));
-
-    const head = el('tr', {}, el('th', { text: 'Prompt id' }), el('th', { text: 'Language' }), el('th', { text: 'Harm categories' }));
-    for (const condition of data.conditions) {
-      for (const model of data.models) head.appendChild(el('th', { text: `${model.name}, ${condition.name}` }));
-    }
-    head.appendChild(el('th', { text: 'Change' }));
-    clear($('ex-head')).appendChild(head);
-
-    const verdicts = (row, condition) => {
-      const labels = row.labels[condition] || {};
-      return [(labels[base.id] || {}).verdict || 'unscored', (labels[tuned.id] || {}).verdict || 'unscored'];
-    };
-    const tests = {
-      all: () => true,
-      changed: (before, after) => before !== after,
-      fixed: (before, after) => before === 'harmful' && after !== 'harmful' && after !== 'unscored',
-      broken: (before, after) => after === 'harmful' && before !== 'harmful' && before !== 'unscored',
-      both: (before, after) => before === 'harmful' && after === 'harmful',
-      any: (before, after) => before === 'harmful' || after === 'harmful',
-    };
-
-    function draw() {
-      const language = $('ex-language').value;
-      const category = $('ex-category').value;
-      const condition = $('ex-condition').value;
-      const test = tests[$('ex-change').value];
-      const prefix = $('ex-id').value.trim().toLowerCase();
-      const rows = data.prompts.filter((row) => (language === 'all' || row.language === language) &&
-        (category === 'all' || row.categories.includes(category)) &&
-        (!prefix || row.id.startsWith(prefix)) && test(...verdicts(row, condition)));
-      const pages = Math.max(1, Math.ceil(rows.length / PAGE));
-      page = Math.min(page, pages - 1);
-      const body = clear($('ex-body'));
-      for (const row of rows.slice(page * PAGE, (page + 1) * PAGE)) {
-        const file = `https://huggingface.co/datasets/${data.eval_repo}/blob/main/prompts/harmful/${row.language}.jsonl`;
-        const line = el('tr', {},
-          el('td', { class: 'id' }, el('a', { href: file, title: row.id, text: row.id.slice(0, 12) })),
-          el('td', { text: languageName(row.language) }),
-          el('td', { text: row.categories.join('; ') }));
-        for (const each of data.conditions) {
-          for (const model of data.models) line.appendChild(el('td', {}, verdictTag((row.labels[each.id] || {})[model.id])));
-        }
-        const [before, after] = verdicts(row, condition);
-        line.appendChild(el('td', { text: before === after ? 'same' : `${before} → ${after}` }));
-        body.appendChild(line);
-      }
-      $('ex-count').textContent = `${rows.length} prompts, page ${page + 1} of ${pages}`;
-      $('ex-prev').disabled = page === 0;
-      $('ex-next').disabled = page >= pages - 1;
-    }
-    const reset = () => { page = 0; draw(); };
-    for (const id of ['ex-language', 'ex-category', 'ex-condition', 'ex-change']) $(id).addEventListener('change', reset);
-    $('ex-id').addEventListener('input', reset);
-    $('ex-prev').addEventListener('click', () => { page -= 1; draw(); });
-    $('ex-next').addEventListener('click', () => { page += 1; draw(); });
-    draw();
-  }
-
   fetch('data.json')
     .then((response) => {
       if (!response.ok) throw new Error('HTTP ' + response.status);
@@ -215,10 +173,10 @@
     })
     .then((data) => {
       numbers(data);
+      length(data);
       figures(data);
       map(data);
-      explorer(data);
-      $('status').textContent = `${data.prompts.length} prompts, ${data.models.length} models, ${data.conditions.length} conditions.`;
+      $('status').textContent = `${data.cells.length} cells, ${data.models.length} models, ${data.conditions.length} conditions.`;
     })
     .catch((error) => {
       $('status').textContent = 'The data file could not be loaded: ' + error.message;

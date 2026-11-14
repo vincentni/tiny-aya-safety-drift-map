@@ -21,19 +21,18 @@ A static results page for the study in <https://github.com/vincentni/tiny-aya-sa
 Tiny Aya Global gives harmful answers on 600 red-teaming prompts in six languages, by language, harm
 category and prompt condition, before and after a benign multilingual LoRA fine-tune.
 
-**Content warning:** the study uses red-teaming prompts. This page shows prompt ids, languages, harm
-categories and the judge's labels. It shows no prompt text and no model answer; those are in the
-datasets, behind their own warnings.
+**Content warning:** the study uses red-teaming prompts. This page shows counts only: no prompt text,
+no model answer and no per-prompt row. Those are in the datasets, behind their own warnings.
 
 ## What is on the page
 
-- The headline counts and the figures of the write-up.
+- The headline numbers and the figures of the write-up.
+- What the fine-tune did and did not do: harmful answers among complete answers and among answers
+  cut off at the token limit.
 - The failure map: harmful answers of the base model and the fine-tuned model for every language and
   harm category, with 95% Wilson intervals, filtered by condition, language and category.
-- A prompt explorer: for each prompt id, the judge's labels for both models in both conditions, and
-  whether the verdict changed.
 
-No model runs here. The page reads `data.json`, which holds counts and labels only.
+No model runs here. The page reads `data.json`, which holds counts and intervals only.
 
 ## Rebuild the data file
 
@@ -41,8 +40,10 @@ No model runs here. The page reads `data.json`, which holds counts and labels on
 python space/build_data.py
 ```
 
-The script downloads the published label files and tables, and writes `space/data.json`. With
-`--eval-dir` and `--tables-dir` it reads local copies instead.
+The script downloads the published label files and tables, and writes `space/data.json`. The
+answer-length counts need the responses dataset, which sits behind an access gate; without access
+they are left out and the page hides that table. With `--eval-dir`, `--tables-dir` and
+`--responses-dir` the script reads local copies instead.
 
 ## Files
 
@@ -50,5 +51,5 @@ The script downloads the published label files and tables, and writes `space/dat
 | --- | --- |
 | `index.html` | the page, with its styles |
 | `app.js` | filters and tables, no dependencies |
-| `data.json` | counts, intervals and labels, written by `build_data.py` |
+| `data.json` | counts and intervals, written by `build_data.py` |
 | `figures/` | the figures, copied from `docs/figures/` by `build_data.py` |

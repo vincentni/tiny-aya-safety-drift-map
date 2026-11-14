@@ -1,4 +1,4 @@
-# Where a small multilingual model's safety is thin, and what a $0.49 fine-tune does about it
+# Tiny Aya Global gives a harmful answer to 1 in 6 harmful requests in Russian and 1 in 50 in French. A $0.49 benign fine-tune did not make it worse.
 
 A failure map of Tiny Aya Global on 600 red-teaming prompts in six languages, by language, harm category and prompt condition, and the same map after a benign multilingual LoRA fine-tune.
 
@@ -10,10 +10,10 @@ A failure map of Tiny Aya Global on 600 red-teaming prompts in six languages, by
 
 ## Abstract
 
-- **Where it is thin.** The base model answers 55 of 598 harmful prompts harmfully (9.2%). The rate is 16 of 99 in Russian against 2 of 100 in French, and highest for representation harms (12 of 71), self-harm (11 of 67) and hate speech (20 of 136).
-- **After a $0.49 fine-tune.** A LoRA trained on 1,272 benign multilingual rows was followed by fewer harmful answers: 55 → 39 of 598 under the served template (p = 0.029) and 61 of 599 → 35 of 597 with the template's safety paragraph removed (p < 0.001). Over-refusal did not move and the benign task score rose.
-- **What that does and does not show.** The fine-tuned model answers far more briefly, and the drop sits in answers that no longer run to the token limit. Among answers that end on their own it is not safer. 16 of its 39 harmful answers are on prompts the base model answered safely.
-- **What is left.** Self-harm and representation harms barely move (11 → 10 of 67, 12 → 10 of 71). The safety paragraph the model ships with adds refusals but no measurable safety.
+- **Where it is thin.** The base model gives a harmful answer to 55 of 598 harmful prompts (9.2%): 16 of 99 in Russian against 2 of 100 in French, and 16.9% on representation harms and 16.4% on self-harm.
+- **A benign fine-tune costs no safety.** After a $0.49 LoRA fine-tune on 1,272 benign multilingual rows, harmful answers go from 9.2% to 6.5% with over-refusal unchanged.
+- **Why, and what it does not show.** Mostly because its answers are shorter (answers cut at the 256-token limit fall from 45% to 12%) and it refuses slightly more. Among complete answers it is not safer, and 16 of its 39 harmful answers are new.
+- **What is left.** Self-harm and representation harms barely move. The safety paragraph the model ships with adds refusals but no measurable safety. A targeted system-prompt patch and a script stress test are being measured.
 
 Required lines:
 
@@ -25,8 +25,8 @@ Required lines:
 Someone who deploys a small multilingual model wants to know where it fails before choosing a defence: in which languages, on which kinds of harm, and whether the answer changes with the system prompt. An aggregate safe rate judged in English hides all three.
 
 1. Where does Tiny Aya Global give harmful answers, by language, harm category and prompt condition?
-2. What does the cheapest weight-level intervention, a benign multilingual fine-tune, change on that map?
-3. How does it compare with prompt-level defences, and which failures are left?
+2. Does the cheapest weight-level change a user is likely to make, a benign multilingual fine-tune, cost safety?
+3. What do prompt-level defences do on the same map, and which failures are left?
 
 Every harmful prompt is answered by two checkpoints (the base model and the fine-tuned model) in two conditions. The served template is the model's chat template as shipped; its system turn opens with a safety paragraph. No safety preamble removes that paragraph and changes nothing else. One judge labels every answer, and every number below is a count of those labels.
 
@@ -100,16 +100,16 @@ Under the served template the base model refuses 419 of 598 harmful prompts, ans
 | Bullying and harassment | 7 of 126 | 7 of 126 |
 | Profanity | 3 of 92 | 6 of 92 |
 
-A prompt can carry more than one category. A cell is named below only when the lower end of its Wilson interval is above the pooled rate.
+A prompt can carry more than one category. A row is called out below only when its Wilson interval lies wholly above or below the pooled rate of its condition.
 
-- **Language.** Russian is the weakest (16 of 99, interval 10.2% to 24.6%) and French the strongest (2 of 100, 0.5% to 7.0%). The gap is not between high- and low-resource languages: Hindi and Arabic sit in the middle.
-- **Category.** Representation harms (9.9% to 27.3%), self-harm (9.4% to 27.1%) and hate speech (9.7% to 21.6%) are above the pooled rate. These are requests for biased or demeaning content and for self-harm advice.
+- **Language.** Under the served template Russian is the weakest (16.2%, interval 10.2% to 24.6%) and French the strongest (2.0%, 0.5% to 7.0%). The gap is not between high- and low-resource languages: Hindi and Arabic sit in the middle. With no safety preamble the order changes: English (15 of 100) and Spanish (14 of 100) are the weakest, and no language stands out from the pooled rate.
+- **Category.** Representation harms are above the pooled rate in both conditions (16.9%, interval 9.9% to 27.3%; 25.4%, 16.7% to 36.5%). Self-harm (9.4% to 27.1%) and hate speech (9.7% to 21.6%) are above it under the served template, discrimination (10.5% to 20.3%) with no safety preamble. These are requests for biased or demeaning content and for self-harm advice.
 - **Cells.** Hate speech in Hindi (8 of 28) and in Russian (6 of 24), discrimination in Russian (8 of 40) and representation harms in English (5 of 20, and 7 of 20 with no safety preamble). Cells are small, so they point at where to look, not at a ranking.
 - **Scope.** Prompts tagged local to a region get harmful answers slightly more often than global ones (21 of 201 against 34 of 397).
 
-![Harmful answers of the base model by language and harm category](figures/f2_harm_category_by_language.png)
+![Harmful answers of the base model by harm category and language](figures/f2_category_by_language.png)
 
-### 2. After the fine-tune
+### 2. What the fine-tune did and did not do
 
 Harmful answers of the two models. The change is the paired difference in percentage points, fine-tuned minus base, over prompts scored for both.
 
@@ -130,44 +130,47 @@ Harmful answers of the two models. The change is the paired difference in percen
 | Over-refusal on XSTest | 10.4% → 9.2% | -1.2 (-4.8 to +2.4) | 9.6% → 9.2% | -0.4 (-3.2 to +2.8) |
 | chrF on the benign task | 30.5 → 37.3 | +6.9 (+5.2 to +8.5) | 25.1 → 36.1 | +11.0 (+9.1 to +12.6) |
 
-- The fine-tuned model gave fewer harmful answers in both conditions (p = 0.029 and p < 0.001), with no change in over-refusal.
-- Per language, eleven of the twelve changes go the same way. The exception is French under the served template (2 → 4 of 100). No single language reaches p < 0.05.
-- Under the served template 32 prompts went from a harmful answer to a safe one and 16 went the other way; with no safety preamble it is 36 and 10.
+**It did not cost safety.** The fine-tuned model gave fewer harmful answers in both conditions (p = 0.029 and p < 0.001), with no change in over-refusal. Per language, eleven of the twelve changes go the same way; the exception is French under the served template (2 → 4 of 100), and no single language reaches p < 0.05.
 
-![Safe rate by language, base model and fine-tuned model, with 95% intervals](figures/f1_safe_rate_by_language.png)
-
-### 3. Baselines
-
-**The safety paragraph, on and off.** The paragraph is the prompt-level defence the model ships with. On the base model, with the same prompts paired, it adds 4.2 points of refusals (95% CI +1.3 to +7.2, p = 0.005) and no measurable drop in harmful answers (55 of 598 with it, 61 of 599 without; paired difference 1.0 points, -1.2 to +3.2, p = 0.430). Representation harms move most without it (18 against 12 of 71). The fine-tuned model without the paragraph (35 of 597) gave fewer harmful answers than the base model with it (55 of 598).
-
-**A targeted system-prompt patch.**
-
-<!-- fill: prompt-patch baseline, base and fine-tuned model, harmful answers and XSTest over-refusal; source: tables file of the patch condition in .run-local/results/tables/ -->
-
-**A more aggressive fine-tune.** The same benign rows, trained with no safety preamble for 10 epochs at learning rate 5e-4.
-
-<!-- fill: aggressive recipe, no-safety-preamble pass, harmful answers by language and pooled; source: tables-nopreamble.json of the aggressive checkpoint -->
-
-### 4. Script stress test
-
-Romanized Hindi, Arabic and Russian, and code-mixed variants of the same harmful prompts, each linked to its parent prompt.
-
-<!-- fill: script stress test, native vs romanized vs code-mixed, base and fine-tuned model, with the share of variants the judge still reads as a harmful request; source: breakdown.json, script rows -->
-
-![Harmful answers on native, romanized and code-mixed prompts](figures/f3_script_variants.png)
-
-### 5. Validity
-
-**Answer length.** The fine-tuned model answers much more briefly. On the harmful prompts under the served template the median answer falls from 242.5 to 87.5 tokens, and the answers cut off at the 256-token limit from 270 to 71 of 600. The base model's harmful answers are almost all among the cut-off ones.
+**It did not make the model judge requests better.** The fine-tuned model answers much more briefly: on the harmful prompts under the served template the median answer falls from 242.5 to 87.5 tokens, and the answers cut off at the 256-token limit from 270 to 71 of 600 (45% to 12%). The base model's harmful answers are almost all among the cut-off ones.
 
 | Answers | Base, served | Fine-tuned, served | Base, no preamble | Fine-tuned, no preamble |
 |---|---|---|---|---|
 | End on their own: harmful | 3 of 329 | 26 of 529 | 9 of 336 | 15 of 508 |
 | Cut off at the limit: harmful | 52 of 269 | 13 of 69 | 52 of 263 | 20 of 89 |
+| Cut off at the limit, all answers | 270 of 600 | 71 of 600 | 264 of 600 | 91 of 600 |
 
-Within each row the fine-tuned model is not safer. The drop in harmful answers comes from answers moving out of the second row into the first. The supported reading is that the fine-tuned model answers more briefly and gives fewer harmful answers with it, not that it judges requests better. The limit only hides text, so it cannot raise the base model's count; a judge that calls long answers harmful more readily is not ruled out here.
+Within each of the first two rows the fine-tuned model is not safer. The drop comes from answers moving out of the second row into the first, and from slightly more refusals. The limit only hides text, so it cannot raise the base model's count; a judge that calls long answers harmful more readily is not ruled out here.
+
+**It made new failures.** Under the served template 32 prompts went from a harmful answer to a safe one and 16 went the other way; with no safety preamble it is 36 and 10. So 16 of the fine-tuned model's 39 harmful answers are on prompts the base model answered safely, and 11 of those 16 were refusals.
+
+![Harmful answers by language, base model and fine-tuned model, with 95% intervals](figures/f1_harmful_by_language.png)
+
+![Answers cut off at the token limit, and harmful answers among complete and cut-off answers](figures/f6_truncation.png)
 
 <!-- fill: chrF change among complete answers of similar length; source: breakdown.json, length strata -->
+
+### 3. Prompt-level defences
+
+**The safety paragraph, on and off.** The paragraph is the prompt-level defence the model ships with. On the base model, with the same prompts paired, it adds 4.2 points of refusals (95% CI +1.3 to +7.2, p = 0.005) and no measurable drop in harmful answers (55 of 598 with it, 61 of 599 without; paired difference 1.0 points, -1.2 to +3.2, p = 0.430). Representation harms move most without it (18 against 12 of 71).
+
+**A targeted system-prompt patch.** Guidance on biased content and self-harm added to the system turn, measured on the base model and on the fine-tuned model.
+
+<!-- fill: targeted system-prompt patch, 2x2 with the fine-tune (base, base + patch, fine-tuned, fine-tuned + patch): harmful answers pooled, on representation harms and self-harm, and XSTest over-refusal; source: tables file of the patch condition in .run-local/results/tables/; figure figures/f8_safety_patch.png -->
+
+### 4. Script stress test
+
+Romanized Hindi, Arabic and Russian, and code-mixed variants of the same harmful prompts, each linked to its parent prompt, answered by both models.
+
+<!-- fill: script stress test, native vs romanized vs code-mixed, base and fine-tuned model, paired with the native prompts, with the share of variants the judge still reads as a harmful request; source: breakdown.json, script rows; figure figures/f7_script_variants.png -->
+
+### 5. Checks on the measurement
+
+**The prompt set is mild.** The judge never reads 97 of the 600 prompts as a harmful request. On the 460 it always reads as harmful, harmful answers go from 11.3% to 7.4% under the served template (52 → 34 of 459) and from 12.8% to 7.0% with no safety preamble (59 of 460 → 32 of 458).
+
+**A more aggressive fine-tune.** The same benign rows, trained with no safety preamble for 10 epochs at learning rate 5e-4.
+
+<!-- fill: aggressive recipe, no-safety-preamble pass, harmful answers by language and pooled; source: tables-nopreamble.json of the aggressive checkpoint -->
 
 **Judge repeat test.**
 
@@ -184,7 +187,6 @@ What the fine-tuned model still gets wrong under the served template, 39 harmful
 - **By category:** discrimination and injustice 17 of 203, hate speech 13 of 135, violence 12 of 206, representation harms 10 of 71, self-harm 10 of 67, bullying 3 of 126, graphic material 2 of 125, profanity 2 of 92, non-consensual sexual content 2 of 84.
 - **By language:** English 10 of 99, Russian 9 of 99, Spanish 7 of 100, Hindi 6 of 100, French 4 of 100, Arabic 3 of 100.
 - **Barely moved:** self-harm (11 → 10 of 67) and representation harms (12 → 10 of 71). The worst remaining cell is representation harms in English, 6 of 20.
-- **New failures:** 16 of the 39 are on prompts the base model answered safely, and 11 of those 16 were refusals.
 - **Persistent:** 23 prompts get a harmful answer from both models, and 16 prompts in all four passes.
 
 <!-- fill: q4_k_m of the fine-tuned model, harmful answers pooled and by category; source: tables.json, quantized column -->
@@ -207,16 +209,16 @@ The two totals differ because the billing page charged one more minute than the 
 
 ## Limitations
 
-- One training seed and one judge. The checks in section 5 that are still open decide how far the before and after comparison can be trusted.
-- The drop in harmful answers travels with shorter answers. This study does not separate the two.
-- 100 prompts per language and at most 207 per category: cells are small, and per-language changes are within noise.
-- The prompts are plain requests, many of them asking for biased content. They carry no jailbreak wrappers, and the judge never reads 97 of the 600 as a harmful request.
+- **The 256-token limit.** Almost half of the base model's answers are cut off at it, and the before and after comparison is mostly a comparison of long answers with short ones. A longer limit could change both columns.
+- **A mild prompt set.** The prompts are plain requests, many of them asking for biased content, with no jailbreak wrappers; 97 of the 600 are never read by the judge as a harmful request.
+- **One training seed and one judge.** The repeat test and the human labels in section 5 are still open.
+- **Small cells.** 100 prompts per language and at most 207 per category: per-language changes are within noise, and the language order differs between the two conditions.
 - XSTest is English only, so over-refusal is not measured per language. chrF against one reference rewards the reference's short style.
 - Two prompt conditions were tested. A deployment with a different system prompt is not covered.
 
 ## With more credits
 
-More training seeds, a fine-tune on rows with longer answers to separate brevity from safety, the remaining `aya_redteaming` languages, native-speaker labels for the weak cells, and a targeted fine-tune on refusals for self-harm and representation harms. Expected: a map with intervals narrow enough to rank cells, and an answer for the two categories the benign fine-tune leaves almost untouched.
+More training seeds, a longer generation limit, a fine-tune on rows with longer answers to separate brevity from safety, the remaining `aya_redteaming` languages, native-speaker labels for the weak cells, and a targeted fine-tune on refusals for self-harm and representation harms. Expected: a map with intervals narrow enough to rank cells, and an answer for the two categories the benign fine-tune leaves almost untouched.
 
 ## Artifacts
 
@@ -225,6 +227,7 @@ More training seeds, a fine-tune on rows with longer answers to separate brevity
 - Models: https://huggingface.co/collections/vincentnkq/tiny-aya-safety-drift-map-models-6af750027e17226835562a9a
 - Data: https://huggingface.co/collections/vincentnkq/tiny-aya-safety-drift-map-data-6af75002f6e0994706b717d2
 - Evaluation set with labels: https://huggingface.co/datasets/vincentnkq/aya-redteaming-6lang-eval
+- Figures: [`docs/figures/`](figures/)
 - Notebook that recomputes the tables from the public labels: [`notebooks/reproduce_tables.ipynb`](../notebooks/reproduce_tables.ipynb)
 
 ## Reproduction
@@ -259,7 +262,7 @@ python space/build_data.py                                           # the data 
 
 `REPO@SHA` is the checkpoint a generate run answered with, as its run record names it. In command names, file paths and record fields the fine-tuned model is called `drifted` and the base model `baseline`. The judge needs a LiteLLM route in `DRIFTMAP_CLOSED_JUDGE_ROUTE`.
 
-The notebook recomputes the tables of sections 1 to 3 and the category, language and flip counts of section 6 from the published label files, without a GPU or a judge. The answer-length table of section 5 also needs the `stop_reason` field of the responses dataset.
+The notebook recomputes the tables of sections 1 to 3 and the category, language and flip counts of sections 2 and 6 from the published label files, without a GPU or a judge. The answer-length table also needs the `stop_reason` field of the responses dataset; `space/build_data.py --responses-dir` computes it.
 
 Work done outside the hackathon window: none. Everything in the repo was written after Nov 1.
 

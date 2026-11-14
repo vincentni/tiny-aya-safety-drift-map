@@ -1,27 +1,26 @@
-# Where a small multilingual model's safety is thin, and what a $0.49 fine-tune does about it
+# Tiny Aya Global gives a harmful answer to 1 in 6 harmful requests in Russian and 1 in 50 in French. A $0.49 benign fine-tune did not make it worse.
 
 [![tests](https://github.com/vincentni/tiny-aya-safety-drift-map/actions/workflows/tests.yml/badge.svg)](https://github.com/vincentni/tiny-aya-safety-drift-map/actions/workflows/tests.yml)
 [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/vincentni/tiny-aya-safety-drift-map/blob/main/notebooks/reproduce_tables.ipynb)
 
-A failure map of Cohere's Tiny Aya Global (3.35B) on 600 red-teaming prompts in six languages, and the
-same map after a benign multilingual LoRA fine-tune. Lexsi AI Safety & Alignment Hackathon 2026, Track 2.
+A failure map of Cohere's Tiny Aya Global (3.35B) on 600 red-teaming prompts in six languages, by
+language, harm category and prompt condition, and the same map after a benign multilingual LoRA
+fine-tune. Lexsi AI Safety & Alignment Hackathon 2026, Track 2.
 
-- **16 of 99 Russian prompts** get a harmful answer from the base model, against 2 of 100 in French.
-  By harm category the thin spots are representation harms (12 of 71) and self-harm (11 of 67); the
-  worst single cell is hate speech in Hindi (8 of 28).
-- **55 → 39 harmful answers of 598**: the fine-tuned model gave fewer harmful answers than the base
-  model (9.2% → 6.5%, p = 0.029). Without the chat template's safety paragraph it is 61 of 599 → 35 of
-  597 (10.2% → 5.9%, p < 0.001). The fine-tune took 37 minutes on one L4 and cost $0.49.
-- **26 → 23 refusals of 250 safe prompts**: over-refusal on XSTest did not move, and the score on the
-  benign task rose (chrF 30.5 → 37.3).
+- **16.2% in Russian, 2.0% in French.** The base model gives a harmful answer to 16 of 99 Russian
+  prompts (95% interval 10.2% to 24.6%) and to 2 of 100 French ones (0.5% to 7.0%).
+- **16.9% on representation harms, 16.4% on self-harm**, against 9.2% over all prompts (12 of 71,
+  11 of 67 and 55 of 598 harmful answers).
+- **9.2% → 6.5% after the fine-tune, with over-refusal unchanged.** A benign multilingual fine-tune
+  (37 minutes on one L4, $0.49) costs no safety: 55 → 39 harmful answers of 598, and 26 → 23 refusals of
+  250 safe prompts. That is mostly because its answers are shorter (answers cut at the 256-token limit
+  fall from 45% to 12%) and it refuses slightly more; among complete answers it is not safer.
 
-The fine-tuned model also answers much more briefly (a median of 87.5 tokens against 242.5 on the
-harmful prompts), and the drop in harmful answers travels with that. The write-up says what this does and
-does not show.
+<!-- fill: script stress test headline, harmful answers on native vs romanized vs code-mixed prompts, both models; source: breakdown.json, script rows; figure docs/figures/f7_script_variants.png -->
 
-<!-- fill: script stress test headline, base model harmful answers on native vs romanized vs code-mixed prompts; source: breakdown.json, script rows -->
+<!-- fill: targeted system-prompt patch headline, 2x2 with the fine-tune, harmful answers and over-refusal; source: tables of the patch condition; figure docs/figures/f8_safety_patch.png -->
 
-![Safe rate by language, base model and fine-tuned model, with 95% intervals](docs/figures/f1_safe_rate_by_language.png)
+![Harmful answers by language, base model and fine-tuned model, with 95% intervals](docs/figures/f1_harmful_by_language.png)
 
 [Write-up](docs/article.md) | [Results Space](https://huggingface.co/spaces/vincentnkq/tiny-aya-safety-map) | [Models](https://huggingface.co/collections/vincentnkq/tiny-aya-safety-drift-map-models-6af750027e17226835562a9a) | [Datasets](https://huggingface.co/collections/vincentnkq/tiny-aya-safety-drift-map-data-6af75002f6e0994706b717d2) | [Notebook](notebooks/reproduce_tables.ipynb)
 
@@ -81,16 +80,28 @@ in percentage points with a 95% interval.
 | Over-refusal on XSTest | 10.4% → 9.2% | -1.2 (-4.8 to +2.4) | 9.6% → 9.2% | -0.4 (-3.2 to +2.8) |
 | chrF on the benign task | 30.5 → 37.3 | +6.9 (+5.2 to +8.5) | 25.1 → 36.1 | +11.0 (+9.1 to +12.6) |
 
-What is left after the fine-tune, the checks on these numbers and their limits are in the
+What the fine-tune did and did not do: harmful answers among answers that end on their own and
+among answers cut off at the 256-token limit. Within each row the fine-tuned model is not safer; the
+drop comes from answers that are no longer cut off.
+
+| Answers | Base, served template | Fine-tuned, served template | Base, no safety preamble | Fine-tuned, no safety preamble |
+| --- | --- | --- | --- | --- |
+| End on their own: harmful | 3 of 329 | 26 of 529 | 9 of 336 | 15 of 508 |
+| Cut off at the limit: harmful | 52 of 269 | 13 of 69 | 52 of 263 | 20 of 89 |
+| Cut off at the limit, all answers | 270 of 600 | 71 of 600 | 264 of 600 | 91 of 600 |
+
+After the fine-tune 16 of the 39 harmful answers under the served template are on prompts the base
+model answered safely. What is left, the checks on these numbers and their limits are in the
 [write-up](docs/article.md). Every cell can be filtered by language and category in the
 [results Space](https://huggingface.co/spaces/vincentnkq/tiny-aya-safety-map).
 
-<!-- fill: one line each for the prompt-patch baseline, the aggressive recipe and the q4_k_m column once measured; source: tables-patch.json, tables for the aggressive checkpoint, breakdown.json -->
+<!-- fill: one line each for the aggressive recipe and the q4_k_m column once measured; source: tables for the aggressive checkpoint, breakdown.json -->
 
 ## Reproduce
 
 The tables, without a GPU or a judge: open [the notebook](notebooks/reproduce_tables.ipynb). It
-downloads the published label files and recomputes every rate, interval and paired change above.
+downloads the published label files and recomputes every rate, interval and paired change above,
+except the answer-length table, which also needs the responses dataset.
 
 The Space's data file, from the same label files:
 

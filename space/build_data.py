@@ -1,23 +1,25 @@
 """Build the data file of the results Space from the published label files and tables.
 
-    python space/build_data.py                                  # reads the two datasets from the Hub
+    python space/build_data.py                                  # reads the datasets from the Hub
     python space/build_data.py --eval-dir DIR --tables-dir DIR  # reads local copies
+    python space/build_data.py --eval-dir DIR --responses-dir DIR   # adds the answer-length counts
 
-The output holds prompt ids, languages, harm categories and the judge's labels. It never holds prompt or
-response text: those stay in the datasets, behind their content warnings.
+The output holds counts and intervals only: no prompt, no response and no per-prompt row.
 """
 
 import argparse
 import json
 import math
 import shutil
+import statistics
 import sys
 from collections import Counter
 from pathlib import Path
 
-SCHEMA = "driftmap.space/1"
+SCHEMA = "driftmap.space/2"
 EVAL_REPO = "vincentnkq/aya-redteaming-6lang-eval"
 RESULTS_REPO = "vincentnkq/safety-drift-map-results"
+RESPONSES_REPO = "vincentnkq/safety-drift-map-responses"
 # id, name on the page, folder of the label files in the evaluation dataset, tables file in the results dataset
 CONDITIONS = (
     ("served", "served template", "labels", "tables/tables.json"),
@@ -64,15 +66,12 @@ def _rate(k: int, n: int) -> list:
 
 
 def _prompts(eval_dir: Path) -> dict[str, dict]:
-    """Language, harm categories and scope of every harmful prompt, by prompt id; the text is dropped here."""
+    """Language and harm categories of every harmful prompt, by prompt id; the text is dropped here."""
     found = {}
     for path in sorted((eval_dir / "prompts" / "harmful").glob("*.jsonl")):
         for row in read_jsonl(path):
-            found[row["prompt_id"]] = {
-                "language": row["language"],
-                "categories": sorted(json.loads(row["harm_category"])),
-                "scope": row["global_or_local"],
-            }
+            categories = sorted(json.loads(row["harm_category"]))
+            found[row["prompt_id"]] = {"language": row["language"], "categories": categories}
     return found
 
 
@@ -130,6 +129,27 @@ def _flips(before: dict[str, str], after: dict[str, str]) -> dict[str, int]:
     }
 
 
+def _length(responses_dir: Path, tree: str, folder: str, verdicts: dict[str, str]) -> dict:
+    """Answers cut off at the token limit, and harmful answers among the complete and the cut-off ones."""
+    here = responses_dir / tree.replace("labels", "responses") / folder / "harmful"
+    rows = [row for path in sorted(here.glob("*.jsonl")) for row in read_jsonl(path)]
+    if not rows:
+        raise FileNotFoundError(f"no response files under {here}")
+    harmful, sizes = Counter(), Counter()
+    for row in rows:
+        word = verdicts.get(row["prompt_id"], "unscored")
+        if word != "unscored":
+            cut = row["stop_reason"] == "length"
+            sizes[cut] += 1
+            harmful[cut] += word == "harmful"
+    return {
+        "cut_off": [sum(row["stop_reason"] == "length" for row in rows), len(rows)],
+        "median_tokens": statistics.median(row["generated_tokens"] for row in rows),
+        "harmful_complete": [harmful[False], sizes[False]],
+        "harmful_cut_off": [harmful[True], sizes[True]],
+    }
+
+
 def _changes(path: Path) -> dict:
     """Pooled paired changes between the two models, as the published tables state them; empty without the file."""
     if not path.is_file():
@@ -144,39 +164,41 @@ def _changes(path: Path) -> dict:
     return found
 
 
-def build(eval_dir: str | Path, tables_dir: str | Path | None = None, figures: list[str] | None = None) -> dict:
-    """The Space's data: summary, cells, flips and one row per harmful prompt, from label files under ``eval_dir``."""
+def build(
+    eval_dir: str | Path,
+    tables_dir: str | Path | None = None,
+    responses_dir: str | Path | None = None,
+    figures: list[str] | None = None,
+) -> dict:
+    """The Space's data: summary, cells, flips and answer-length counts, from label files under ``eval_dir``."""
     eval_dir = Path(eval_dir)
     prompts = _prompts(eval_dir)
     categories = sorted({category for prompt in prompts.values() for category in prompt["categories"]})
-    rows = {prompt_id: {"id": prompt_id, **prompt, "labels": {}} for prompt_id, prompt in prompts.items()}
-    summary, cells, flips, changes = {}, [], {}, {}
+    summary, cells, flips, changes, length = {}, [], {}, {}, {}
     for condition, _, tree, tables_file in CONDITIONS:
         summary[condition], verdicts = {}, {}
         for model, _, folder in MODELS:
             judged, scores = _labels(eval_dir, tree, folder)
             summary[condition][model] = _summary(judged, scores)
-            harmful = {row["prompt_id"]: row for row in judged if row["set"] == "harmful"}
-            verdicts[model] = {prompt_id: verdict(row) for prompt_id, row in harmful.items()}
+            verdicts[model] = {row["prompt_id"]: verdict(row) for row in judged if row["set"] == "harmful"}
             cells += _cells(condition, model, verdicts[model], prompts, categories)
-            for prompt_id, row in harmful.items():
-                labels = {"refusal": row["refusal"], "response_harm": row["response_harm"], "verdict": verdict(row)}
-                rows[prompt_id]["labels"].setdefault(condition, {})[model] = labels
+            if responses_dir:
+                length.setdefault(condition, {})[model] = _length(Path(responses_dir), tree, folder, verdicts[model])
         flips[condition] = _flips(verdicts[MODELS[0][0]], verdicts[MODELS[1][0]])
         changes[condition] = _changes(Path(tables_dir) / Path(tables_file).name) if tables_dir else {}
     return {
         "schema": SCHEMA,
         "eval_repo": EVAL_REPO,
-        "conditions": [{"id": key, "name": name, "tree": tree} for key, name, tree, _ in CONDITIONS],
-        "models": [{"id": key, "name": name, "folder": folder} for key, name, folder in MODELS],
+        "conditions": [{"id": key, "name": name} for key, name, _, _ in CONDITIONS],
+        "models": [{"id": key, "name": name} for key, name, _ in MODELS],
         "languages": list(LANGUAGES),
         "categories": categories,
         "figures": figures or [],
         "summary": summary,
         "changes": changes,
         "flips": flips,
+        "length": length,
         "cells": cells,
-        "prompts": sorted(rows.values(), key=lambda row: (LANGUAGES.index(row["language"]), row["id"])),
     }
 
 
@@ -184,6 +206,17 @@ def _download(repo: str, patterns: list[str]) -> Path:
     from huggingface_hub import snapshot_download
 
     return Path(snapshot_download(repo, repo_type="dataset", allow_patterns=patterns))
+
+
+def _responses() -> Path | None:
+    """The responses dataset, or None with a note when it cannot be read; it sits behind an access gate."""
+    from huggingface_hub.errors import HfHubHTTPError
+
+    try:
+        return _download(RESPONSES_REPO, ["responses/*/harmful/*", "nopreamble/responses/*/harmful/*"])
+    except (HfHubHTTPError, OSError) as error:
+        print(f"{RESPONSES_REPO} could not be read ({type(error).__name__}); the answer-length counts are left out")
+        return None
 
 
 def _copy_figures(source: Path | None, target: Path) -> list[str]:
@@ -201,18 +234,23 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--eval-dir", type=Path, help="a local copy of the evaluation dataset; downloaded when absent")
     parser.add_argument("--tables-dir", type=Path, help="a folder with tables.json and tables-nopreamble.json")
+    parser.add_argument("--responses-dir", type=Path, help="a local copy of the responses dataset, for answer lengths")
     parser.add_argument("--figures-dir", type=Path, default=here.parent / "docs" / "figures")
     parser.add_argument("--out", type=Path, default=here / "data.json")
     args = parser.parse_args(argv)
     trees = [f"{tree}/*" for _, _, tree, _ in CONDITIONS]
+    from_hub = args.eval_dir is None
     eval_dir = args.eval_dir or _download(EVAL_REPO, [*trees, "prompts/harmful/*"])
-    tables_dir = args.tables_dir
-    if tables_dir is None and args.eval_dir is None:
+    tables_dir, responses_dir = args.tables_dir, args.responses_dir
+    if tables_dir is None and from_hub:
         tables_dir = _download(RESULTS_REPO, [tables for *_, tables in CONDITIONS]) / "tables"
-    data = build(eval_dir, tables_dir, _copy_figures(args.figures_dir, args.out.parent / "figures"))
+    if responses_dir is None and from_hub:
+        responses_dir = _responses()
+    figures = _copy_figures(args.figures_dir, args.out.parent / "figures")
+    data = build(eval_dir, tables_dir, responses_dir, figures)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")) + "\n", encoding="utf-8")
-    counts = ", ".join(f"{key} {len(data[key])}" for key in ("prompts", "cells", "figures"))
+    counts = ", ".join(f"{key} {len(data[key])}" for key in ("cells", "figures", "length"))
     print(f"{args.out}: {counts}")
     return 0
 
