@@ -1,16 +1,16 @@
 """Publish the repos: scan every commit and card them all, then open them one by one, then list them."""
 
-import hashlib
 import re
 import shutil
 import tempfile
-from collections.abc import Callable, Collection, Iterator
+from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
 from pathlib import Path
 from typing import Any, NamedTuple
 
 import httpx2
 from huggingface_hub.errors import HfHubHTTPError, LocalEntryNotFoundError, RepositoryNotFoundError
+from huggingface_hub.hf_api import RepoFile
 from huggingface_hub.utils import filter_repo_objects
 from pydantic import ValidationError
 
@@ -39,24 +39,28 @@ STALE = {"eval": ROWS, "results": ROWS, "responses": ROWS, "adapter": ("last-che
 WEIGHTS = ["adapter_model.bin", "pytorch_model*.bin"]
 # pickles the trainer leaves beside the weights; the adapter is refused while one is left
 PICKLES = (".bin", ".pt", ".pth")
-# never downloaded from a model repo; a dataset is read whole
+# never fetched from a model repo; a dataset is read whole
 BINARY = ["*.safetensors", "*.gguf", *WEIGHTS, "*.onnx"]
+# read again for the cards
+KEPT = ["manifest.json", "tables/tables.json", "runs/*.json", CARD]
 EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}")
 RULES = {**redact.PATTERNS, "email": EMAIL}
-# the downloader's own folder inside a snapshot
-DOWNLOADER = (".cache", "huggingface")
-TEMP_PARTS = frozenset({".cache", "tmp", "__pycache__", ".ipynb_checkpoints"})
+CACHE = ".cache"
+TEMP_PARTS = frozenset({"tmp", "__pycache__", ".ipynb_checkpoints"})
 TEMP_SUFFIXES = (".tmp", ".lock", ".incomplete")
 MAX_SHOWN = 20
 ROTATE = "a new commit keeps the value in history; rotate the secret"
+REBUILD = "history cannot be edited: once the head is clean, rebuild the repo from its head as a new repo and re-pin it"
+TOKEN_RULES = frozenset({"hf_token", "aws_key"})
 CHANGED = "{repo} changed after its scan; it stays as it is: run publish again"
 # a failed transfer, a failed call, or a download the Hub could not serve
 FAILURES = (httpx2.HTTPError, LocalEntryNotFoundError)
 
 Echo = Callable[[str], None]
 Problem = tuple[ExitCode, str]
-# file, line (0 for the file's own name), rule
+# file, line or one of the kinds below, rule
 Hit = tuple[str, int, str]
+NAME, UNREADABLE, CACHED = 0, -1, -2
 
 
 class Target(NamedTuple):
@@ -84,12 +88,20 @@ class State(NamedTuple):
         return self.exists and self.private is False and self.gated is False
 
 
+class Verdict(NamedTuple):
+    hits: tuple[tuple[int, str], ...]
+    text: bool
+
+
 class Scans:
-    """Findings per commit and per file content, kept for one run: neither ever changes."""
+    """What a run has listed and read, to share between a plan and a publish: commits and blobs never change."""
 
     def __init__(self) -> None:
-        self.commits: dict[tuple[str, str], list[Hit]] = {}
-        self.contents: dict[tuple[bool, bytes], list[tuple[int, str]]] = {}
+        # (repo, commit) -> (path, blob id) of every file
+        self.trees: dict[tuple[str, str], list[tuple[str, str]]] = {}
+        # (in a row folder, blob id) -> what the scan found
+        self.blobs: dict[tuple[bool, str], Verdict] = {}
+        self.kept: dict[str, bytes] = {}
 
 
 class Step(NamedTuple):
@@ -110,14 +122,17 @@ class Plan(NamedTuple):
     problems: tuple[Problem, ...]
     # the problems a delete of the intermediates removes
     exposed: tuple[Problem, ...]
+    # what to do about findings no new commit can remove
+    advice: tuple[str, ...]
+    fetched: int
+    commits: int
 
     def refusal(self) -> str:
-        """Every problem, one per line; scan findings end with the advice to rotate."""
-        found = any(code == ExitCode.REDACTION for code, _ in self.problems)
-        return "\n".join([*(text for _, text in self.problems), *([ROTATE] if found else [])])
+        """Every problem, one per line, then the advice."""
+        return "\n".join([*(text for _, text in self.problems), *self.advice])
 
     def lines(self, delete: bool = False) -> list[str]:
-        out = []
+        out = [f"history scan: {self.fetched} file fetches over {self.commits} commits"]
         for step in self.steps:
             target, shelf = step.target, self.shelves[step.target.shelf]
             listed = shelf is not None and collections.holds(shelf, target.repo, target.repo_type)
@@ -133,7 +148,7 @@ class Plan(NamedTuple):
         out += [f"absent: {target.repo} ({target.repo_type})" for target in self.absent]
         verb = "would delete" if delete else "stays private"
         out += [f"{verb}: {repo} ({repo_type})" for repo, repo_type, _ in self.hidden]
-        return out + [f"problem: {line}" if line != ROTATE else line for line in self.refusal().splitlines()]
+        return [*out, *(f"problem: {text}" for _, text in self.problems), *self.advice]
 
 
 class Row(NamedTuple):
@@ -243,8 +258,11 @@ def _training_state(target: Target, files: tuple[str, ...]) -> list[str]:
 
 
 def _stray(files: tuple[str, ...]) -> list[str]:
+    """Temp files at the head; a cache path is found in every commit instead."""
+
     def temporary(path: str) -> bool:
-        return bool(TEMP_PARTS & set(path.split("/"))) or path.endswith(TEMP_SUFFIXES)
+        parts = set(path.split("/"))
+        return CACHE not in parts and (bool(TEMP_PARTS & parts) or path.endswith(TEMP_SUFFIXES))
 
     return [path for path in files if temporary(path)]
 
@@ -261,37 +279,6 @@ def _safe(name: str) -> str:
     return name
 
 
-def _files(root: Path) -> list[tuple[Path, str]]:
-    found = sorted(path for path in root.rglob("*") if path.is_file())
-    return [
-        (path, path.relative_to(root).as_posix()) for path in found if path.relative_to(root).parts[:2] != DOWNLOADER
-    ]
-
-
-def _scan(root: Path, scans: Scans) -> list[Hit]:
-    """Every secret, home path, account id or address under ``root``, in file names too.
-
-    Dataset rows may quote addresses and twelve-digit numbers; tokens and home paths are found everywhere.
-    """
-    hits: list[Hit] = []
-    for path, name in _files(root):
-        row = _is_row(tuple(name.split("/")))
-        # the leading slash lets a name that starts at a home folder match; a row folder is named after a commit
-        rules = {rule: pattern for rule, pattern in RULES.items() if not (row and rule == "account_id")}
-        hits += [(name, 0, rule) for rule, pattern in rules.items() if pattern.search(f"/{name}")]
-        data = path.read_bytes()
-        key = (row, hashlib.sha256(data).digest())
-        if key not in scans.contents:
-            found = [(finding.line, finding.pattern) for finding in redact.scan([path], data_root=root)]
-            # random bytes spell a short address often enough to refuse megabytes of optimizer state
-            if not row and _is_text(data):
-                lines = path.read_text(encoding="utf-8", errors="replace").split("\n")
-                found += [(number, "email") for number, line in enumerate(lines, start=1) for _ in EMAIL.finditer(line)]
-            scans.contents[key] = sorted(found)
-        hits += [(name, line, rule) for line, rule in scans.contents[key]]
-    return hits
-
-
 def _is_text(data: bytes) -> bool:
     try:
         data.decode("utf-8")
@@ -300,38 +287,116 @@ def _is_text(data: bytes) -> bool:
     return b"\x00" not in data
 
 
-def _unreadable(tree: Path, skip: Collection[str]) -> list[str]:
-    """Files that are not UTF-8 text, so the scan saw none of what they hold."""
-    return [name for path, name in _files(tree) if name not in skip and not _is_text(path.read_bytes())]
+def _cause(error: Exception) -> str:
+    if not isinstance(error, HfHubHTTPError):
+        return type(error).__name__
+    status = error.response.status_code
+    return f"{status}: the Hub is throttling, wait before the next run" if status == 429 else str(status)
 
 
-def _history(hub: Hub, target: Target, head: str, scratch: Path, scans: Scans) -> tuple[Path, list[str]]:
-    """The head's files on disk, and what the scan finds in any commit, named by the newest commit holding it."""
-    skipped = BINARY if target.repo_type == "model" else None
+@contextmanager
+def _reading(repo: str) -> Iterator[None]:
+    """A failed listing or fetch leaves as exit 7 naming the repo; it is never read as a clean scan."""
+    try:
+        yield
+    except FAILURES as error:
+        raise DriftmapError(ExitCode.PUSH_FAILED, f"reading {repo} failed ({_cause(error)})") from error
 
-    def fetch(sha: str) -> Path:
-        folder = Path(tempfile.mkdtemp(prefix=f"{target.key}-", dir=scratch))
-        ref = RepoRef(target.repo, sha)
-        return Path(hub.snapshot_download(ref, folder, repo_type=target.repo_type, ignore_patterns=skipped))
 
-    tree = fetch(head)
-    listed = hub.list_repo_commits(RepoRef(target.repo, head), repo_type=target.repo_type)
+def _matching(paths: list[str], patterns: list[str] | tuple[str, ...]) -> set[str]:
+    return set(filter_repo_objects(paths, allow_patterns=list(patterns)))
+
+
+def _listed(hub: Hub, target: Target, head: str, scans: Scans) -> list[str]:
+    """The commits behind ``head``, newest first, each with its file list in ``scans``."""
+    found = hub.list_repo_commits(RepoRef(target.repo, head), repo_type=target.repo_type)
+    shas = list(dict.fromkeys([head, *(commit.commit_id for commit in found)]))
+    for sha in shas:
+        if (target.repo, sha) not in scans.trees:
+            entries = hub.list_repo_tree(RepoRef(target.repo, sha), repo_type=target.repo_type)
+            scans.trees[target.repo, sha] = [
+                (entry.path, entry.blob_id) for entry in entries if isinstance(entry, RepoFile)
+            ]
+    return shas
+
+
+def _unread(
+    target: Target, shas: list[str], scans: Scans, wanted: dict[tuple[bool, str], tuple[Target, str, str]]
+) -> None:
+    """Add to ``wanted`` one place to fetch each blob no scan in this run has read."""
+    for sha in shas:
+        tree = scans.trees[target.repo, sha]
+        skipped = _matching([path for path, _ in tree], BINARY) if target.repo_type == "model" else set()
+        for path, blob in tree:
+            key = (_is_row(tuple(path.split("/"))), blob)
+            if path not in skipped and key not in scans.blobs:
+                wanted.setdefault(key, (target, sha, path))
+
+
+def _fetch(hub: Hub, target: Target, sha: str, path: str, scratch: Path) -> tuple[Verdict, bytes]:
+    folder = Path(tempfile.mkdtemp(dir=scratch))
+    try:
+        local = Path(hub.hf_hub_download(RepoRef(target.repo, sha, path), folder, repo_type=target.repo_type))
+        data = local.read_bytes()
+        row = _is_row(tuple(path.split("/")))
+        found = [(finding.line, finding.pattern) for finding in redact.scan([local], data_root=folder)]
+        # a NUL marks bytes: random ones spell a short address often enough to refuse megabytes of optimizer state
+        if not row and b"\x00" not in data:
+            found += [(number, "email") for number in _addressed(data.decode("utf-8", errors="replace"))]
+        return Verdict(tuple(sorted(found)), _is_text(data)), data
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+
+
+def _read(hub: Hub, wanted: dict[tuple[bool, str], tuple[Target, str, str]], scans: Scans, scratch: Path) -> None:
+    for key, (target, sha, path) in wanted.items():
+        scans.blobs[key], data = _fetch(hub, target, sha, path, scratch)
+        if _matching([path], KEPT):
+            scans.kept[key[1]] = data
+
+
+class Found(NamedTuple):
+    secrets: list[str]
+    other: list[str]
+    tokens: bool
+
+
+def _found(target: Target, shas: list[str], scans: Scans) -> Found:
+    """What the scan holds against any commit, each named by the newest commit it is in."""
     held: dict[Hit, list[str]] = {}
-    for sha in dict.fromkeys([head, *(commit.commit_id for commit in listed)]):
-        if (target.repo, sha) not in scans.commits:
-            folder = tree if sha == head else fetch(sha)
-            scans.commits[target.repo, sha] = _scan(folder, scans)
-            if folder != tree:
-                shutil.rmtree(folder)
-        for hit in scans.commits[target.repo, sha]:
-            held.setdefault(hit, []).append(sha)
-    texts = []
-    for (name, line, rule), shas in sorted(held.items()):
-        spot = f"{_safe(name)}:{line}: {rule}" if line else f"{_safe(name)}: {rule} in the file name"
-        earlier = len(shas) - 1
+    for sha in shas:
+        tree = scans.trees[target.repo, sha]
+        paths = [path for path, _ in tree]
+        skipped = _matching(paths, BINARY) if target.repo_type == "model" else set()
+        # the adapter's checkpoint pickles are bytes by nature and leave with its card
+        tolerated = {path for path in _matching(paths, STALE["adapter"]) if path.endswith(PICKLES)}
+        for path, blob in tree:
+            parts = tuple(path.split("/"))
+            row = _is_row(parts)
+            # the leading slash lets a name that starts at a home folder match; a row folder is named after a commit
+            rules = {rule: pattern for rule, pattern in RULES.items() if not (row and rule == "account_id")}
+            hits = [(path, NAME, rule) for rule, pattern in rules.items() if pattern.search(f"/{path}")]
+            hits += [(path, CACHED, "")] if CACHE in parts else []
+            if path not in skipped:
+                verdict = scans.blobs[row, blob]
+                hits += [(path, line, rule) for line, rule in verdict.hits]
+                if not verdict.text and not (target.key == "adapter" and path in tolerated):
+                    hits.append((path, UNREADABLE, ""))
+            for hit in hits:
+                held.setdefault(hit, []).append(sha)
+    secrets, other = [], []
+    for (path, line, rule), within in sorted(held.items()):
+        earlier = len(within) - 1
         more = f" (and {earlier} earlier commit{'s' * (earlier > 1)})" if earlier else ""
-        texts.append(f"{target.repo}@{shas[0][:12]}/{spot}{more}")
-    return tree, _capped(texts, target.repo)
+        spot = f"{target.repo}@{within[0][:12]}/{_safe(path)}"
+        if line == CACHED:
+            other.append(f"{spot}: a cache path{more}")
+        elif line == UNREADABLE:
+            other.append(f"{spot}: not text, so the scan cannot read it{more}")
+        else:
+            secrets.append(f"{spot}:{line}: {rule}{more}" if line else f"{spot}: {rule} in the file name{more}")
+    tokens = any(rule in TOKEN_RULES for (_, line, rule) in held if line >= NAME)
+    return Found(_capped(secrets, target.repo), _capped(other, target.repo), tokens)
 
 
 def _capped(texts: list[str], repo: str) -> list[str]:
@@ -339,9 +404,24 @@ def _capped(texts: list[str], repo: str) -> list[str]:
     return texts if more <= 0 else [*texts[:MAX_SHOWN], f"{repo}: {more} more findings"]
 
 
-def _read[T](cls: type[T], tree: Path | None, name: str) -> T | None:
-    path = tree / name if tree else None
-    return load(cls, path) if path is not None and path.is_file() else None
+def _advice(found: list[Found]) -> tuple[str, ...]:
+    final = any(one.secrets or one.other for one in found)
+    return (*([REBUILD] if final else []), *([ROTATE] if any(one.tokens for one in found) else []))
+
+
+def _kept(hub: Hub, target: Target, head: str, scans: Scans, scratch: Path) -> dict[str, bytes]:
+    """The head's card inputs by path; one the scan read under another name is fetched here."""
+    tree = dict(scans.trees[target.repo, head])
+    held = {}
+    for path in sorted(_matching(list(tree), KEPT)):
+        if tree[path] not in scans.kept:
+            scans.kept[tree[path]] = _fetch(hub, target, head, path, scratch)[1]
+        held[path] = scans.kept[tree[path]]
+    return held
+
+
+def _parsed[T](cls: type[T], files: dict[str, bytes], name: str) -> T | None:
+    return cls.model_validate_json(files[name]) if name in files else None
 
 
 def _hidden(settings: Settings, hub: Hub) -> list[tuple[str, str, State]]:
@@ -350,10 +430,7 @@ def _hidden(settings: Settings, hub: Hub) -> list[tuple[str, str, State]]:
 
 
 def plan(settings: Settings, hub: Hub, *, writeup: str | None = None, scans: Scans | None = None) -> Plan:
-    """Read every repo, scan each of its commits and render its card; nothing on the Hub changes.
-
-    ``scans`` carries the commits already read, so a second plan in one run reads only what is new.
-    """
+    """Read every repo, scan each commit and render each card; nothing on the Hub changes. Exit 4 above the ceiling."""
     scans = scans if scans is not None else Scans()
     wanted = targets(settings)
     hidden = _hidden(settings, hub)
@@ -368,40 +445,61 @@ def plan(settings: Settings, hub: Hub, *, writeup: str | None = None, scans: Sca
     secrets: list[Problem] = []
     other = [(ExitCode.INTEGRITY, f"{target.repo} does not exist") for target in absent if target.required]
     other += _shelf_problems(settings, shelves)
-    steps = []
+
+    shas, unread, needs = {}, {}, {}
+    for target in present:
+        with _reading(target.repo):
+            shas[target.key] = _listed(hub, target, states[target.key].sha, scans)
+        before = len(unread)
+        _unread(target, shas[target.key], scans, unread)
+        needs[target.repo] = len(unread) - before
+    ceiling = settings.publish.max_file_fetches
+    if len(unread) > ceiling:
+        most = ", ".join(f"{repo} {count}" for repo, count in needs.items() if count)
+        raise DriftmapError(
+            ExitCode.GUARD_REFUSAL,
+            f"the history scan needs {len(unread)} file fetches ({most}), above publish.max_file_fetches = {ceiling}; "
+            "nothing was fetched: raise the value in driftmap.toml, or rebuild the longest repo from its head",
+        )
+    steps, found = [], []
     with tempfile.TemporaryDirectory(prefix="driftmap-publish-") as scratch:
-        trees = {}
+        for key, (target, sha, path) in unread.items():
+            with _reading(target.repo):
+                _read(hub, {key: (target, sha, path)}, scans, Path(scratch))
+        files = {}
         for target in present:
-            trees[target.key], found = _history(hub, target, states[target.key].sha, Path(scratch), scans)
-            secrets += [(ExitCode.REDACTION, text) for text in found]
+            with _reading(target.repo):
+                files[target.key] = _kept(hub, target, states[target.key].sha, scans, Path(scratch))
+            found.append(_found(target, shas[target.key], scans))
+            secrets += [(ExitCode.REDACTION, text) for text in found[-1].secrets]
+            other += [(ExitCode.INTEGRITY, text) for text in found[-1].other]
         manifest = tables = None
         try:
-            manifest = _read(Manifest, trees.get("eval"), "manifest.json")
-            tables = _read(Tables, trees.get("results"), "tables/tables.json")
+            manifest = _parsed(Manifest, files.get("eval", {}), "manifest.json")
+            tables = _parsed(Tables, files.get("results", {}), "tables/tables.json")
         except ValidationError as error:
             other.append((ExitCode.INTEGRITY, f"{error.title} on the Hub does not parse; build and upload it again"))
         records = []
-        for path in sorted(trees["results"].glob("runs/*.json")) if "results" in trees else ():
+        for name, data in sorted(files.get("results", {}).items()):
             try:
-                records.append(load(RunRecord, path))
+                records += [RunRecord.model_validate_json(data)] if name.startswith("runs/") else []
             except ValidationError:
                 continue
         rendered = cards.render_cards(settings, manifest=manifest, tables=tables, records=records, writeup=writeup)
         for target in present:
-            state, tree, card = states[target.key], trees[target.key], rendered[target.repo]
-            staged = Path(scratch, "cards", target.key)
-            staged.mkdir(parents=True)
-            (staged / CARD).write_text(card, encoding="utf-8")
+            state, card = states[target.key], rendered[target.repo]
+            staged = Path(scratch, "cards", target.key, CARD)
+            staged.parent.mkdir(parents=True)
+            staged.write_text(card, encoding="utf-8")
+            hits = [*redact.scan([staged]), *((staged, number, "email") for number in _addressed(card))]
             secrets += [
-                (ExitCode.REDACTION, f"{target.repo}/{name}:{line}: {rule} in the new card")
-                for name, line, rule in _scan(staged, scans)
+                (ExitCode.REDACTION, f"{target.repo}/{CARD}:{line}: {rule} in the new card") for _, line, rule in hits
             ]
             deletes = _stale(target, state.files)
             gaps = {
                 "holds cache or temp files": [path for path in _stray(state.files) if path not in deletes],
                 "holds training state": [path for path in _training_state(target, state.files) if path not in deletes],
             }
-            gaps["holds files the scan cannot read"] = _unreadable(tree, {*deletes, *gaps["holds training state"]})
             other += [
                 (ExitCode.INTEGRITY, f"{target.repo} {gap}: {', '.join(map(_safe, names))}")
                 for gap, names in gaps.items()
@@ -410,10 +508,18 @@ def plan(settings: Settings, hub: Hub, *, writeup: str | None = None, scans: Sca
             lacks = cards.missing(target.key, card, settings, manifest)
             if lacks:
                 other.append((ExitCode.INTEGRITY, f"{target.repo} cannot get a complete card: {'; '.join(lacks)}"))
-            head = tree / CARD
-            current = head.is_file() and head.read_text(encoding="utf-8") == card
+            current = files[target.key].get(CARD) == card.encode()
             steps.append(Step(target, state, card, not current, tuple(deletes)))
-    return Plan(tuple(steps), absent, tuple(hidden), shelves, (*exposed, *secrets, *other), tuple(exposed))
+    commits = sum(len(found) for found in shas.values())
+    problems = (*exposed, *secrets, *other)
+    return Plan(
+        tuple(steps), absent, tuple(hidden), shelves, problems, tuple(exposed), _advice(found), len(unread), commits
+    )
+
+
+def _addressed(text: str) -> list[int]:
+    """Line numbers, one per address in the text."""
+    return [number for number, line in enumerate(text.split("\n"), start=1) for _ in EMAIL.finditer(line)]
 
 
 def _shelf_problems(settings: Settings, shelves: dict[str, Any | None]) -> list[Problem]:
@@ -448,8 +554,7 @@ def _reported(action: str, settings: Settings, hub: Hub, resume: str) -> Iterato
     try:
         yield
     except FAILURES as error:
-        cause = error.response.status_code if isinstance(error, HfHubHTTPError) else type(error).__name__
-        text = f"{action} failed ({cause}); {_public_now(settings, hub)}\n{resume}"
+        text = f"{action} failed ({_cause(error)}); {_public_now(settings, hub)}\n{resume}"
         raise DriftmapError(ExitCode.PUSH_FAILED, text) from error
 
 
@@ -457,11 +562,16 @@ def _verified(hub: Hub, step: Step, scratch: Path, scans: Scans) -> str:
     """The head a repo may be opened at: its card commit on top of the planned files, every new commit scanned."""
     target = step.target
     now = _state(hub, target.repo, target.repo_type)
-    tree, found = _history(hub, target, now.sha, scratch, scans)
-    if found:
-        raise DriftmapError(ExitCode.REDACTION, "\n".join([*found, ROTATE]))
+    shas = _listed(hub, target, now.sha, scans)
+    unread: dict[tuple[bool, str], tuple[Target, str, str]] = {}
+    _unread(target, shas, scans, unread)
+    _read(hub, unread, scans, scratch)
+    found = _found(target, shas, scans)
+    if found.secrets or found.other:
+        code = ExitCode.REDACTION if found.secrets else ExitCode.INTEGRITY
+        raise DriftmapError(code, "\n".join([*found.secrets, *found.other, *_advice([found])]))
     planned = (set(step.state.files) - set(step.deletes)) | {CARD}
-    if set(now.files) != planned or (tree / CARD).read_text(encoding="utf-8") != step.card:
+    if set(now.files) != planned or _kept(hub, target, now.sha, scans, scratch).get(CARD) != step.card.encode():
         raise DriftmapError(ExitCode.INTEGRITY, CHANGED.format(repo=target.repo))
     return now.sha
 
@@ -474,14 +584,12 @@ def publish(
     delete: bool = False,
     writeup: str | None = None,
     resume: str | None = None,
+    scans: Scans | None = None,
     echo: Echo = print,
 ) -> Check | None:
-    """Card, open and list every repo; returns the final check, None after a dry run.
-
-    ``delete`` removes the intermediates once nothing else stands in the way; a failed write ends with ``resume``.
-    """
+    """Card, open and list every repo; the final check, or None after a dry run. ``scans`` reuses an earlier plan's."""
     _identity(settings, hub)
-    scans = Scans()
+    scans = scans if scans is not None else Scans()
     drawn = plan(settings, hub, writeup=writeup, scans=scans)
     # a paid job rebuilds the merged checkpoint, so it goes only when the run can go on
     if delete and not dry_run and set(drawn.problems) <= set(drawn.exposed):
@@ -532,6 +640,17 @@ def publish(
     for step in drawn.steps:
         with reported(f"reading {step.target.repo} before it is opened"):
             unchanged(step)
+
+    def closed(target: Target, code: ExitCode, why: str) -> DriftmapError:
+        """Make a repo private again; the error to raise says whether that worked."""
+        try:
+            hub.update_repo_settings(target.repo, private=True, repo_type=target.repo_type)
+        except FAILURES as error:
+            left = f"closing it failed ({_cause(error)}): it is PUBLIC, make it private by hand"
+            return DriftmapError(ExitCode.PUSH_FAILED, f"{target.repo} {why}, and {left}\n{resume}")
+        return DriftmapError(code, f"{target.repo} {why}; it is private again: run publish again")
+
+    opened = []
     for step in drawn.steps:
         target = step.target
         with reported(f"opening {target.repo}"):
@@ -539,14 +658,17 @@ def publish(
                 echo(f"already public: {target.repo} ({target.repo_type})")
                 continue
             hub.update_repo_settings(target.repo, private=False, gated=False, repo_type=target.repo_type)
-            after = _state(hub, target.repo, target.repo_type)
+            try:
+                after = _state(hub, target.repo, target.repo_type)
+            except FAILURES as error:
+                # unread, it may hold a commit no scan has seen
+                why = f"could not be read after it was opened ({_cause(error)})"
+                raise closed(target, ExitCode.PUSH_FAILED, why) from error
             if after.sha != heads[target.key]:
-                # what landed in between was never scanned
-                hub.update_repo_settings(target.repo, private=True, repo_type=target.repo_type)
-                closed = f"{target.repo} changed while it was opened; it is private again: run publish again"
-                raise DriftmapError(ExitCode.INTEGRITY, closed)
+                raise closed(target, ExitCode.INTEGRITY, "changed while it was opened")
             if not after.open:
                 raise DriftmapError(ExitCode.UNEXPECTED, f"{target.repo} is still private or gated after the change")
+        opened.append(target)
         echo(f"public: {target.repo} ({target.repo_type})")
 
     for step in drawn.steps:
@@ -556,6 +678,14 @@ def publish(
         if added:
             echo(f"listed: {step.target.repo} in {shelf.slug}")
 
+    for step in drawn.steps:
+        target = step.target
+        with reported(f"reading {target.repo} before the final check"):
+            if _state(hub, target.repo, target.repo_type).sha == heads[target.key]:
+                continue
+            if target in opened:
+                raise closed(target, ExitCode.INTEGRITY, "changed after it was opened")
+            raise DriftmapError(ExitCode.INTEGRITY, CHANGED.format(repo=target.repo))
     with reported("the final check"):
         result = check(settings, hub)
     echo(result.table())

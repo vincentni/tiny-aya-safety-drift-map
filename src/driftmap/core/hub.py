@@ -185,11 +185,21 @@ class Hub:
         return self._call(ref, "dataset", self._api.dataset_info, ref.repo, revision=ref.revision)
 
     def list_repo_commits(self, target: RepoRef | str, *, repo_type: str | None = None) -> list[Any]:
-        """Every commit behind the reference's revision, or behind the head; the newest first."""
+        """Every commit behind the reference's revision, or behind the head; the newest first. A 429 is final."""
         ref = _ref(target)
-        return self._call(
+        return self._transfer(
             ref, repo_type, self._api.list_repo_commits, ref.repo, repo_type=repo_type, revision=ref.revision
         )
+
+    def list_repo_tree(self, target: RepoRef | str, *, repo_type: str | None = None) -> list[Any]:
+        """Every file and folder at the reference's revision, or at the head. A 429 is final."""
+        ref = _ref(target)
+
+        def listed() -> list[Any]:
+            tree = self._api.list_repo_tree(ref.repo, recursive=True, revision=ref.revision, repo_type=repo_type)
+            return list(tree)
+
+        return self._transfer(ref, repo_type, listed)
 
     def create_collection(self, title: str, *, exists_ok: bool = True, **kwargs: Any) -> Any:
         return self._call(None, None, self._api.create_collection, title, exists_ok=exists_ok, **kwargs)

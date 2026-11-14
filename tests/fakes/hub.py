@@ -17,7 +17,7 @@ from huggingface_hub.errors import (
     RepositoryNotFoundError,
     RevisionNotFoundError,
 )
-from huggingface_hub.hf_api import Collection, DatasetInfo, GitCommitInfo, ModelInfo, RepoFile, RepoUrl
+from huggingface_hub.hf_api import Collection, DatasetInfo, GitCommitInfo, ModelInfo, RepoFile, RepoFolder, RepoUrl
 from huggingface_hub.utils import filter_repo_objects, hf_raise_for_status
 
 ENDPOINT = "https://huggingface.co"
@@ -290,6 +290,40 @@ class FakeHub:
                 )
                 for oid in reversed(upto)
             ]
+
+    def list_repo_tree(
+        self,
+        repo_id: str,
+        path_in_repo: str | None = None,
+        *,
+        recursive: bool = False,
+        expand: bool = False,
+        revision: str | None = None,
+        repo_type: str | None = None,
+        token: str | bool | None = None,
+    ) -> list[RepoFile | RepoFolder]:
+        with self._op(
+            "list_repo_tree",
+            self._repo_url(repo_id, repo_type),
+            repo_id=repo_id,
+            path_in_repo=path_in_repo,
+            recursive=recursive,
+            repo_type=repo_type,
+            revision=revision,
+        ):
+            tree = self._tree(repo_id, repo_type, revision)
+            prefix = f"{path_in_repo.strip('/')}/" if path_in_repo else ""
+            inside = {path: data for path, data in tree.items() if path.startswith(prefix)}
+            folders = {path.rsplit("/", depth)[0] for path in inside for depth in range(1, path.count("/") + 1)}
+            folders = {folder for folder in folders if len(folder) >= len(prefix)}
+            if not recursive:
+                level = prefix.count("/")
+                inside = {path: data for path, data in inside.items() if path.count("/") == level}
+                folders = {folder for folder in folders if folder.count("/") == level}
+            # like the Hub: folders are listed beside the files
+            entries = [RepoFolder(path=folder, oid=hashlib.sha1(folder.encode()).hexdigest()) for folder in folders]
+            entries += [self._repo_file(path, data) for path, data in inside.items()]
+            return sorted(entries, key=lambda entry: entry.path)
 
     def get_paths_info(
         self,

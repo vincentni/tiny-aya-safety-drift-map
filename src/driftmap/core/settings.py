@@ -200,6 +200,8 @@ class Readiness(Section):
 
 class Publish(Section):
     space_not_serving: bool = False
+    # files one history scan may fetch before it stops and asks
+    max_file_fetches: Positive = 2000
 
 
 class Settings(Section):

@@ -118,6 +118,11 @@ def license_of(key: str, manifest: Manifest | None) -> str | list[str] | None:
     return names[0] if len(names) == 1 else names
 
 
+def _unlicensed(manifest: Manifest) -> list[str]:
+    """Dataset sources the manifest gives no licence for."""
+    return [ref.repo for ref in manifest.sources if ref.kind == "dataset" and not manifest.licences.get(ref.repo)]
+
+
 def license_field(text: str | None) -> str:
     """The licence in a card's metadata as shown in a table; ``-`` when there is none."""
     found = RepoCard(text or "", ignore_metadata_errors=True).data.to_dict().get("license")
@@ -284,8 +289,10 @@ def missing(key: str, text: str | None, settings: Settings, manifest: Manifest |
     card = RepoCard(text, ignore_metadata_errors=True)
     data, wanted = card.data.to_dict(), license_of(key, manifest)
     lacks = []
-    if not wanted:
-        lacks.append(f"the source licences ({'no manifest.json' if manifest is None else 'none in manifest.json'})")
+    unlicensed = [] if manifest is None else _unlicensed(manifest)
+    if key == "eval" and (manifest is None or unlicensed):
+        named = "no manifest.json" if manifest is None else f"none in manifest.json for {', '.join(unlicensed)}"
+        lacks.append(f"the source licences ({named})")
     elif data.get("license") != wanted:
         shown = ", ".join(wanted) if isinstance(wanted, list) else wanted
         lacks.append(f"license: {shown} in the card metadata")

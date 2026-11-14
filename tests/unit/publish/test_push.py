@@ -9,7 +9,17 @@ from huggingface_hub.repocard import RepoCard
 from driftmap.core.schemas import DriftmapError, ExitCode
 from driftmap.core.settings import load_settings
 from driftmap.publish import cards
-from driftmap.publish.push import ROTATE, Scans, check, delete_intermediates, intermediates, plan, publish, targets
+from driftmap.publish.push import (
+    REBUILD,
+    ROTATE,
+    Scans,
+    check,
+    delete_intermediates,
+    intermediates,
+    plan,
+    publish,
+    targets,
+)
 from tests.fakes import FakeHub
 from tests.fakes.labels import make_settings
 from tests.fakes.published import (
@@ -160,10 +170,10 @@ def test_pickled_training_state_is_read_and_weights_are_not(settings, fake):
     found = [text for _, text in plan(settings, hub).problems]
 
     assert found == [f"{at(fake, ADAPTER)}/last-checkpoint/training_args.bin:1: hf_token (and 2 earlier commits)"]
-    downloads = {kwargs["repo_id"]: kwargs for name, kwargs in fake.calls if name == "snapshot_download"}
-    skipped = downloads[ADAPTER]["ignore_patterns"]
-    assert "*.safetensors" in skipped and "*.bin" not in skipped
-    assert downloads[RESULTS]["ignore_patterns"] is None
+    fetched = [kwargs["filename"] for name, kwargs in fake.calls if name == "hf_hub_download"]
+    assert "last-checkpoint/training_args.bin" in fetched and "last-checkpoint/optimizer.pt" in fetched
+    assert not any(name.endswith(".safetensors") for name in fetched)
+    assert not calls(fake, "snapshot_download")
 
 
 def test_training_state_leaves_the_adapter_or_refuses_it(settings, fake):
@@ -285,10 +295,10 @@ def test_thirty_files_go_through_one_call_at_a_time(settings, fake):
     assert publish(settings, hub, echo=lambda line: None).ok
 
     assert fake.max_in_flight == 1
-    downloads = calls(fake, "snapshot_download")
-    assert list(dict.fromkeys(downloads)) == list(PUBLISHED)
-    # 31 commits before the card, then the card commit
-    assert downloads.count(RESULTS) == 32
+    fetched = calls(fake, "hf_hub_download")
+    assert list(dict.fromkeys(fetched)) == list(PUBLISHED)
+    # four files from the jobs, thirty logs, the new card, and the card again for the final check
+    assert fetched.count(RESULTS) == 36
     assert calls(fake, "add_collection_item") == list(PUBLISHED)
 
 
@@ -418,7 +428,8 @@ def test_a_late_commit_is_scanned_before_anything_opens(settings, fake, said):
         publish(settings, hub, echo=said.append)
 
     assert refused.value.exit_code == ExitCode.REDACTION
-    assert str(refused.value).splitlines() == [f"{at(fake, RESULTS)}/logs/drift-None.log:1: hf_token", ROTATE]
+    found = f"{at(fake, RESULTS)}/logs/drift-None.log:1: hf_token"
+    assert str(refused.value).splitlines() == [found, REBUILD, ROTATE]
     assert set(PUBLISHED) <= fake.private and not calls(fake, "update_repo_settings")
 
 
@@ -429,8 +440,10 @@ def test_cache_and_temp_files_refuse_their_repo(settings, fake):
 
     found = [text for code, text in plan(settings, hub).problems if code == ExitCode.INTEGRITY]
 
-    expected = ".cache/huggingface/download/runs/a.json.lock, runs/.drift.json.123.tmp"
-    assert found == [f"{RESULTS} holds cache or temp files: {expected}"]
+    assert found == [
+        f"{at(fake, RESULTS)}/.cache/huggingface/download/runs/a.json.lock: a cache path (and 1 earlier commit)",
+        f"{RESULTS} holds cache or temp files: runs/.drift.json.123.tmp",
+    ]
 
 
 def test_a_missing_or_private_collection_refuses_before_any_write(settings, fake):
@@ -527,6 +540,7 @@ def test_a_value_in_an_earlier_commit_refuses_the_repo(settings, fake, said):
     assert str(refused.value).splitlines() == [
         f"{at(fake, EVAL, 1)}/notes.txt:1: home_path",
         f"{at(fake, RESULTS, 1)}/logs/judge.log:2: hf_token",
+        REBUILD,
         ROTATE,
     ]
     assert said[-1] == ROTATE and writes(fake) == [] and set(PUBLISHED) <= fake.private
@@ -539,13 +553,15 @@ def test_each_commit_is_read_once_in_a_run(settings, fake):
     fake.calls.clear()
     scans = Scans()
 
-    assert plan(settings, hub, scans=scans).problems == ()
-    first = calls(fake, "snapshot_download")
+    first = plan(settings, hub, scans=scans)
+    fetched = calls(fake, "hf_hub_download")
     fake.calls.clear()
-    assert plan(settings, hub, scans=scans).problems == ()
+    second = plan(settings, hub, scans=scans)
 
-    assert first.count(RESULTS) == 3 and len(first) == 8
-    assert calls(fake, "snapshot_download") == list(PUBLISHED)
+    assert first.problems == second.problems == ()
+    # results holds four files from the jobs and the two logs, over three commits
+    assert fetched.count(RESULTS) == 6 and first.fetched == len(fetched) and first.commits == 8
+    assert second.fetched == 0 and not calls(fake, "hf_hub_download") and not calls(fake, "list_repo_tree")
     assert calls(fake, "list_repo_commits") == list(PUBLISHED)
 
 
@@ -704,7 +720,8 @@ def test_a_read_back_that_fails_is_reported_like_a_failed_write(settings, fake, 
         publish(settings, hub, echo=said.append)
 
     assert failed.value.exit_code == ExitCode.PUSH_FAILED
-    assert str(failed.value).splitlines()[0] == f"opening {EVAL} failed (503); public now: {EVAL}"
+    closed = f"{EVAL} could not be read after it was opened (503); it is private again: run publish again"
+    assert str(failed.value) == closed and set(PUBLISHED) <= fake.private
 
 
 def test_a_public_repo_that_is_gated_is_opened(settings, fake, said):
@@ -779,14 +796,247 @@ def test_files_the_scan_cannot_read_and_file_names_are_covered(settings, fake):
 
     found = [text for _, text in plan(settings, hub).problems]
 
+    unread = "not text, so the scan cannot read it"
     assert found == [
         f"{at(fake, RESULTS)}/logs/.cache/kept.log:1: hf_token",
         f"{at(fake, RESULTS)}/logs/***: email in the file name (and 1 earlier commit)",
-        f"{RESULTS} holds cache or temp files: logs/.cache/kept.log",
-        f"{RESULTS} holds files the scan cannot read: logs/old.log.gz, logs/wide.log",
-        f"{RESPONSES} holds files the scan cannot read: responses/all.parquet",
+        f"{at(fake, RESULTS)}/logs/.cache/kept.log: a cache path",
+        f"{at(fake, RESULTS)}/logs/old.log.gz: {unread} (and 3 earlier commits)",
+        f"{at(fake, RESULTS)}/logs/wide.log: {unread} (and 2 earlier commits)",
+        f"{at(fake, RESPONSES)}/responses/all.parquet: {unread}",
     ]
     assert address not in "".join(found)
+
+
+def test_a_long_history_costs_one_fetch_per_distinct_file(settings, fake, said):
+    hub = seed(fake)
+    for index in range(100):
+        put(fake, EVAL, f"prompts/harmful/part-{index:03d}.jsonl", f'{{"prompt_id": "p-{index}"}}\n'.encode())
+    put(fake, EVAL, "prompts/harmful/part-000.jsonl", b'{"prompt_id": "p-0, again"}\n')
+    fake.calls.clear()
+
+    drawn = plan(settings, hub)
+
+    fetched = calls(fake, "hf_hub_download")
+    # five distinct files at the seed, a hundred added, one rewritten: 102 commits, 106 files
+    assert fetched.count(EVAL) == 106 and drawn.fetched == len(fetched) < 130
+    assert calls(fake, "list_repo_tree").count(EVAL) == 102 and not calls(fake, "snapshot_download")
+    publish(settings, hub, dry_run=True, echo=said.append)
+    assert said[0] == f"history scan: {drawn.fetched} file fetches over {drawn.commits} commits"
+
+
+def test_a_scan_above_the_ceiling_stops_before_the_first_fetch(tmp_path, fake, said):
+    hub = seed(fake)
+    capped = load_settings(settings_toml(tmp_path, publish={"max_file_fetches": 5}))
+
+    for run in (lambda: plan(capped, hub), lambda: publish(capped, hub, dry_run=True, echo=said.append)):
+        with pytest.raises(DriftmapError, match="above publish.max_file_fetches = 5; nothing was fetched") as stopped:
+            run()
+        assert stopped.value.exit_code == ExitCode.GUARD_REFUSAL
+        needs = f"{EVAL} 5, {RESULTS} 4, {RESPONSES} 3, {ADAPTER} 7, {REPAIRED} 1, {GGUF} 1"
+        assert f"the history scan needs 21 file fetches ({needs}), above" in str(stopped.value)
+    assert not calls(fake, "hf_hub_download") and writes(fake) == []
+    assert load_settings(settings_toml(tmp_path)).publish.max_file_fetches == 2000
+
+
+def test_a_publish_reuses_what_its_plan_read(settings, fake):
+    hub = seed(fake)
+    scans = Scans()
+    assert plan(settings, hub, scans=scans).fetched == 21
+    fake.calls.clear()
+    said = []
+
+    assert publish(settings, hub, scans=scans, echo=said.append).ok
+
+    # the six new cards, then what the final check reads
+    fetched = [kwargs["filename"] for name, kwargs in fake.calls if name == "hf_hub_download"]
+    assert sorted(fetched) == ["README.md"] * 12 + ["manifest.json"]
+    assert said[0] == "history scan: 0 file fetches over 6 commits"
+
+
+@pytest.mark.parametrize("method", ["list_repo_commits", "list_repo_tree", "hf_hub_download"])
+def test_a_throttled_scan_stops_at_once_and_names_the_repo(settings, fake, method):
+    hub = seed(fake)
+    real, tried = getattr(fake, method), []
+
+    def throttled(repo_id, *args, **kwargs):
+        if repo_id == RESULTS:
+            tried.append(repo_id)
+            fake._raise(429, f"https://huggingface.co/api/datasets/{repo_id}", {"ratelimit": '"api";r=0;t=5'})
+        return real(repo_id, *args, **kwargs)
+
+    setattr(fake, method, throttled)
+
+    for run in (lambda: plan(settings, hub), lambda: publish(settings, hub, echo=lambda line: None)):
+        tried.clear()
+        with pytest.raises(DriftmapError) as stopped:
+            run()
+        assert stopped.value.exit_code == ExitCode.PUSH_FAILED
+        assert str(stopped.value) == f"reading {RESULTS} failed (429: the Hub is throttling, wait before the next run)"
+        assert tried == [RESULTS]
+    assert writes(fake) == []
+
+
+def test_a_listing_that_keeps_failing_is_never_a_clean_scan(settings, fake):
+    hub = seed(fake)
+    tried = []
+
+    def list_repo_tree(repo_id, *args, **kwargs):
+        tried.append(repo_id)
+        raise httpx2.ConnectError("connection refused")
+
+    fake.list_repo_tree = list_repo_tree
+
+    with pytest.raises(DriftmapError) as stopped:
+        publish(settings, hub, echo=lambda line: None)
+
+    assert stopped.value.exit_code == ExitCode.PUSH_FAILED
+    assert str(stopped.value) == f"reading {EVAL} failed (ConnectError)"
+    assert tried == [EVAL] * 3 and writes(fake) == []
+
+
+def test_one_damaged_byte_does_not_switch_the_address_rule_off(settings, fake):
+    hub = seed(fake)
+    address = ("someone" + "@" + "example.org").encode()
+    put(fake, RESULTS, "logs/damaged.log", b"INFO driftmap: \xff notify " + address + b"\n")
+    put(fake, RESULTS, "logs/bytes.log", b"\x00\x01 " + address + b"\n")
+
+    found = [text for _, text in plan(settings, hub).problems]
+
+    unread = "not text, so the scan cannot read it"
+    assert found == [
+        f"{at(fake, RESULTS)}/logs/damaged.log:1: email (and 1 earlier commit)",
+        f"{at(fake, RESULTS)}/logs/bytes.log: {unread}",
+        f"{at(fake, RESULTS)}/logs/damaged.log: {unread} (and 1 earlier commit)",
+    ]
+
+
+def test_a_cache_path_or_an_unreadable_file_in_an_earlier_commit_refuses(settings, fake, said):
+    hub = seed(fake)
+    put(fake, RESULTS, ".cache/huggingface/download/x.log", f"token {TOKEN}\n".encode())
+    put(fake, RESULTS, "logs/old.log.gz", b"\x1f\x8b\x08\x00binary")
+    put(fake, RESPONSES, "smoke/responses/dump.bin", b"\x00\x01\x02")
+    fake._commit(RESULTS, "tidy", {}, [".cache/huggingface/download/x.log", "logs/old.log.gz"])
+    fake.calls.clear()
+
+    with pytest.raises(DriftmapError) as refused:
+        publish(settings, hub, echo=said.append)
+
+    unread = "not text, so the scan cannot read it"
+    assert refused.value.exit_code == ExitCode.REDACTION
+    assert str(refused.value).splitlines() == [
+        f"{at(fake, RESULTS, 1)}/.cache/huggingface/download/x.log:1: hf_token (and 1 earlier commit)",
+        f"{at(fake, RESULTS, 1)}/.cache/huggingface/download/x.log: a cache path (and 1 earlier commit)",
+        f"{at(fake, RESULTS, 1)}/logs/old.log.gz: {unread}",
+        f"{at(fake, RESPONSES)}/smoke/responses/dump.bin: {unread}",
+        REBUILD,
+        ROTATE,
+    ]
+    assert writes(fake) == []
+
+
+def test_only_a_token_finding_asks_for_a_rotation(settings, fake):
+    hub = seed(fake)
+    put(fake, RESULTS, "logs/paths.log", f"reading /{'home'}/alice/data\n".encode())
+
+    drawn = plan(settings, hub)
+
+    assert drawn.advice == (REBUILD,) and drawn.refusal().splitlines()[-1] == REBUILD
+    assert "rebuild the repo from its head as a new repo and re-pin it" in REBUILD
+    put(fake, RESULTS, f"logs/{TOKEN}.log", b"INFO driftmap: done\n")
+    again = plan(settings, hub)
+    assert again.advice == (REBUILD, ROTATE)
+    assert f"{at(fake, RESULTS)}/logs/***.log: hf_token in the file name" in again.refusal()
+    assert plan(settings, seed(FakeHub(fake.root / "clean"))).advice == ()
+
+
+def test_a_dataset_is_read_whole_whatever_its_files_are_called(settings, fake):
+    hub = seed(fake)
+    put(fake, RESULTS, "weights/model.safetensors", f"token {TOKEN}\n".encode())
+
+    found = [text for _, text in plan(settings, hub).problems]
+
+    assert found == [f"{at(fake, RESULTS)}/weights/model.safetensors:1: hf_token"]
+
+
+def test_twelve_digits_in_a_file_name_outside_the_row_folders_are_found(settings, fake):
+    hub = seed(fake)
+    put(fake, RESULTS, f"logs/{DIGITS}.log", b"INFO driftmap: done\n")
+    put(fake, RESPONSES, f"responses/{REPOS['merged']}--{DIGITS}/harmful/fr.jsonl", b'{"response": "ok"}\n')
+
+    found = [text for _, text in plan(settings, hub).problems]
+
+    assert found == [f"{at(fake, RESULTS)}/logs/***.log: account_id in the file name"]
+
+
+def test_an_unreadable_file_arriving_after_the_scan_stops_the_run(settings, fake, said):
+    hub = seed(fake)
+    real = fake.upload_folder
+
+    def upload_folder(**kwargs):
+        commit = real(**kwargs)
+        if kwargs["repo_id"] == GGUF:
+            put(fake, RESULTS, "logs/drift-None.log", b"\x1f\x8b\x08\x00binary")
+        return commit
+
+    fake.upload_folder = upload_folder
+
+    with pytest.raises(DriftmapError) as refused:
+        publish(settings, hub, echo=said.append)
+
+    assert refused.value.exit_code == ExitCode.INTEGRITY
+    unread = f"{at(fake, RESULTS)}/logs/drift-None.log: not text, so the scan cannot read it"
+    assert str(refused.value).splitlines() == [unread, REBUILD]
+    assert set(PUBLISHED) <= fake.private and not calls(fake, "update_repo_settings")
+
+
+def test_a_repo_that_cannot_be_closed_again_is_named_as_public(settings, fake, said):
+    hub = seed(fake)
+    real, reading, state = fake.update_repo_settings, fake.repo_info, {"opened": False}
+
+    def update_repo_settings(repo_id, **kwargs):
+        if kwargs.get("private") is True:
+            raise httpx2.ConnectError("connection refused")
+        state["opened"] = True
+        return real(repo_id, **kwargs)
+
+    def repo_info(repo_id, **kwargs):
+        if state["opened"] and repo_id == EVAL:
+            state["opened"] = False
+            put(fake, EVAL, "notes.txt", b"a job still running\n")
+        return reading(repo_id, **kwargs)
+
+    fake.update_repo_settings, fake.repo_info = update_repo_settings, repo_info
+
+    with pytest.raises(DriftmapError) as failed:
+        publish(settings, hub, echo=said.append)
+
+    assert failed.value.exit_code == ExitCode.PUSH_FAILED
+    left = "closing it failed (ConnectError): it is PUBLIC, make it private by hand"
+    assert str(failed.value).splitlines() == [
+        f"{EVAL} changed while it was opened, and {left}",
+        "resume: run publish(settings, hub) again; finished steps are skipped",
+    ]
+    assert set(PUBLISHED) - fake.private == {EVAL}
+
+
+def test_a_commit_after_the_opening_closes_the_repo_before_the_final_check(settings, fake, said):
+    hub = seed(fake)
+    real = fake.add_collection_item
+
+    def add_collection_item(slug, item_id, item_type, **kwargs):
+        if item_id == GGUF:
+            put(fake, RESPONSES, f"responses/{SLUG}/harmful/es.jsonl", b'{"response": "late"}\n')
+        return real(slug, item_id, item_type, **kwargs)
+
+    fake.add_collection_item = add_collection_item
+
+    with pytest.raises(DriftmapError, match=f"{RESPONSES} changed after it was opened; it is private again") as refused:
+        publish(settings, hub, echo=said.append)
+
+    assert refused.value.exit_code == ExitCode.INTEGRITY
+    assert set(PUBLISHED) & fake.private == {RESPONSES}
+    assert not any(line.startswith("repo ") for line in said)
 
 
 def test_the_code_repo_the_cards_link_to_pins_its_toolkits():

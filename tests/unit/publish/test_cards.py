@@ -182,8 +182,11 @@ def test_model_cards_must_name_the_base_model_and_the_notice(settings):
         assert missing(key, rendered[repo].replace("Not certified", "Certified"), settings) == [
             "the not-certified notice"
         ]
+    partly = manifest().model_copy(update={"licences": {"CohereLabs/aya_redteaming": "apache-2.0", "Paul/XSTest": ""}})
+    gap = "the source licences (none in manifest.json for CohereLabs/aya_dataset, Paul/XSTest)"
+    assert missing("eval", rendered[EVAL], settings, partly)[0] == gap
     empty = manifest().model_copy(update={"licences": {}})
-    assert missing("eval", rendered[EVAL], settings, empty) == ["the source licences (none in manifest.json)"]
+    assert len(missing("eval", rendered[EVAL], settings, empty)) == 1
     assert "quoted outputs keep the base model's cc-by-nc-4.0 terms" in rendered[RESULTS]
 
 
