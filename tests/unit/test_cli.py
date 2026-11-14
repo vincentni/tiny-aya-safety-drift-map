@@ -1505,14 +1505,14 @@ def test_table_breakdown_reads_every_condition_writes_prints_and_uploads_without
     local = world.root / TABLES_DIR / "breakdown.json"
     found = Breakdown.model_validate_json(local.read_bytes())
     assert found.conditions == {"keep": "served template", "strip": "no safety preamble"}
-    assert found.columns == {"baseline": "baseline", "drifted": "fine-tuned"}
+    assert found.columns == {"baseline": "base model", "drifted": "fine-tuned"}
     hate = {"harm_category": HATE}
     assert breakdown_rate(found, "keep", "baseline", **hate) == (12, 18)
     assert breakdown_rate(found, "keep", "drifted", **hate) == (6, 18)
     assert breakdown_rate(found, "strip", "baseline", **hate) == (18, 18)
     assert breakdown_rate(found, "strip", "drifted") == (0, 24)
     assert breakdown_rate(found, "keep", "baseline", global_or_local="local") == (0, 12)
-    # the stored answers say which were cut off at the token cap: here the two harmful ones of each language
+    # the stored answers say which were cut off at the token limit: here the two harmful ones of each language
     cut = {(row.condition, row.column): (row.k, row.n) for row in found.at_cap if row.language == "all"}
     assert cut == {
         ("keep", "baseline"): (12, 24),
@@ -1522,7 +1522,7 @@ def test_table_breakdown_reads_every_condition_writes_prints_and_uploads_without
     }
     assert breakdown_rate(found, "keep", "baseline", length="truncated") == (12, 12)
     assert breakdown_rate(found, "keep", "baseline", length="complete") == (0, 12)
-    assert "### Answers cut off at the cap of 256 new tokens" in built.output
+    assert "### Answers cut off at the 256-token limit" in built.output
     # their text goes nowhere
     assert "placeholder response" not in built.output and b"placeholder response" not in local.read_bytes()
     # labels no finished run generated are left on the Hub, under either condition
@@ -1586,7 +1586,7 @@ def test_table_breakdown_leaves_out_a_column_its_generate_run_marks_not_comparab
 
     assert built.exit_code == 0, built.output
     found = Breakdown.model_validate_json((world.root / TABLES_DIR / "breakdown.json").read_bytes())
-    assert found.columns == {"baseline": "baseline"} and found.changes == [] and found.transitions == []
+    assert found.columns == {"baseline": "base model"} and found.changes == [] and found.transitions == []
     assert [(row.condition, row.column, row.state, row.reason) for row in found.not_tabled] == [
         ("keep", "drifted", "not_comparable", "another seed")
     ]
@@ -1731,7 +1731,7 @@ def test_table_variants_pairs_each_columns_variants_with_their_parents_writes_pr
     local = world.root / TABLES_DIR / "variants.json"
     found = VariantTables.model_validate_json(local.read_bytes())
     assert found.conditions == {"keep": "served template", "patch": "safety patch"}
-    assert found.columns == {"baseline": "baseline", "drifted": "fine-tuned"}
+    assert found.columns == {"baseline": "base model", "drifted": "fine-tuned"}
     sources = {(source.condition, source.column): source for source in found.sources}
     assert {key: (source.variants_revision, source.judged, source.left_out) for key, source in sources.items()} == {
         ("keep", "baseline"): (first, 4, 0),
@@ -2971,7 +2971,7 @@ def test_a_breakdown_of_the_other_fine_tune_is_written_beside_the_standard_one(w
     assert breakdown_rate(other, "strip", "drifted") == (6, 24)
     cut = {row.column: (row.k, row.n) for row in other.at_cap if row.language == "all"}
     assert cut == {"baseline": (6, 24), "drifted": (18, 24)}
-    assert "| language | baseline | aggressive fine-tune |" in apart.output
+    assert "| language | base model | aggressive fine-tune |" in apart.output
     for name in ("breakdown.json", "breakdown.md", "breakdown-aggressive.json", "breakdown-aggressive.md"):
         assert stored(world, f"tables/{name}") == (local / name).read_bytes()
 

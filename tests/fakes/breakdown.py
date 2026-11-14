@@ -175,7 +175,7 @@ def stored_variants(*rows: dict, conditions=None) -> dict:
     return {
         "schema": "driftmap.variants/1",
         "conditions": conditions or {"keep": "served template"},
-        "columns": {"baseline": "baseline", "drifted": "fine-tuned"},
+        "columns": {"baseline": "base model", "drifted": "fine-tuned"},
         "sources": [],
         "rows": list(rows),
         "seeds": {"seed": 0, "bootstrap": 42},

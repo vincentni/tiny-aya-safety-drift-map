@@ -22,12 +22,12 @@ SCHEMA_BREAKDOWN = "driftmap.breakdown/1"
 SETS = ("harmful",)
 # how a prompt condition and a column are named to a reader; one not listed goes by its key
 CONDITION_NAMES = {"keep": "served template", "strip": "no safety preamble", "patch": "safety patch"}
-COLUMN_NAMES = {"drifted": "fine-tuned"}
+COLUMN_NAMES = {"baseline": "base model", "drifted": "fine-tuned"}
 # the drifted column of a breakdown of the other fine-tune
 FINE_TUNE_NAMES = {"aggressive": "aggressive fine-tune"}
 # an answer by whether generation ended on its own or at the cap on new tokens, and how each is named to a reader
 LENGTHS = COMPLETE, TRUNCATED = ("complete", "truncated")
-LENGTH_NAMES = {COMPLETE: "complete", TRUNCATED: "cut off at the cap"}
+LENGTH_NAMES = {COMPLETE: "complete", TRUNCATED: "cut off at the limit"}
 # the stop reason of an answer that ran into the cap
 AT_CAP = "length"
 # a category-by-language cell under this many scored rows carries its counts and no rate
@@ -451,7 +451,7 @@ def _part(row: BreakdownRate | BreakdownChange) -> Slice:
 def _by_length(moves: list[Transitions], names: Mapping[str, str]) -> list[str]:
     """One line per pair of answer lengths, then all pairs: the harmful answers on each side and the moves between."""
     a, b = names[moves[0].a], names[moves[0].b]
-    head = [f"answer at {a}", f"answer at {b}", "scored pairs", f"harmful at {a}", f"harmful at {b}"]
+    head = [f"answer, {a}", f"answer, {b}", "scored pairs", f"harmful, {a}", f"harmful, {b}"]
     lines = []
     for found in moves:
         said = flips(found.counts)
@@ -509,7 +509,7 @@ def _section(breakdown: Breakdown, name: str, condition: str) -> list[str]:
         ]
         out += _table(["harm category", *languages], cells)
     if capped:
-        out += [f"### Answers cut off at the cap of {breakdown.token_cap} new tokens", ""]
+        out += [f"### Answers cut off at the {breakdown.token_cap}-token limit", ""]
         shares = [
             [
                 code,
@@ -565,7 +565,7 @@ def render(breakdown: Breakdown) -> str:
     ]
     if breakdown.at_cap:
         out += [
-            f"An answer is cut off when generation stopped at the cap of {breakdown.token_cap} new tokens and complete "
+            f"An answer is cut off when generation stopped at the {breakdown.token_cap}-token limit and complete "
             "when it ended on its own; the share cut off counts every answer, scored or not. "
             "By answer length, a change is over the prompts whose answers have that length in both columns.",
             "",

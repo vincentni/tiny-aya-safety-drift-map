@@ -26,7 +26,8 @@ from ..table.rates import wilson
 LANGUAGE_NAMES = {"en": "English", "fr": "French", "es": "Spanish", "ru": "Russian", "hi": "Hindi", "ar": "Arabic"}
 # names too long for an axis
 CATEGORY_NAMES = {"Harms of Representation Allocation and Quality of Service": "Representation & allocation harms"}
-LENGTH_LABELS = {COMPLETE: "Complete answers", TRUNCATED: "Answers cut off at the token cap"}
+# an answer's length on an axis; the cut-off one takes the limit on new tokens
+LENGTH_LABELS = {COMPLETE: "Complete answers", TRUNCATED: "Answers cut off at the {limit}-token limit"}
 # how the prompts of a script variant were rewritten, as named on an axis; another goes by its variant's code
 REWRITE_NAMES = {"romanized": "Latin script", "codemixed": "Mixed with English"}
 HARMFUL_UNIT = "Harmful answers (% of scored responses)"
@@ -138,6 +139,11 @@ def _capital(text: str) -> str:
     return text[:1].upper() + text[1:]
 
 
+def _model(shown: str) -> str:
+    """A column's name as a noun: the fine-tuned model, the base model."""
+    return shown if shown.endswith("model") else f"{shown} model"
+
+
 def _condition(condition: str) -> str:
     return _capital(CONDITION_NAMES.get(condition, condition))
 
@@ -221,8 +227,9 @@ def harmful_by_language(
     """Harmful-response rate per language and pooled: a panel per condition, a series per tabled column.
 
     The languages run from the weakest down by the first column of the first condition; the pooled rate is last.
-    ``names`` gives the name each column is shown under.
+    ``names`` gives the name a column is shown under where it is not the usual one.
     """
+    names = {**COLUMN_NAMES, **names}
     codes = [*settings.languages, "all"]
     names = _names(tables, names)
     found = []
@@ -254,6 +261,7 @@ def before_after(tables: Mapping[str, Tables], settings: Settings, names: Mappin
 
     The title states the paired changes between the first two columns under the first condition, with intervals.
     """
+    names = {**COLUMN_NAMES, **names}
     columns = list(dict.fromkeys(column for table in tables.values() for column in _tabled(table)))
     names = _names(tables, names)
     labels = tuple(_condition(condition) for condition in tables)
@@ -352,13 +360,13 @@ def category_by_language(breakdown: Breakdown) -> Heat:
         for to, cell in enumerate(line)
         if cell and cell.rate is not None
     ]
-    title = f"Harmful answers at {shown} by harm category and language"
+    title = f"Harmful answers by harm category and language ({shown})"
     if rated:
         # the highest rate; among equals the one with more scored responses
         _, _, at, to = max(rated)
         worst = grid[at][to]
         counts = f"{worst.k} of {worst.n} answers harmful ({worst.rate:.1f}%)"
-        title = f"Weakest cell at {shown}: {rows[at]} in {columns[to]}, {counts}"
+        title = f"Weakest cell ({shown}): {rows[at]} in {columns[to]}, {counts}"
     unit = f"{HARMFUL_UNIT}, {breakdown.conditions[condition]}"
     return Heat(title, unit, rows, columns, tuple(grid), breakdown.min_cell_n)
 
@@ -450,7 +458,7 @@ def truncation(breakdown: Breakdown) -> Chart:
             notes = tuple(f"{shares[length]:.0f}% of answers" for length in LENGTHS)
             series.append(Series(shown, _estimates(rates.get(length) for length in LENGTHS), notes))
         if series:
-            labels = tuple(LENGTH_LABELS[length] for length in LENGTHS)
+            labels = tuple(LENGTH_LABELS[length].format(limit=breakdown.token_cap) for length in LENGTHS)
             panels.append(Panel(_condition(condition), HARMFUL_UNIT, labels, tuple(series)))
     lead = next((condition for condition, shares in capped.items() if len(shares) > 1), None)
     moves = {(row.length_a, row.length_b): flips(row.counts) for row in _moves(breakdown, lead)} if lead else {}
@@ -465,8 +473,9 @@ def truncation(breakdown: Breakdown) -> Chart:
         finding = "Fewer harmful answers after fine-tuning, mostly because answers got shorter"
     else:
         finding = "Fewer harmful answers after fine-tuning, and not mostly through shorter answers"
-    cap = f"{capped[lead][0]:.0f}% ran into the token cap before, {capped[lead][-1]:.0f}% after"
-    return Chart(f"{finding}: {cap} ({_condition(lead).lower()})", tuple(panels))
+    limit = f"the {breakdown.token_cap}-token limit"
+    reached = f"{capped[lead][0]:.0f}% reached {limit} before, {capped[lead][-1]:.0f}% after"
+    return Chart(f"{finding}: {reached} ({_condition(lead).lower()})", tuple(panels))
 
 
 def script_variants(found: Variants | None) -> Chart:
@@ -504,7 +513,7 @@ def script_variants(found: Variants | None) -> Chart:
         return Chart(f"Rewriting the prompts does not clearly raise the harmful-response rate ({where})", tuple(panels))
     row, label, shown = clearest
     rates = f"{row.variant * 100:.1f}% against {row.parent * 100:.1f}% as written"
-    title = f"Rewritten prompts ({label}) draw more harmful answers at {shown}: {rates} ({where})"
+    title = f"Rewritten prompts ({label}) draw more harmful answers: {rates} ({shown}, {where})"
     return Chart(title, tuple(panels))
 
 
@@ -536,7 +545,7 @@ def safety_patch(
             refused.append(Series(shown, _estimates(found)))
         panels.append(Panel(METRICS[1][2], METRICS[1][3], labels, tuple(refused)))
     moved = [
-        f"from {first.value:.1f}% to {second.value:.1f}% for the {label.lower()} model"
+        f"from {first.value:.1f}% to {second.value:.1f}% for the {_model(label.lower())}"
         for label, first, second in zip(labels, harmful[0].points, harmful[1].points, strict=True)
         if None not in (first.value, second.value)
     ]

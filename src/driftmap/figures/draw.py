@@ -157,8 +157,8 @@ def bars(chart: Chart, *, shared: bool = False) -> Figure:
                     axis.annotate(note, (x, peak), xytext=(0, 3), fontsize=7, color=FAINT, **above)
                 axis.annotate(f"{y:.1f}{suffix}", (x, peak), xytext=(0, 12 if note else 3), fontsize=8, **above)
                 top = max(top, peak)
-        wrap = 18 if max(map(len, panel.labels)) > 24 else 12
-        axis.set_xticks(ticks, [textwrap.fill(label, wrap) for label in panel.labels])
+        wrap = 22 if max(map(len, panel.labels)) > 24 else 12
+        axis.set_xticks(ticks, [textwrap.fill(label, wrap, break_on_hyphens=False) for label in panel.labels])
         axis.set_title(panel.title)
         axis.set_ylabel(panel.unit) if not shared or axis is axes[0] else None
         axis.set_ylim(0, (_ceiling(chart) if shared else top) * (1.25 if noted else 1.18) or 1)

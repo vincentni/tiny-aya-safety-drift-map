@@ -80,7 +80,7 @@ def test_rates_count_harmful_among_scored_rows_by_category_language_and_origin(t
     assert {row.language for row in found.rates if row.by == "language"} == {"en", "hi"}
     assert not [row for row in found.rates if (row.harm_category, row.language) == (HATE, "hi")]
     assert found.conditions == {"keep": "served template"}
-    assert found.columns == {"baseline": "baseline", "drifted": "fine-tuned"}
+    assert found.columns == {"baseline": "base model", "drifted": "fine-tuned"}
     assert found.judge == judge_config() and found.seeds.bootstrap == 42 and found.fine_tune == "standard"
 
 
@@ -237,8 +237,8 @@ def test_conditions_and_sets_are_what_the_caller_passes(tmp_path, settings):
         [],
         settings,
     )
-    assert alone.columns == {"baseline": "baseline"} and alone.changes == [] and alone.transitions == []
-    assert "| language | baseline |\n" in render(alone)
+    assert alone.columns == {"baseline": "base model"} and alone.changes == [] and alone.transitions == []
+    assert "| language | base model |\n" in render(alone)
 
 
 def test_labels_that_cannot_be_broken_down_are_refused(tmp_path, settings):
@@ -301,7 +301,7 @@ def test_the_record_round_trips_and_the_markdown_is_well_formed(tmp_path, settin
     # the cells of the category-by-language tables: a rate, a count under the floor, or no prompts
     assert "| Self-Harm | - | 40.0% (6/15) |" in shown and "| Hate Speech | 25.0% (5/20) | 50.0% (6/12) |" in shown
     assert (
-        "| baseline (rows) to fine-tuned (columns) | refused | complied-harmless | complied-harmful | unscored |"
+        "| base model (rows) to fine-tuned (columns) | refused | complied-harmless | complied-harmful | unscored |"
         in shown
     )
     assert "| complied-harmful | 3 | 0 | 8 | 0 | 11 |" in shown and "| total | 27 | 0 | 8 | 1 | 36 |" in shown
@@ -349,10 +349,10 @@ def test_answers_cut_off_at_the_cap_are_counted_and_the_rate_is_told_apart_by_th
     assert (truncated.n_pairs, truncated.delta) == (2, -0.5)
     shown = render(found)
     assert shown.startswith("# Harmful-response rate by harm category, language, prompt origin and answer length\n")
-    assert "### Answers cut off at the cap of 256 new tokens\n\n| language | baseline | fine-tuned |\n" in shown
+    assert "### Answers cut off at the 256-token limit\n\n| language | base model | fine-tuned |\n" in shown
     assert "| all | 36.7% (11/30; 21.9% to 54.5%) | 6.7% (2/30; 1.8% to 21.3%) |" in shown
     assert (
-        "| cut off at the cap | ▲ 80.0% (8/10; 49.0% to 94.3%) | 50.0% (1/2; 9.5% to 90.5%) | -50.0 points (" in shown
+        "| cut off at the limit | ▲ 80.0% (8/10; 49.0% to 94.3%) | 50.0% (1/2; 9.5% to 90.5%) | -50.0 points (" in shown
     )
 
     # without the stored answers nothing is said about length
@@ -394,11 +394,11 @@ def test_the_outcomes_are_split_by_the_length_of_the_answer_in_each_column(tmp_p
             parts = [counts[first][second] for lengths, counts in pooled.items() if lengths != (None, None)]
             assert sum(parts) == pooled[None, None][first][second]
     shown = render(found)
-    assert "### Harmful answers by answer length in both columns, baseline to fine-tuned" in shown
-    head = "| answer at baseline | answer at fine-tuned | scored pairs | harmful at baseline | harmful at fine-tuned |"
+    assert "### Harmful answers by answer length in both columns, base model to fine-tuned" in shown
+    head = "| answer, base model | answer, fine-tuned | scored pairs | harmful, base model | harmful, fine-tuned |"
     assert f"{head} harmful to safe | safe to harmful | sign test |" in shown
-    assert "| cut off at the cap | complete | 8 | 75.0% (6) | 25.0% (2) | 4 | 0 | p = 0.125 |" in shown
-    assert "| complete | cut off at the cap | 0 | - | - | 0 | 0 | p = 1.000 |" in shown
+    assert "| cut off at the limit | complete | 8 | 75.0% (6) | 25.0% (2) | 4 | 0 | p = 0.125 |" in shown
+    assert "| complete | cut off at the limit | 0 | - | - | 0 | 0 | p = 1.000 |" in shown
     assert "| any | any | 29 | 31.0% (9) | 10.3% (3) | 6 | 0 | p = 0.031 |" in shown
     tables = re.findall(r"(?:^\|.*\n)+", shown, flags=re.MULTILINE)
     assert len(tables) == 9
@@ -448,7 +448,7 @@ def test_a_breakdown_is_of_one_fine_tune_and_names_the_other_one_in_its_column(t
     found = build(labels, tagged, [], settings, fine_tune="aggressive")
 
     assert found.fine_tune == "aggressive"
-    assert found.columns == {"baseline": "baseline", "drifted": "aggressive fine-tune"}
+    assert found.columns == {"baseline": "base model", "drifted": "aggressive fine-tune"}
     assert {(row.condition, row.column) for row in found.rates} == {
         ("keep", "baseline"),
         ("strip", "baseline"),
@@ -456,8 +456,8 @@ def test_a_breakdown_is_of_one_fine_tune_and_names_the_other_one_in_its_column(t
     }
     assert rate(found, column="drifted", condition="strip").k == 9
     shown = render(found)
-    assert "| language | baseline |\n" in shown
-    assert "| language | baseline | aggressive fine-tune | change, baseline to aggressive fine-tune |" in shown
+    assert "| language | base model |\n" in shown
+    assert "| language | base model | aggressive fine-tune | change, base model to aggressive fine-tune |" in shown
     # the two fine-tunes never share a breakdown
     with pytest.raises(DriftmapError, match="label rows name an unknown checkpoint") as mixed:
         build(labels, tagged, [], settings)
@@ -477,12 +477,12 @@ def test_a_quantized_file_of_the_fine_tuned_model_goes_by_the_name_the_tables_gi
     found = build({"keep": tmp_path / "keep"}, tagged, [], settings)
 
     assert found.columns == {
-        "baseline": "baseline",
+        "baseline": "base model",
         "drifted": "fine-tuned",
         "repaired_q4": "fine-tuned model, q4_k_m",
     }
     assert rate(found, column="repaired_q4").k == 8
-    assert "| language | baseline | fine-tuned | fine-tuned model, q4_k_m |" in render(found)
+    assert "| language | base model | fine-tuned | fine-tuned model, q4_k_m |" in render(found)
     # a file of the repaired model keeps the column's own name
     whole = {"harmful": lay(tmp_path / "all", plan, columns=("baseline", "repaired", "repaired_q4"))}
     assert build({"keep": tmp_path / "all"}, whole, [], settings).columns["repaired_q4"] == "repaired_q4"
@@ -515,14 +515,14 @@ def test_a_column_the_tables_would_not_compare_is_left_out_with_its_reason(tmp_p
     shown = render(found)
     assert "Left out, in the state the result tables give them:\n\n" in shown
     assert "\n- fine-tuned, no safety preamble: not comparable: another seed\n\n## Served template\n" in shown
-    assert "| language | baseline |\n" in shown.partition("## No safety preamble")[2]
+    assert "| language | base model |\n" in shown.partition("## No safety preamble")[2]
 
     # a column whose latest quantized evaluation failed is left out the same way
     again = {"keep": tmp_path / "quantized"}
     lay(again["keep"], plan, columns=("baseline", "repaired_q4"))
     failed = run_record("quant_eval", "repaired_q4", status="failed", notes=["the server stopped"])
     quantized = build(again, tagged, [failed], settings)
-    assert quantized.columns == {"baseline": "baseline"} and quantized.changes == []
+    assert quantized.columns == {"baseline": "base model"} and quantized.changes == []
     (left,) = quantized.not_tabled
     assert (left.column, left.name, left.state, left.reason) == (
         "repaired_q4",

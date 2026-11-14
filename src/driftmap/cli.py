@@ -969,7 +969,7 @@ def table_breakdown(
     """Break the harmful-response rate down by harm category, language, prompt origin and answer length.
 
     Covers every prompt condition that has labels, and each prompt's outcome before and after fine-tuning; whether
-    an answer was cut off at the token cap is read from the stored responses. Prints and uploads the result.
+    an answer was cut off at the token limit is read from the stored responses. Prints and uploads the result.
     """
     # nothing is launched or billed to the ledger, so no readiness report is needed
     chosen = {"fine_tune": fine_tune} if fine_tune != "standard" else {}

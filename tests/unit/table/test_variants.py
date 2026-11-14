@@ -58,7 +58,7 @@ def test_each_column_compares_its_variants_with_their_parents_and_counts_the_rew
 
     assert found.schema_ == "driftmap.variants/1"
     assert found.conditions == {"keep": "served template", "patch": "safety patch"}
-    assert found.columns == {"baseline": "baseline", "drifted": "fine-tuned"}
+    assert found.columns == {"baseline": "base model", "drifted": "fine-tuned"}
     assert [(source.condition, source.column, source.judged, source.left_out) for source in found.sources] == [
         ("keep", "baseline", 10, 0),
         ("keep", "drifted", 10, 1),
@@ -90,10 +90,10 @@ def test_each_column_compares_its_variants_with_their_parents_and_counts_the_rew
     assert shown.startswith("# Script variants against their parent prompts\n\n")
     assert [line for line in shown.splitlines() if line.startswith("#")][1:] == [
         "## Served template",
-        "### Baseline",
+        "### Base model",
         "### Fine-tuned",
         "## Safety patch",
-        "### Baseline",
+        "### Base model",
     ]
     assert f"Checkpoint `{CHECKPOINTS['drifted']}`, variant prompts at `cccccccccccc`: " in shown
     assert "10 variant labels, 1 left out." in shown
