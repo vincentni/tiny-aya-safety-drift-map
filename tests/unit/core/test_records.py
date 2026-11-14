@@ -364,6 +364,37 @@ def _money_fields():
                 yield cls.__name__, name, field.rebuild_annotation()
 
 
+def test_an_alpha_screen_can_wait_for_its_judge():
+    unjudged = {"safe_rate_pooled": None, "n_judged": 0, "pass_safety": None}
+    row = SAMPLES["alpha_screen"]["alphas"][0] | unjudged
+    waiting = {
+        "alphas": [row],
+        "chosen": None,
+        "recover_status": "screened",
+        "judge": None,
+        "baseline_safe_pooled": None,
+    }
+
+    screen = records.AlphaScreen.model_validate(_payload("alpha_screen", **waiting))
+
+    assert (screen.recover_status, screen.judge, screen.baseline_safe_pooled) == ("screened", None, None)
+    # rows written before the counts existed read as zero; new ones keep theirs
+    assert (screen.alphas[0].n_benign_scored, screen.alphas[0].n_benign_empty) == (0, 0)
+    counted = records.AlphaRow.model_validate(row | {"n_benign_scored": 78, "n_benign_empty": 42})
+    assert records.AlphaRow.model_validate_json(counted.model_dump_json()) == counted
+    assert (counted.n_benign_scored, counted.n_benign_empty) == (78, 42)
+    assert records.AlphaScreen.model_validate_json(screen.model_dump_json(by_alias=True)) == screen
+    for field in ("judge", "baseline_safe_pooled"):
+        payload = _payload("alpha_screen")
+        del payload[field]
+        with pytest.raises(ValidationError) as caught:
+            records.AlphaScreen.model_validate(payload)
+        assert _locs(caught) == [(field,)]
+    with pytest.raises(ValidationError) as caught:
+        records.AlphaScreen.model_validate(_payload("alpha_screen", recover_status="pending"))
+    assert _locs(caught) == [("recover_status",)]
+
+
 def test_floats_are_finite_and_money_is_a_strict_int():
     """NaN, float money and string money are refused; tables hold no NaN (TS-CFG-13)."""
     with pytest.raises(ValidationError) as caught:

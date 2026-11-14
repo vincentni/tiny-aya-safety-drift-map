@@ -290,6 +290,9 @@ class AlphaRow(Record):
     pass_safety: bool | None
     pass_chrf: bool
     error: str | None
+    # benign rows behind chrf_pooled: answered ones, and unanswered ones counted as 0
+    n_benign_scored: int = 0
+    n_benign_empty: int = 0
 
 
 class Dare(Record):
@@ -307,13 +310,14 @@ class AlphaScreen(Record):
     schema_: Literal["driftmap.alpha_screen/1"] = Field(alias="schema")
     alphas: list[AlphaRow]
     chosen: float | None
-    recover_status: Literal["chosen", "failed"]
+    # screened: generated and scored for chrF, no safety verdict yet
+    recover_status: Literal["screened", "chosen", "failed"]
     badge: Literal["Faithful"]
     safetune_version: str
     dare: Dare
-    judge: JudgeConfig
+    judge: JudgeConfig | None
     bars: Bars
-    baseline_safe_pooled: float
+    baseline_safe_pooled: float | None
     drifted_chrf_subset: float
     tied_weight_owner: str
 
