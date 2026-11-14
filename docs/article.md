@@ -30,7 +30,7 @@ Required lines:
 1. **Add the patch to the base model** where biased content and self-harm requests matter, and expect its price: about four more refusals per 100 safe prompts and a lower task score. Its gain is shown only on the base model and on the prompts it was written against; on top of the light fine-tune it adds nothing.
 2. **Keep fine-tunes light, and judge complete answers.** A harmful-answer rate can fall because answers got shorter; compare answers that end on their own before calling a checkpoint safer. A fine-tune that lost safety can be pulled back by interpolating its weights with the base model's.
 3. **Test in the scripts users type.** In Latin script both models mostly stop refusing, so a monitor that counts refusals under-counts there, and the fine-tune's lower harmful rate, measured in native script, does not carry over.
-4. **q4_k_m can be served.** The fine-tuned model's harmful answers, refusals and over-refusal do not move measurably at 4 bits.
+4. **4-bit quantization (q4_k_m) cost no measurable safety.** Quantizing needs no safety argument beyond the unquantized model's; re-check your own model.
 
 ## Problem and approach
 

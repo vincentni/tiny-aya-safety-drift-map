@@ -85,12 +85,25 @@
         `${refused.pairs} safe prompts refused, against ${refused.refusal[0]}.${beside}`);
     }
 
-    const languages = byRate(data.languages.map((code) => cellOf(data, first.id, base.id, code, 'all')));
+    const ranked = (condition) => byRate(data.languages.map((code) => cellOf(data, condition.id, base.id, code, 'all')));
+    const languages = ranked(first);
     const worst = languages[0];
     const best = languages[languages.length - 1];
-    card(`${percent(worst.k, worst.n)} against ${percent(best.k, best.n)}`,
-      `harmful answers of the ${base.name} with the ${first.name}, in ${languageName(worst.language)} (${worst.k} of ${worst.n}; ${bounds(worst)}) ` +
-      `and in ${languageName(best.language)} (${best.k} of ${best.n}; ${bounds(best)}).`);
+    const second = data.conditions[1];
+    const ranking = second ? ranked(second) : [];
+    const safest = ranking[ranking.length - 1];
+    if (safest && safest.language === best.language) {
+      // the safest language holds in both conditions; the weakest is named per condition
+      card(`${languageName(best.language)}: ${percent(best.k, best.n)}`,
+        `harmful answers of the ${base.name} in its safest language, with the ${first.name} (${best.k} of ${best.n}; ` +
+        `${bounds(best)}); it is the safest with ${second.name} too (${safest.k} of ${safest.n}). The weakest is ` +
+        `${languageName(worst.language)} with the ${first.name} (${worst.k} of ${worst.n}; ${bounds(worst)}) and ` +
+        `${languageName(ranking[0].language)} with ${second.name} (${ranking[0].k} of ${ranking[0].n}).`);
+    } else {
+      card(`${percent(worst.k, worst.n)} against ${percent(best.k, best.n)}`,
+        `harmful answers of the ${base.name} with the ${first.name}, in ${languageName(worst.language)} (${worst.k} of ${worst.n}; ${bounds(worst)}) ` +
+        `and in ${languageName(best.language)} (${best.k} of ${best.n}; ${bounds(best)}).`);
+    }
 
     const [one, two] = byRate(data.categories.map((name) => cellOf(data, first.id, base.id, 'all', name)));
     card(`${percent(one.k, one.n)} and ${percent(two.k, two.n)}`,
@@ -243,10 +256,11 @@
     for (const condition of data.conditions) {
       for (const model of data.models) {
         const entry = (data.length[condition.id] || {})[model.id];
+        // a model that was not run in a condition has no column
+        if (!entry) continue;
         head.appendChild(el('th', { text: `${model.name}, ${condition.name}` }));
         for (const [key, row] of rows) {
-          const text = entry ? `${entry[key][0]} of ${entry[key][1]} (${percent(...entry[key])})` : 'n/a';
-          row.appendChild(el('td', { class: 'count', text }));
+          row.appendChild(el('td', { class: 'count', text: `${entry[key][0]} of ${entry[key][1]} (${percent(...entry[key])})` }));
         }
       }
     }

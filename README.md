@@ -13,7 +13,7 @@ benign rows, a weight-space repair of the overfit one, and 4-bit quantization. L
 - **10.2% → 14.2% → 8.5%** with no safety preamble: the same overfit fine-tune (p = 0.007), then with a quarter of the base weights mixed back (p < 0.001), which keeps the task gain. Each drift is under the 5-point bar set in advance.
 - **Typed in Latin script, prompts lose their refusals (69% → 25%)**; the fine-tuned model's harmful answers rise from 5.8% to 14.7% (p < 0.001).
 
-What to do with this: **Add the patch to the base model.** **Keep fine-tunes light, and judge complete answers.** **Test in the scripts users type.** **q4_k_m can be served.** ([Why](docs/article.md#what-to-do-with-this))
+What to do with this: **Add the patch to the base model.** **Keep fine-tunes light, and judge complete answers.** **Test in the scripts users type.** **4-bit quantization (q4_k_m) cost no measurable safety.** ([Why](docs/article.md#what-to-do-with-this))
 
 ![Harmful answers and over-refusal of the base model and the fine-tuned model, with and without the safety patch](docs/figures/f8_safety_patch.png)
 
