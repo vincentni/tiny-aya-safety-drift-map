@@ -1526,6 +1526,23 @@ def test_table_breakdown_covers_the_safety_patch_and_reads_nothing_of_the_script
     assert "left unread" not in built.output and "hi-Latn" not in built.output
 
 
+def test_table_breakdown_leaves_out_a_column_its_generate_run_marks_not_comparable(world):
+    evaluation(world, {"baseline": 2, "drifted": 1})
+    answered(world, {"baseline": 2, "drifted": 1})
+    tagged(world)
+    generated(world, "drifted", notes=[f"{NOT_COMPARABLE}another seed"])
+
+    built = run("table", "breakdown")
+
+    assert built.exit_code == 0, built.output
+    found = Breakdown.model_validate_json((world.root / TABLES_DIR / "breakdown.json").read_bytes())
+    assert found.columns == {"baseline": "baseline"} and found.changes == [] and found.transitions == []
+    assert [(row.condition, row.column, row.state, row.reason) for row in found.not_tabled] == [
+        ("keep", "drifted", "not_comparable", "another seed")
+    ]
+    assert "- fine-tuned, served template: not comparable: another seed" in built.output
+
+
 def test_table_breakdown_refuses_prompts_without_tags_and_missing_labels(world):
     evaluation(world, {})
     tagged(world)
@@ -1756,6 +1773,11 @@ def test_figures_are_drawn_from_the_stored_tables_and_breakdown_without_the_hub(
     assert drawn.exit_code == 0, drawn.output
     assert drawn.output.splitlines()[:2] == ["verb      figures", "out       docs/figures"]
     assert drawn.output.splitlines()[-len(FIGURES) :] == [f"docs/figures/{name}" for name in FIGURES]
+    # a figure without its data is not drawn, and said so
+    assert drawn.output.splitlines()[-len(FIGURES) - 2 : -len(FIGURES)] == [
+        "not drawn: f7_script_variants: needs variants.json beside the tables, holding the pooled harmful pairings",
+        "not drawn: f8_safety_patch: needs the safety-patch condition in the breakdown",
+    ]
     assert sorted(path.name for path in (world.root / "docs" / "figures").iterdir()) == sorted(FIGURES)
     assert all((world.root / "docs" / "figures" / name).stat().st_size > 2000 for name in FIGURES)
     assert len(world.hub.calls) == calls and not world.client_log.exists()
@@ -1768,6 +1790,9 @@ def test_figures_are_drawn_from_the_stored_tables_and_breakdown_without_the_hub(
     elsewhere = run("figures", "--out", "elsewhere")
     assert elsewhere.exit_code == 0, elsewhere.output
     assert elsewhere.output.splitlines()[-2:] == [f"elsewhere/f7_script_variants.{kind}" for kind in ("png", "svg")]
+    assert [line for line in elsewhere.output.splitlines() if line.startswith("not drawn: ")] == [
+        "not drawn: f8_safety_patch: needs the safety-patch condition in the breakdown"
+    ]
     folders = (world.root / "docs" / "figures", world.root / "elsewhere")
     one, both = ([(where / name).read_bytes() for name in FIGURES] for where in folders)
     # the figure of the tables changes, the one of the breakdown is the same file again

@@ -9,7 +9,7 @@ from typing import Any, Literal, NamedTuple
 import numpy as np
 from pydantic import Field
 
-from ..core.records import AlphaScreen, GenerationRow, JudgeConfig, LabelRow, Mode, Record, Seeds
+from ..core.records import AlphaScreen, GenerationRow, JudgeConfig, LabelRow, Mode, Record, RunRecord, Seeds
 from ..core.schemas import DriftmapError, ExitCode
 from ..core.settings import Settings
 from ..judge.incremental import read_rows
@@ -142,6 +142,16 @@ class AtCap(Record):
     ci: tuple[float, float] | None
 
 
+class NotTabled(Record):
+    """A column with label rows that is left out under one condition, in the state the result tables give it."""
+
+    condition: str
+    column: str
+    name: str
+    state: str
+    reason: str | None
+
+
 class Breakdown(Record):
     schema_: Literal["driftmap.breakdown/1"] = Field(alias="schema")
     # the fine-tune of the drifted column
@@ -156,6 +166,7 @@ class Breakdown(Record):
     changes: list[BreakdownChange]
     transitions: list[Transitions]
     at_cap: list[AtCap]
+    not_tabled: list[NotTabled]
     judge: JudgeConfig
     seeds: Seeds
 
@@ -336,19 +347,32 @@ def build(
     language and prompt id; both decide what is broken down. ``responses`` maps a condition to the folder of its
     stored answers, ``<checkpoint>/<set>/<language>.jsonl``: with it, every labelled answer is also told apart by
     whether it was cut off at the cap on new tokens. ``fine_tune`` names the fine-tune of the drifted column; label
-    rows of the other one are refused. Raises DriftmapError on rows that do not fit.
+    rows of the other one are refused. A column the result tables would not table under a condition, by the run
+    records among ``records``, is left out there and listed with its reason. Raises DriftmapError on rows that do
+    not fit.
     """
     screens = [record for record in records if isinstance(record, AlphaScreen)]
-    chosen = bool(screens) and screens[-1].recover_status == "chosen"
+    recover = screens[-1].recover_status if screens else None
+    runs = sorted((record for record in records if isinstance(record, RunRecord)), key=lambda run: run.started)
+    names = COLUMN_NAMES | ({"drifted": FINE_TUNE_NAMES[fine_tune]} if fine_tune in FINE_TUNE_NAMES else {})
     judges: dict[str, JudgeConfig] = {}
     made: tuple[list, list, list, list] = ([], [], [], [])
+    not_tabled: list[NotTabled] = []
     for condition, labels_dir in labels.items():
         rows = [row for row in table._read(Path(labels_dir)) if row.set in tagged]
         lengths = _lengths(Path(responses[condition]), tagged) if responses is not None else None
-        columns, _ = table._columns(rows, settings, chosen, mode, fine_tune)
+        columns, spare = table._columns(rows, settings, recover == "chosen", mode, fine_tune)
         found = {column: table._judge(column, columns[column], settings, mode) for column in columns}
         judged = [column for column in table.COLUMNS if found.get(column)]
         judges |= {f"{condition}/{column}": found[column] for column in judged}
+        # a column is broken down only where the result tables would compare it
+        known = (columns, judged, spare, runs, recover, settings, mode, condition, fine_tune)
+        states = {column: table.column_state(column, *known) for column in table.COLUMNS if column in columns}
+        for column, said in states.items():
+            if said.state != "tabled":
+                fields = {"name": names.get(column, column), "state": said.state, "reason": said.reason}
+                not_tabled.append(NotTabled(condition=condition, column=column, **fields))
+        judged = [column for column in judged if states[column].state == "tabled"]
         for column in judged:
             _listed(column, columns[column], tagged, mode)
             unanswered = [row for row in columns[column] if lengths is not None and _answer(row) not in lengths]
@@ -369,7 +393,6 @@ def build(
         raise DriftmapError(ExitCode.USAGE, f"no judged labels of {sought}")
     conditions = dict.fromkeys(row.condition for row in rates)
     columns = [column for column in table.COLUMNS if any(row.column == column for row in rates)]
-    names = COLUMN_NAMES | ({"drifted": FINE_TUNE_NAMES[fine_tune]} if fine_tune in FINE_TUNE_NAMES else {})
     return Breakdown(
         schema=SCHEMA_BREAKDOWN,
         fine_tune=fine_tune,
@@ -381,6 +404,7 @@ def build(
         changes=changes,
         transitions=transitions,
         at_cap=at_cap,
+        not_tabled=not_tabled,
         judge=next(iter(judges.values())),
         seeds=Seeds(seed=settings.seed, bootstrap=BOOTSTRAP_SEED),
     )
@@ -544,6 +568,12 @@ def render(breakdown: Breakdown) -> str:
             "By answer length, a change is over the prompts whose answers have that length in both columns.",
             "",
         ]
+    if breakdown.not_tabled:
+        out += ["Left out, in the state the result tables give them:", ""]
+        for row in breakdown.not_tabled:
+            where = f"{row.name}, {CONDITION_NAMES.get(row.condition, row.condition)}"
+            out.append(f"- {where}: {row.state.replace('_', ' ')}" + (f": {row.reason}" if row.reason else ""))
+        out.append("")
     for name in sets:
         for condition, shown in breakdown.conditions.items():
             section = _section(breakdown, name, condition)

@@ -58,6 +58,15 @@ STEMS = {
 }
 
 
+# what a figure that is not always drawn needs
+NEEDS = {
+    "outcomes": "two tabled columns in the breakdown",
+    "length": "a breakdown built with the stored responses",
+    "variants": "variants.json beside the tables, holding the pooled harmful pairings",
+    "patch": "the safety-patch condition in the breakdown",
+}
+
+
 def _figure(title: str, height: float) -> Figure:
     figure = Figure(figsize=(WIDTH, height), layout="constrained")
     wrapped = textwrap.fill(title, 88, break_on_hyphens=False)

@@ -316,6 +316,56 @@ def _flags(pooled: dict[str, Rate], chrf: dict[str, float | None], settings: Set
     return {name: raised for name, raised in flags.items() if raised is not None}
 
 
+def column_state(
+    column: str,
+    columns: Mapping[str, list[LabelRow]],
+    judged: Sequence[str],
+    spare: Mapping[str, str],
+    runs: list[RunRecord],
+    recover: str | None,
+    settings: Settings,
+    mode: Mode,
+    preamble: str,
+    fine_tune: str | None = None,
+    not_run: Mapping[str, str] | None = None,
+) -> ColumnState:
+    """Whether a column is tabled, and why not: from its rows, the judged columns and the run records by start.
+
+    ``judged`` lists the columns with judged rows, the first being the one the others are compared with; ``spare``
+    names per column a checkpoint left out, ``recover`` is the status of the latest alpha screen.
+    """
+    nopre = {
+        repo.rpartition("/")[2] for run_mode in ("full", "smoke") for repo in repo_names(settings, run_mode, "strip")
+    }
+    reference = judged[0]
+    rows = columns.get(column, [])
+    steered = bool(rows) and _reference(rows[0].checkpoint).steer is not None
+    generation = _generation_runs(column, steered, runs, settings, mode, preamble, fine_tune)
+    kind = "inference-time" if steered else "weights"
+    source = _q4_source(generation, settings, mode) if column == "repaired_q4" else None
+    if column == "repaired_q4":
+        # a file made from the merged fine-tuned model says so; one made from the repaired model needs no word
+        kind = "q4_k_m of drifted" if source and source[0] == "drifted" else "q4_k_m"
+    if column == "repaired_q4" and recover == "failed":
+        name, reason = "not_applicable", "weight-space repair failed its bars, so there is nothing to quantize"
+    elif generation and generation[-1].kind == "quant_eval" and generation[-1].status == "failed":
+        name, reason = "failed", "; ".join(generation[-1].notes) or "the quant-eval run failed"
+    elif column not in judged:
+        generated = rows or any(run.status == "ok" for run in generation)
+        absent = (not_run or {}).get(column, "no generation run recorded")
+        name, reason = ("generated", "generated, not judged yet") if generated else ("not_run", absent)
+    else:
+        repo = _reference(rows[0].checkpoint).repo.rpartition("/")[2]
+        trained = "strip" if repo in nopre else "keep"
+        differs = column != reference and _difference(column, reference, columns, generation, runs, mode, trained)
+        if source and not differs:
+            differs = _other_source(source, columns)
+        unused = f"{spare[column]} has labels but is not tabled" if column in spare else None
+        name = "not_comparable" if differs else "tabled"
+        reason = "; ".join(filter(None, [differs, _unscored(rows), unused])) or None
+    return ColumnState(state=name, reason=reason, kind=kind)
+
+
 def build(
     labels_dir: str | Path,
     targets: Targets,
@@ -345,41 +395,8 @@ def build(
     reference = judged[0]
     runs = sorted((record for record in records if isinstance(record, RunRecord)), key=lambda run: run.started)
 
-    nopre = {
-        repo.rpartition("/")[2] for run_mode in ("full", "smoke") for repo in repo_names(settings, run_mode, "strip")
-    }
-
-    def state(column: str) -> ColumnState:
-        rows = columns.get(column, [])
-        steered = bool(rows) and _reference(rows[0].checkpoint).steer is not None
-        generation = _generation_runs(column, steered, runs, settings, mode, preamble, fine_tune)
-        kind = "inference-time" if steered else "weights"
-        source = _q4_source(generation, settings, mode) if column == "repaired_q4" else None
-        if column == "repaired_q4":
-            # a file made from the merged fine-tuned model says so; one made from the repaired model needs no word
-            kind = "q4_k_m of drifted" if source and source[0] == "drifted" else "q4_k_m"
-        if column == "repaired_q4" and recover == "failed":
-            name, reason = "not_applicable", "weight-space repair failed its bars, so there is nothing to quantize"
-        elif generation and generation[-1].kind == "quant_eval" and generation[-1].status == "failed":
-            name, reason = "failed", "; ".join(generation[-1].notes) or "the quant-eval run failed"
-        elif column not in judged:
-            generated = rows or any(run.status == "ok" for run in generation)
-            absent = (not_run or {}).get(column, "no generation run recorded")
-            name, reason = ("generated", "generated, not judged yet") if generated else ("not_run", absent)
-        else:
-            repo = _reference(rows[0].checkpoint).repo.rpartition("/")[2]
-            trained = "strip" if repo in nopre else "keep"
-            differs = column != reference and _difference(
-                column, reference, columns, generation, runs, mode, trained
-            )
-            if source and not differs:
-                differs = _other_source(source, columns)
-            unused = f"{spare[column]} has labels but is not tabled" if column in spare else None
-            name = "not_comparable" if differs else "tabled"
-            reason = "; ".join(filter(None, [differs, _unscored(rows), unused])) or None
-        return ColumnState(state=name, reason=reason, kind=kind)
-
-    states = {column: state(column) for column in COLUMNS}
+    known = (columns, judged, spare, runs, recover, settings, mode, preamble, fine_tune, not_run)
+    states = {column: column_state(column, *known) for column in COLUMNS}
     shown = [column for column in COLUMNS if states[column].state in SHOWN]
     tabled = [column for column in shown if states[column].state == "tabled"]
     languages = tuple(settings.languages)

@@ -1056,7 +1056,11 @@ def figures(
         except (ValueError, LookupError, TypeError, AttributeError):
             found = f"{VARIANTS}: not the pairings of each checkpoint"
             raise DriftmapError(ExitCode.USAGE, f"{found}, a list of them under baseline and under drifted") from None
-    for path in draw.draw_all(tables, breakdown, settings, root / out, variants):
+    written = draw.draw_all(tables, breakdown, settings, root / out, variants)
+    for name, needed in draw.NEEDS.items():
+        if not any(path.stem == draw.STEMS[name] for path in written):
+            typer.echo(f"not drawn: {draw.STEMS[name]}: needs {needed}")
+    for path in written:
         typer.echo(path.relative_to(root) if path.is_relative_to(root) else path)
 
 

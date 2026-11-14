@@ -6,11 +6,12 @@ import pytest
 from driftmap.core.records import dump, load
 from driftmap.core.schemas import DriftmapError, ExitCode
 from driftmap.table import breakdown
-from driftmap.table.breakdown import MIN_CELL_N, STATES, Breakdown, Tags, build, flips, render, state, tags
+from driftmap.table.breakdown import MIN_CELL_N, STATES, Breakdown, NotTabled, Tags, build, flips, render, state, tags
+from driftmap.table.build import NOT_COMPARABLE
 from driftmap.table.rates import wilson
 from driftmap.table.stats import paired_delta
 from tests.fakes.breakdown import HATE, PROFANITY, REPRESENTATION, SELF_HARM, answer, lay, prompts, write_answers
-from tests.fakes.labels import CHECKPOINTS, judge_config, label, make_settings, write_labels
+from tests.fakes.labels import CHECKPOINTS, judge_config, label, make_settings, run_record, write_labels
 
 
 @pytest.fixture
@@ -464,3 +465,51 @@ def test_a_breakdown_is_of_one_fine_tune_and_names_the_other_one_in_its_column(t
     lay(labels["strip"], plan)
     with pytest.raises(DriftmapError, match="label rows name an unknown checkpoint"):
         build(labels, tagged, [], settings, fine_tune="aggressive")
+
+
+def test_a_column_the_tables_would_not_compare_is_left_out_with_its_reason(tmp_path, settings):
+    plan = prompts("en", [HATE], 20, {"harmful*": 6}, {"harmful": 2})
+    labels = {name: tmp_path / name for name in ("keep", "strip")}
+    responses = {name: tmp_path / f"{name}-answers" for name in labels}
+    tagged = {"harmful": lay(labels["keep"], plan, responses=responses["keep"])}
+    lay(labels["strip"], plan, responses=responses["strip"])
+    # the run that generated the fine-tuned answers with no safety preamble says they do not compare
+    differs = run_record("generate", "drifted", notes=["preamble: strip", f"{NOT_COMPARABLE}another seed"])
+    served = run_record("generate", "drifted", run_id="served")
+
+    found = build(labels, tagged, [served, differs], settings, responses=responses)
+
+    assert found.not_tabled == [
+        NotTabled(condition="strip", column="drifted", name="fine-tuned", state="not_comparable", reason="another seed")
+    ]
+    assert {(row.condition, row.column) for row in found.rates} == {
+        ("keep", "baseline"),
+        ("keep", "drifted"),
+        ("strip", "baseline"),
+    }
+    # nothing is measured against it: no change, no outcome, no share of cut-off answers
+    for rows in (found.changes, found.transitions):
+        assert {row.condition for row in rows} == {"keep"}
+    assert {(row.condition, row.column) for row in found.at_cap if row.condition == "strip"} == {("strip", "baseline")}
+    shown = render(found)
+    assert "Left out, in the state the result tables give them:\n\n" in shown
+    assert "\n- fine-tuned, no safety preamble: not comparable: another seed\n\n## Served template\n" in shown
+    assert "| language | baseline |\n" in shown.partition("## No safety preamble")[2]
+
+    # a column whose latest quantized evaluation failed is left out the same way
+    again = {"keep": tmp_path / "quantized"}
+    lay(again["keep"], plan, columns=("baseline", "repaired_q4"))
+    failed = run_record("quant_eval", "repaired_q4", status="failed", notes=["the server stopped"])
+    quantized = build(again, tagged, [failed], settings)
+    assert quantized.columns == {"baseline": "baseline"} and quantized.changes == []
+    (left,) = quantized.not_tabled
+    assert (left.column, left.name, left.state, left.reason) == (
+        "repaired_q4",
+        "repaired_q4",
+        "failed",
+        "the server stopped",
+    )
+    assert "- repaired_q4, served template: failed: the server stopped" in render(quantized)
+    # with every column tabled nothing is listed
+    assert build(labels, tagged, [served], settings, responses=responses).not_tabled == []
+    assert "Left out" not in render(build(labels, tagged, [served], settings, responses=responses))
