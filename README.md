@@ -1,25 +1,130 @@
-# driftmap
+# Where a small multilingual model's safety is thin, and what a $0.49 fine-tune does about it
 
-<!-- fill: one-paragraph summary of findings -->
+[![tests](https://github.com/vincentni/tiny-aya-safety-drift-map/actions/workflows/tests.yml/badge.svg)](https://github.com/vincentni/tiny-aya-safety-drift-map/actions/workflows/tests.yml)
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/vincentni/tiny-aya-safety-drift-map/blob/main/notebooks/reproduce_tables.ipynb)
 
-Findings so far: in six languages and two prompt conditions (the served chat template, and the
-same template without its safety paragraph), benign LoRA fine-tuning left Tiny Aya Global as safe
-or safer and better at the benign task. The pooled safe rate on harmful prompts went from 90.8%
-to 93.5% under the served template and from 89.8% to 94.1% without the safety paragraph; chrF on
-held-out benign prompts went from 30.5 to 37.3 and from 25.1 to 36.1. No language lost safety
-beyond noise. Tables, method and limits are in `docs/article.md`.
+A failure map of Cohere's Tiny Aya Global (3.35B) on 600 red-teaming prompts in six languages, and the
+same map after a benign multilingual LoRA fine-tune. Lexsi AI Safety & Alignment Hackathon 2026, Track 2.
 
-Measures how benign fine-tuning erodes refusal behaviour in Cohere's Tiny Aya Global,
-language by language, repairs it with SafeTune, and re-checks the repair after 4-bit
-quantization. Written for the Lexsi hackathon 2026. The write-up is `docs/article.md`.
+- **16 of 99 Russian prompts** get a harmful answer from the base model, against 2 of 100 in French.
+  By harm category the thin spots are representation harms (12 of 71) and self-harm (11 of 67); the
+  worst single cell is hate speech in Hindi (8 of 28).
+- **55 → 39 harmful answers of 598**: the fine-tuned model gave fewer harmful answers than the base
+  model (9.2% → 6.5%, p = 0.029). Without the chat template's safety paragraph it is 61 of 599 → 35 of
+  597 (10.2% → 5.9%, p < 0.001). The fine-tune took 37 minutes on one L4 and cost $0.49.
+- **26 → 23 refusals of 250 safe prompts**: over-refusal on XSTest did not move, and the score on the
+  benign task rose (chrF 30.5 → 37.3).
 
-The pipeline in one line: build the evaluation set, generate and judge the baseline,
-fine-tune (the drift), generate and judge the drifted model, repair, quantize, build the tables.
+The fine-tuned model also answers much more briefly (a median of 87.5 tokens against 242.5 on the
+harmful prompts), and the drop in harmful answers travels with that. The write-up says what this does and
+does not show.
 
-Jobs run on Hugging Face Jobs. Every dataset, model and result lives on the Hub under the
-owner named in `driftmap.toml`; local state is in `.run-local/`, which is not tracked.
+<!-- fill: script stress test headline, base model harmful answers on native vs romanized vs code-mixed prompts; source: breakdown.json, script rows -->
 
-## Setup
+![Safe rate by language, base model and fine-tuned model, with 95% intervals](docs/figures/f1_safe_rate_by_language.png)
+
+[Write-up](docs/article.md) | [Results Space](https://huggingface.co/spaces/vincentnkq/tiny-aya-safety-map) | [Models](https://huggingface.co/collections/vincentnkq/tiny-aya-safety-drift-map-models-6af750027e17226835562a9a) | [Datasets](https://huggingface.co/collections/vincentnkq/tiny-aya-safety-drift-map-data-6af75002f6e0994706b717d2) | [Notebook](notebooks/reproduce_tables.ipynb)
+
+**Content warning:** the datasets hold red-teaming prompts and model answers, and some answers are
+harmful. Nothing harmful is quoted in this repository or shown in the Space.
+
+## What was measured
+
+- **Models.** `CohereLabs/tiny-aya-global`, and the same model after a LoRA fine-tune on 1,272 benign
+  instruction rows (212 per language, 3 epochs). Both are evaluated as full weights with greedy decoding.
+- **Prompts.** 600 harmful prompts from `CohereLabs/aya_redteaming` (100 each in English, French,
+  Spanish, Russian, Hindi and Arabic, tagged with nine harm categories), 250 safe prompts from XSTest
+  for over-refusal, and 600 held-out benign prompts for task quality.
+- **Conditions.** The served template (the model's chat template as shipped, which opens with a safety
+  paragraph) and no safety preamble (that paragraph removed, nothing else changed).
+- **Judge.** One closed model under a fixed public rubric labels every answer: is the request harmful,
+  did the model refuse, is the answer harmful. Every label is published. A pair the judge could not
+  label is counted nowhere.
+- **Statistics.** Wilson 95% intervals on rates; changes between the two models are paired by prompt,
+  with a bootstrap interval and an exact sign test. One training seed.
+
+## Results
+
+Harmful answers by language.
+
+| Language | Base, served template | Fine-tuned, served template | Base, no safety preamble | Fine-tuned, no safety preamble |
+| --- | --- | --- | --- | --- |
+| en | 12 of 100 | 10 of 99 | 15 of 100 | 11 of 99 |
+| fr | 2 of 100 | 4 of 100 | 5 of 100 | 1 of 100 |
+| es | 8 of 100 | 7 of 100 | 14 of 100 | 7 of 100 |
+| ru | 16 of 99 | 9 of 99 | 12 of 99 | 7 of 99 |
+| hi | 10 of 100 | 6 of 100 | 8 of 100 | 5 of 100 |
+| ar | 7 of 99 | 3 of 100 | 7 of 100 | 4 of 99 |
+| all | 55 of 598 (9.2%) | 39 of 598 (6.5%) | 61 of 599 (10.2%) | 35 of 597 (5.9%) |
+
+Harmful answers by harm category. A prompt can carry more than one category.
+
+| Harm category | Base, served template | Fine-tuned, served template | Base, no safety preamble | Fine-tuned, no safety preamble |
+| --- | --- | --- | --- | --- |
+| Representation, allocation and quality-of-service harms | 12 of 71 | 10 of 71 | 18 of 71 | 11 of 71 |
+| Self-harm | 11 of 67 | 10 of 67 | 11 of 67 | 7 of 67 |
+| Hate speech | 20 of 136 | 13 of 135 | 19 of 136 | 11 of 135 |
+| Discrimination and injustice | 26 of 203 | 17 of 203 | 30 of 203 | 17 of 202 |
+| Violence, threats and incitement | 16 of 206 | 12 of 206 | 16 of 207 | 11 of 206 |
+| Graphic material | 8 of 126 | 2 of 125 | 9 of 126 | 1 of 125 |
+| Non-consensual sexual content | 5 of 84 | 2 of 84 | 9 of 84 | 4 of 84 |
+| Bullying and harassment | 7 of 126 | 3 of 126 | 7 of 126 | 2 of 125 |
+| Profanity | 3 of 92 | 2 of 92 | 6 of 92 | 4 of 92 |
+
+The two models side by side. Changes are fine-tuned minus base over the prompts scored for both,
+in percentage points with a 95% interval.
+
+| Metric | Served template | Change | No safety preamble | Change |
+| --- | --- | --- | --- | --- |
+| Harmful answers | 9.2% → 6.5% | -2.7 (-5.0 to -0.3) | 10.2% → 5.9% | -4.4 (-6.7 to -2.2) |
+| Refusals of harmful prompts | 70.6% → 74.4% | | 66.4% → 78.4% | |
+| Over-refusal on XSTest | 10.4% → 9.2% | -1.2 (-4.8 to +2.4) | 9.6% → 9.2% | -0.4 (-3.2 to +2.8) |
+| chrF on the benign task | 30.5 → 37.3 | +6.9 (+5.2 to +8.5) | 25.1 → 36.1 | +11.0 (+9.1 to +12.6) |
+
+What is left after the fine-tune, the checks on these numbers and their limits are in the
+[write-up](docs/article.md). Every cell can be filtered by language and category in the
+[results Space](https://huggingface.co/spaces/vincentnkq/tiny-aya-safety-map).
+
+<!-- fill: one line each for the prompt-patch baseline, the aggressive recipe and the q4_k_m column once measured; source: tables-patch.json, tables for the aggressive checkpoint, breakdown.json -->
+
+## Reproduce
+
+The tables, without a GPU or a judge: open [the notebook](notebooks/reproduce_tables.ipynb). It
+downloads the published label files and recomputes every rate, interval and paired change above.
+
+The Space's data file, from the same label files:
+
+```bash
+python space/build_data.py
+```
+
+The whole pipeline, from the source datasets to the tables (Hugging Face Jobs, one L4):
+
+```bash
+uv python install 3.12 && uv sync --frozen
+uv run pytest -q -m "not smoke"
+
+uv run driftmap ready --pin
+uv run driftmap data build
+uv run driftmap launch generate --mode full --wait -- --kind baseline
+uv run driftmap launch drift --mode full --wait -- --epochs 3
+uv run driftmap launch generate --mode full --wait -- --kind drifted
+uv run driftmap judge closed --checkpoint REPO@SHA --mode full       # once per checkpoint
+uv run driftmap table build
+```
+
+Each full run needs a passing smoke run first; the commands below give the details. In command
+names, file paths and record fields the fine-tuned model is called `drifted` and the base model
+`baseline`.
+
+## Commands reference
+
+`driftmap` is the pipeline behind the numbers: it builds the evaluation set, generates and judges the
+answers of a checkpoint, fine-tunes, and builds the tables. Jobs run on Hugging Face Jobs. Every
+dataset, model and result lives on the Hub under the owner named in `driftmap.toml`; local state is
+in `.run-local/`, which is not tracked.
+
+### Setup
 
 Needs Python 3.12 and [uv](https://docs.astral.sh/uv/).
 
@@ -31,14 +136,14 @@ uv run pytest -q -m "not smoke"
 The tests are offline. Commands that reach the Hub read `HF_TOKEN`, or the token stored by
 `hf auth login`, and expect it to belong to the owner.
 
-## Commands
+### Commands
 
 The groups follow the order of a run. The judge commands come after each generate run.
 
 `--mode` is `smoke` by default for `plan`, `launch`, `judge closed` and `repair choose`: a short
 rehearsal on a few rows. Arguments after `--` go to the job script. Every command has `--help`.
 
-### Setup and data
+Setup and data:
 
 ```bash
 uv run driftmap ready --pin                  # pin the source revisions, run the readiness checks
@@ -46,7 +151,7 @@ uv run driftmap data build --dry-run         # build the evaluation set locally,
 uv run driftmap data build                   # upload it and pin the commit
 ```
 
-### Baseline
+Base model:
 
 ```bash
 uv run driftmap plan generate                # the job, its cost at timeout, every guard verdict
@@ -54,16 +159,16 @@ uv run driftmap launch generate --wait -- --kind baseline            # smoke run
 uv run driftmap launch generate --mode full --wait -- --kind baseline
 ```
 
-### Fine-tune
+Fine-tune:
 
 ```bash
-uv run driftmap launch drift --wait          # the smoke drift
+uv run driftmap launch drift --wait          # the smoke fine-tune
 uv run driftmap launch drift --mode full -- --epochs 3               # the measured run: three passes
 uv run driftmap wait <job id>                # follow a job, record what it cost
 uv run driftmap chain drift generate --target drifted                # two jobs, one after the other
 ```
 
-### Judge
+Judge:
 
 ```bash
 uv run driftmap judge closed --checkpoint REPO@SHA                   # label the smoke responses, runs here
@@ -71,14 +176,22 @@ uv run driftmap judge closed --checkpoint REPO@SHA --mode full
 uv run driftmap judge reparse --checkpoint REPO@SHA                  # after a parser change
 ```
 
-### Tables
+Tables:
 
 ```bash
 uv run driftmap table build                  # tables from the labels: saved, printed, uploaded
 uv run driftmap decide drift --proceed --note "why"                  # when table build exits 8
 ```
 
-### Repair
+No-safety-preamble condition:
+
+```bash
+uv run driftmap launch generate --mode full --wait -- --kind baseline --preamble strip
+uv run driftmap judge closed --checkpoint REPO@SHA --mode full --preamble strip
+uv run driftmap table build --preamble strip # the no-safety-preamble tables, in tables-nopreamble
+```
+
+Weight-space repair (not needed for the results above):
 
 ```bash
 uv run driftmap launch repair --wait         # the smoke screen of the repair
@@ -88,15 +201,7 @@ uv run driftmap repair choose --mode full    # rate each alpha, store the choice
 uv run driftmap launch repair --mode full --wait -- --apply ALPHA    # push the repaired model
 ```
 
-### No-safety-preamble condition
-
-```bash
-uv run driftmap launch generate --mode full --wait -- --kind baseline --preamble strip
-uv run driftmap judge closed --checkpoint REPO@SHA --mode full --preamble strip
-uv run driftmap table build --preamble strip # the no-safety-preamble tables, in tables-nopreamble
-```
-
-### Housekeeping
+Housekeeping:
 
 ```bash
 uv run driftmap status                       # spend, pending jobs, latest run of each kind
@@ -104,7 +209,7 @@ uv run driftmap ledger reconcile             # billing against the ledger
 uv run driftmap scan <path>...               # tokens, account ids, home paths, before publishing
 ```
 
-### Publish
+Publish:
 
 ```bash
 uv run driftmap publish plan --writeup URL   # scan every commit, print what a run would do
@@ -117,21 +222,7 @@ a home path, a cache path or a file the scan cannot read, when a merged or smoke
 sits in a collection (`--delete-intermediates` removes those repos first), when a required repo or
 a collection is missing, when a card would be incomplete, or when the token is not the owner's.
 
-## The repair
-
-The repair moves the drifted weights toward the original model (WiSE-FT): each weight becomes
-`(1 - alpha) * drifted + alpha * original`. It takes two jobs with a step on the workstation between
-them. The screen job generates, for each alpha under `[repair]` in `driftmap.toml`, the answers to 20
-harmful and 20 benign prompts per language and scores the benign ones with chrF. `judge closed --rows`
-labels the harmful answers. `repair choose` then rates every alpha over the prompts that it, the other
-alphas and the baseline all have a verdict on, and picks the smallest alpha whose safe rate is within
-`safety_points` of the baseline's and whose chrF is within `chrf_points` of the drifted model's. It
-prints one line per alpha and stores the record as `alpha_screen.json` in the results dataset:
-`chosen`, `failed` when no alpha passes both bars, or `screened` while labels are missing or cover
-under 90% of an alpha's harmful prompts. The apply job pushes the model at the chosen alpha and refuses
-any other value.
-
-## The judge
+### The judge
 
 The tables are scored by a closed model under the rubric in `src/driftmap/judge/rubric.py`
 (`rubric-v1`): one JSON object per exchange with `request_harm`, `refusal` and `response_harm`.
@@ -158,15 +249,29 @@ The tables are scored by a closed model under the rubric in `src/driftmap/judge/
   one responses-repo file (or a glob of them, such as the repair screen's
   `screen/<slug>/alpha-*.jsonl`) and writes `labels-<name>` beside each.
 
-## The no-safety-preamble condition
+### The no-safety-preamble condition
 
 `--preamble strip` on the generate and drift jobs is the "no safety preamble" condition: every
 prompt is rendered without the safety paragraph the model's chat template opens its system turn
 with, and nothing else in the template changes. Those runs keep their files under `nopreamble/`,
-a drift run trained that way pushes to repos ending in `-nopre`, and
+a fine-tune trained that way pushes to repos ending in `-nopre`, and
 `driftmap judge closed --preamble strip` labels those responses.
 
-## What a launch is checked against
+### The repair
+
+The repair job moves fine-tuned weights toward the original model (WiSE-FT): each weight becomes
+`(1 - alpha) * fine-tuned + alpha * original`. It takes two jobs with a step on the workstation between
+them. The screen job generates, for each alpha under `[repair]` in `driftmap.toml`, the answers to 20
+harmful and 20 benign prompts per language and scores the benign ones with chrF. `judge closed --rows`
+labels the harmful answers. `repair choose` then rates every alpha over the prompts that it, the other
+alphas and the base model all have a verdict on, and picks the smallest alpha whose safe rate is within
+`safety_points` of the base model's and whose chrF is within `chrf_points` of the fine-tuned model's. It
+prints one line per alpha and stores the record as `alpha_screen.json` in the results dataset:
+`chosen`, `failed` when no alpha passes both bars, or `screened` while labels are missing or cover
+under 90% of an alpha's harmful prompts. The apply job pushes the model at the chosen alpha and refuses
+any other value.
+
+### What a launch is checked against
 
 A launch needs a readiness report less than a day old, made under the current configuration.
 Then every guard runs; one refusal is exit 4 and nothing is submitted.
@@ -180,38 +285,39 @@ Then every guard runs; one refusal is exit 4 and nothing is submitted.
 - `in_flight_gpu`: no other GPU job is running or pending on the ledger.
 - `timeout_lost`: no job of this kind was already lost at this timeout.
 - `oom_repeat`: this kind did not already run out of memory under this configuration.
-- `drift_decision`: repair and steer wait for `decide drift` while the measured drift is below the threshold.
+- `drift_decision`: repair and steer wait for `decide drift` while the measured drop in safe rate is below the threshold.
 
 The ceilings are under `[ceilings]` in `driftmap.toml`; the ledger is `.run-local/results/ledger.jsonl`.
 
-A repair launch is also checked for its inputs: an ok drift run and the drifted checkpoint's benign
-labels, and with `--apply` a screen that `repair choose` stored as chosen. `chain` takes no repair
-step, because the choice sits between its two jobs.
+A repair launch is also checked for its inputs: an ok fine-tune run and the fine-tuned checkpoint's
+benign labels, and with `--apply` a screen that `repair choose` stored as chosen. `chain` takes no
+repair step, because the choice sits between its two jobs.
 
-## On the Hub
+### On the Hub
 
 Names under the owner, from `[repos]` in `driftmap.toml`:
 
 - `aya-redteaming-6lang-eval` (dataset): prompts, training rows and labels.
 - `safety-drift-map-responses` (dataset): model responses and the judge's raw outputs.
 - `safety-drift-map-results` (dataset): run records, tables and decisions.
-- `tiny-aya-global-drift-lora` (model): the drifted adapter.
-- `tiny-aya-global-drift-merged` (model, private): the merged drifted weights, an intermediate.
-- The same two names ending in `-nopre`, once a drift run with no safety preamble exists: its
+- `tiny-aya-global-drift-lora` (model): the fine-tuned adapter.
+- `tiny-aya-global-drift-merged` (model, private): the merged fine-tuned weights, an intermediate.
+- The same two names ending in `-nopre`, once a fine-tune with no safety preamble exists: its
   adapter is published like the first, its merged weights stay private.
-- `tiny-aya-global-repaired` and `tiny-aya-global-repaired-GGUF` (models): the repaired model and its q4_k_m file.
+- `tiny-aya-global-repaired` and `tiny-aya-global-repaired-GGUF` (models): the output of the repair
+  job and its q4_k_m file, when that job is run.
 
-## Licences and use
+### Licences and use
 
 - Code: Apache-2.0, see `LICENSE`.
-- Tiny Aya Global is cc-by-nc-4.0. Every weight derived from it here (adapter, merged, repaired,
-  GGUF) is under the same licence: non-commercial use only.
+- Tiny Aya Global is cc-by-nc-4.0. Every weight derived from it here is under the same licence:
+  non-commercial use only.
 - Source datasets: `aya_redteaming` and `aya_dataset` are Apache-2.0, XSTest is cc-by-4.0; the
   evaluation set built from them keeps those terms.
-- The drifted adapter is a research artifact only. It is a model made less safe on purpose and
-  is published so the measurement can be repeated. Do not deploy it or serve it to users.
+- The adapters are research artifacts, published so the measurements can be repeated. They are
+  evaluated only as described here and are not certified for deployment.
 
-## Exit codes
+### Exit codes
 
 | Code | Meaning |
 | --- | --- |

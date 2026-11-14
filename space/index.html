@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tiny Aya safety failure map</title>
+<style>
+  :root { --ink: #1c2330; --soft: #5b6472; --line: #d9dee6; --band: #f4f6f9; --harm: #b3261e; --refuse: #1b6e3c; --answer: #2a5db0; --none: #7a8290; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--ink); background: #fff; }
+  main { max-width: 1080px; margin: 0 auto; padding: 24px 20px 64px; }
+  h1 { font-size: 1.7rem; line-height: 1.25; margin: 0 0 8px; }
+  h2 { font-size: 1.25rem; margin: 40px 0 8px; padding-top: 16px; border-top: 1px solid var(--line); }
+  p { margin: 8px 0; }
+  a { color: var(--answer); }
+  .lead { color: var(--soft); max-width: 70ch; }
+  .warning { background: #fff6e5; border: 1px solid #f0d9a8; border-radius: 6px; padding: 10px 14px; max-width: 80ch; }
+  .numbers { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; margin: 20px 0; }
+  .number { border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; background: var(--band); }
+  .number strong { display: block; font-size: 1.6rem; line-height: 1.2; }
+  .number span { color: var(--soft); font-size: 0.92rem; }
+  .figures { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
+  .figures figure { margin: 0; }
+  .figures img { width: 100%; height: auto; border: 1px solid var(--line); border-radius: 6px; }
+  .figures figcaption { color: var(--soft); font-size: 0.9rem; }
+  .controls { display: flex; flex-wrap: wrap; gap: 12px 18px; align-items: end; margin: 12px 0; }
+  .controls label { display: flex; flex-direction: column; font-size: 0.85rem; color: var(--soft); gap: 3px; }
+  .controls label.inline { flex-direction: row; align-items: center; gap: 6px; }
+  select, input[type="text"], button { font: inherit; padding: 5px 8px; border: 1px solid var(--line); border-radius: 6px; background: #fff; color: var(--ink); }
+  button { cursor: pointer; }
+  button:disabled { color: var(--none); cursor: default; }
+  .scroll { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 0.92rem; }
+  th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { background: var(--band); position: sticky; top: 0; font-weight: 600; }
+  td.count { white-space: nowrap; font-variant-numeric: tabular-nums; }
+  td.id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; white-space: nowrap; }
+  .bar { display: inline-block; height: 8px; background: var(--harm); border-radius: 2px; vertical-align: middle; margin-right: 6px; }
+  .tag { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 0.82rem; color: #fff; white-space: nowrap; }
+  .tag.harmful { background: var(--harm); }
+  .tag.refused { background: var(--refuse); }
+  .tag.answered { background: var(--answer); }
+  .tag.unscored { background: var(--none); }
+  .note { color: var(--soft); font-size: 0.88rem; }
+  .pager { display: flex; gap: 10px; align-items: center; margin: 10px 0; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Where a small multilingual model's safety is thin, and what a $0.49 fine-tune does about it</h1>
+  <p class="lead">Tiny Aya Global (3.35B) on 600 red-teaming prompts in six languages, before and after a benign
+    multilingual LoRA fine-tune. One judge labels every answer under a fixed public rubric.
+    <a href="https://github.com/vincentni/tiny-aya-safety-drift-map">Code and write-up</a>.</p>
+  <p class="warning"><strong>Content warning.</strong> The study uses red-teaming prompts. This page shows prompt
+    ids, languages, harm categories and the judge's labels. It shows no prompt text and no model answer.</p>
+
+  <div class="numbers" id="numbers" aria-live="polite"></div>
+  <p class="note">The fine-tuned model also answers much more briefly, and the drop in harmful answers travels
+    with that. The write-up says what the comparison does and does not show.</p>
+
+  <section id="figures-section" hidden>
+    <h2>Figures</h2>
+    <div class="figures" id="figures"></div>
+  </section>
+
+  <section>
+    <h2>Failure map</h2>
+    <p>Harmful answers among the prompts the judge could label, with a 95% Wilson interval. A prompt can carry
+      more than one harm category, so category rows overlap.</p>
+    <div class="controls">
+      <label>Condition <select id="map-condition"></select></label>
+      <label>Language <select id="map-language"></select></label>
+      <label>Harm category <select id="map-category"></select></label>
+      <label class="inline"><input type="checkbox" id="map-small" checked> hide cells with fewer than 15 prompts</label>
+    </div>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>Language</th><th>Harm category</th><th>Base model</th><th>Fine-tuned model</th></tr></thead>
+        <tbody id="map-body"></tbody>
+      </table>
+    </div>
+    <p class="note" id="map-note"></p>
+  </section>
+
+  <section>
+    <h2>Prompt explorer</h2>
+    <p>One row per harmful prompt: the judge's verdict on the answer of each model in each condition. Hover a
+      verdict for the two labels behind it. The prompt text is in the dataset file the id links to.</p>
+    <div class="controls">
+      <label>Language <select id="ex-language"></select></label>
+      <label>Harm category <select id="ex-category"></select></label>
+      <label>Condition <select id="ex-condition"></select></label>
+      <label>Show <select id="ex-change">
+        <option value="all">every prompt</option>
+        <option value="changed">verdict changed after the fine-tune</option>
+        <option value="fixed">harmful, then not harmful</option>
+        <option value="broken">not harmful, then harmful</option>
+        <option value="both">harmful for both models</option>
+        <option value="any">harmful for either model</option>
+      </select></label>
+      <label>Prompt id starts with <input type="text" id="ex-id" size="14" autocomplete="off"></label>
+    </div>
+    <div class="pager">
+      <button id="ex-prev" type="button">Previous</button>
+      <span id="ex-count"></span>
+      <button id="ex-next" type="button">Next</button>
+    </div>
+    <div class="scroll">
+      <table>
+        <thead id="ex-head"></thead>
+        <tbody id="ex-body"></tbody>
+      </table>
+    </div>
+    <p class="note">Verdicts: <span class="tag harmful">harmful</span> the answer is harmful;
+      <span class="tag refused">refused</span> the model refused;
+      <span class="tag answered">answered</span> it answered without harmful content;
+      <span class="tag unscored">unscored</span> the judge gave no readable labels.</p>
+  </section>
+
+  <p class="note" id="status">Loading data.</p>
+</main>
+<script src="app.js"></script>
+</body>
+</html>
