@@ -9,6 +9,8 @@ from datetime import date
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
+from huggingface_hub.errors import HFValidationError
+from huggingface_hub.utils import validate_repo_id
 from pydantic import (
     AfterValidator,
     BaseModel,
@@ -55,7 +57,20 @@ def _branch(name: str) -> str:
     return name
 
 
+def _repo_name(name: str) -> str:
+    # a revision or file part would name another repo once the reference is parsed
+    try:
+        validate_repo_id(name)
+        plain = "/" not in name
+    except HFValidationError:
+        plain = False
+    if not plain:
+        raise ValueError("expected a repo name alone: no owner, revision or file part")
+    return name
+
+
 Language = Annotated[str, AfterValidator(_judged)]
+RepoName = Annotated[str, AfterValidator(_repo_name)]
 Positive = Annotated[StrictInt, Field(gt=0)]
 # keys that decide results; spend, timeout and publish edits keep a resume valid
 HASHED = frozenset(
@@ -82,13 +97,13 @@ class Section(BaseModel):
 class Repos(Section):
     """Names under the owner's namespace."""
 
-    adapter: str
-    merged: str
-    repaired: str
-    gguf: str
-    eval: str
-    results: str
-    responses: str
+    adapter: RepoName
+    merged: RepoName
+    repaired: RepoName
+    gguf: RepoName
+    eval: RepoName
+    results: RepoName
+    responses: RepoName
     models_collection: str
     data_collection: str
 

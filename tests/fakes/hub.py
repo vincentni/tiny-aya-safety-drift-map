@@ -17,7 +17,7 @@ from huggingface_hub.errors import (
     RepositoryNotFoundError,
     RevisionNotFoundError,
 )
-from huggingface_hub.hf_api import Collection, DatasetInfo, ModelInfo, RepoFile, RepoUrl
+from huggingface_hub.hf_api import Collection, DatasetInfo, GitCommitInfo, ModelInfo, RepoFile, RepoUrl
 from huggingface_hub.utils import filter_repo_objects, hf_raise_for_status
 
 ENDPOINT = "https://huggingface.co"
@@ -38,6 +38,8 @@ class FakeHub:
         self.private: set[str] = set()
         self.authorized: set[str] = set()
         self.settings: dict[str, dict[str, Any]] = {}
+        # repos whose settings calls are accepted and change nothing
+        self.frozen: set[str] = set()
         self.collections: dict[str, dict[str, Any]] = {}
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.threads: set[int] = set()
@@ -154,10 +156,17 @@ class FakeHub:
         *,
         gated: str | bool | None = None,
         private: bool | None = None,
-        repo_type: str | None = None,
+        visibility: str | None = None,
         token: str | bool | None = None,
-        **kwargs: Any,
+        repo_type: str | None = None,
     ) -> None:
+        # like the library: one way to name the visibility, and something to change
+        if private is not None and visibility is not None:
+            raise ValueError("`private` and `visibility` cannot be passed together.")
+        if visibility is not None:
+            private = visibility != "public"
+        if gated is None and private is None:
+            raise ValueError("At least one setting must be updated.")
         with self._op(
             "update_repo_settings",
             self._repo_url(repo_id, repo_type),
@@ -165,16 +174,36 @@ class FakeHub:
             gated=gated,
             private=private,
             repo_type=repo_type,
-            **kwargs,
         ):
             self._check_access(repo_id, repo_type)
+            if repo_id in self.frozen:
+                return
             self.settings.setdefault(repo_id, {}).update(
-                {k: v for k, v in {"gated": gated, "private": private, **kwargs}.items() if v is not None}
+                {k: v for k, v in {"gated": gated, "private": private}.items() if v is not None}
             )
             if gated is not None:
                 (self.gated.add if gated else self.gated.discard)(repo_id)
             if private is not None:
                 (self.private.add if private else self.private.discard)(repo_id)
+
+    def delete_repo(
+        self,
+        repo_id: str,
+        *,
+        token: str | bool | None = None,
+        repo_type: str | None = None,
+        missing_ok: bool = False,
+    ) -> None:
+        url = f"{ENDPOINT}/api/repos/delete"
+        with self._op("delete_repo", url, repo_id=repo_id, repo_type=repo_type, missing_ok=missing_ok):
+            if self.repo_types.get(repo_id) != (repo_type or "model"):
+                if missing_ok:
+                    return
+                self._raise(404, url, {"X-Error-Code": "RepoNotFound"})
+            for held in (self.repos, self.repo_types, self.heads, self.settings):
+                held.pop(repo_id, None)
+            for flagged in (self.gated, self.private, self.authorized):
+                flagged.discard(repo_id)
 
     def repo_info(
         self,
@@ -228,6 +257,39 @@ class FakeHub:
             revision=revision,
         ):
             return sorted(self._tree(repo_id, repo_type, revision))
+
+    def list_repo_commits(
+        self,
+        repo_id: str,
+        *,
+        repo_type: str | None = None,
+        token: str | bool | None = None,
+        revision: str | None = None,
+        formatted: bool = False,
+    ) -> list[GitCommitInfo]:
+        with self._op(
+            "list_repo_commits",
+            self._repo_url(repo_id, repo_type),
+            repo_id=repo_id,
+            repo_type=repo_type,
+            revision=revision,
+        ):
+            self._tree(repo_id, repo_type, revision)
+            # commits are kept in the order they were made; the Hub lists the newest first
+            made = [oid for oid in self.repos[repo_id] if oid != "main"]
+            upto = made[: made.index(self._sha(repo_id, revision)) + 1]
+            return [
+                GitCommitInfo(
+                    commit_id=oid,
+                    authors=[self.user],
+                    created_at=datetime(2026, 11, 2, 10, 0, tzinfo=UTC),
+                    title="commit",
+                    message="",
+                    formatted_title=None,
+                    formatted_message=None,
+                )
+                for oid in reversed(upto)
+            ]
 
     def get_paths_info(
         self,
@@ -288,6 +350,8 @@ class FakeHub:
         commit_message: str | None = None,
         allow_patterns: list[str] | str | None = None,
         ignore_patterns: list[str] | str | None = None,
+        delete_patterns: list[str] | str | None = None,
+        parent_commit: str | None = None,
         token: str | bool | None = None,
         **kwargs: Any,
     ) -> CommitInfo:
@@ -302,9 +366,14 @@ class FakeHub:
             commit_message=commit_message,
             allow_patterns=allow_patterns,
             ignore_patterns=ignore_patterns,
+            delete_patterns=delete_patterns,
+            parent_commit=parent_commit,
             **kwargs,
         ):
             self._writable(repo_id, repo_type, revision)
+            # like the Hub: a commit on another parent than the head is refused
+            if parent_commit is not None and parent_commit != self.heads[repo_id]:
+                self._raise(412, self._repo_url(repo_id, repo_type))
             folder = Path(folder_path)
             relative = [p.relative_to(folder).as_posix() for p in folder.rglob("*") if p.is_file()]
             prefix = (path_in_repo or "").strip("/")
@@ -312,7 +381,15 @@ class FakeHub:
                 f"{prefix}/{rel}" if prefix else rel: (folder / rel).read_bytes()
                 for rel in filter_repo_objects(relative, allow_patterns=allow_patterns, ignore_patterns=ignore_patterns)
             }
-            return self._commit(repo_id, commit_message or f"Upload folder {prefix or '/'}", update)
+            # like the library: patterns are matched under path_in_repo, .gitattributes stays, an added file is kept
+            held = {
+                path[len(prefix) + 1 if prefix else 0 :]: path
+                for path in self.repos[repo_id]["main"]
+                if not prefix or path.startswith(f"{prefix}/")
+            }
+            doomed = [] if delete_patterns is None else filter_repo_objects(held, allow_patterns=delete_patterns)
+            delete = [held[rel] for rel in doomed if held[rel] != ".gitattributes" and held[rel] not in update]
+            return self._commit(repo_id, commit_message or f"Upload folder {prefix or '/'}", update, delete)
 
     def hf_hub_download(
         self,
@@ -429,6 +506,32 @@ class FakeHub:
             )
             return self._collection(slug)
 
+    def list_collections(
+        self,
+        *,
+        owner: list[str] | str | None = None,
+        item: list[str] | str | None = None,
+        sort: str | None = None,
+        limit: int | None = None,
+        token: str | bool | None = None,
+    ) -> list[Collection]:
+        owners = [owner] if isinstance(owner, str) else owner
+        with self._op("list_collections", f"{ENDPOINT}/api/collections", owner=owner, item=item, limit=limit):
+            found = [
+                # like the Hub: a listing carries at most four items per collection
+                self._collection(slug, max_items=4)
+                for slug, record in self.collections.items()
+                if owners is None or record["owner"]["name"] in owners
+            ]
+            return found[:limit]
+
+    def get_collection(self, collection_slug: str, *, token: str | bool | None = None) -> Collection:
+        url = f"{ENDPOINT}/api/collections/{collection_slug}"
+        with self._op("get_collection", url, collection_slug=collection_slug):
+            if collection_slug not in self.collections:
+                self._raise(404, url)
+            return self._collection(collection_slug)
+
     def add_collection_item(
         self,
         collection_slug: str,
@@ -518,15 +621,19 @@ class FakeHub:
     def _sha(self, repo_id: str, revision: str | None) -> str:
         return self.heads[repo_id] if revision in (None, "main") else revision
 
-    def _commit(self, repo_id: str, message: str, update: dict[str, bytes] | None = None) -> CommitInfo:
+    def _commit(
+        self, repo_id: str, message: str, update: dict[str, bytes] | None = None, delete: list[str] | None = None
+    ) -> CommitInfo:
         # one lock, so the head always matches the live main tree
         with self._lock:
             tree = self.repos[repo_id]["main"]
             # like HfApi.create_commit: an upload that changes nothing makes no commit
-            if update is not None and all(tree.get(path) == data for path, data in update.items()):
+            if update is not None and not delete and all(tree.get(path) == data for path, data in update.items()):
                 return self._commit_info(repo_id, message, self.heads[repo_id])
             self._commits += 1
             tree.update(update or {})
+            for path in delete or ():
+                del tree[path]
             snapshot = dict(tree)
             digest = hashlib.sha1(
                 json.dumps(sorted((p, hashlib.sha256(b).hexdigest()) for p, b in snapshot.items())).encode()
@@ -547,13 +654,13 @@ class FakeHub:
             payload["lfs"] = {"oid": hashlib.sha256(data).hexdigest(), "size": len(data), "pointerSize": 134}
         return RepoFile(**payload)
 
-    def _collection(self, slug: str) -> Collection:
+    def _collection(self, slug: str, max_items: int | None = None) -> Collection:
         record = self.collections[slug]
         return Collection(
             slug=slug,
             title=record["title"],
             owner=record["owner"],
-            items=[dict(item) for item in record["items"]],
+            items=[dict(item) for item in record["items"][:max_items]],
             lastUpdated=datetime(2026, 11, 2, 10, 0, tzinfo=UTC).isoformat().replace("+00:00", "Z"),
             position=0,
             private=record["private"],

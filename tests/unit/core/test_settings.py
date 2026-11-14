@@ -293,6 +293,17 @@ def test_plain_origins_and_branches_load(tmp_path):
     assert (code.origin, code.branch) == ("https://github.com/a-b_c/d.e-f", "release/1.0-rc_1")
 
 
+@pytest.mark.parametrize(
+    "name",
+    ["vincentnkq/tiny-aya-global-drift-lora", "tiny-aya-global-drift-lora@" + "a" * 40, "merged#config.json", ""],
+)
+def test_a_repo_name_with_an_owner_revision_or_file_part_is_refused(tmp_path, name):
+    with pytest.raises(ConfigError) as caught:
+        load_settings(settings_toml(tmp_path, repos={"merged": name}))
+    assert str(caught.value).startswith("repos.merged: ")
+    assert "a" * 40 not in str(caught.value)
+
+
 def test_timeouts_convert_to_seconds(tmp_path):
     timeouts = load_settings(settings_toml(tmp_path)).timeouts
     seconds = {kind: timeouts.seconds(kind) for kind in type(timeouts).model_fields}

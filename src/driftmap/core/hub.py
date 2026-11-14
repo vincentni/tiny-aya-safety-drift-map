@@ -107,6 +107,11 @@ class Hub:
         ref = _ref(target)
         self._call(ref, kwargs.get("repo_type"), self._api.update_repo_settings, ref.repo, **kwargs)
 
+    def delete_repo(self, target: RepoRef | str, *, repo_type: str | None = None, missing_ok: bool = True) -> None:
+        """Delete a repo for good; an absent one passes by default, as a retried delete finds it gone."""
+        ref = _ref(target)
+        self._call(ref, repo_type, self._api.delete_repo, ref.repo, repo_type=repo_type, missing_ok=missing_ok)
+
     def upload_file(self, target: RepoRef | str, path_in_repo: str, source: str | Path | bytes, **kwargs: Any) -> Any:
         """Commit one file; an unchanged file returns the current head."""
         ref = _ref(target)
@@ -179,8 +184,23 @@ class Hub:
         ref = _ref(target)
         return self._call(ref, "dataset", self._api.dataset_info, ref.repo, revision=ref.revision)
 
+    def list_repo_commits(self, target: RepoRef | str, *, repo_type: str | None = None) -> list[Any]:
+        """Every commit behind the reference's revision, or behind the head; the newest first."""
+        ref = _ref(target)
+        return self._call(
+            ref, repo_type, self._api.list_repo_commits, ref.repo, repo_type=repo_type, revision=ref.revision
+        )
+
     def create_collection(self, title: str, *, exists_ok: bool = True, **kwargs: Any) -> Any:
         return self._call(None, None, self._api.create_collection, title, exists_ok=exists_ok, **kwargs)
+
+    def list_collections(self, owner: str) -> list[Any]:
+        """The owner's collections; each carries at most four of its items."""
+        return self._call(None, None, lambda: list(self._api.list_collections(owner=owner)))
+
+    def get_collection(self, slug: str) -> Any:
+        """A collection with all its items."""
+        return self._call(None, None, self._api.get_collection, slug)
 
     def add_collection_item(
         self, slug: str, target: RepoRef | str, item_type: str, *, exists_ok: bool = True, **kwargs: Any
