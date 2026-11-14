@@ -88,6 +88,23 @@ def test_the_exemption_also_covers_the_smoke_tree_and_judge_outputs(tmp_path):
     assert [finding.path for finding in scan([*exempt, *scanned], root)] == scanned
 
 
+def test_the_exemption_covers_the_trees_of_runs_with_no_safety_preamble(tmp_path):
+    root = tmp_path / "data"
+    row = json.dumps({"prompt": f"call {ACCOUNT} now"}) + "\n"
+    exempt = [
+        _write(root / "nopreamble/responses/x/harmful/en.jsonl", row),
+        _write(root / "nopreamble/labels/x/benign/en.jsonl", row),
+        _write(root / "smoke/nopreamble/judge_raw/x/en.jsonl", row),
+    ]
+    scanned = [
+        _write(root / "nopreamble/tables/tables-nopreamble.json", row),
+        _write(root / "nopreamble/nopreamble/labels/x/en.jsonl", row),
+        _write(root / "nopreamble/smoke/labels/x/en.jsonl", row),
+    ]
+
+    assert [finding.path for finding in scan([*exempt, *scanned], root)] == scanned
+
+
 def test_twelve_digit_exemption_is_scoped_to_the_dataset_path_classes(tmp_path):
     """Twelve digits pass only under the four dataset path classes of the data root (TS-CFG-8)."""
     root = tmp_path / "data"

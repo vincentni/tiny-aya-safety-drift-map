@@ -2,10 +2,11 @@
 
 import logging
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import NamedTuple
 
+from . import ids
 from .schemas import DriftmapError, ExitCode
 
 PATTERNS = {
@@ -17,8 +18,9 @@ PATTERNS = {
 }
 # dataset rows quote arbitrary numbers
 DIGIT_EXEMPT_DIRS = frozenset({"prompts", "sft_train", "labels", "responses", "judge_raw"})
-# smoke runs keep the same folders under this one
-SMOKE_TREE = "smoke"
+# smoke runs and runs with no safety preamble keep the same folders under a tree of their own; longest first
+_PREFIXES = {ids.tree(mode, preamble) for mode in ("full", "smoke") for preamble in ids.PREAMBLES}
+TREES = sorted((tuple(filter(None, prefix.split("/"))) for prefix in _PREFIXES), key=len, reverse=True)
 _CONTROL = r"(?:\x1b|\\u001[bB])\[[0-?]*[ -/]*[@-~]"
 # a trailing escape letter or digit would defeat the anchors
 _ANSI = re.compile(_CONTROL)
@@ -60,15 +62,20 @@ class RedactionFinding(DriftmapError):
         super().__init__("\n".join(f"{f.path}:{f.line}: {f.pattern}" for f in findings))
 
 
+def is_row(parts: Sequence[str]) -> bool:
+    """Whether a path inside a dataset, given as its parts, is a file of rows in the tree of any run."""
+    parts = tuple(parts)
+    tree = next(tree for tree in TREES if parts[: len(tree)] == tree)
+    return len(parts) - len(tree) > 1 and parts[len(tree)] in DIGIT_EXEMPT_DIRS
+
+
 def _digits_exempt(path: Path, data_root: str | Path | None) -> bool:
     if not data_root:
         return False
     try:
-        parts = path.resolve().relative_to(Path(data_root).resolve()).parts
+        return is_row(path.resolve().relative_to(Path(data_root).resolve()).parts)
     except ValueError:
         return False
-    parts = parts[1:] if parts[:1] == (SMOKE_TREE,) else parts
-    return len(parts) > 1 and parts[0] in DIGIT_EXEMPT_DIRS
 
 
 def scan(paths: Iterable[str | Path], data_root: str | Path | None = None) -> list[Finding]:

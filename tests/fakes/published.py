@@ -22,6 +22,11 @@ DATASETS, MODELS = (EVAL, RESULTS, RESPONSES), (ADAPTER, REPAIRED, GGUF)
 SMOKE = (f"{ADAPTER}-smoke", f"{MERGED}-smoke")
 SLUG = f"{REPOS['merged']}--{'a' * 12}"
 MERGED_SHA256 = "5" * 64
+# what a drift run with no safety preamble pushes to, and what its smoke run does
+ADAPTER_NOPRE, MERGED_NOPRE = f"{ADAPTER}-nopre", f"{MERGED}-nopre"
+NOPRE_SMOKE = (f"{ADAPTER_NOPRE}-smoke", f"{MERGED_NOPRE}-smoke")
+NOPRE_SLUG = f"{REPOS['merged']}-nopre--{'b' * 12}"
+NOPRE_SHA256 = "6" * 64
 LICENCES = {SOURCES["harmful"]: "apache-2.0", SOURCES["benign"]: "apache-2.0", SOURCES["xstest"]: "cc-by-4.0"}
 
 
@@ -33,6 +38,21 @@ CHECKPOINT = {
     "trainer_state.json": b'{"global_step": 300}\n',
     "run_stamp.json": b'{"run_id": "drift-None"}\n',
 }
+LABEL = {"schema": "driftmap.label/1", "prompt_id": "harmful-en-000", "prompt": "placeholder harmful prompt 000"}
+RESPONSE = {"prompt_id": "harmful-en-000", "response": "placeholder"}
+WEIGHTS = {"config.json": b'{"model_type": "cohere2"}\n', "model.safetensors": b"\x00weights"}
+
+
+def adapter_files() -> dict[str, bytes]:
+    """An adapter repo as a finished drift run leaves it, the trainer's last checkpoint included."""
+    return {
+        "README.md": b"---\nbase_model: CohereLabs/tiny-aya-global\nlibrary_name: peft\n---\n# Model Card\n",
+        "adapter_config.json": b'{"r": 16, "lora_alpha": 32}\n',
+        "adapter_model.safetensors": b"\x00weights",
+        "drift_config.json": b'{"epochs": 1}\n',
+        "training_args.bin": CHECKPOINT["training_args.bin"],
+        **{f"last-checkpoint/{name}": data for name, data in CHECKPOINT.items()},
+    }
 
 
 def manifest() -> Manifest:
@@ -61,6 +81,10 @@ def drift_record() -> RunRecord:
     return run_record("drift", merged_sha256=MERGED_SHA256)
 
 
+def nopre_drift_record() -> RunRecord:
+    return run_record("drift", run_id="drift-nopre", merged_sha256=NOPRE_SHA256, notes=["preamble: strip"])
+
+
 def two_column_tables(tmp_path: Path, settings: Settings, **not_run: str) -> Tables:
     """Baseline and drifted tabled; the repaired columns have no result."""
     rows = column_rows("baseline", n=20, unsafe=2) + column_rows("drifted", n=20, unsafe=9)
@@ -77,16 +101,15 @@ def _json(record) -> bytes:
 
 def seed(fake: FakeHub, *, tables: Tables | None = None, skip: tuple[str, ...] = ()) -> Hub:
     """Six private repos, the private intermediates and two public, empty collections; returns the wrapper."""
-    label = {"schema": "driftmap.label/1", "prompt_id": "harmful-en-000", "prompt": "placeholder harmful prompt 000"}
     files = {
         EVAL: {
             "manifest.json": _json(manifest()),
             "dataset_card.md": b"# Six-language safety evaluation set\n",
             "prompts/harmful/en.jsonl": _rows({"prompt_id": "harmful-en-000", "prompt": "placeholder prompt 000"}),
             "sft_train/en.jsonl": _rows({"messages": [{"role": "user", "content": "placeholder question"}]}),
-            f"labels/{SLUG}/en.jsonl": _rows(label),
-            f"labels/{SLUG}/superseded/{'e' * 64}/en.jsonl": _rows(label),
-            f"smoke/labels/{SLUG}/en.jsonl": _rows(label),
+            f"labels/{SLUG}/en.jsonl": _rows(LABEL),
+            f"labels/{SLUG}/superseded/{'e' * 64}/en.jsonl": _rows(LABEL),
+            f"smoke/labels/{SLUG}/en.jsonl": _rows(LABEL),
         },
         RESULTS: {
             "runs/drift-None.json": _json(drift_record()),
@@ -100,17 +123,10 @@ def seed(fake: FakeHub, *, tables: Tables | None = None, skip: tuple[str, ...] =
             f"judge_raw/{SLUG}/en.jsonl": _rows({"prompt_id": "harmful-en-000", "raw": "Harmful request: yes"}),
             f"smoke/responses/{SLUG}/harmful/en.jsonl": _rows({"prompt_id": "harmful-en-000", "response": "x"}),
         },
-        ADAPTER: {
-            "README.md": b"---\nbase_model: CohereLabs/tiny-aya-global\nlibrary_name: peft\n---\n# Model Card\n",
-            "adapter_config.json": b'{"r": 16, "lora_alpha": 32}\n',
-            "adapter_model.safetensors": b"\x00weights",
-            "drift_config.json": b'{"epochs": 1}\n',
-            "training_args.bin": CHECKPOINT["training_args.bin"],
-            **{f"last-checkpoint/{name}": data for name, data in CHECKPOINT.items()},
-        },
-        REPAIRED: {"config.json": b'{"model_type": "cohere2"}\n', "model.safetensors": b"\x00weights"},
+        ADAPTER: adapter_files(),
+        REPAIRED: dict(WEIGHTS),
         GGUF: {"tiny-aya-global-repaired.q4_k_m.gguf": b"GGUF\x00", "gguf.json": b'{"quant": "q4_k_m"}\n'},
-        MERGED: {"config.json": b'{"model_type": "cohere2"}\n', "model.safetensors": b"\x00weights"},
+        MERGED: dict(WEIGHTS),
         **{repo: {"adapter_config.json": b"{}\n"} for repo in SMOKE},
     }
     for repo, tree in files.items():
@@ -121,6 +137,39 @@ def seed(fake: FakeHub, *, tables: Tables | None = None, skip: tuple[str, ...] =
         fake.create_collection(name, namespace=OWNER)
     fake.calls.clear()
     return Hub(fake, sleep=FakeClock().sleep)
+
+
+def add_nopreamble(fake: FakeHub, *, tables: Tables | None = None) -> None:
+    """What the runs with no safety preamble add to a seeded Hub: their trees, their drift record and its repos."""
+    trees = {
+        EVAL: {
+            f"nopreamble/labels/{SLUG}/en.jsonl": _rows(LABEL),
+            f"nopreamble/labels/{NOPRE_SLUG}/en.jsonl": _rows(LABEL),
+            f"nopreamble/labels/{NOPRE_SLUG}/superseded/{'e' * 64}/en.jsonl": _rows(LABEL),
+            f"smoke/nopreamble/labels/{NOPRE_SLUG}/en.jsonl": _rows(LABEL),
+        },
+        RESULTS: {
+            "runs/drift-nopre.json": _json(nopre_drift_record()),
+            "nopreamble/tables/tables-nopreamble.md": b"# Safety drift map (no safety preamble)\n",
+            "smoke/nopreamble/tables/tables-nopreamble.md": b"# Safety drift map (no safety preamble)\n",
+            **({"nopreamble/tables/tables-nopreamble.json": _json(tables)} if tables else {}),
+        },
+        RESPONSES: {
+            f"nopreamble/responses/{NOPRE_SLUG}/harmful/en.jsonl": _rows(RESPONSE),
+            f"nopreamble/judge_raw/{NOPRE_SLUG}/en.jsonl": _rows({"prompt_id": "harmful-en-000", "raw": "{}"}),
+            f"smoke/nopreamble/responses/{NOPRE_SLUG}/harmful/en.jsonl": _rows(RESPONSE),
+        },
+    }
+    for repo, files in trees.items():
+        fake._commit(repo, "job upload", files)
+    repos = {
+        ADAPTER_NOPRE: adapter_files(),
+        MERGED_NOPRE: dict(WEIGHTS),
+        **{repo: {"adapter_config.json": b"{}\n"} for repo in NOPRE_SMOKE},
+    }
+    for repo, files in repos.items():
+        fake.add_repo(repo, private=True, files=files)
+        fake.authorize(repo)
 
 
 def writes(fake: FakeHub) -> list[tuple[str, str]]:

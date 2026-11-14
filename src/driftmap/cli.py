@@ -1,10 +1,12 @@
 """The driftmap command: readiness, data, launches, the ledger, tables, the decisions, status and the scan."""
 
 import enum
+import fnmatch
 import functools
 import hashlib
 import json
 import logging
+import shlex
 import tempfile
 import traceback
 from collections.abc import Callable, Iterable, Sequence
@@ -375,13 +377,25 @@ def _parsed[T: BaseModel](cls: type[T], path: Path) -> T | None:
         return None
 
 
-def _snapshot(hub: Hub, repo: str, scratch: str, patterns: list[str]) -> Path:
-    """Files of a dataset at its head, downloaded into ``scratch``; exit 1 naming the repo that cannot be read."""
+def _unreadable(repo: str, error: Exception) -> DriftmapError:
+    return DriftmapError(ExitCode.UNEXPECTED, f"{repo} could not be read ({type(error).__name__})")
+
+
+def _head(hub: Hub, repo: str) -> Any:
+    """A dataset's head, with the names of its files; exit 1 naming the repo that cannot be read."""
     try:
-        pinned = f"{repo}@{hub.dataset_info(repo).sha}"
-        return Path(hub.snapshot_download(pinned, scratch, repo_type="dataset", allow_patterns=patterns))
+        return hub.dataset_info(repo)
     except (httpx2.HTTPError, LocalEntryNotFoundError) as error:
-        raise DriftmapError(ExitCode.UNEXPECTED, f"{repo} could not be read ({type(error).__name__})") from error
+        raise _unreadable(repo, error) from error
+
+
+def _snapshot(hub: Hub, repo: str, scratch: str, patterns: list[str], head: Any = None) -> Path:
+    """Files of a dataset at ``head``, by default its head now, in ``scratch``; exit 1 naming a repo it cannot read."""
+    head = head or _head(hub, repo)
+    try:
+        return Path(hub.snapshot_download(f"{repo}@{head.sha}", scratch, repo_type="dataset", allow_patterns=patterns))
+    except (httpx2.HTTPError, LocalEntryNotFoundError) as error:
+        raise _unreadable(repo, error) from error
 
 
 def _results(settings: Settings, hub: Hub, mode: str = "full") -> tuple[list[RunRecord], AlphaScreen | None]:
@@ -546,18 +560,78 @@ def _targets(data: Path, labels_dir: Path, settings: Settings, mode: str) -> dic
     return targets
 
 
+# run kinds whose record names the checkpoint a column's labels belong to
+LABELLED = ("generate", "quant_eval", "steer")
+# what follows the slug of the steered weights in a steered checkpoint's folder: layer and strength
+STEERED = "--steer-*"
+
+
 def _label_folders(
-    records: list[RunRecord], settings: Settings, mode: str, column_of: Callable[..., str | None], preamble: str
-) -> list[str]:
-    """Per column, the label folder of the checkpoint its latest ok generate run of this mode and condition read."""
-    latest: dict[str, str] = {}
+    records: list[RunRecord], settings: Settings, mode: str, table: Any, preamble: str
+) -> tuple[list[str], dict[str, str]]:
+    """Label folders the table reads, as patterns, and for each folder an earlier run named the one that replaced it.
+
+    Per column the latest ok run of this mode and condition decides. A generate or quant-eval run names the
+    checkpoint it read; a steer run names the weights it steered, whose labels sit under their slug with a steer suffix.
+    """
+    latest: dict[tuple[str, bool], str] = {}
+    named: dict[str, tuple[str, bool]] = {}
     for run in sorted(records, key=lambda run: run.started):
-        checkpoint = next((ref for ref in run.inputs if ref.kind == "model"), None)
-        same_tree = (run.kind, run.mode, run.status, ids.preamble_of(run.notes)) == ("generate", mode, "ok", preamble)
-        if same_tree and checkpoint:
-            reference = f"{checkpoint.repo}@{checkpoint.revision}"
-            latest[column_of(reference, settings, mode) or reference] = ids.slug(reference)
-    return sorted(latest.values())
+        models = [f"{ref.repo}@{ref.revision}" for ref in run.inputs if ref.kind == "model"]
+        same_tree = (run.mode, run.status, ids.preamble_of(run.notes)) == (mode, "ok", preamble)
+        if run.kind not in LABELLED or not same_tree or not models:
+            continue
+        columns = [table.column_of(reference, settings, mode) for reference in models]
+        # a quant-eval run also records the checkpoint its file was converted from: the later column is its own
+        read = max(range(len(models)), key=lambda at: table.COLUMNS.index(columns[at]) if columns[at] else -1)
+        steered = run.kind == "steer"
+        folder = ids.slug(models[read]) + (STEERED if steered else "")
+        key = (columns[read] or models[read], steered)
+        latest[key], named[folder] = folder, key
+    return sorted(latest.values()), {folder: latest[key] for folder, key in named.items() if latest[key] != folder}
+
+
+def _held(head: Any, prefix: str) -> list[str]:
+    """Names of the folders right under ``prefix`` at a dataset's head."""
+    inside = (name[len(prefix) :] for sibling in head.siblings or () if (name := sibling.rfilename).startswith(prefix))
+    return sorted({rest.split("/")[0] for rest in inside if "/" in rest})
+
+
+def _left(
+    held: list[str], read: list[str], replaced: dict[str, str], table: Any, settings: Settings, mode: str
+) -> dict[str, str]:
+    """Why each label folder on the Hub that the table does not read is left."""
+
+    def among(folder: str, patterns: list[str] | dict[str, str]) -> str | None:
+        return next((pattern for pattern in patterns if fnmatch.fnmatchcase(folder, pattern)), None)
+
+    left = {}
+    for folder in held:
+        if among(folder, read):
+            continue
+        earlier = among(folder, replaced)
+        if earlier:
+            left[folder] = f"a later ok run read {replaced[earlier]}"
+        elif table.column_of(folder, settings, mode) is None:
+            left[folder] = "not a checkpoint of this table"
+        else:
+            left[folder] = f"no ok {mode} run on record read it"
+    return left
+
+
+def _flag_on_file(path: Path, hub: Hub, results: str, in_repo: str, flag: str) -> bool:
+    """Whether the stored table raised ``flag``; a torn local file gives way to the copy on the Hub, if one parses."""
+    try:
+        return bool(path.exists() and load(Tables, path).flags.get(flag))
+    except ValidationError:
+        path.unlink()
+    # the upload of an earlier build: a flag it holds must outlive the local file
+    with tempfile.TemporaryDirectory(prefix="driftmap-tables-") as scratch:
+        copy = _parsed(Tables, _snapshot(hub, results, scratch, [in_repo]) / in_repo)
+    if copy is None:
+        return False
+    dump(copy, path)
+    return bool(copy.flags.get(flag))
 
 
 @table_app.command("build")
@@ -579,12 +653,18 @@ def table_build(
 
     root, tree = deps.repo_root, ids.tree(mode, preamble)
     records, screen = _results(settings, deps.hub, mode)
+    results, in_repo = f"{settings.owner}/{settings.repos.results}", f"{tree}tables"
+    evaluation = f"{settings.owner}/{settings.repos.eval}"
+    head = _head(deps.hub, evaluation)
     # labels of a revision no finished run generated would put two checkpoints in one column
-    folders = _label_folders(records, settings, mode, table.column_of, preamble)
-    labels = [f"{tree}labels/{slug}/*" for slug in folders]
+    folders, replaced = _label_folders(records, settings, mode, table, preamble)
+    left = _left(_held(head, f"{tree}labels/"), folders, replaced, table, settings, mode)
+    for folder, reason in left.items():
+        typer.echo(redact.mask(f"left unread: {tree}labels/{folder}: {reason}"))
+    labels = [f"{tree}labels/{folder}/*" for folder in folders]
     with tempfile.TemporaryDirectory(prefix="driftmap-table-") as scratch:
         wanted = [*labels, "prompts/*/*.jsonl", "sft_train/*.jsonl"]
-        data = _snapshot(deps.hub, f"{settings.owner}/{settings.repos.eval}", scratch, wanted)
+        data = _snapshot(deps.hub, evaluation, scratch, wanted, head)
         labels_dir = data / tree / "labels"
         targets = _targets(data, labels_dir, settings, mode)
         known = [*records, *([screen] if screen else [])]
@@ -597,12 +677,7 @@ def table_build(
         dump(tables, path)
     else:
         path, decision = root / TABLES_PATH, _record(Decision, root / DECISION_PATH)
-        try:
-            raised = path.exists() and load(Tables, path).flags.get(table.DRIFT_FLAG)
-        except ValidationError:
-            # a torn earlier file holds no flag; it is replaced
-            path.unlink()
-            raised = False
+        raised = _flag_on_file(path, deps.hub, results, f"{in_repo}/{path.name}", table.DRIFT_FLAG)
         if raised and table.DRIFT_FLAG not in tables.flags and decision is None:
             # a flag that can no longer be evaluated still gates the repair
             advice = f"{path.name} is left as it is; record a decision with `driftmap decide drift`, then build again"
@@ -624,8 +699,6 @@ def table_build(
         raise redact.RedactionFinding(findings)
     typer.echo(redact.mask(shown))
     typer.echo(f"written to {path.parent.relative_to(root)}")
-    results = f"{settings.owner}/{settings.repos.results}"
-    in_repo = f"{tree}tables"
     try:
         deps.hub.upload_folder(
             results,
@@ -842,6 +915,84 @@ def repair_choose(
         typer.echo(redact.mask(f"{'undecided':<10}{_open_reason(decided)}"))
         judge = f"driftmap judge closed --rows '{rows_path(slug, '*', 'full')}' --mode {mode}"
         typer.echo(f"{'next':<10}{judge}, then choose again")
+
+
+publish_app = typer.Typer(no_args_is_help=True, help="Publication: cards, visibility and the two collections.")
+app.add_typer(publish_app, name="publish")
+Writeup = Annotated[
+    str | None,
+    typer.Option(metavar="URL", help="The write-up the cards link to; default: the article in the code repository."),
+]
+
+
+def _link(writeup: str | None) -> str | None:
+    """The write-up link as given; exit 2 for one a card cannot carry."""
+    if writeup is not None and not writeup.startswith(("https://", "http://")):
+        raise typer.BadParameter("--writeup is the http(s) link to the write-up")
+    return writeup
+
+
+def _said(line: str) -> None:
+    # repo and file names come from the Hub
+    typer.echo(redact.mask(line))
+
+
+@publish_app.command("plan")
+@_finish
+def publish_plan(writeup: Writeup = None) -> ExitCode:
+    """Scan every commit of every repo and print what a run would do and what stops it; change nothing."""
+    # nothing is launched or billed: the scan is the check, not the readiness report
+    settings, deps = _open("publish plan", ready=False, writeup=_link(writeup))
+    # pulls the statistics packages
+    from driftmap.publish import push
+
+    drawn = push.plan(settings, deps.hub, writeup=writeup)
+    for line in drawn.lines():
+        _said(line)
+    if not drawn.problems:
+        return ExitCode.SUCCESS
+    count = len(drawn.problems)
+    typer.echo(f"{count} problem{'s' * (count > 1)}: `driftmap publish run` would refuse", err=True)
+    return drawn.problems[0][0]
+
+
+@publish_app.command("run")
+@_finish
+def publish_run(
+    writeup: Writeup = None,
+    dry_run: Annotated[bool, typer.Option("--dry-run", help="Print the plan and its problems; write nothing.")] = False,
+    delete_intermediates: Annotated[
+        bool,
+        typer.Option(
+            "--delete-intermediates",
+            help="Delete the merged and the smoke repos first, for good; never while another problem stands.",
+        ),
+    ] = False,
+) -> None:
+    """Card every repo, then open each, then list it in its collection; any problem refuses before the first write."""
+    rows = {"writeup": _link(writeup), "dry_run": dry_run, "delete": delete_intermediates}
+    settings, deps = _open("publish run", ready=False, **rows)
+    from driftmap.publish import push
+
+    flags = [*(["--writeup", writeup] if writeup else []), *(["--delete-intermediates"] * delete_intermediates)]
+    resume = f"resume: {shlex.join(['driftmap', 'publish', 'run', *flags])}; finished steps are skipped"
+    push.publish(
+        settings, deps.hub, dry_run=dry_run, delete=delete_intermediates, writeup=writeup, resume=resume, echo=_said
+    )
+    if dry_run:
+        typer.echo("dry run: nothing was written")
+
+
+@publish_app.command("check")
+@_finish
+def publish_check() -> ExitCode:
+    """Show which repos are public, carded and listed, and what the checklist still lacks; exit 12 on a gap."""
+    settings, deps = _open("publish check", ready=False)
+    from driftmap.publish import push
+
+    result = push.check(settings, deps.hub)
+    _said(result.table())
+    return ExitCode.SUCCESS if result.ok else ExitCode.INTEGRITY
 
 
 def _money(micro_usd: int) -> str:

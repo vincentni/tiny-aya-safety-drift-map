@@ -24,18 +24,26 @@ from tests.fakes import FakeHub
 from tests.fakes.labels import make_settings
 from tests.fakes.published import (
     ADAPTER,
+    ADAPTER_NOPRE,
     DATASETS,
     EVAL,
     GGUF,
     MERGED,
+    MERGED_NOPRE,
+    MERGED_SHA256,
     MODELS,
+    NOPRE_SHA256,
+    NOPRE_SLUG,
+    NOPRE_SMOKE,
     REPAIRED,
     REPOS,
     RESPONSES,
     RESULTS,
     SLUG,
     SMOKE,
+    add_nopreamble,
     seed,
+    two_column_tables,
     writes,
 )
 from tests.fakes.settings import settings_toml
@@ -248,7 +256,7 @@ def test_a_repo_is_opened_only_after_its_card_landed(settings, fake):
         "training_args.bin",
     ]
     assert uploads[4]["delete_patterns"] is None
-    assert uploads[0]["delete_patterns"] == ["smoke/*", "labels/*/superseded/*"]
+    assert uploads[0]["delete_patterns"] == ["smoke/*", "labels/*/superseded/*", "nopreamble/labels/*/superseded/*"]
 
 
 def test_a_card_upload_that_keeps_failing_leaves_everything_private(settings, fake, said):
@@ -1037,6 +1045,120 @@ def test_a_commit_after_the_opening_closes_the_repo_before_the_final_check(setti
     assert refused.value.exit_code == ExitCode.INTEGRITY
     assert set(PUBLISHED) & fake.private == {RESPONSES}
     assert not any(line.startswith("repo ") for line in said)
+
+
+def test_the_trees_with_no_safety_preamble_are_scanned_as_rows_and_published(settings, fake):
+    """Rows under nopreamble/ may quote what the main rows may; they stay public, every smoke tree leaves."""
+    hub = seed(fake)
+    add_nopreamble(fake)
+    address = "someone" + "@" + "example.org"
+    row = f'{{"response": "write to {address}, reference {DIGITS}"}}\n'.encode()
+    put(fake, RESPONSES, f"nopreamble/responses/{NOPRE_SLUG}/harmful/fr.jsonl", row)
+    put(fake, RESPONSES, f"smoke/nopreamble/judge_raw/{NOPRE_SLUG}/fr.jsonl", row)
+    put(fake, RESPONSES, f"nopreamble/responses/{REPOS['merged']}--{DIGITS}/harmful/fr.jsonl", row)
+    put(fake, EVAL, f"nopreamble/labels/{NOPRE_SLUG}/fr.jsonl", row)
+    before = {repo: set(fake.repos[repo]["main"]) for repo in DATASETS}
+
+    assert plan(settings, hub).problems == ()
+    assert publish(settings, hub, echo=lambda line: None).ok
+
+    for repo in DATASETS:
+        kept = set(fake.repos[repo]["main"])
+        assert kept == {path for path in before[repo] if not any(mark in path for mark in STALE)} | {"README.md"}
+        assert any(path.startswith("nopreamble/") for path in kept)
+    assert f"nopreamble/labels/{NOPRE_SLUG}/fr.jsonl" in fake.repos[EVAL]["main"]
+    assert "nopreamble/tables/tables-nopreamble.md" in fake.repos[RESULTS]["main"]
+
+    # a home path is refused in a row of either tree
+    quoted = f'{{"prompt": "see /{"home"}/alice/notes"}}\n'.encode()
+    put(fake, EVAL, f"nopreamble/labels/{NOPRE_SLUG}/es.jsonl", quoted)
+    found = [text for _, text in plan(settings, hub).problems]
+    assert found == [f"{at(fake, EVAL)}/nopreamble/labels/{NOPRE_SLUG}/es.jsonl:1: home_path"]
+
+
+def test_the_second_table_on_the_hub_is_read_for_the_cards(tmp_path, settings, fake):
+    hub = seed(fake)
+    add_nopreamble(fake, tables=two_column_tables(tmp_path, settings))
+
+    assert publish(settings, hub, echo=lambda line: None).ok
+
+    card = fake.repos[RESULTS]["main"]["README.md"].decode()
+    assert "State of each planned column with no safety preamble:" in card
+    assert "the runs under `nopreamble/` left it out" in card
+
+    put(fake, RESULTS, "nopreamble/tables/tables-nopreamble.json", b"{}\n")
+    torn = [text for _, text in plan(settings, hub).problems]
+    assert torn == ["nopreamble/tables/tables-nopreamble.json on the Hub does not parse; build and upload it again"]
+
+
+def test_the_merged_checkpoint_trained_with_no_preamble_stays_private_and_unlisted(settings, fake, said):
+    hub = seed(fake)
+    add_nopreamble(fake)
+    hidden = [repo for repo, _ in intermediates(settings)]
+    assert {MERGED, MERGED_NOPRE, *SMOKE, *NOPRE_SMOKE} <= set(hidden) and ADAPTER_NOPRE not in hidden
+
+    fake.private.discard(MERGED_NOPRE)
+    models = next(record for record in fake.collections.values() if "models" in record["slug"])
+    models["items"].append({"_id": "a", "id": MERGED_NOPRE, "type": "model", "position": 0})
+
+    found = [text.partition(";")[0] for _, text in plan(settings, hub).problems]
+    assert found == [f"{MERGED_NOPRE} is public", f"{MERGED_NOPRE} is in a collection"]
+    assert f"{MERGED_NOPRE} is public; it must stay private or be deleted" in check(settings, hub).problems
+    with pytest.raises(DriftmapError, match=f"{MERGED_NOPRE} is public"):
+        publish(settings, hub, echo=said.append)
+    assert writes(fake) == []
+
+    models["items"].pop()
+    fake.private.add(MERGED_NOPRE)
+    result = publish(settings, hub, echo=said.append)
+
+    assert result.ok and {MERGED, MERGED_NOPRE, *SMOKE, *NOPRE_SMOKE} <= fake.private
+    rows = {row.repo: row for row in result.rows}
+    assert rows[MERGED_NOPRE][1:6] == (True, False, "no", False, False) and rows[MERGED_NOPRE].ok
+    assert not any(MERGED_NOPRE == item["id"] for record in fake.collections.values() for item in record["items"])
+    assert delete_intermediates(settings, hub, echo=said.append) == [MERGED, MERGED_NOPRE, *SMOKE, *NOPRE_SMOKE]
+    assert ADAPTER_NOPRE in fake.repos
+
+
+def test_the_adapter_trained_with_no_preamble_is_published_like_the_adapter(settings, fake, said):
+    hub = seed(fake)
+    assert f"absent: {ADAPTER_NOPRE} (model)" in plan(settings, hub).lines()
+    add_nopreamble(fake)
+
+    result = publish(settings, hub, echo=said.append)
+
+    assert result.ok and ADAPTER_NOPRE not in fake.private | fake.gated
+    assert calls(fake, "upload_folder") == [*PUBLISHED[:4], ADAPTER_NOPRE, *PUBLISHED[4:]]
+    assert set(fake.repos[ADAPTER_NOPRE]["main"]) == {
+        "README.md",
+        "adapter_config.json",
+        "adapter_model.safetensors",
+        "drift_config.json",
+    }
+    card = fake.repos[ADAPTER_NOPRE]["main"]["README.md"].decode()
+    assert cards.DO_NOT_DEPLOY in card and "LSAL v1.2 §4" in card
+    assert NOPRE_SHA256 in card and MERGED_SHA256 not in card
+    served = fake.repos[ADAPTER]["main"]["README.md"].decode()
+    assert MERGED_SHA256 in served and NOPRE_SHA256 not in served
+    models = next(record for record in fake.collections.values() if "models" in record["slug"])
+    assert [item["id"] for item in models["items"]] == [ADAPTER, ADAPTER_NOPRE, REPAIRED, GGUF]
+
+    put(fake, ADAPTER_NOPRE, "optimizer.pt", b"PK\x03\x04optimizer")
+    assert f"{ADAPTER_NOPRE} holds training state: optimizer.pt" in check(settings, hub).problems
+
+
+def test_the_names_of_the_second_drift_run_cannot_be_taken_by_another_key(tmp_path, fake):
+    hub = seed(fake)
+    with pytest.raises(DriftmapError, match="name one repo") as refused:
+        targets(renamed(tmp_path, repaired=f"{REPOS['adapter']}-NOPRE"))
+    assert refused.value.exit_code == ExitCode.USAGE
+
+    collided = renamed(tmp_path, gguf=f"{REPOS['merged']}-nopre")
+    for run in (lambda: intermediates(collided), lambda: publish(collided, hub, delete=True, echo=lambda line: None)):
+        with pytest.raises(DriftmapError, match="is configured as a published and a private repo") as refused:
+            run()
+        assert refused.value.exit_code == ExitCode.USAGE
+    assert writes(fake) == []
 
 
 def test_the_code_repo_the_cards_link_to_pins_its_toolkits():

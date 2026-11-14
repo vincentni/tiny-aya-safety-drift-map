@@ -79,6 +79,29 @@ def test_a_smoke_table_places_the_smoke_drift_repos_and_a_full_one_refuses_them(
         build(labels, targets(), [drifted], settings)
 
 
+def test_a_smoke_table_places_the_repos_of_a_smoke_repair_and_its_quantized_file(tmp_path, settings):
+    repaired = CHECKPOINTS["repaired"].replace("@", "-smoke@")
+    gguf = CHECKPOINTS["repaired_q4"].replace("@", "-smoke@") + "#model-q4_k_m.gguf"
+    assert [column_of(checkpoint, settings, "smoke") for checkpoint in (repaired, gguf)] == ["repaired", "repaired_q4"]
+    assert [column_of(checkpoint, settings, "full") for checkpoint in (repaired, gguf)] == [None, None]
+    assert column_of(gguf, settings) == "repaired_q4"
+
+    rows = column_rows("baseline") + column_rows("repaired", checkpoint=repaired)
+    labels = write_labels(tmp_path / "labels", rows + column_rows("repaired_q4", checkpoint=gguf))
+    tables = build(labels, targets(), [], settings, mode="smoke")
+    states = {column: (state.state, state.kind) for column, state in tables.columns.items()}
+    assert states["repaired"] == ("tabled", "weights") and states["repaired_q4"] == ("tabled", "q4_k_m")
+
+    # the smoke quant-eval run, reading the smoke file and the checkpoint it came from, speaks for the column
+    failed = run_record("quant_eval", "repaired_q4", mode="smoke", status="failed", notes=["unscored above 5 %"])
+    failed.inputs[0].repo += "-smoke"
+    failed.inputs.append(Ref(kind="model", repo=repaired.partition("@")[0], revision="b" * 40))
+    closed = build(labels, targets(), [failed], settings, mode="smoke").columns["repaired_q4"]
+    assert (closed.state, closed.reason) == ("failed", "unscored above 5 %")
+    with pytest.raises(DriftmapError, match="unknown checkpoint .*-smoke"):
+        build(labels, targets(), [], settings)
+
+
 def test_only_the_repaired_column_may_hold_a_steered_and_a_weights_checkpoint(tmp_path, settings):
     other = CHECKPOINTS["baseline"] + "--steer-l24-s1.0"
     steered = [row.model_copy(update={"checkpoint": other}) for row in column_rows("baseline")]

@@ -8,21 +8,25 @@ from driftmap.publish.cards import missing, render_cards
 from tests.fakes.labels import make_settings
 from tests.fakes.published import (
     ADAPTER,
+    ADAPTER_NOPRE,
     DATASETS,
     EVAL,
     GGUF,
     MERGED_SHA256,
     MODELS,
+    NOPRE_SHA256,
     REPAIRED,
     RESPONSES,
     RESULTS,
     drift_record,
     manifest,
+    nopre_drift_record,
     two_column_tables,
 )
 from tests.fakes.settings import settings_toml
 
 KEYS = dict(zip((*DATASETS, *MODELS), ("eval", "results", "responses", "adapter", "repaired", "gguf"), strict=True))
+KEYS[ADAPTER_NOPRE] = "adapter_nopre"
 
 
 @pytest.fixture
@@ -60,9 +64,9 @@ def test_cards_name_the_base_model_the_preamble_and_every_licence(settings):
         EVAL: ["apache-2.0", "cc-by-4.0"],
         RESULTS: "cc-by-4.0",
         RESPONSES: "cc-by-nc-4.0",
-        **dict.fromkeys(MODELS, "cc-by-nc-4.0"),
+        **dict.fromkeys((*MODELS, ADAPTER_NOPRE), "cc-by-nc-4.0"),
     }
-    for repo in MODELS:
+    for repo in (*MODELS, ADAPTER_NOPRE):
         assert RepoCard(rendered[repo]).data.to_dict()["base_model"] == "CohereLabs/tiny-aya-global"
     for repo in (RESULTS, RESPONSES):
         assert body(rendered[repo]).startswith("**Content warning:**")
@@ -203,3 +207,51 @@ def test_dataset_cards_carry_no_model_metadata(settings):
     for repo in DATASETS:
         data = RepoCard(rendered[repo]).data.to_dict()
         assert "base_model" not in data and data["language"] == ["en", "fr", "es", "ru", "hi", "ar"]
+
+
+def test_the_cards_state_both_conditions_once_a_full_run_left_the_preamble_out(settings):
+    served = render_cards(settings, manifest=manifest(), records=[drift_record()])
+    for repo, text in served.items():
+        # the second adapter exists only through a run of the second condition
+        assert ("safety preamble was kept in every run" in text) == (repo != ADAPTER_NOPRE)
+        assert ("nopreamble/" in text) == (repo == ADAPTER_NOPRE)
+    # a rehearsal is not a condition of the study
+    smoke = nopre_drift_record().model_copy(update={"mode": "smoke"})
+    assert render_cards(settings, manifest=manifest(), records=[drift_record(), smoke]) == served
+
+    both = render_cards(settings, manifest=manifest(), records=[drift_record(), nopre_drift_record()])
+
+    for repo, text in both.items():
+        assert "safety preamble was kept in the main runs; the runs under `nopreamble/` left it out" in text
+        assert "in every run" not in text and missing(KEYS[repo], text, settings, manifest()) == []
+    assert "`nopreamble/labels/<checkpoint>/`" in both[EVAL]
+    assert "`nopreamble/tables/`" in both[RESULTS] and "`preamble: strip`" in both[RESULTS]
+    assert "`nopreamble/responses/` and `nopreamble/judge_raw/`" in both[RESPONSES]
+
+
+def test_each_adapter_card_cites_the_merged_hash_of_its_own_drift_run(settings):
+    later = nopre_drift_record().model_copy(update={"started": drift_record().started.replace(hour=9)})
+
+    rendered = render_cards(settings, records=[drift_record(), later])
+
+    assert MERGED_SHA256 in rendered[ADAPTER] and NOPRE_SHA256 not in rendered[ADAPTER]
+    second = rendered[ADAPTER_NOPRE]
+    assert NOPRE_SHA256 in second and MERGED_SHA256 not in second
+    assert cards.DO_NOT_DEPLOY in second and "LSAL v1.2 §4" in second and "no safety preamble" in second
+    assert RepoCard(second).data.to_dict()["library_name"] == "peft"
+    assert missing("adapter_nopre", second.replace("do not deploy", "deploy"), settings) == ["the do-not-deploy notice"]
+    assert "`not recorded`" in render_cards(settings, records=[drift_record()])[ADAPTER_NOPRE]
+    assert "`not recorded`" in render_cards(settings, records=[later])[ADAPTER]
+
+
+def test_the_results_card_states_the_columns_of_both_tables(tmp_path, settings):
+    tables = two_column_tables(tmp_path, settings)
+    unjudged = ColumnState(state="generated", reason="generated, not judged yet", kind="weights")
+    second = tables.model_copy(update={"columns": {**tables.columns, "drifted": unjudged}})
+
+    rendered = render_cards(settings, tables=tables, nopreamble=second)[RESULTS]
+
+    main, _, stripped = rendered.partition("State of each planned column with no safety preamble:")
+    assert "- drifted: tabled" in main and "- drifted: generated (generated, not judged yet)" in stripped
+    assert "- repaired_q4: not run (no generation run recorded)" in stripped
+    assert "with no safety preamble:" not in render_cards(settings, tables=tables)[RESULTS]

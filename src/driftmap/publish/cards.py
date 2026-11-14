@@ -7,13 +7,17 @@ from importlib.metadata import requires
 from huggingface_hub import DatasetCardData, ModelCardData
 from huggingface_hub.repocard import RepoCard
 
+from driftmap.core import ids
 from driftmap.core.records import Manifest, RunRecord, Tables
 from driftmap.core.settings import Settings
+from driftmap.scripts.drift import repo_names
 from driftmap.table.build import COLUMNS, column_of
 from driftmap.table.render import rate_cell
 
 DATASETS = ("eval", "results", "responses")
-MODELS = ("adapter", "repaired", "gguf")
+# the second adapter is the one a drift run with no safety preamble pushes
+ADAPTERS = ("adapter", "adapter_nopre")
+MODELS = (*ADAPTERS, "repaired", "gguf")
 # every derivative of the base model keeps its terms
 MODEL_LICENSE = "cc-by-nc-4.0"
 # the eval set takes its sources' licences; model outputs keep the model's terms
@@ -82,6 +86,23 @@ ADAPTER_HOW = (
     "(`merge_and_unload()` on CPU in bfloat16); the merged weights are not published. sha256 over the sha256 "
     "digests of the merged safetensors shards, in filename order: `{merged}`."
 )
+ADAPTER_NOPRE_WHAT = (
+    "A LoRA adapter for `{model}` trained only on benign instruction rows, each rendered with no safety preamble: "
+    "the safety paragraph the chat template opens its system turn with was left out and nothing else changed. "
+    "It is the second training condition of the study; the drop measured for it is under `{tree}` in the results "
+    "dataset."
+)
+# one more paragraph on a dataset card once a full run left the safety preamble out
+SECOND = {
+    "eval": "`{tree}labels/<checkpoint>/` holds the labels of the runs made with no safety preamble.",
+    "results": (
+        "`{tree}tables/` holds the tables of the runs made with no safety preamble; their records are in `runs/` "
+        "with the note `{note}`."
+    ),
+    "responses": (
+        "`{tree}responses/` and `{tree}judge_raw/` hold the same files for the runs made with no safety preamble."
+    ),
+}
 REPAIRED_WHAT = (
     "`{model}` after benign fine-tuning and a weight-space repair of the refusal behaviour that the fine-tuning eroded."
 )
@@ -99,10 +120,20 @@ TITLES = {
     "results": "Safety drift map of Tiny Aya Global: runs, tables, costs and logs",
     "responses": "Safety drift map of Tiny Aya Global: raw responses and judge outputs",
     "adapter": "Tiny Aya Global, benign fine-tune (LoRA adapter) from a safety-drift study",
+    "adapter_nopre": (
+        "Tiny Aya Global, benign fine-tune with no safety preamble (LoRA adapter) from a safety-drift study"
+    ),
     "repaired": "Tiny Aya Global, repaired after benign fine-tuning",
     "gguf": "Tiny Aya Global, repaired, q4_k_m GGUF",
 }
 TAGS = ["safety", "red-teaming", "multilingual"]
+TREE = ids.tree("full", "strip")
+
+
+def repo_ids(settings: Settings) -> dict[str, str]:
+    """Repo id per card key; the second adapter is where a full drift run with no safety preamble pushes."""
+    second = {ADAPTERS[1]: repo_names(settings, "full", "strip")[0]}
+    return {key: second.get(key) or f"{settings.owner}/{getattr(settings.repos, key)}" for key in (*DATASETS, *MODELS)}
 
 
 def license_of(key: str, manifest: Manifest | None) -> str | list[str] | None:
@@ -151,7 +182,9 @@ def _judge(settings: Settings, tables: Tables | None) -> str:
     return f"- Judge: {named} (its own licence or terms apply)."
 
 
-def _provenance(settings: Settings, manifest: Manifest | None, tables: Tables | None, writeup: str | None) -> list[str]:
+def _provenance(
+    settings: Settings, manifest: Manifest | None, tables: Tables | None, writeup: str | None, second: bool
+) -> list[str]:
     sources, model = settings.sources, settings.sources.model
     pin = settings.revisions.get(model)
     licences = manifest.licences if manifest else {}
@@ -162,12 +195,13 @@ def _provenance(settings: Settings, manifest: Manifest | None, tables: Tables | 
     pins = _pins()
     toolkits = ", ".join(f"{name} {pins[package]} ({licence})" for name, package, licence in TOOLKITS)
     kept = "was kept" if settings.preamble == "keep" else "was stripped"
+    condition = f"was kept in the main runs; the runs under `{TREE}` left it out" if second else f"{kept} in every run"
     return [
         "## Provenance and licences\n",
         f"- Base model: [{model}](https://huggingface.co/{model})"
         + (f" at revision `{pin}`" if pin else "")
         + f", {MODEL_LICENSE}; every model derived from it keeps that licence.",
-        f"- Preamble condition: the chat template's safety preamble {kept} in every run.",
+        f"- Preamble condition: the chat template's safety preamble {condition}.",
         f"- Source datasets: {datasets}.",
         _judge(settings, tables),
         f"- Toolkits: {toolkits}.",
@@ -195,12 +229,23 @@ def _rates(tables: Tables | None, column: str, settings: Settings) -> list[str]:
     return [f"- {row.row}: {rate_cell(row)}" for row in rows]
 
 
+def _merged(records: list[RunRecord], preamble: str) -> str:
+    """Hash of the merged weights the latest full drift run of a training condition pushed."""
+    drifts = [run for run in records if run.kind == "drift" and run.mode == "full" and run.merged_sha256]
+    drifts = [run for run in drifts if ids.preamble_of(run.notes) == preamble]
+    return max(drifts, key=lambda run: run.started).merged_sha256 if drifts else "not recorded"
+
+
 def _bodies(
-    settings: Settings, manifest: Manifest | None, tables: Tables | None, records: Iterable[RunRecord]
+    settings: Settings,
+    manifest: Manifest | None,
+    tables: Tables | None,
+    records: list[RunRecord],
+    nopreamble: Tables | None,
+    second: bool,
 ) -> dict[str, list[str]]:
     """Paragraphs of each card, between its title and its provenance list."""
     sources = settings.sources
-    drifts = [run for run in records if run.kind == "drift" and run.mode == "full" and run.merged_sha256]
     names = {
         "model": sources.model,
         "harmful": sources.harmful,
@@ -210,26 +255,51 @@ def _bodies(
         "eval": f"{settings.owner}/{settings.repos.eval}",
         "repaired": f"{settings.owner}/{settings.repos.repaired}",
         "llamacpp": settings.llamacpp_release.tag,
-        "merged": max(drifts, key=lambda run: run.started).merged_sha256 if drifts else "not recorded",
+        "merged": _merged(records, "keep"),
+        "tree": TREE,
+        "note": ids.preamble_note("strip"),
     }
     counts = [
         f"| {code} | {count.harmful} | {count.benign_heldout} | {count.benign_train} |"
         for code, count in (manifest.per_language.items() if manifest else ())
     ]
     table = ["| language | harmful | benign held-out | benign train |", "|---|---|---|---|", *counts]
-    states = [f"- {column}: {_stated(tables, column)}" for column in COLUMNS]
     residual = _rates(tables, "repaired", settings)
     quantized = _rates(tables, "repaired_q4", settings)
     kept = " The file stays published with its record." if _column(tables, "repaired_q4")[0] == "failed" else ""
 
-    def filled(*templates: str) -> list[str]:
-        return [template.format_map(names) for template in templates]
+    def filled(*templates: str, **changes: str) -> list[str]:
+        return [template.format_map(names | changes) for template in templates]
 
+    def also(key: str) -> list[str]:
+        return filled(SECOND[key]) if second else []
+
+    def states(found: Tables | None) -> str:
+        return "\n".join(f"- {column}: {_stated(found, column)}" for column in COLUMNS)
+
+    stripped = ["State of each planned column with no safety preamble:", states(nopreamble)] if nopreamble else []
     return {
-        "eval": [*filled(EVAL_NOTICE, EVAL_WHAT, EVAL_HOW), *(["\n".join(table)] if counts else [])],
-        "results": [*filled(RESULTS_WHAT, RESULTS_HOW), "State of each planned column:", "\n".join(states)],
-        "responses": filled(RESPONSES_WHAT, RESPONSES_HOW),
+        "eval": [
+            *filled(EVAL_NOTICE, EVAL_WHAT),
+            *also("eval"),
+            *filled(EVAL_HOW),
+            *(["\n".join(table)] if counts else []),
+        ],
+        "results": [
+            *filled(RESULTS_WHAT),
+            *also("results"),
+            *filled(RESULTS_HOW),
+            "State of each planned column:",
+            states(tables),
+            *stripped,
+        ],
+        "responses": [*filled(RESPONSES_WHAT), *also("responses"), *filled(RESPONSES_HOW)],
         "adapter": [f"**{DO_NOT_DEPLOY}**", LSAL, *filled(ADAPTER_WHAT, ADAPTER_HOW)],
+        "adapter_nopre": [
+            f"**{DO_NOT_DEPLOY}**",
+            LSAL,
+            *filled(ADAPTER_NOPRE_WHAT, ADAPTER_HOW, merged=_merged(records, "strip")),
+        ],
         "repaired": [
             f"**{NOT_CERTIFIED}** The numbers below are measurements under the stated conditions, not a safety claim.",
             *([NOT_SERVED] if settings.publish.space_not_serving else []),
@@ -259,10 +329,19 @@ def render_cards(
     tables: Tables | None = None,
     records: Iterable[RunRecord] = (),
     writeup: str | None = None,
+    nopreamble: Tables | None = None,
 ) -> dict[str, str]:
-    """README text per repo id for the six published repos; ``writeup`` defaults to the article in the code repo."""
-    rendered = {}
-    for key, body in _bodies(settings, manifest, tables, records).items():
+    """README text per repo id for every repo a publication may open; ``writeup`` defaults to the code repo's article.
+
+    ``nopreamble`` is the table of the runs with no safety preamble. The cards name that condition once it is
+    given, or a full run made under it is among ``records``.
+    """
+    records = list(records)
+    second = nopreamble is not None or any(
+        run.mode == "full" and ids.preamble_of(run.notes) == "strip" for run in records
+    )
+    rendered, repos = {}, repo_ids(settings)
+    for key, body in _bodies(settings, manifest, tables, records, nopreamble, second).items():
         licence = license_of(key, manifest)
         if key in DATASETS:
             data = DatasetCardData(
@@ -273,14 +352,15 @@ def render_cards(
             data = ModelCardData(
                 license=licence,
                 base_model=settings.sources.model,
-                library_name={"adapter": "peft", "repaired": "transformers"}.get(key),
+                library_name={**dict.fromkeys(ADAPTERS, "peft"), "repaired": "transformers"}.get(key),
                 language=list(settings.languages),
                 tags=[*TAGS, "gguf"] if key == "gguf" else TAGS,
             )
             top = []
-        blocks = [*top, f"# {TITLES[key]}", *body, "\n".join(_provenance(settings, manifest, tables, writeup))]
-        text = f"---\n{data.to_yaml()}\n---\n\n" + "\n\n".join(blocks) + "\n"
-        rendered[f"{settings.owner}/{getattr(settings.repos, key)}"] = text
+        # the second adapter exists only through a run of the second condition
+        provenance = _provenance(settings, manifest, tables, writeup, second or key == ADAPTERS[1])
+        blocks = [*top, f"# {TITLES[key]}", *body, "\n".join(provenance)]
+        rendered[repos[key]] = f"---\n{data.to_yaml()}\n---\n\n" + "\n\n".join(blocks) + "\n"
     return rendered
 
 
@@ -304,7 +384,7 @@ def missing(key: str, text: str | None, settings: Settings, manifest: Manifest |
         lacks.append("the content warning as the first line")
     needles = {
         "the harmful-prompts notice": f"harmful prompts from `{settings.sources.harmful}`" if key == "eval" else "",
-        "the do-not-deploy notice": DO_NOT_DEPLOY if key == "adapter" else "",
+        "the do-not-deploy notice": DO_NOT_DEPLOY if key in ADAPTERS else "",
         "the not-certified notice": NOT_CERTIFIED if key in ("repaired", "gguf") else "",
         "the base model's licence": MODEL_LICENSE if key in MODELS else "",
         "the link to the code": settings.code.origin,

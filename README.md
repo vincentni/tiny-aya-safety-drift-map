@@ -47,6 +47,9 @@ The tests are offline. Commands that reach the Hub read `HF_TOKEN`, or the token
     uv run driftmap launch repair --mode full --wait -- --apply ALPHA    # push the repaired model
     uv run driftmap judge reparse --checkpoint REPO@SHA                  # after a parser change
     uv run driftmap scan <path>...               # tokens, account ids, home paths, before publishing
+    uv run driftmap publish plan --writeup URL   # scan every commit, print what a run would do
+    uv run driftmap publish run --writeup URL    # card, open and list the repos; try --dry-run first
+    uv run driftmap publish check                # which repos are public, carded and listed
 
 `--mode` is `smoke` by default for `plan`, `launch`, `judge closed` and `repair choose`: a short
 rehearsal on a few rows. Arguments after `--` go to the job script. Every command has `--help`.
@@ -64,6 +67,11 @@ prints one line per alpha and stores the record as `alpha_screen.json` in the re
 `chosen`, `failed` when no alpha passes both bars, or `screened` while labels are missing or cover
 under 90% of an alpha's harmful prompts. The apply job pushes the model at the chosen alpha and refuses
 any other value.
+
+`publish run` refuses before its first write when any commit of a repo holds a token, an address,
+a home path, a cache path or a file the scan cannot read, when a merged or smoke repo is public or
+sits in a collection (`--delete-intermediates` removes those repos first), when a required repo or
+a collection is missing, when a card would be incomplete, or when the token is not the owner's.
 
 ## The judge
 
@@ -123,6 +131,8 @@ Names under the owner, from `[repos]` in `driftmap.toml`:
 - `safety-drift-map-results` (dataset): run records, tables and decisions.
 - `tiny-aya-global-drift-lora` (model): the drifted adapter.
 - `tiny-aya-global-drift-merged` (model, private): the merged drifted weights, an intermediate.
+- The same two names ending in `-nopre`, once a drift run with no safety preamble exists: its
+  adapter is published like the first, its merged weights stay private.
 - `tiny-aya-global-repaired` and `tiny-aya-global-repaired-GGUF` (models): the repaired model and its q4_k_m file.
 
 ## Licences and use
@@ -140,4 +150,4 @@ Names under the owner, from `[repos]` in `driftmap.toml`:
 0 done, 1 unexpected error, 2 usage or configuration, 3 not ready, 4 refused by a guard
 (or the judge stopped: throttling, quota, too many answers without labels),
 5 job lost or not found, 6 redaction finding, 7 upload failed, 8 drift decision needed,
-12 a data, label or record file is not what it should be, 130 interrupted.
+12 a data, label or record file, or the published state, is not what it should be, 130 interrupted.

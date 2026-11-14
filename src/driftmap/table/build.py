@@ -9,6 +9,7 @@ from statistics import fmean
 
 from pydantic import ValidationError
 
+from .. import quant
 from ..core import ids
 from ..core.records import (
     AlphaScreen,
@@ -63,19 +64,20 @@ class DuplicateKey(DriftmapError):
 
 
 def _repo_columns(settings: Settings, mode: Mode | None = None) -> dict[str, str]:
-    """Column per repo name; a full build leaves out the repos a smoke drift run pushes to."""
+    """Column per repo name; a full build leaves out the repos a smoke run pushes to."""
     repos = settings.repos
-    names = {
-        settings.sources.model.rpartition("/")[2]: "baseline",
+    placed = {
+        settings.sources.model: "baseline",
         repos.adapter: "drifted",
         repos.merged: "drifted",
         repos.repaired: "repaired",
         repos.gguf: "repaired_q4",
     }
-    trained = [repo_names(settings, "full", "strip")]
+    placed |= dict.fromkeys(repo_names(settings, "full", "strip"), "drifted")
     if mode != "full":
-        trained += [repo_names(settings, "smoke", preamble) for preamble in ids.PREAMBLES]
-    return names | {repo.rpartition("/")[2]: "drifted" for pair in trained for repo in pair}
+        placed |= {repo: "drifted" for preamble in ids.PREAMBLES for repo in repo_names(settings, "smoke", preamble)}
+        placed |= dict(zip(quant.repo_names(settings, "smoke"), ("repaired", "repaired_q4"), strict=True))
+    return {repo.rpartition("/")[2]: column for repo, column in placed.items()}
 
 
 def _reference(checkpoint: str) -> ids.RepoRef | None:

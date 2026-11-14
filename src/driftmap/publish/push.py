@@ -21,6 +21,7 @@ from driftmap.core.records import Manifest, RunRecord, Tables, load
 from driftmap.core.schemas import DriftmapError, ExitCode
 from driftmap.core.settings import Settings
 from driftmap.publish import cards, collections
+from driftmap.scripts.drift import repo_names
 
 SMOKE_SUFFIX = ids.repo_suffix("smoke")
 CARD = "README.md"
@@ -30,19 +31,30 @@ ORDER = (
     ("results", "dataset", "data", True),
     ("responses", "dataset", "data", True),
     ("adapter", "model", "models", True),
+    ("adapter_nopre", "model", "models", False),
     ("repaired", "model", "models", False),
     ("gguf", "model", "models", False),
 )
-ROWS = ("smoke/*", "labels/*/superseded/*")
-# removed by a repo's card commit; the adapter's training state is not part of the artifact
-STALE = {"eval": ROWS, "results": ROWS, "responses": ROWS, "adapter": ("last-checkpoint/*", "training_args.bin")}
+# a smoke tree goes whole, the one with no safety preamble inside it too; the full trees lose their superseded labels
+ROWS = ("smoke/*", "labels/*/superseded/*", f"{cards.TREE}labels/*/superseded/*")
+CHECKPOINT = ("last-checkpoint/*", "training_args.bin")
+# removed by a repo's card commit; an adapter's training state is not part of the artifact
+STALE = {**dict.fromkeys(cards.DATASETS, ROWS), **dict.fromkeys(cards.ADAPTERS, CHECKPOINT)}
 WEIGHTS = ["adapter_model.bin", "pytorch_model*.bin"]
-# pickles the trainer leaves beside the weights; the adapter is refused while one is left
+# pickles the trainer leaves beside the weights; an adapter is refused while one is left
 PICKLES = (".bin", ".pt", ".pth")
 # never fetched from a model repo; a dataset is read whole
 BINARY = ["*.safetensors", "*.gguf", *WEIGHTS, "*.onnx"]
+# where `table build --preamble strip` uploads its table
+STRIPPED_TABLES = f"{cards.TREE}tables/tables-nopreamble.json"
+# what the cards are rendered from: file, the repo it is in, the record it holds
+CARD_INPUTS = (
+    ("manifest.json", "eval", Manifest),
+    ("tables/tables.json", "results", Tables),
+    (STRIPPED_TABLES, "results", Tables),
+)
 # read again for the cards
-KEPT = ["manifest.json", "tables/tables.json", "runs/*.json", CARD]
+KEPT = [*(name for name, _, _ in CARD_INPUTS), "runs/*.json", CARD]
 EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}")
 RULES = {**redact.PATTERNS, "email": EMAIL}
 CACHE = ".cache"
@@ -185,26 +197,39 @@ class Check(NamedTuple):
 
 def targets(settings: Settings) -> list[Target]:
     """The repos a publication makes public, in the order they are handled; a usage error on a name it must not open."""
-    seen: dict[str, str] = {}
+    repos, seen = cards.repo_ids(settings), {}
     for key, *_ in ORDER:
-        name = getattr(settings.repos, key).casefold()
+        name = repos[key].partition("/")[2].casefold()
         if name.endswith(SMOKE_SUFFIX):
             raise DriftmapError(
-                ExitCode.USAGE, f"repos.{key} = {name} ends with {SMOKE_SUFFIX}; a smoke repo is never published"
+                ExitCode.USAGE, f"{_setting(key)} = {name} ends with {SMOKE_SUFFIX}; a smoke repo is never published"
             )
         if name in seen:
-            raise DriftmapError(ExitCode.USAGE, f"repos.{key} and repos.{seen[name]} name one repo")
+            raise DriftmapError(ExitCode.USAGE, f"{_setting(key)} and {_setting(seen[name])} name one repo")
         seen[name] = key
-    return [Target(key, f"{settings.owner}/{getattr(settings.repos, key)}", *rest) for key, *rest in ORDER]
+    return [Target(key, repos[key], *rest) for key, *rest in ORDER]
+
+
+def _setting(key: str) -> str:
+    """The setting a target takes its name from, as a refusal names it."""
+    derived = key == cards.ADAPTERS[1]
+    return f"repos.adapter with {ids.repo_suffix('full', 'strip')}" if derived else f"repos.{key}"
+
+
+def _merged(settings: Settings) -> list[str]:
+    """The merged checkpoint of each training condition; neither is ever published."""
+    return [repo_names(settings, "full", preamble)[1] for preamble in ids.PREAMBLES]
 
 
 def intermediates(settings: Settings) -> list[tuple[str, str]]:
-    """Repo id and type of the merged checkpoint and of every smoke repo; a usage error when one is also published."""
+    """Repo id and type of the merged checkpoints and of every smoke repo; a usage error when one is also published."""
     owner, repos = settings.owner, settings.repos
     keys = ("adapter", "merged", "repaired", "gguf", "eval", "results", "responses")
     kinds = {key: "dataset" if key in cards.DATASETS else "model" for key in keys}
     smoke = [(f"{owner}/{getattr(repos, key)}{SMOKE_SUFFIX}", kinds[key]) for key in keys]
-    hidden = [(f"{owner}/{repos.merged}", "model"), *smoke]
+    # a smoke drift run with no safety preamble pushes to a pair of its own
+    smoke += [(repo, "model") for repo in repo_names(settings, "smoke", "strip")]
+    hidden = [*((repo, "model") for repo in _merged(settings)), *smoke]
     published = {target.repo.casefold() for target in targets(settings)}
     for repo, _ in hidden:
         try:
@@ -250,7 +275,7 @@ def _stale(target: Target, files: tuple[str, ...]) -> list[str]:
 
 
 def _training_state(target: Target, files: tuple[str, ...]) -> list[str]:
-    if target.key != "adapter":
+    if target.key not in cards.ADAPTERS:
         return []
     names = [path.rpartition("/")[2] for path in files]
     weights = set(filter_repo_objects(names, allow_patterns=WEIGHTS))
@@ -265,11 +290,6 @@ def _stray(files: tuple[str, ...]) -> list[str]:
         return CACHE not in parts and (bool(TEMP_PARTS & parts) or path.endswith(TEMP_SUFFIXES))
 
     return [path for path in files if temporary(path)]
-
-
-def _is_row(parts: tuple[str, ...]) -> bool:
-    parts = parts[1:] if parts[:1] == (redact.SMOKE_TREE,) else parts
-    return len(parts) > 1 and parts[0] in redact.DIGIT_EXEMPT_DIRS
 
 
 def _safe(name: str) -> str:
@@ -328,7 +348,7 @@ def _unread(
         tree = scans.trees[target.repo, sha]
         skipped = _matching([path for path, _ in tree], BINARY) if target.repo_type == "model" else set()
         for path, blob in tree:
-            key = (_is_row(tuple(path.split("/"))), blob)
+            key = (redact.is_row(path.split("/")), blob)
             if path not in skipped and key not in scans.blobs:
                 wanted.setdefault(key, (target, sha, path))
 
@@ -338,7 +358,7 @@ def _fetch(hub: Hub, target: Target, sha: str, path: str, scratch: Path) -> tupl
     try:
         local = Path(hub.hf_hub_download(RepoRef(target.repo, sha, path), folder, repo_type=target.repo_type))
         data = local.read_bytes()
-        row = _is_row(tuple(path.split("/")))
+        row = redact.is_row(path.split("/"))
         found = [(finding.line, finding.pattern) for finding in redact.scan([local], data_root=folder)]
         # a NUL marks bytes: random ones spell a short address often enough to refuse megabytes of optimizer state
         if not row and b"\x00" not in data:
@@ -368,11 +388,11 @@ def _found(target: Target, shas: list[str], scans: Scans) -> Found:
         tree = scans.trees[target.repo, sha]
         paths = [path for path, _ in tree]
         skipped = _matching(paths, BINARY) if target.repo_type == "model" else set()
-        # the adapter's checkpoint pickles are bytes by nature and leave with its card
-        tolerated = {path for path in _matching(paths, STALE["adapter"]) if path.endswith(PICKLES)}
+        # an adapter's checkpoint pickles are bytes by nature and leave with its card
+        tolerated = {path for path in _matching(paths, CHECKPOINT) if path.endswith(PICKLES)}
         for path, blob in tree:
             parts = tuple(path.split("/"))
-            row = _is_row(parts)
+            row = redact.is_row(parts)
             # the leading slash lets a name that starts at a home folder match; a row folder is named after a commit
             rules = {rule: pattern for rule, pattern in RULES.items() if not (row and rule == "account_id")}
             hits = [(path, NAME, rule) for rule, pattern in rules.items() if pattern.search(f"/{path}")]
@@ -380,7 +400,7 @@ def _found(target: Target, shas: list[str], scans: Scans) -> Found:
             if path not in skipped:
                 verdict = scans.blobs[row, blob]
                 hits += [(path, line, rule) for line, rule in verdict.hits]
-                if not verdict.text and not (target.key == "adapter" and path in tolerated):
+                if not verdict.text and not (target.key in cards.ADAPTERS and path in tolerated):
                     hits.append((path, UNREADABLE, ""))
             for hit in hits:
                 held.setdefault(hit, []).append(sha)
@@ -473,19 +493,23 @@ def plan(settings: Settings, hub: Hub, *, writeup: str | None = None, scans: Sca
             found.append(_found(target, shas[target.key], scans))
             secrets += [(ExitCode.REDACTION, text) for text in found[-1].secrets]
             other += [(ExitCode.INTEGRITY, text) for text in found[-1].other]
-        manifest = tables = None
-        try:
-            manifest = _parsed(Manifest, files.get("eval", {}), "manifest.json")
-            tables = _parsed(Tables, files.get("results", {}), "tables/tables.json")
-        except ValidationError as error:
-            other.append((ExitCode.INTEGRITY, f"{error.title} on the Hub does not parse; build and upload it again"))
+        parsed = []
+        for name, key, cls in CARD_INPUTS:
+            try:
+                parsed.append(_parsed(cls, files.get(key, {}), name))
+            except ValidationError:
+                parsed.append(None)
+                other.append((ExitCode.INTEGRITY, f"{name} on the Hub does not parse; build and upload it again"))
+        manifest, tables, stripped = parsed
         records = []
         for name, data in sorted(files.get("results", {}).items()):
             try:
                 records += [RunRecord.model_validate_json(data)] if name.startswith("runs/") else []
             except ValidationError:
                 continue
-        rendered = cards.render_cards(settings, manifest=manifest, tables=tables, records=records, writeup=writeup)
+        rendered = cards.render_cards(
+            settings, manifest=manifest, tables=tables, records=records, writeup=writeup, nopreamble=stripped
+        )
         for target in present:
             state, card = states[target.key], rendered[target.repo]
             staged = Path(scratch, "cards", target.key, CARD)
@@ -523,7 +547,7 @@ def _addressed(text: str) -> list[int]:
 
 
 def _shelf_problems(settings: Settings, shelves: dict[str, Any | None]) -> list[Problem]:
-    merged = f"{settings.owner}/{settings.repos.merged}".casefold()
+    merged = {repo.casefold() for repo in _merged(settings)}
     problems = []
     for shelf, found in shelves.items():
         name = getattr(settings.repos, collections.SHELVES[shelf])
@@ -535,7 +559,7 @@ def _shelf_problems(settings: Settings, shelves: dict[str, Any | None]) -> list[
         problems += [
             (ExitCode.INTEGRITY, f"{item.item_id} is in a collection")
             for item in found.items
-            if item.item_id.casefold().endswith(SMOKE_SUFFIX) or item.item_id.casefold() == merged
+            if item.item_id.casefold().endswith(SMOKE_SUFFIX) or item.item_id.casefold() in merged
         ]
     return problems
 
@@ -751,7 +775,7 @@ def check(settings: Settings, hub: Hub) -> Check:
 
 
 def delete_intermediates(settings: Settings, hub: Hub, *, echo: Echo = print) -> list[str]:
-    """Delete the merged checkpoint and every smoke repo for good, as the owner; returns the repos deleted."""
+    """Delete the merged checkpoints and every smoke repo for good, as the owner; returns the repos deleted."""
     _identity(settings, hub)
     gone = []
     for repo, repo_type in intermediates(settings):

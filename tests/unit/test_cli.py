@@ -21,7 +21,7 @@ from hypothesis import settings as examples
 from hypothesis import strategies as st
 from typer.testing import CliRunner
 
-from driftmap import cli
+from driftmap import cli, quant
 from driftmap.core import clients, ids
 from driftmap.core import hub as core_hub
 from driftmap.core.hub import Hub
@@ -62,7 +62,7 @@ from driftmap.repair import screen_gen, select
 from driftmap.table import build as table_build
 from driftmap.table import render
 from driftmap.table.build import NOT_COMPARABLE
-from tests.fakes import FakeHub, FakeJobsClient, judge_world
+from tests.fakes import FakeHub, FakeJobsClient, judge_world, published
 from tests.fakes import labels as fake_labels
 from tests.fakes.datasets import (
     BENIGN,
@@ -93,6 +93,7 @@ VERBS = [
     "launch",
     "ledger",
     "plan",
+    "publish",
     "ready",
     "repair",
     "scan",
@@ -284,6 +285,7 @@ def test_help_lists_every_verb():
     assert groups == {"data": ["build"], "ledger": ["reconcile"], "table": ["build"], "judge": ["closed", "reparse"]}
     assert sorted(typer.main.get_command(cli.app).commands["decide"].commands) == ["drift"]
     assert sorted(typer.main.get_command(cli.app).commands["repair"].commands) == ["choose"]
+    assert sorted(typer.main.get_command(cli.app).commands["publish"].commands) == ["check", "plan", "run"]
 
 
 def test_the_data_package_is_imported_only_inside_its_verb():
@@ -1155,7 +1157,9 @@ def test_table_build_takes_each_column_from_its_latest_ok_generate_run(world):
         return {row.checkpoint for row in tables.safety if "drift" in row.checkpoint}
 
     # labels of a revision no finished run generated are left on the Hub
-    assert run("table", "build").exit_code == 0 and drifted() == {fake_labels.CHECKPOINTS["drifted"]}
+    first = run("table", "build")
+    assert first.exit_code == 0 and drifted() == {fake_labels.CHECKPOINTS["drifted"]}
+    assert unread(first) == [f"left unread: labels/{ids.slug(later)}: no ok full run on record read it"]
     newer = datetime(2026, 11, 14, tzinfo=UTC)
     for changes in ({"status": "failed"}, {"mode": "smoke"}, {"kind": "judge"}):
         generated(world, "drifted", later, run_id="generate-full-again", started=newer, **changes)
@@ -1314,6 +1318,256 @@ def test_a_table_that_cannot_be_saved_is_not_shown_or_uploaded(world, monkeypatc
     result = run("table", "build")
     assert result.exit_code == ExitCode.INTEGRITY and "# Safety drift map" not in result.output
     assert "tables/tables.json" not in world.hub.repos[RESULTS]["main"]
+
+
+GGUF = f"{fake_labels.CHECKPOINTS['repaired_q4']}#{quant.GGUF_FILE}"
+STEERED = fake_labels.CHECKPOINTS["drifted"] + "--steer-l24-s1.0"
+
+
+def quant_evaluated(world, checkpoint=GGUF, **changes):
+    """Record a quant-eval run as the job writes it: the GGUF first, then the checkpoint it was converted from."""
+    record = generated(world, "repaired_q4", checkpoint.partition("#")[0], **{"kind": "quant_eval", **changes})
+    source, revision = fake_labels.REFS["repaired"]
+    record.inputs.append(Ref(kind="model", repo=source + ids.repo_suffix(record.mode), revision=revision))
+    world.push(f"runs/{record.run_id}.json", record.model_dump_json(by_alias=True).encode())
+
+
+def states(world):
+    tables = Tables.model_validate_json((world.root / TABLES_PATH).read_bytes())
+    return {column: (state.state, state.kind) for column, state in tables.columns.items()}
+
+
+def unread(result):
+    return [line for line in result.output.splitlines() if line.startswith("left unread: ")]
+
+
+def test_the_q4_column_follows_quant_eval_runs_and_names_the_folders_it_leaves(world):
+    evaluation(world, {"baseline": 0, "drifted": 2, "repaired": 1})
+    put_labels(world, fake_labels.column_rows("repaired_q4", unsafe=1, checkpoint=GGUF))
+    slug = ids.slug(GGUF)
+
+    # labels alone do not fill the column: no finished run says which file they belong to
+    bare = run("table", "build")
+    assert bare.exit_code == 0 and states(world)["repaired_q4"] == ("not_run", "q4_k_m")
+    assert unread(bare) == [f"left unread: labels/{slug}: no ok full run on record read it"]
+    for changes in ({"status": "failed"}, {"mode": "smoke"}, {"kind": "quant"}):
+        quant_evaluated(world, run_id="quant_eval-full-1", **changes)
+        assert run("table", "build").exit_code == 0 and states(world)["repaired_q4"][0] != "tabled", changes
+
+    quant_evaluated(world, run_id="quant_eval-full-1")
+    built = run("table", "build")
+
+    assert built.exit_code == 0, built.output
+    assert states(world)["repaired_q4"] == ("tabled", "q4_k_m") and unread(built) == []
+    tables = Tables.model_validate_json((world.root / TABLES_PATH).read_bytes())
+    assert GGUF in {row.checkpoint for row in tables.safety}
+
+    # a later file takes the column; the earlier folder stays on the Hub, named
+    later = GGUF.replace("c" * 40, "e" * 40)
+    put_labels(world, fake_labels.column_rows("repaired_q4", checkpoint=later))
+    put_labels(world, fake_labels.column_rows("baseline", checkpoint=f"{OWNER}/some-other-model@{'9' * 40}"))
+    quant_evaluated(world, later, run_id="quant_eval-full-2", started=datetime(2026, 11, 14, tzinfo=UTC))
+    moved = run("table", "build")
+    assert moved.exit_code == 0, moved.output
+    tables = Tables.model_validate_json((world.root / TABLES_PATH).read_bytes())
+    assert {row.checkpoint for row in tables.safety if "GGUF" in row.checkpoint} == {later}
+    assert unread(moved) == [
+        "left unread: labels/some-other-model--999999999999: not a checkpoint of this table",
+        f"left unread: labels/{slug}: a later ok run read {ids.slug(later)}",
+    ]
+
+
+def test_a_smoke_table_follows_the_smoke_quant_eval_run(world):
+    evaluation(world, {"baseline": 0}, mode="smoke")
+    rehearsed = GGUF.replace("@", "-smoke@")
+    put_labels(world, fake_labels.column_rows("repaired_q4", checkpoint=rehearsed), mode="smoke")
+    quant_evaluated(world, rehearsed, mode="smoke", run_id="quant_eval-smoke-1")
+
+    built = run("table", "build", "--mode", "smoke")
+
+    assert built.exit_code == 0, built.output
+    local = world.root / LOCAL / "results" / "smoke" / "tables" / "tables.json"
+    tables = Tables.model_validate_json(local.read_bytes())
+    assert tables.columns["repaired_q4"].state == "tabled" and unread(built) == []
+    assert rehearsed in {row.checkpoint for row in tables.safety}
+
+
+def test_a_steered_column_follows_steer_runs(world):
+    evaluation(world, {"baseline": 0, "drifted": 2})
+    steered = [row.model_copy(update={"checkpoint": STEERED}) for row in fake_labels.column_rows("drifted")]
+    put_labels(world, steered)
+    folder = f"labels/{ids.slug(STEERED)}"
+
+    bare = run("table", "build")
+    assert bare.exit_code == 0 and states(world)["repaired"] == ("not_run", "weights")
+    assert unread(bare) == [f"left unread: {folder}: no ok full run on record read it"]
+
+    # the steer run records the weights it steered; its folder is theirs with the steer suffix
+    generated(world, "drifted", kind="steer", run_id="steer-full-1")
+    built = run("table", "build")
+
+    assert built.exit_code == 0, built.output
+    assert states(world) == {
+        "baseline": ("tabled", "weights"),
+        "drifted": ("tabled", "weights"),
+        "repaired": ("tabled", "inference-time"),
+        "repaired_q4": ("not_run", "q4_k_m"),
+    }
+    assert unread(built) == []
+
+    # a steer run on other weights does not speak for this folder
+    other = fake_labels.CHECKPOINTS["drifted"].replace("a" * 40, "e" * 40)
+    generated(world, "drifted", other, kind="steer", run_id="steer-full-1")
+    moved = run("table", "build")
+    assert moved.exit_code == 0 and states(world)["repaired"] == ("not_run", "weights")
+    assert unread(moved) == [f"left unread: {folder}: no ok full run on record read it"]
+
+
+def test_a_torn_local_table_takes_its_drift_flag_from_the_copy_on_the_hub(world):
+    evaluation(world, {"baseline": 0, "drifted": 0})
+    assert run("table", "build").exit_code == 8
+    local, on_hub = world.root / TABLES_PATH, stored(world, "tables/tables.json")
+
+    # the flag the Hub copy holds is on file, not new
+    local.write_text("{")
+    assert run("table", "build").exit_code == 0
+    assert Tables.model_validate_json(local.read_bytes()).flags["drift_below_threshold"] is True
+
+    local.write_text("{")
+    generated(world, "drifted", notes=[f"{NOT_COMPARABLE}another seed"])
+    again = run("table", "build")
+
+    # the flag can no longer be evaluated: it stays, locally and on the Hub, and so does the guard
+    assert again.exit_code == ExitCode.DRIFT_BELOW_THRESHOLD and "driftmap decide drift" in again.stderr
+    assert local.read_bytes() == on_hub == stored(world, "tables/tables.json")
+    assert run("launch", "repair", "--dry-run").exit_code == 4
+
+    # a Hub copy that does not parse either holds no flag
+    local.write_text("{")
+    world.push("tables/tables.json", b"{")
+    assert run("table", "build").exit_code == 0
+    assert "drift_below_threshold" not in json.loads(stored(world, "tables/tables.json"))["flags"]
+
+
+LINK = "https://huggingface.co/blog/vincentnkq/drift-map"
+PUBLISHED = (*published.DATASETS, *published.MODELS)
+
+
+@pytest.fixture
+def shelf(monkeypatch):
+    """A checkout whose Hub holds the project's repos as the jobs leave them: private, uncarded, unlisted."""
+    fake = FakeHub(Path.cwd().with_name("published-hub"))
+    published.seed(fake)
+    return World(monkeypatch, Path.cwd(), hub=fake)
+
+
+def test_publish_plan_prints_the_plan_and_exits_with_its_first_problem(shelf):
+    # nothing is launched, so a stale readiness report is no obstacle
+    (shelf.root / READY_PATH).unlink()
+
+    clean = run("publish", "plan")
+
+    assert clean.exit_code == 0, clean.output
+    assert clean.output.splitlines()[0].split() == ["verb", "publish", "plan"]
+    assert "history scan: 21 file fetches over 6 commits" in clean.output
+    eval_line = f"{published.EVAL} (dataset): private -> public; card: write; delete 2 files; collection: add"
+    assert eval_line in clean.output and f"stays private: {published.MERGED} (model)" in clean.output
+    assert "problem: " not in clean.output
+
+    shelf.hub._commit(published.RESULTS, "job upload", {"logs/judge.log": f"token {TOKEN}\n".encode()})
+    refused = run("publish", "plan", "--writeup", LINK)
+
+    assert refused.exit_code == ExitCode.REDACTION == 6
+    assert f"writeup   {LINK}" in refused.output
+    assert [line.rpartition("/logs/")[2] for line in refused.output.splitlines() if line.startswith("problem: ")] == [
+        "judge.log:1: hf_token"
+    ]
+    assert "rotate the secret" in refused.output and TOKEN not in refused.output
+    assert "1 problem: `driftmap publish run` would refuse" in refused.stderr
+    assert published.writes(shelf.hub) == [] and set(PUBLISHED) <= shelf.hub.private
+
+
+def test_a_publish_dry_run_prints_the_plan_and_writes_nothing(shelf):
+    dry = run("publish", "run", "--dry-run", "--delete-intermediates", "--writeup", LINK)
+
+    assert dry.exit_code == 0, dry.output
+    assert dry.output.splitlines()[:4] == [
+        "verb      publish run",
+        f"writeup   {LINK}",
+        "dry-run   yes",
+        "delete    yes",
+    ]
+    assert f"{published.GGUF} (model): private -> public; card: write; " in dry.output
+    assert f"would delete: {published.MERGED} (model)" in dry.output
+    assert dry.output.splitlines()[-1] == "dry run: nothing was written"
+    assert published.writes(shelf.hub) == [] and set(PUBLISHED) <= shelf.hub.private
+    assert {published.MERGED, *published.SMOKE} <= set(shelf.hub.repos)
+
+
+def test_publish_run_cards_opens_and_lists_and_the_check_agrees(shelf):
+    before = run("publish", "check")
+    assert before.exit_code == ExitCode.INTEGRITY == 12 and before.output.splitlines()[0] == "verb      publish check"
+    assert f"- {published.EVAL} is private" in before.output and published.writes(shelf.hub) == []
+
+    done = run("publish", "run", "--writeup", LINK)
+
+    assert done.exit_code == 0, done.output
+    assert not (shelf.hub.private | shelf.hub.gated) & set(PUBLISHED)
+    assert {published.MERGED, *published.SMOKE} <= shelf.hub.private
+    for repo in PUBLISHED:
+        assert f"- Write-up: {LINK}" in shelf.hub.repos[repo]["main"]["README.md"].decode()
+        assert f"card: {repo}\n" in done.output and f"listed: {repo} in " in done.output
+    assert f"public: {published.EVAL} (dataset)" in done.output
+
+    shelf.hub.calls.clear()
+    after = run("publish", "check")
+    assert after.exit_code == 0 and published.writes(shelf.hub) == []
+    assert f"{published.EVAL} yes yes no yes yes apache-2.0, cc-by-4.0" in flat(after)
+    assert f"{published.MERGED} yes no no no no -" in flat(after)
+    again = run("publish", "run", "--writeup", LINK)
+    assert again.exit_code == 0 and f"already public: {published.GGUF} (model)" in again.output
+
+
+def test_a_failed_publish_exits_7_and_names_the_command_to_run_again(shelf):
+    real, left = shelf.hub.upload_folder, [1]
+
+    def upload_folder(**kwargs):
+        if kwargs["repo_id"] == published.RESULTS and left[0]:
+            left[0] -= 1
+            shelf.hub._raise(403, f"https://huggingface.co/api/datasets/{published.RESULTS}/commit/main")
+        return real(**kwargs)
+
+    shelf.hub.upload_folder = upload_folder
+
+    failed = run("publish", "run", "--delete-intermediates", "--writeup", LINK)
+
+    assert failed.exit_code == ExitCode.PUSH_FAILED == 7
+    assert failed.stderr.splitlines() == [
+        f"error: the card upload to {published.RESULTS} failed (403); public now: none",
+        f"resume: driftmap publish run --writeup {LINK} --delete-intermediates; finished steps are skipped",
+    ]
+    assert "deleted: " + published.MERGED in failed.output and set(PUBLISHED) <= shelf.hub.private
+    resumed = run("publish", "run", "--writeup", LINK, "--delete-intermediates")
+    assert resumed.exit_code == 0, resumed.output
+    assert not shelf.hub.private & set(PUBLISHED) and published.MERGED not in shelf.hub.repos
+
+
+def test_publish_passes_the_library_refusals_through_and_checks_its_link(shelf, monkeypatch):
+    with monkeypatch.context() as patch:
+        patch.setattr(cli, "load_settings", lambda path: pytest.fail("the config was read"))
+        for verb in ("plan", "run"):
+            bad = run("publish", verb, "--writeup", "docs/article.md")
+            assert bad.exit_code == 2 and "--writeup is the http(s) link" in flat(bad)
+        assert run("publish", "check", "--writeup", LINK).exit_code == 2
+
+    shelf.hub.private.discard(published.MERGED)
+    exposed = run("publish", "run")
+    assert exposed.exit_code == ExitCode.INTEGRITY and f"{published.MERGED} is public" in exposed.stderr
+
+    shelf.hub.user = "someone-else"
+    stranger = run("publish", "run")
+    assert stranger.exit_code == ExitCode.READINESS and "someone-else" in stranger.stderr
+    assert published.writes(shelf.hub) == [] and set(PUBLISHED) <= shelf.hub.private
 
 
 def test_judge_reparse_hands_the_checkpoint_to_the_library(world, monkeypatch):
