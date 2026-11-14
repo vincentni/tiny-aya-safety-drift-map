@@ -46,7 +46,7 @@ from driftmap.jobs import launcher, readiness
 from driftmap.jobs.kinds import KINDS, State, prerequisites
 from driftmap.jobs.ledger import Ledger
 from driftmap.jobs.plan import MASK, SECRET_NAMES
-from driftmap.jobs.snapshot import DECISION_PATH, LOCAL, TABLES_PATH, Deps, _billing_used, write_decision
+from driftmap.jobs.snapshot import DECISION_PATH, LOCAL, TABLES_PATH, Deps, _billing_used, tables_path, write_decision
 
 log = logging.getLogger(__name__)
 
@@ -476,10 +476,19 @@ def launch(
     rows = {"kind": kind.value, "mode": mode, "dry_run": dry_run, "wait": wait, "limit": limit}
     settings, deps = _open("launch", **rows, job_args=args, overrides=overrides, reason=reason or None)
     _launch_inputs(deps.repo_root)
-    missing = []
+    missing, named = [], None
     if kind.value == "repair":
         apply = _apply_alpha(parsed, settings, mode)
-        missing = prerequisites("repair", _state(settings, deps, mode, None, apply=apply)("repair"))
+        chosen = {"fine_tune": parsed.fine_tune, "preamble": parsed.preamble}
+        missing = prerequisites("repair", _state(settings, deps, mode, None, apply=apply, **chosen)("repair"))
+        if parsed.fine_tune != "standard":
+            # naming the fine-tune stands for the drift decision, so its own tables must show it measured
+            named = (parsed.fine_tune, parsed.preamble)
+            held = tables_path(parsed.preamble, parsed.fine_tune)
+            table = _record(Tables, deps.repo_root / held)
+            if table is None or "drifted" not in table.columns or table.columns["drifted"].state != "tabled":
+                build = f"driftmap table build --preamble {parsed.preamble} --fine-tune {parsed.fine_tune}"
+                missing.append(f"{held.name} with the fine-tuned column tabled; run `{build}`")
     elif kind.value in ("quant", "quant_eval"):
         missing = _quant_missing(kind.value, parsed, settings, deps.hub, mode)
     if missing:
@@ -499,6 +508,7 @@ def launch(
         override_soft=override_soft,
         limit=limit,
         args=args,
+        **({"named": named} if named else {}),
     )
 
 
@@ -537,19 +547,30 @@ def _snapshot(hub: Hub, repo: str, scratch: str, patterns: list[str], head: Any 
     return _files(hub, repo, (head or _head(hub, repo)).sha, scratch, patterns)
 
 
-def _results(settings: Settings, hub: Hub, mode: str = "full") -> tuple[list[RunRecord], AlphaScreen | None]:
-    """Run records, by run id, and the alpha screen of ``mode`` at the results repo's head; a torn file is left out."""
+def _results(
+    settings: Settings, hub: Hub, mode: str = "full", preamble: str = "keep", fine_tune: str = "standard"
+) -> tuple[list[RunRecord], AlphaScreen | None]:
+    """Run records, by run id, and an alpha screen at the results repo's head; a torn file is left out.
+
+    The screen is the one of ``mode``, of the fine-tune and of the prompt condition it was screened under.
+    """
     from driftmap.repair.screen_gen import screen_path
 
+    stored = screen_path(mode, preamble, fine_tune)
     with tempfile.TemporaryDirectory(prefix="driftmap-results-") as scratch:
-        root = _snapshot(hub, f"{settings.owner}/{settings.repos.results}", scratch, ["runs/*.json", screen_path(mode)])
+        root = _snapshot(hub, f"{settings.owner}/{settings.repos.results}", scratch, ["runs/*.json", stored])
         records = [_parsed(RunRecord, path) for path in sorted((root / "runs").glob("*.json"))]
-        return [record for record in records if record], _parsed(AlphaScreen, root / screen_path(mode))
+        return [record for record in records if record], _parsed(AlphaScreen, root / stored)
 
 
-def _drifted(records: Iterable[RunRecord], settings: Settings, mode: str) -> tuple[RepoRef, str] | None:
-    """The merged checkpoint of the latest ok drift run of ``mode`` and its weights hash, as the repair job picks it."""
-    repo = f"{settings.owner}/{settings.repos.merged}{ids.repo_suffix(mode)}"
+def _drifted(
+    records: Iterable[RunRecord], settings: Settings, mode: str, fine_tune: str = "standard"
+) -> tuple[RepoRef, str] | None:
+    """The merged checkpoint of the latest ok drift run of ``mode`` and its weights hash, as the repair job picks it.
+
+    ``fine_tune`` names the fine-tune whose merged repo is meant.
+    """
+    repo = f"{settings.owner}/{settings.repos.merged}{ids.repo_suffix(mode, ids.FINE_TUNES[fine_tune])}"
     for run in reversed(sorted(records, key=lambda run: run.started)):
         pushed = next((ref for ref in run.outputs if ref.repo == repo), None)
         if (run.kind, run.status, run.mode) == ("drift", "ok", mode) and run.merged_sha256 and pushed:
@@ -590,27 +611,43 @@ def _quant_missing(kind: str, parsed: argparse.Namespace, settings: Settings, hu
     return ["; ".join([f"a finished quant run that pushed {gguf}", *other[:1]])]
 
 
-def _benign_labelled(settings: Settings, hub: Hub, checkpoint: RepoRef, mode: str) -> frozenset[str]:
-    """Languages whose benign label rows of ``checkpoint`` are in the evaluation dataset."""
+def _benign_labelled(
+    settings: Settings, hub: Hub, checkpoint: RepoRef, mode: str, preamble: str = "keep"
+) -> frozenset[str]:
+    """Languages whose benign label rows of ``checkpoint`` under ``preamble`` are in the evaluation dataset."""
     slug = ids.slug(checkpoint)
     with tempfile.TemporaryDirectory(prefix="driftmap-labels-") as scratch:
-        wanted = [ids.labels_path(slug, "*", mode, benign=True)]
+        wanted = [ids.labels_path(slug, "*", mode, benign=True, preamble=preamble)]
         root = _snapshot(hub, f"{settings.owner}/{settings.repos.eval}", scratch, wanted)
-        paths = {code: root / ids.labels_path(slug, code, mode, benign=True) for code in settings.languages}
+        paths = {
+            code: root / ids.labels_path(slug, code, mode, benign=True, preamble=preamble)
+            for code in settings.languages
+        }
         return frozenset(code for code, path in paths.items() if path.is_file())
 
 
 def _state(
-    settings: Settings, deps: Deps, mode: str, target: str | None, *, apply: float | None = None
+    settings: Settings,
+    deps: Deps,
+    mode: str,
+    target: str | None,
+    *,
+    apply: float | None = None,
+    fine_tune: str = "standard",
+    preamble: str = "keep",
 ) -> Callable[[str], State]:
-    """Reader of what the Hub holds before a step is submitted; ``apply`` is the alpha the repair step is to push."""
+    """Reader of what the Hub holds before a step is submitted; ``apply`` is the alpha the repair step is to push.
+
+    ``fine_tune`` and ``preamble`` name the fine-tune a repair step works on and its prompt condition.
+    """
+    arm = ids.repo_suffix(mode, ids.FINE_TUNES[fine_tune])
 
     def output(record: RunRecord | None, repo: str) -> str | None:
         refs = record.outputs if record else []
         return next((ref.revision for ref in refs if ref.repo == f"{settings.owner}/{repo}"), None)
 
     def read(kind: str) -> State:
-        records, screen = _results(settings, deps.hub, mode)
+        records, screen = _results(settings, deps.hub, mode, preamble, fine_tune)
         # only ok runs of this mode under this config count
         runs = {
             record.run_id: record
@@ -623,15 +660,15 @@ def _state(
         benign: frozenset[str] = frozenset()
         if kind == "repair":
             # the job takes its drift run and the stored screen whatever config they were made under
-            drifted, merged = _drifted(records, settings, mode) or (None, None)
-            benign = _benign_labelled(settings, deps.hub, drifted, mode) if drifted else benign
+            drifted, merged = _drifted(records, settings, mode, fine_tune) or (None, None)
+            benign = _benign_labelled(settings, deps.hub, drifted, mode, preamble) if drifted else benign
         return State(
             languages=tuple(settings.languages),
             checkpoint=target or "drifted",
             apply=apply,
             merged_sha256=merged,
             benign_labels=benign,
-            repaired_revision=output(ok.get("repair"), settings.repos.repaired + ids.repo_suffix(mode)),
+            repaired_revision=output(ok.get("repair"), settings.repos.repaired + arm),
             gguf_record=output(ok.get("quant"), settings.repos.gguf + ids.repo_suffix(mode)) is not None,
             recover_status=screen.recover_status if screen and (kind == "repair" or "repair" in ok) else None,
             chosen=screen.chosen if screen and kind == "repair" else None,
@@ -811,10 +848,8 @@ def _of_fine_tune(name: str, fine_tune: str) -> str:
 
 
 def _tables_name(preamble: str, fine_tune: str = "standard") -> str:
-    """File of a condition's tables: tables.json, which alone gates the repair, or tables-<tree>.json beside it."""
-    tree = ids.tree("full", preamble).strip("/")
-    name = f"{TABLES_PATH.stem}-{tree}{TABLES_PATH.suffix}" if tree else TABLES_PATH.name
-    return _of_fine_tune(name, fine_tune)
+    """File of a condition's tables: tables.json, or tables-<tree>[-<fine-tune>].json beside it."""
+    return tables_path(preamble, fine_tune).name
 
 
 def _read_folders(

@@ -23,7 +23,7 @@ from tests.fakes import FakeClock, FakeHub
 from tests.fakes.labels import judge_config, run_record
 from tests.fakes.safetune import FakeSafeTune
 from tests.fakes.settings import BASE, settings_toml
-from tests.fakes.tokenizers import BOS_ID, build
+from tests.fakes.tokenizers import BOS_ID, SAFETY, build, served_template
 
 OWNER = BASE["owner"]
 MODEL = BASE["sources"]["model"]
@@ -123,21 +123,33 @@ class NoModelPushHub(FakeHub):
 
 
 class World:
-    def __init__(self, tmp_path, monkeypatch, checkpoints, *, mode="full", hub=FakeHub, settings=None):
+    def __init__(
+        self, tmp_path, monkeypatch, checkpoints, *, mode="full", hub=FakeHub, settings=None, fine_tune="standard"
+    ):
         (tmp_path / "scratch").mkdir()
         # the job's working directories go with the test's own
         monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "scratch"))
         self.mode = mode
-        self.suffix = "-smoke" if mode == "smoke" else ""
-        self.tree = "smoke/" if mode == "smoke" else ""
+        # the other fine-tune was trained, and is screened here, with no safety preamble
+        other = fine_tune != "standard"
+        self.suffix = ("-nopre" if other else "") + ("-smoke" if mode == "smoke" else "")
+        self.tree = ("smoke/" if mode == "smoke" else "") + ("nopreamble/" if other else "")
+        self.screen_file = f"{self.tree}alpha_screen{'-' + fine_tune if other else ''}.json"
         self.merged, self.repaired = MERGED + self.suffix, REPAIRED + self.suffix
         self.aligned_files, self.drifted_files = checkpoints[1], checkpoints[0]
+        tokenizer = build()
+        if other:
+            # both checkpoints carry a tokenizer whose template opens with a safety paragraph, as the served one does
+            tokenizer = build(template=served_template())
+            tokenizer.save_pretrained(tmp_path / "tokenizer")
+            files = {path.name: path.read_bytes() for path in (tmp_path / "tokenizer").iterdir()}
+            self.aligned_files, self.drifted_files = (held | files for held in (checkpoints[1], checkpoints[0]))
         self.fake = fake = hub(tmp_path / "hub")
         fake.add_repo(MODEL, gated=True, files=self.aligned_files)
         fake.add_repo(self.merged, private=True, files=self.drifted_files)
         for repo in (JUDGE, SMOL):
             fake.add_repo(repo, files={"tokenizer.json": b"{}", "config.json": b"{}", "model.safetensors": b"w"})
-        self.prefix = render.render(build(), "hello").rendered_prefix_sha256
+        self.prefix = render.render(tokenizer, "hello").rendered_prefix_sha256
         manifest = {"schema": "driftmap.manifest/1", "seed": BASE["seed"], "rendered_prefix_sha256": self.prefix}
         prompts = {f"prompts/{FOLDERS[set_]}/{code}.jsonl": jsonl(prompt_rows(set_, code)) for set_, code in UNITS}
         prompts["manifest.json"] = (json.dumps(manifest, indent=2) + "\n").encode()
@@ -202,6 +214,7 @@ class World:
         sha = sha or weights_sha(self.drifted_files)
         pushed = Ref(kind="model", repo=self.merged, revision=self.fake.heads[self.merged], sha256=sha)
         fields = {"run_id": f"drift-{self.mode}", "mode": self.mode, "merged_sha256": sha, "outputs": [pushed]}
+        fields |= {"notes": ["preamble: strip"]} if "-nopre" in self.suffix else {}
         record = run_record("drift", **{**fields, **changes})
         self.put(RESULTS, record_path(record.run_id), record.model_dump_json(by_alias=True).encode())
 
@@ -237,7 +250,7 @@ class World:
         screen = self.screen()
         labels = {alpha: self.judged_outside(self.name(alpha), count, rows) for alpha, count in unsafe.items()}
         decided = select.judged(screen, labels, self.judged_outside(self.aligned, baseline, rows))
-        self.put(RESULTS, f"{self.tree}alpha_screen.json", decided.model_dump_json(by_alias=True).encode())
+        self.put(RESULTS, self.screen_file, decided.model_dump_json(by_alias=True).encode())
         return decided
 
     def judged_outside(self, checkpoint, unsafe, rows=SCREEN):
@@ -276,7 +289,7 @@ class World:
         return PartialMarker.model_validate_json(self.stored(RESULTS, marker_path(run_id)))
 
     def screen(self):
-        return AlphaScreen.model_validate_json(self.stored(RESULTS, f"{self.tree}alpha_screen.json"))
+        return AlphaScreen.model_validate_json(self.stored(RESULTS, self.screen_file))
 
     def rows_path(self, alpha):
         slug = slug_of(self.merged, self.fake.heads[self.merged])
@@ -481,6 +494,51 @@ def test_a_chosen_alpha_is_applied_saved_with_its_provenance_and_pushed_privatel
     assert outputs[REPAIRED].sha256 == weights_sha(pushed) and set(outputs) == {REPAIRED, RESULTS}
     assert "applied alpha = 0.25, as the decided screen names it" in record.notes
     assert f"chosen = {screen.alphas[1].model_dump_json()}" in record.notes
+
+
+def test_the_other_fine_tune_is_screened_and_repaired_with_no_safety_preamble_under_names_of_its_own(make_world):
+    world = make_world(fine_tune="aggressive")
+    named = ("--fine-tune", "aggressive", "--preamble", "strip")
+    stripped = render.render(render.conditioned(build(template=served_template()), "strip"), "hello")
+    assert stripped.rendered_prefix_sha256 != world.prefix
+
+    assert world.run(*named, "--alphas", "0.25,0.5") == 0
+
+    record = world.record()
+    assert record.status == "ok" and record.inputs[0].repo == f"{MERGED}-nopre" == world.merged
+    assert "preamble: strip" in record.notes and f"drifted = {world.drifted}" in record.notes
+    assert world.paths(RESULTS).count("nopreamble/alpha_screen-aggressive.json") == 1
+    assert not [path for path in world.paths(RESULTS) if path.endswith("alpha_screen.json")]
+    slug = slug_of(world.merged, world.fake.heads[world.merged])
+    files = [f"nopreamble/screen/{slug}/alpha-{alpha:g}.jsonl" for alpha in (0.25, 0.5)]
+    assert world.paths(RESPONSES) == files
+    rows = world.rows(0.25)
+    assert {row.rendered_prefix_sha256 for row in rows} == {stripped.rendered_prefix_sha256}
+    assert not [row for row in rows if SAFETY.strip() in row.rendered_prompt]
+    # the chrF reference is this fine-tune's, measured with no safety preamble
+    assert world.screen().drifted_chrf_subset == pytest.approx(DRIFTED_CHRF)
+
+    decided = world.decide({0.25: 3, 0.5: 3})
+    assert world.run(*named, "--apply", "0.25", run_id=LATER) == 0
+
+    repaired = f"{REPAIRED}-nopre"
+    assert repaired in world.fake.private and REPAIRED not in world.fake.repos
+    pushed = world.fake.repos[repaired]["main"]
+    assert pushed["alpha_screen.json"] == world.stored(RESULTS, "nopreamble/alpha_screen-aggressive.json")
+    assert world.screen() == decided
+    provenance = json.loads(pushed["lexsi_provenance.json"])
+    assert [entry["ref"] for entry in provenance["inputs"]] == [world.drifted, world.aligned]
+    assert {ref.repo for ref in world.record(LATER).outputs} == {repaired, RESULTS}
+
+
+def test_a_fine_tune_without_a_drift_record_of_its_own_is_not_repaired(world):
+    world.fake.add_repo(f"{MERGED}-nopre", private=True, files=world.drifted_files)
+    world.fake.authorize(f"{MERGED}-nopre")
+
+    assert world.run("--fine-tune", "aggressive", "--preamble", "strip") == 12
+
+    assert world.applied() == [] and world.paths(RESPONSES) == []
+    assert any(f"no finished drift record for {MERGED}-nopre in full mode" in note for note in world.record().notes)
 
 
 def not_decided(world):

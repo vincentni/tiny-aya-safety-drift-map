@@ -14,6 +14,7 @@ from huggingface_hub._jobs_api import TERMINAL_JOB_STAGES
 from huggingface_hub.errors import HfHubHTTPError
 from pydantic import ValidationError
 
+from driftmap.core import ids
 from driftmap.core.hub import GateRefused, classify
 from driftmap.core.records import Decision, SmokeRecord, Snapshot, Tables, dump, load
 from driftmap.core.schemas import SCHEMA_DECISION, DriftmapError, ExitCode
@@ -49,6 +50,13 @@ class Deps:
     head: Callable[[str], int] = head_status
 
 
+def tables_path(preamble: str = "keep", fine_tune: str = "standard") -> Path:
+    """The local tables of a prompt condition and fine-tune: tables.json, or a file named after both beside it."""
+    tree = ids.tree("full", preamble).strip("/")
+    parts = [TABLES_PATH.stem, *([tree] if tree else []), *([fine_tune] if fine_tune != "standard" else [])]
+    return TABLES_PATH.with_name("-".join(parts) + TABLES_PATH.suffix)
+
+
 def take_snapshot(
     settings: Settings,
     client: Any,
@@ -58,8 +66,13 @@ def take_snapshot(
     *,
     code_sha: str | None = None,
     run: Run = subprocess.run,
+    named: tuple[str, str] | None = None,
 ) -> Snapshot:
-    """Read everything the guards need; ``code_sha`` defaults to HEAD. Hub and git are read, never written."""
+    """Read everything the guards need; ``code_sha`` defaults to HEAD. Hub and git are read, never written.
+
+    ``named`` is the fine-tune a launch names and the prompt condition it works under: its own tables are the
+    ones read, and naming it stands for the drift decision.
+    """
     root = Path(repo_root)
     billing = _billing_used(client)
     rows = client.list_jobs_hardware()
@@ -68,7 +81,11 @@ def take_snapshot(
     active = [job for job in client.list_jobs() if job.status.stage not in TERMINAL_JOB_STAGES]
     types = source_types(settings)
     decision = read_decision(root / DECISION_PATH)
+    decided = decision.decision if decision else None
     table = _table(root / TABLES_PATH)
+    if named:
+        fine_tune, preamble = named
+        table, decided = _table(root / tables_path(preamble, fine_tune)), f"the {fine_tune} fine-tune is named"
     return Snapshot(
         billing_used_micro_usd=billing,
         ledger_total_micro_usd=ledger.total_micro_usd(),
@@ -84,7 +101,7 @@ def take_snapshot(
         oom_runs=ledger.oom_runs(),
         table_on_file=table is not None,
         drift_flag=table.flags.get("drift_below_threshold") if table else None,
-        drift_decision=decision.decision if decision else None,
+        drift_decision=decided,
         code_on_origin=code_pin_fault(root, settings.code.origin, settings.code.branch, code_sha, run=run) is None,
     )
 

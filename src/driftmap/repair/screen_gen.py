@@ -2,11 +2,13 @@
 
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import replace
+from pathlib import Path
 from statistics import fmean
 from typing import Any, NamedTuple
 
 from auditkit.model import Model
 
+from driftmap.core import ids
 from driftmap.core.records import Decoding, GenerationRow
 from driftmap.gen.adapters import RawPromptAdapter
 from driftmap.gen.hf_backend import run_config
@@ -18,13 +20,14 @@ SETS = ("harmful", "benign")
 SCREEN_FILE = "alpha_screen.json"
 
 
-def _tree(mode: str) -> str:
-    return "smoke/" if mode == "smoke" else ""
+def screen_path(mode: str, preamble: str = "keep", fine_tune: str = "standard") -> str:
+    """File of the screen record in the results repo.
 
-
-def screen_path(mode: str) -> str:
-    """File of the screen record in the results repo; a smoke run keeps its own."""
-    return _tree(mode) + SCREEN_FILE
+    A smoke run and a screen under another prompt condition keep theirs in that tree; another fine-tune than the
+    standard one has a file of its own.
+    """
+    name = Path(SCREEN_FILE)
+    return ids.tree(mode, preamble) + (SCREEN_FILE if fine_tune == "standard" else f"{name.stem}-{fine_tune}.json")
 
 
 class Utility(NamedTuple):
@@ -40,10 +43,11 @@ def checkpoint_id(drifted: str, aligned: str, alpha: float) -> str:
     return f"{drifted}+wiseft-{alpha:g}+{aligned.rpartition('@')[2][:12]}"
 
 
-def rows_path(slug: str, alpha: float | str, mode: str) -> str:
-    """File of one alpha's screen rows, both sets, in the responses repo; ``*`` names every alpha's."""
+def rows_path(slug: str, alpha: float | str, mode: str, preamble: str = "keep") -> str:
+    """File of one alpha's screen rows, both sets, in the responses repo, under the run's tree; ``*`` names every
+    alpha's."""
     name = alpha if isinstance(alpha, str) else f"{alpha:g}"
-    return f"{_tree(mode)}screen/{slug}/alpha-{name}.jsonl"
+    return f"{ids.tree(mode, preamble)}screen/{slug}/alpha-{name}.jsonl"
 
 
 def backend(model: Any, tokenizer: Any, name: str, batch_size: int) -> Model:
@@ -66,8 +70,12 @@ def screen(
     decoding: Decoding,
     batch_size: int,
     between: Callable[[], object] | None = None,
+    system: str | None = None,
 ) -> list[GenerationRow]:
-    """One row per prompt of every unit (``set``, ``language``, ``rows``); ``between`` runs before each; OutOfMemory."""
+    """One row per prompt of every unit (``set``, ``language``, ``rows``); ``between`` runs before each; OutOfMemory.
+
+    ``system`` is the system message every prompt is rendered after.
+    """
     config = replace(run_config(batch_size), max_tokens=decoding.max_new_tokens)
     rows: list[GenerationRow] = []
     for unit in units:
@@ -75,7 +83,7 @@ def screen(
             between()
         rows += run_batch(
             generator,
-            [Prompt.of(tokenizer, row["prompt_id"], row["prompt"]) for row in unit.rows],
+            [Prompt.of(tokenizer, row["prompt_id"], row["prompt"], system) for row in unit.rows],
             adapter=RawPromptAdapter(),
             config=config,
             tokenizer=tokenizer,

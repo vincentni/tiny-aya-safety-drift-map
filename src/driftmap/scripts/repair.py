@@ -16,7 +16,7 @@ from typing import Any
 from huggingface_hub.errors import HfHubHTTPError, RemoteEntryNotFoundError
 from pydantic import ValidationError
 
-from driftmap.core import ids
+from driftmap.core import ids, render
 from driftmap.core.hub import Hub
 from driftmap.core.ids import RepoRef, merged_sha256
 from driftmap.core.records import AlphaRow, AlphaScreen, Decoding, GenerationRow, LabelRow, Ref, RunRecord
@@ -30,7 +30,7 @@ from driftmap.jobkit.oom import oom_text
 from driftmap.judge.incremental import dump_rows, read_rows
 from driftmap.repair import screen_gen, select, wiseft
 from driftmap.repair.screen_gen import SCREEN_FILE, rows_path, screen_path
-from driftmap.scripts import run_job
+from driftmap.scripts import preamble_option, run_job
 from driftmap.scripts.drift import CANARIES, TOKENIZER_FILES, _release, repo_names
 from driftmap.scripts.generate import PROMPT_FILES, _save_marker, check_rendering, check_repos, past_runs, read_units
 
@@ -71,6 +71,14 @@ def _refuse(message: str) -> DriftmapError:
 def _arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--alphas", metavar="A,B", help="weights of the aligned model to screen, up to four")
     parser.add_argument("--apply", metavar="ALPHA", help="push the model at this screened alpha; screens nothing")
+    parser.add_argument(
+        "--fine-tune",
+        choices=tuple(ids.FINE_TUNES),
+        default="standard",
+        help="the fine-tune to repair. standard: the one trained under the served template. "
+        "aggressive: the one trained with no safety preamble; its screen and repaired model get names of their own",
+    )
+    preamble_option(parser)
 
 
 def parse_alphas(text: str, option: str) -> list[float]:
@@ -93,18 +101,31 @@ def drifted_checkpoint(runs: Sequence[RunRecord], repo: str, mode: str) -> tuple
     raise _refuse(f"no finished drift record for {repo} in {mode} mode; the merged weights cannot be verified")
 
 
+def _screen_file(ctx: Context) -> str:
+    """This run's screen record in the results repo."""
+    return screen_path(ctx.run.record.mode, ctx.args.preamble, ctx.args.fine_tune)
+
+
+def _rows_file(ctx: Context, slug: str, alpha: float | str) -> str:
+    """One alpha's screen rows of this run in the responses repo."""
+    return rows_path(slug, alpha, ctx.run.record.mode, ctx.args.preamble)
+
+
 def drifted_chrf(ctx: Context, drifted: RepoRef, units: Sequence[Any], work: Path) -> float:
-    """Mean chrF of the drifted checkpoint over every benign screen prompt, an unscored one counting 0."""
-    settings, mode = ctx.settings, ctx.run.record.mode
+    """Mean chrF of the drifted checkpoint over every benign screen prompt, an unscored one counting 0.
+
+    Read from its labels under the run's prompt condition.
+    """
+    settings, mode, preamble = ctx.settings, ctx.run.record.mode, ctx.args.preamble
     repo = f"{settings.owner}/{settings.repos.eval}"
     head = RepoRef(repo, ctx.hub.dataset_info(repo).sha)
-    wanted = [ids.labels_path(ids.slug(drifted), "*", mode, benign=True)]
+    wanted = [ids.labels_path(ids.slug(drifted), "*", mode, benign=True, preamble=preamble)]
     directory = Path(ctx.hub.snapshot_download(head, work / "labels", repo_type="dataset", allow_patterns=wanted))
     scores: list[float | None] = []
     for unit in units:
         if unit.set != "benign":
             continue
-        path = ids.labels_path(ids.slug(drifted), unit.language, mode, benign=True)
+        path = ids.labels_path(ids.slug(drifted), unit.language, mode, benign=True, preamble=preamble)
         stored = {row.prompt_id: row.chrf for row in read_rows(directory / path, LabelRow, path)}
         missing = [row["prompt_id"] for row in unit.rows if row["prompt_id"] not in stored]
         if missing:
@@ -143,15 +164,14 @@ def check_disk(directory: Path, sizes: Sequence[int | None], note: Callable[[str
 
 def stored_rows(ctx: Context, inputs: Inputs, alphas: Sequence[float]) -> dict[float, list[GenerationRow]]:
     """Per alpha the screen rows already uploaded, when they are of these weights, prompts and decoding."""
-    mode = ctx.run.record.mode
     head = RepoRef(inputs.responses, ctx.hub.dataset_info(inputs.responses).sha)
     scratch = tempfile.mkdtemp(prefix="driftmap-screen-")
-    pattern = rows_path(inputs.slug, "*", mode)
+    pattern = _rows_file(ctx, inputs.slug, "*")
     directory = Path(ctx.hub.snapshot_download(head, scratch, repo_type="dataset", allow_patterns=[pattern]))
     expected = sorted((unit.set, row["prompt_id"]) for unit in inputs.units for row in unit.rows)
     kept = {}
     for alpha in alphas:
-        rows = read_rows(directory / rows_path(inputs.slug, alpha, mode), GenerationRow)
+        rows = read_rows(directory / _rows_file(ctx, inputs.slug, alpha), GenerationRow)
         # the name ties the rows to both revisions; a batch the backend failed on is generated again
         wanted = (inputs.name(alpha), inputs.prefix, inputs.decoding)
         same = all(
@@ -204,13 +224,13 @@ def _dump(screen: AlphaScreen) -> bytes:
 def _put_screen(ctx: Context, screen: AlphaScreen, *, queued: bool = False) -> None:
     """Send the screen to the results repo, now or with the closing save."""
     send = ctx.flusher.add if queued else ctx.flusher.upload
-    send(ctx.run.results, screen_path(ctx.run.record.mode), _dump(screen))
+    send(ctx.run.results, _screen_file(ctx), _dump(screen))
 
 
 def _stored_screen(ctx: Context) -> AlphaScreen | None:
     """The screen in the results repo; None when there is none or it does not parse."""
     head = ctx.hub.dataset_info(ctx.run.results).sha
-    path = screen_path(ctx.run.record.mode)
+    path = _screen_file(ctx)
     scratch = tempfile.mkdtemp(prefix="driftmap-screen-")
     try:
         found = ctx.hub.hf_hub_download(f"{ctx.run.results}@{head}#{path}", scratch, repo_type="dataset")
@@ -237,7 +257,10 @@ def prepare(ctx: Context, device: str) -> Inputs:
     aligned = RepoRef(settings.sources.model, settings.revisions.get(settings.sources.model))
     if aligned.revision is None:
         raise _refuse(f"no pinned revision for {aligned.repo}; pin it and push revisions.json before launching")
-    _, merged_repo = repo_names(settings, mode)
+    preamble = args.preamble
+    if ids.preamble_note(preamble):
+        ctx.run.note(ids.preamble_note(preamble))
+    _, merged_repo = repo_names(settings, mode, ids.FINE_TUNES[args.fine_tune])
     if hub.model_info(merged_repo).private is not True:
         raise _refuse(f"{merged_repo} is not private; drifted weights are never read from an open repo")
     responses = f"{settings.owner}/{settings.repos.responses}"
@@ -263,12 +286,13 @@ def prepare(ctx: Context, device: str) -> Inputs:
     tokenizer = load_tokenizer(tokenizer_dir, CANARIES)
     if not (data_dir / "manifest.json").is_file():
         raise _refuse(f"manifest.json is missing from {eval_repo}")
-    prefix = check_rendering(tokenizer, json.loads((data_dir / "manifest.json").read_bytes()))
+    # from here the tokenizer renders under the run's condition
+    prefix = check_rendering(tokenizer, json.loads((data_dir / "manifest.json").read_bytes()), preamble)
     record.bos_check = True
     per_language = min(screen_gen.PER_LANGUAGE, args.limit or screen_gen.PER_LANGUAGE)
     units = [
         unit
-        for unit in read_units(data_dir, settings.languages, ids.slug(drifted), mode, per_language)
+        for unit in read_units(data_dir, settings.languages, ids.slug(drifted), mode, per_language, preamble)
         if unit.set in screen_gen.SETS
     ]
     return Inputs(
@@ -317,6 +341,7 @@ def _screen_alpha(
             decoding=inputs.decoding,
             batch_size=batch,
             between=ctx.checkpoint,
+            system=render.system_message(ctx.args.preamble),
         )
     finally:
         generator.unload()
@@ -327,7 +352,7 @@ def _screen_alpha(
 
 def run_screen(ctx: Context, inputs: Inputs, alphas: Sequence[float], device: str) -> None:
     """Generate and store every alpha's screen rows with their chrF; the safety verdict is made outside the job."""
-    record, mode, units = ctx.run.record, ctx.run.record.mode, inputs.units
+    record, units = ctx.run.record, inputs.units
     ctx.run.note(f"alphas = {', '.join(f'{alpha:g}' for alpha in alphas)}")
     stored = _stored_screen(ctx)
     earlier = stored.alphas if stored else []
@@ -352,7 +377,7 @@ def run_screen(ctx: Context, inputs: Inputs, alphas: Sequence[float], device: st
         )
 
     for alpha in alphas:
-        key = rows_path(inputs.slug, alpha, mode)
+        key = _rows_file(ctx, inputs.slug, alpha)
         if alpha in rows:
             ctx.run.note(f"alpha {alpha:g}: stored screen rows reused")
             ctx.flusher.mark_done(key)
@@ -414,7 +439,7 @@ def run_apply(ctx: Context, inputs: Inputs, alpha: float, device: str) -> None:
         raise _refuse(f"the stored decision for alpha {alpha:g} does not follow from its rows ({derived})")
     ctx.run.note(f"applied alpha = {alpha:g}, as the decided screen names it")
     ctx.run.note(f"chosen = {next(row for row in screen.alphas if row.alpha == screen.chosen).model_dump_json()}")
-    repaired = f"{settings.owner}/{settings.repos.repaired}{ids.repo_suffix(mode)}"
+    repaired = f"{settings.owner}/{settings.repos.repaired}{ids.repo_suffix(mode, ids.FINE_TUNES[ctx.args.fine_tune])}"
     ctx.hub.create_repo(repaired, private=True)
     # creating over an existing repo leaves its visibility as it was
     if ctx.hub.model_info(repaired).private is not True:

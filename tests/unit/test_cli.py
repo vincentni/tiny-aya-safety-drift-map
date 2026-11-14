@@ -907,6 +907,56 @@ def test_a_repair_launch_needs_its_drift_run_and_labels_and_an_apply_needs_a_cho
     assert len(world.submits()) == 2 and world.submits()[-1].endswith(" --apply 0.25")
 
 
+def test_a_repair_of_a_named_fine_tune_reads_its_own_run_labels_table_and_screen(world, monkeypatch, tmp_path):
+    seconds = itertools.count()
+    stepping = functools.partial(Deps, run=git, now=lambda: datetime.now(UTC) + timedelta(seconds=next(seconds)))
+    monkeypatch.setattr(cli, "Deps", stepping)
+    named = ["--", "--fine-tune", "aggressive", "--preamble", "strip"]
+    # the standard fine-tune's table is flagged and undecided, and is not what this launch stands on
+    dump(fake_labels.bare_tables(drift_below_threshold=True), world.root / TABLES_PATH)
+    bare = run("launch", "repair", "--wait", *named)
+    assert bare.exit_code == 4 and world.submits() == []
+    table = "tables-nopreamble-aggressive.json with the fine-tuned column tabled"
+    for lacking in ("drift record with merged_sha256", "drifted benign labels for en, fr, es, ru, hi, ar", table):
+        assert lacking in bare.output
+    assert "`driftmap table build --preamble strip --fine-tune aggressive`" in bare.output
+
+    world.hub.add_repo(EVAL, repo_type="dataset")
+    trained = fake_labels.CHECKPOINTS["drifted"].replace("@", "-nopre-smoke@")
+    repo, _, revision = trained.partition("@")
+    merged = Ref(kind="model", repo=repo, revision=revision)
+    notes = ["preamble: strip"]
+    world.push_record("drift-smoke-20261105T090000Z", merged_sha256="b" * 64, outputs=[merged], notes=notes)
+    # its benign labels sit in the tree of the condition it is repaired under
+    put_labels(world, fake_labels.column_rows("drifted", n=2, checkpoint=trained), "smoke", "strip")
+    other = fake_labels.CHECKPOINTS["drifted"].replace("@", "-nopre@")
+    # a drop under the threshold raises the flag in its table; naming the fine-tune is the decision
+    tables = published.two_column_tables(tmp_path, world.settings, unsafe=2, preamble="strip", fine_tuned=other)
+    assert tables.flags["drift_below_threshold"] is True
+    dump(tables, world.root / TABLES_DIR / "tables-nopreamble-aggressive.json")
+
+    planned = run("launch", "repair", "--dry-run", *named)
+    assert planned.exit_code == 0 and "cannot run yet" not in planned.output
+    assert verdict(planned, "drift_decision") == "pass"
+    # unnamed, the launch is the standard fine-tune's: it has no drift run, and its flag stands undecided
+    usual = run("launch", "repair", "--dry-run")
+    assert "missing: drift record with merged_sha256" in usual.output and verdict(usual, "drift_decision") == "refused"
+
+    assert run("launch", "repair", "--wait", *named).exit_code == 0
+    (screened_run,) = world.submits()
+    assert screened_run.endswith(" --fine-tune aggressive --preamble strip")
+    applied = [*named, "--apply", "0.25"]
+    # the standard fine-tune's screen decides nothing here
+    world.push("smoke/alpha_screen.json", screen(world.settings, "chosen").model_dump_json().encode())
+    early = run("launch", "repair", "--wait", *applied)
+    assert early.exit_code == 4 and "missing: alpha screen with recover_status chosen" in early.output
+    own = "smoke/nopreamble/alpha_screen-aggressive.json"
+    world.push(own, screen(world.settings, "chosen").model_dump_json().encode())
+    pushed = run("launch", "repair", "--wait", *applied)
+    assert pushed.exit_code == 0, pushed.output
+    assert world.submits()[-1].endswith(" --fine-tune aggressive --preamble strip --apply 0.25")
+
+
 def test_job_arguments_are_read_as_the_job_will_before_anything_is_submitted(world, monkeypatch):
     with monkeypatch.context() as patch:
         # refused on the arguments alone

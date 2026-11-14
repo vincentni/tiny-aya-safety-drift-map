@@ -24,6 +24,8 @@ _FOLDERS = {"benign": "benign_heldout"}
 CONDITIONS = ("keep", "strip", "patch")
 # the ones a fine-tune is trained under
 PREAMBLES = CONDITIONS[:2]
+# a fine-tune by the condition it was trained under, which its repos are named after
+FINE_TUNES = {"standard": "keep", "aggressive": "strip"}
 _TREES = {"keep": "", "strip": "nopreamble/", "patch": "patched/"}
 _PREAMBLE_NOTE = "preamble: "
 # the script variants of the prompts: their files sit in this folder inside a run's tree, where no table reads

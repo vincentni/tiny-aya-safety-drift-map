@@ -38,7 +38,7 @@ COLUMNS = ("baseline", "drifted", "repaired", "repaired_q4")
 SHOWN = ("tabled", "not_comparable")
 LOW_RESOURCE = ("hi", "ar")
 # the fine-tune a table's drifted column holds, by the training condition its repos are named after
-FINE_TUNES = {"standard": "keep", "aggressive": "strip"}
+FINE_TUNES = ids.FINE_TUNES
 DRIFT_POINTS = 5
 DRIFT_FLAG = "drift_below_threshold"
 # what a reader is shown for the fourth column when its file was made from the fine-tuned model

@@ -159,8 +159,12 @@ def launch(
     limit: int | None = None,
     args: Sequence[str] = (),
     sleep: Callable[[float], None] = time.sleep,
+    named: tuple[str, str] | None = None,
 ) -> ExitCode:
-    """Submit one job if every guard passes; a refusal is exit 4, and a dry run submits and records nothing."""
+    """Submit one job if every guard passes; a refusal is exit 4, and a dry run submits and records nothing.
+
+    ``named`` is the fine-tune the job's arguments name and its prompt condition, as ``take_snapshot`` takes it.
+    """
     report = require_ready(deps.repo_root / READY_PATH, settings.config_hash(), now=deps.now)
     settings = _on_offered_gpu(settings, report.gpu_flavor)
     # held from the first snapshot read until the hold is closed
@@ -180,7 +184,7 @@ def launch(
         held = [line.job_id for line in last.values() if line.pending and line.kind not in cpu]
         code_sha = _head(deps)
         snapshot = take_snapshot(
-            settings, deps.client, deps.hub, ledger, deps.repo_root, code_sha=code_sha, run=deps.run
+            settings, deps.client, deps.hub, ledger, deps.repo_root, code_sha=code_sha, run=deps.run, named=named
         )
         in_flight = list(dict.fromkeys([*snapshot.in_flight_gpu, *held]))
         snapshot = snapshot.model_copy(update={"in_flight_gpu": in_flight})
