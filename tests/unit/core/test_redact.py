@@ -11,7 +11,7 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
-from driftmap.core.redact import PATTERNS, Filter, Finding, RedactionFinding, configure_logging, mask, scan
+from driftmap.core.redact import PATTERNS, Filter, Finding, RedactionFinding, configure_logging, is_row, mask, scan
 from driftmap.core.schemas import DriftmapError
 
 # built at runtime: no secret-shaped literal in this file
@@ -103,6 +103,26 @@ def test_the_exemption_covers_the_trees_of_runs_with_no_safety_preamble(tmp_path
     ]
 
     assert [finding.path for finding in scan([*exempt, *scanned], root)] == scanned
+
+
+def test_the_exemption_covers_the_trees_of_runs_under_the_safety_patch(tmp_path):
+    root = tmp_path / "data"
+    row = json.dumps({"prompt": f"call {ACCOUNT} now"}) + "\n"
+    exempt = [
+        _write(root / "patched/responses/x/harmful/en.jsonl", row),
+        _write(root / "patched/labels/x/en.jsonl", row),
+        _write(root / "patched/judge_raw/x/en.jsonl", row),
+        _write(root / "smoke/patched/responses/x/xstest/en.jsonl", row),
+    ]
+    scanned = [
+        _write(root / "patched/tables/tables-patched.json", row),
+        _write(root / "patched/nopreamble/labels/x/en.jsonl", row),
+        _write(root / "patched/smoke/labels/x/en.jsonl", row),
+    ]
+
+    assert [finding.path for finding in scan([*exempt, *scanned], root)] == scanned
+    assert is_row(("patched", "labels", "x", "en.jsonl")) and is_row(("smoke", "patched", "responses", "x", "en.jsonl"))
+    assert not is_row(("patched", "tables", "tables-patched.json")) and not is_row(("patched", "runs", "x.json"))
 
 
 def test_the_exemption_covers_the_repair_screen_and_the_files_judged_beside_its_rows(tmp_path):

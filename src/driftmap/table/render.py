@@ -12,6 +12,8 @@ WORDS = {
     "chrf": ("higher chrF", "lower chrF"),
 }
 ABSENT = {"failed": "failed", "not_applicable": "n/a"}
+# what the title says after its name for a table of another condition than the served template
+CONDITIONS = {"strip": " (no safety preamble)", "patch": " (safety patch)"}
 
 
 def _judge(tables: Tables) -> str:
@@ -97,7 +99,7 @@ def render(tables: Tables, settings: Settings) -> str:
                 _absent(tables.columns[column]) or hatch + delta_cell(gaps.get(column), n, judge, preamble, words)
             )
 
-    out = ["# Safety drift map" + (" (no safety preamble)" if preamble == "strip" else ""), ""]
+    out = ["# Safety drift map" + CONDITIONS.get(preamble, ""), ""]
     out += section("Safe rate on harmful prompts", by_metric("safe"), rate_cell, gap_line)
     out += section("Refusal rate on harmful prompts", by_metric("refusal"), rate_cell)
     out += section("Over-refusal on XSTest (English)", tables.over_refusal, rate_cell)

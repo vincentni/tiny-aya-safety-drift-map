@@ -1135,9 +1135,9 @@ def evaluation(world, columns, mode="full", n=4, listed=None, preamble="keep"):
         # a smoke drift run pushes to its own repos
         changes = {"checkpoint": SMOKE_DRIFTED} if (column, mode) == ("drifted", "smoke") else {}
         put_labels(world, fake_labels.column_rows(column, n=n, unsafe=unsafe, **changes), mode, preamble)
-        if preamble == "strip":
-            run_id = f"generate-{mode}-{column}-strip"
-            generated(world, column, changes.get("checkpoint"), mode=mode, run_id=run_id, notes=["preamble: strip"])
+        if preamble != "keep":
+            run_id, notes = f"generate-{mode}-{column}-{preamble}", [f"preamble: {preamble}"]
+            generated(world, column, changes.get("checkpoint"), mode=mode, run_id=run_id, notes=notes)
         else:
             generated(world, column, changes.get("checkpoint"), mode=mode)
     for name, by_language in fake_labels.targets(listed or n).items():
@@ -1710,6 +1710,9 @@ def test_judge_closed_hands_its_options_to_the_library_and_never_shows_the_route
     passed = {"sets": ["xstest"], "mode": "full", "concurrency": 2, "limit": 5, "retry_unscored": True}
     passed["preamble"] = "strip"
     assert seen[-1][2:] == (f"{AYA}@{'1' * 40}", passed)
+    assert run("judge", "closed", "--checkpoint", f"{AYA}@{'1' * 40}", *options[:-1], "patch").exit_code == 0
+    assert seen[-1][2:] == (f"{AYA}@{'1' * 40}", passed | {"preamble": "patch"})
+    assert run("judge", "closed", "--checkpoint", f"{AYA}@{'1' * 40}", "--preamble", "drop").exit_code == 2
 
 
 def test_judge_closed_takes_a_rows_path_in_place_of_a_checkpoint(world, monkeypatch):
@@ -2180,6 +2183,49 @@ def test_a_table_without_the_preamble_reads_and_writes_its_own_tree_and_leaves_t
     assert run("table", "build", "--preamble", "drop").exit_code == 2
 
 
+def test_a_table_under_the_safety_patch_reads_and_writes_its_own_tree_and_leaves_the_guard_alone(world):
+    evaluation(world, {"baseline": 0, "drifted": 0}, preamble="patch")
+    assert "no judged labels" in run("table", "build").stderr
+    assert "no judged labels" in run("table", "build", "--preamble", "strip").stderr
+
+    built = run("table", "build", "--preamble", "patch")
+
+    assert built.exit_code == 0, built.output
+    assert built.output.splitlines()[:3] == ["verb      table build", "mode      full", "preamble  patch"]
+    local = world.root / TABLES_DIR
+    tables = Tables.model_validate_json((local / "tables-patched.json").read_bytes())
+    assert {row.preamble for row in tables.safety + tables.over_refusal} == {"patch"}
+    assert "preamble=patch" in built.output and "preamble=keep" not in built.output
+    assert "# Safety drift map (safety patch)\n" in built.output
+    assert "runs under the safety patch, written to tables-patched" in flat(run("table", "build", "--help"))
+    assert sorted(path.name for path in local.iterdir()) == ["tables-patched.json", "tables-patched.md"]
+    on_hub = world.hub.repos[RESULTS]["main"]
+    assert stored(world, "patched/tables/tables-patched.json") == (local / "tables-patched.json").read_bytes()
+    assert stored(world, "patched/tables/tables-patched.md") == (local / "tables-patched.md").read_bytes()
+    assert not [path for path in on_hub if path.endswith("tables.json") or path.endswith("tables.md")]
+    # the flag of this table is not the one the guard reads
+    assert tables.flags["drift_below_threshold"] is True
+    dump(fake_labels.bare_tables(), world.root / TABLES_PATH)
+    assert run("launch", "repair", "--dry-run").exit_code == 0
+
+    # the other two conditions build beside it, each from its own labels and runs
+    evaluation(world, {"baseline": 0, "drifted": 2})
+    evaluation(world, {"baseline": 0, "drifted": 1}, preamble="strip")
+    assert run("table", "build").exit_code == 0 and run("table", "build", "--preamble", "strip").exit_code == 0
+    kept = Tables.model_validate_json((world.root / TABLES_PATH).read_bytes())
+    stripped = Tables.model_validate_json((local / "tables-nopreamble.json").read_bytes())
+    assert {row.preamble for row in kept.safety} == {"keep"} and {row.preamble for row in stripped.safety} == {"strip"}
+    assert Tables.model_validate_json((local / "tables-patched.json").read_bytes()) == tables
+    again = run("table", "build", "--preamble", "patch")
+    assert again.exit_code == 0 and Tables.model_validate_json((local / "tables-patched.json").read_bytes()) == tables
+
+    evaluation(world, {"baseline": 0, "drifted": 0}, mode="smoke", preamble="patch")
+    smoke = run("table", "build", "--mode", "smoke", "--preamble", "patch")
+    assert smoke.exit_code == 0, smoke.output
+    assert (world.root / LOCAL / "results" / "smoke" / "tables" / "tables-patched.json").is_file()
+    assert "smoke/patched/tables/tables-patched.json" in on_hub
+
+
 def test_the_latest_run_without_the_preamble_names_the_drifted_checkpoint(world):
     evaluation(world, {"baseline": 0, "drifted": 2}, preamble="strip")
     trained = fake_labels.CHECKPOINTS["drifted"].replace("@", "-nopre@")
@@ -2213,3 +2259,15 @@ def test_a_job_without_the_preamble_passes_through_under_the_kinds_smoke_record(
     assert verdict(full, "smoke") == "pass" and " --kind baseline --preamble strip\n" in full.output
     drift = run("launch", "drift", "--dry-run", "--", "--preamble", "strip")
     assert drift.exit_code == 0 and " --preamble strip\n" in drift.output
+
+    # a run under the safety patch is covered by the same record; a fine-tune takes no patch
+    patch = [*BASELINE, "--preamble", "patch"]
+    assert " --kind baseline --preamble patch\n" in run("launch", "generate", "--dry-run", *patch).output
+    full = run("launch", "generate", "--mode", "full", "--dry-run", *patch)
+    assert full.exit_code == 0, full.output
+    assert verdict(full, "smoke") == "pass" and " --kind baseline --preamble patch\n" in full.output
+    tuned = run("launch", "generate", "--mode", "full", "--dry-run", "--", "--kind", "drifted", "--preamble", "patch")
+    assert tuned.exit_code == 0 and " --kind drifted --preamble patch\n" in tuned.output
+    refused = run("launch", "drift", "--dry-run", "--", "--preamble", "patch")
+    assert refused.exit_code == 2 and "the drift job would stop on its arguments" in flat(refused)
+    assert "invalid choice: 'patch'" in flat(refused) and len(world.submits()) == 1

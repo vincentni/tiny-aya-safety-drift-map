@@ -18,8 +18,8 @@ PATTERNS = {
 }
 # dataset rows quote arbitrary numbers; screen holds the repair screen's rows with their labels and judge answers
 DIGIT_EXEMPT_DIRS = frozenset({"prompts", "sft_train", "labels", "responses", "judge_raw", "screen"})
-# smoke runs and runs with no safety preamble keep the same folders under a tree of their own; longest first
-_PREFIXES = {ids.tree(mode, preamble) for mode in ("full", "smoke") for preamble in ids.PREAMBLES}
+# smoke runs and runs under another prompt condition keep the same folders under a tree of their own; longest first
+_PREFIXES = {ids.tree(mode, preamble) for mode in ("full", "smoke") for preamble in ids.CONDITIONS}
 TREES = sorted((tuple(filter(None, prefix.split("/"))) for prefix in _PREFIXES), key=len, reverse=True)
 _CONTROL = r"(?:\x1b|\\u001[bB])\[[0-?]*[ -/]*[@-~]"
 # a trailing escape letter or digit would defeat the anchors

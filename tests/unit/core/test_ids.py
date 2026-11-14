@@ -163,12 +163,37 @@ def test_runs_without_the_preamble_get_a_tree_and_repos_of_their_own():
         ids.repo_suffix("full", "")
 
 
-def test_a_run_says_in_its_notes_that_it_left_the_preamble_out():
+def test_runs_under_the_safety_patch_get_a_tree_of_their_own_and_no_repos():
+    slug = "tiny-aya-global--0123456789ab"
+    # every prompt condition, and the two a fine-tune is trained under
+    assert ids.CONDITIONS == ("keep", "strip", "patch") and ids.PREAMBLES == ("keep", "strip")
+    assert ids.tree("full", "patch") == "patched/" and ids.tree("smoke", "patch") == "smoke/patched/"
+    assert ids.responses_path(slug, "xstest", "en", "full", "patch") == f"patched/responses/{slug}/xstest/en.jsonl"
+    assert ids.responses_path(slug, "benign", "hi", "smoke", "patch") == (
+        f"smoke/patched/responses/{slug}/benign_heldout/hi.jsonl"
+    )
+    assert ids.labels_path(slug, "ru", "full", preamble="patch") == f"patched/labels/{slug}/ru.jsonl"
+    assert ids.labels_path(slug, "ru", "smoke", benign=True, preamble="patch") == (
+        f"smoke/patched/labels/{slug}/benign/ru.jsonl"
+    )
+    assert ids.judge_raw_path(slug, "ar", "full", "patch") == f"patched/judge_raw/{slug}/ar.jsonl"
+    trees = [ids.tree(mode, preamble) for mode in ("full", "smoke") for preamble in ids.CONDITIONS]
+    assert len(set(trees)) == 6
+    for mode in ("full", "smoke"):
+        with pytest.raises(ValueError, match="trained"):
+            ids.repo_suffix(mode, "patch")
+
+
+def test_a_run_says_in_its_notes_which_condition_it_ran_under_unless_it_is_the_served_template():
     assert ids.preamble_note("keep") is None
     assert ids.preamble_note("strip") == "preamble: strip"
+    assert ids.preamble_note("patch") == "preamble: patch"
     assert ids.preamble_of(["training rows limited to 8", "preamble: strip"]) == "strip"
+    assert ids.preamble_of(["conditions: {}", "preamble: patch"]) == "patch"
     assert ids.preamble_of(["conditions: {}", "preamble: keep"]) == "keep"
     assert ids.preamble_of([]) == "keep"
+    with pytest.raises(ValueError):
+        ids.preamble_note("drop")
 
 
 def test_merged_sha256_covers_the_shards_in_filename_order(tmp_path):

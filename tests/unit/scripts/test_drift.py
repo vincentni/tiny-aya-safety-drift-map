@@ -1186,6 +1186,14 @@ def test_a_run_under_the_served_template_is_unchanged_by_the_option(served):
     assert recipe["rendered_prefix_sha256"] == json.loads(served.manifest)["rendered_prefix_sha256"]
 
 
+def test_a_fine_tune_takes_no_safety_patch(world, capsys):
+    with pytest.raises(SystemExit) as stop:
+        world.run("--preamble", "patch")
+
+    assert stop.value.code == 2 and "invalid choice: 'patch'" in capsys.readouterr().err
+    assert world.fake.calls == [] and world.trainers == []
+
+
 @pytest.mark.parametrize("fault", ["no paragraph", "another template"])
 def test_a_strip_run_is_refused_unless_the_served_template_is_the_evaluation_sets(make_world, fault):
     if fault == "no paragraph":

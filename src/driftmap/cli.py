@@ -55,6 +55,11 @@ REVISIONS = "revisions.json"
 DATA_DIR = LOCAL / "data"
 # beside tables.json, which alone gates the repair
 NOPREAMBLE_TABLES = "tables-nopreamble.json"
+# the table file of each other prompt condition, and what its upload commit adds
+CONDITION_TABLES = {
+    "strip": (NOPREAMBLE_TABLES, ", no safety preamble"),
+    "patch": ("tables-patched.json", ", safety patch"),
+}
 # label set and its folder under prompts/ in the evaluation dataset
 PROMPT_SETS = (("harmful", "harmful"), ("benign", "benign_heldout"), ("xstest", "xstest"))
 # 128 + SIGINT, as a shell reports it
@@ -671,7 +676,10 @@ def table_build(
     ] = "full",
     preamble: Annotated[
         Preamble,
-        typer.Option(help="strip: the runs with no safety preamble, written to tables-nopreamble."),
+        typer.Option(
+            help="strip: runs with no safety preamble, written to tables-nopreamble. "
+            "patch: runs under the safety patch, written to tables-patched."
+        ),
     ] = "keep",
 ) -> None:
     """Build the tables from the labels on the Hub, print and upload them; exit 8 on a new, undecided drift flag."""
@@ -699,10 +707,11 @@ def table_build(
         known = [*records, *([screen] if screen else [])]
         tables = table.build(labels_dir, targets, known, settings, mode=mode, preamble=preamble)
     flagged = None
-    if mode == "smoke" or preamble == "strip":
+    name, said = CONDITION_TABLES.get(preamble, (TABLES_PATH.name, ""))
+    if mode == "smoke" or preamble != "keep":
         # only the full table under the served template gates the repair
         folder = root / LOCAL / "results" / ("smoke" if mode == "smoke" else "") / TABLES_PATH.parent.name
-        path = folder / (TABLES_PATH.name if preamble == "keep" else NOPREAMBLE_TABLES)
+        path = folder / name
         dump(tables, path)
     else:
         path, decision = root / TABLES_PATH, _record(Decision, root / DECISION_PATH)
@@ -735,7 +744,7 @@ def table_build(
             repo_type="dataset",
             path_in_repo=in_repo,
             allow_patterns=[path.name, path.with_suffix(".md").name],
-            commit_message=f"add {mode} tables" + (", no safety preamble" if preamble == "strip" else ""),
+            commit_message=f"add {mode} tables{said}",
         )
     except httpx2.HTTPError as error:
         message = f"the tables are in {path.parent.relative_to(root)} but were not uploaded ({type(error).__name__})"
@@ -799,7 +808,11 @@ def judge_closed(
         bool, typer.Option("--retry-unscored", help="Ask unscored pairs again and store what stays unscored.")
     ] = False,
     preamble: Annotated[
-        Preamble, typer.Option(help="With --checkpoint, strip: the responses made with no safety preamble.")
+        Preamble,
+        typer.Option(
+            help="With --checkpoint, strip: the responses made with no safety preamble; "
+            "patch: the ones made under the safety patch."
+        ),
     ] = "keep",
 ) -> None:
     """Label stored responses with the closed model; runs here, no job. Run it again to resume."""

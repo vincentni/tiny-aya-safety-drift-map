@@ -1,3 +1,4 @@
+import os
 import re
 from pathlib import Path
 
@@ -66,3 +67,43 @@ def test_the_stripped_template_differs_from_the_served_one_by_the_safety_paragra
         assert other.rendered_prompt == one.rendered_prompt.replace(paragraph, "")
         assert other.rendered_prefix_sha256 != one.rendered_prefix_sha256
         assert render.token_count(strip, other.rendered_prompt) == len(fewer)
+
+
+@pytest.mark.enable_socket
+def test_the_patched_rendering_is_the_served_one_with_the_patch_as_one_block_of_the_system_turn(tmp_path):
+    directory = pinned_tokenizer(tmp_path / "tokenizer")
+    keep = load_tokenizer(directory, CANARIES)
+    patch = render.conditioned(load_tokenizer(directory, CANARIES), "patch")
+    assert patch.chat_template == keep.chat_template
+    added = set()
+
+    for prompt in ("hello", "Wie backe ich ein Brot?", "नमस्ते 12345", "مرحبا بالعالم"):
+        messages = [{"role": "user", "content": prompt}]
+        system = [{"role": "system", "content": render.PATCH}, *messages]
+        kept = keep.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        patched = patch.apply_chat_template(system, tokenize=False, add_generation_prompt=True)
+        head = os.path.commonprefix([kept, patched])
+        tail = kept[len(head) :]
+        block = patched[len(head) : len(patched) - len(tail)]
+        # one insertion, inside the system turn, holding the patch once and no token of its own
+        assert patched == head + block + tail and block.count(render.PATCH) == 1
+        assert render.SYSTEM_TURN in head and render.END_OF_TURN not in head and tail.startswith(render.END_OF_TURN)
+        assert "# Developer Preamble" in block and not re.search(r"<\|?[A-Z_]+\|?>", block)
+        special = {keep.convert_tokens_to_ids(marker) for marker in set(re.findall(r"<\|?[A-Z_]+\|?>", kept))}
+        assert keep.bos_token_id in special and keep.unk_token_id not in special
+        ids, more = (
+            list(tokenizer.apply_chat_template(turns, tokenize=True, add_generation_prompt=True)["input_ids"])
+            for tokenizer, turns in ((keep, messages), (patch, system))
+        )
+        # BOS and every turn token, in the same order
+        assert [i for i in more if i in special] == [i for i in ids if i in special]
+        assert more[0] == ids[0] == keep.bos_token_id and more.count(keep.bos_token_id) == 1
+        one, other = render.render(keep, prompt), render.render(patch, prompt, render.system_message("patch"))
+        assert other.rendered_prompt == one.rendered_prompt.replace(tail, block + tail)
+        assert other.rendered_prefix_sha256 == render.prefix_hash(other.rendered_prompt) != one.rendered_prefix_sha256
+        assert render.PATCH in other.rendered_prompt.partition(render.USER_TURN)[0]
+        assert render.token_count(patch, other.rendered_prompt) == len(more)
+        assert other.prefix_tokens - one.prefix_tokens == len(more) - len(ids)
+        added.add(len(more) - len(ids))
+    # the same cost for every prompt, far inside the room the evaluation set leaves under the length limit
+    assert len(added) == 1 and 0 < added.pop() < 200

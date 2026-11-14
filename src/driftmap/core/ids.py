@@ -19,8 +19,12 @@ _REF = re.compile(
 
 # a row's set name, where its folder under prompts/ and responses/ differs
 _FOLDERS = {"benign": "benign_heldout"}
-# keep: the chat template as served; strip: no safety preamble
-PREAMBLES = ("keep", "strip")
+# the prompt conditions. keep: the chat template as served; strip: no safety preamble;
+# patch: the served template, with the safety patch as its system message
+CONDITIONS = ("keep", "strip", "patch")
+# the ones a fine-tune is trained under
+PREAMBLES = CONDITIONS[:2]
+_TREES = {"keep": "", "strip": "nopreamble/", "patch": "patched/"}
 _PREAMBLE_NOTE = "preamble: "
 
 
@@ -84,23 +88,29 @@ def slug(ref: RepoRef | str) -> str:
 
 
 def tree(mode: str, preamble: str = "keep") -> str:
-    """Path prefix of a run's files: smoke runs, and no-safety-preamble runs inside either mode, sit apart."""
-    return ("smoke/" if mode == "smoke" else "") + ("nopreamble/" if _stripped(preamble) else "")
+    """Path prefix of a run's files: smoke runs, and inside either mode the runs of each other condition, sit apart."""
+    return ("smoke/" if mode == "smoke" else "") + _TREES[_known(preamble)]
 
 
 def repo_suffix(mode: str, preamble: str = "keep") -> str:
-    """Name suffix of a run's model repos; a smoke run and one trained with no safety preamble get their own."""
-    return ("-nopre" if _stripped(preamble) else "") + ("-smoke" if mode == "smoke" else "")
+    """Name suffix of a run's model repos; a smoke run and one trained with no safety preamble get their own.
+
+    ValueError for a condition no fine-tune is trained under.
+    """
+    if _known(preamble) not in PREAMBLES:
+        raise ValueError(f"no model is trained under {preamble!r}; a fine-tune takes {' or '.join(PREAMBLES)}")
+    return ("-nopre" if preamble == "strip" else "") + ("-smoke" if mode == "smoke" else "")
 
 
 def preamble_note(preamble: str) -> str | None:
-    """The record note of a run with no safety preamble; a run under the served template leaves none."""
-    return f"{_PREAMBLE_NOTE}strip" if _stripped(preamble) else None
+    """The record note that names a run's condition; a run under the served template leaves none."""
+    return None if _known(preamble) == "keep" else f"{_PREAMBLE_NOTE}{preamble}"
 
 
 def preamble_of(notes: Iterable[str]) -> str:
     """The condition a run's record notes name; ``keep`` when they name none."""
-    return "strip" if preamble_note("strip") in notes else "keep"
+    notes = list(notes)
+    return next((preamble for preamble in CONDITIONS[1:] if preamble_note(preamble) in notes), "keep")
 
 
 def responses_path(slug: str, set: str, language: str, mode: str, preamble: str = "keep") -> str:
@@ -118,10 +128,10 @@ def judge_raw_path(slug: str, language: str, mode: str, preamble: str = "keep") 
     return f"{tree(mode, preamble)}judge_raw/{slug}/{language}.jsonl"
 
 
-def _stripped(preamble: str) -> bool:
-    if preamble not in PREAMBLES:
-        raise ValueError(f"preamble is {' or '.join(PREAMBLES)}, not {preamble!r}")
-    return preamble == "strip"
+def _known(preamble: str) -> str:
+    if preamble not in CONDITIONS:
+        raise ValueError(f"preamble is one of {', '.join(CONDITIONS)}, not {preamble!r}")
+    return preamble
 
 
 def _steer_suffix(steer: Steer | None) -> str:

@@ -24,9 +24,9 @@ class Prompt(NamedTuple):
     rendered_prefix_sha256: str
 
     @classmethod
-    def of(cls, tokenizer, prompt_id: str, prompt: str) -> Self:
-        """Render ``prompt`` through the chat template."""
-        rendered = render(tokenizer, prompt)
+    def of(cls, tokenizer, prompt_id: str, prompt: str, system: str | None = None) -> Self:
+        """Render ``prompt`` through the chat template, after ``system`` as the system message."""
+        rendered = render(tokenizer, prompt, system)
         return cls(prompt_id, prompt, rendered.rendered_prompt, rendered.rendered_prefix_sha256)
 
 

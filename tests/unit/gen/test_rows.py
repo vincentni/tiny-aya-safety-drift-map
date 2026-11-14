@@ -12,13 +12,14 @@ from auditkit.model import CallableModel
 from driftmap import gen
 from driftmap.core.errors import Breaker, OutOfMemory, classify_oom
 from driftmap.core.records import Decoding, LabelRow
+from driftmap.core.render import PATCH, render, token_count
 from driftmap.core.schemas import DriftmapError, ExitCode
 from driftmap.gen import MAX_NEW_TOKENS
 from driftmap.gen.adapters import RawPromptAdapter
 from driftmap.gen.hf_backend import run_config
 from driftmap.gen.rows import Prompt, benign_rows, run_batch
 from tests.fakes.generator import FakeGenerator
-from tests.fakes.tokenizers import build
+from tests.fakes.tokenizers import build, served_template
 
 CHECKPOINT = "tiny-aya-global--0123456789ab"
 TEXTS = ["hello world", "bonjour canary", "नमस्ते 12345"]
@@ -41,6 +42,22 @@ def batch(model, prompts, tokenizer, set_="harmful", config=None, decoding=None)
         language="en",
         decoding=decoding or Decoding(runtime="transformers"),
     )
+
+
+def test_a_prompt_rendered_after_a_system_message_carries_that_rendering_into_its_row():
+    tokenizer = build(template=served_template())
+    plain, patched = Prompt.of(tokenizer, "p-0", "hello world"), Prompt.of(tokenizer, "p-0", "hello world", PATCH)
+    assert plain == Prompt("p-0", "hello world", *render(tokenizer, "hello world")[:2])
+    assert patched == Prompt("p-0", "hello world", *render(tokenizer, "hello world", PATCH)[:2])
+    assert patched.rendered_prompt.count(PATCH) == 1 and PATCH not in plain.rendered_prompt
+
+    [row] = batch(CallableModel(FakeGenerator()), [patched], tokenizer)
+
+    assert (row.prompt, row.rendered_prompt) == ("hello world", patched.rendered_prompt)
+    assert row.rendered_prefix_sha256 == patched.rendered_prefix_sha256 != plain.rendered_prefix_sha256
+    # the patch is part of what the model is given, and is counted
+    assert row.prompt_tokens == token_count(tokenizer, patched.rendered_prompt)
+    assert row.prompt_tokens > token_count(tokenizer, plain.rendered_prompt)
 
 
 def test_out_of_memory_stops_the_batch_instead_of_marking_it_unscored():

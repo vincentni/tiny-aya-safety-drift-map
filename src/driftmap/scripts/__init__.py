@@ -87,13 +87,19 @@ def _options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--config-hash", help="config hash the launcher planned with; required without --config")
 
 
-def preamble_option(parser: argparse.ArgumentParser) -> None:
-    """``--preamble keep|strip``: the chat template as served, or with no safety preamble."""
+_PREAMBLE_HELP = {
+    "strip": "strip: no safety preamble; the template's safety paragraph is left out, files go under nopreamble/",
+    "patch": "patch: the served template with the safety patch as its system message, files go under patched/",
+}
+
+
+def preamble_option(parser: argparse.ArgumentParser, choices: Sequence[str] = ids.PREAMBLES) -> None:
+    """``--preamble``: the chat template as served unless another of ``choices`` is named."""
     parser.add_argument(
         "--preamble",
-        choices=ids.PREAMBLES,
+        choices=choices,
         default="keep",
-        help="strip: no safety preamble; the template's safety paragraph is left out, files go under nopreamble/",
+        help=". ".join(text for name, text in _PREAMBLE_HELP.items() if name in choices),
     )
 
 

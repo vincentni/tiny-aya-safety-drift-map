@@ -66,7 +66,7 @@ def _refuse(message: str) -> DriftmapError:
 def _arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--kind", required=True, choices=TARGETS, help="the table column to generate")
     parser.add_argument("--checkpoint", type=ids.parse, metavar="REPO@SHA", help="revision to read, when not implied")
-    preamble_option(parser)
+    preamble_option(parser, ids.CONDITIONS)
 
 
 def _repaired(settings: Settings, mode: str) -> str:
@@ -150,7 +150,11 @@ def resolve_checkpoint(ctx: Context, runs: Sequence[RunRecord]) -> tuple[RepoRef
 
 
 def check_rendering(tokenizer: Any, manifest: dict[str, Any], preamble: str = "keep") -> str:
-    """Refuse a tokenizer that pads, starts or prefixes a prompt unlike the evaluation set; returns the prefix hash."""
+    """Refuse a tokenizer that pads, starts or prefixes a prompt unlike the evaluation set; returns the prefix hash.
+
+    Under another condition than the served template the hash is that condition's, and a condition that takes the
+    longest prompt of the evaluation set over the rendered length limit is refused.
+    """
     if tokenizer.pad_token is None:
         raise _refuse("the tokenizer has no pad token; a batch cannot be padded")
     rendered = render.render(tokenizer, PROBE)
@@ -163,8 +167,16 @@ def check_rendering(tokenizer: Any, manifest: dict[str, Any], preamble: str = "k
         raise _refuse(f"the rendered prefix ({prefix[:12]}) is not the evaluation set's ({str(expected)[:12]})")
     if preamble == "keep":
         return prefix
-    # compared as served; from here the tokenizer renders without the paragraph
-    return render.render(render.conditioned(tokenizer, preamble), PROBE).rendered_prefix_sha256
+    # compared as served; from here the prompts are rendered under the other condition
+    other = render.render(render.conditioned(tokenizer, preamble), PROBE, render.system_message(preamble))
+    counts = [render.token_count(tokenizer, probe.rendered_prompt) for probe in (rendered, other)]
+    added = counts[1] - counts[0]
+    # the evaluation set was cut to the limit as served
+    longest = max((manifest.get("max_rendered_tokens") or {}).values(), default=0)
+    if longest + added > render.MAX_RENDERED_TOKENS:
+        over = f"{added} more tokens per prompt take the longest one to {longest + added}"
+        raise _refuse(f"{over}, over the rendered length limit of {render.MAX_RENDERED_TOKENS}")
+    return other.rendered_prefix_sha256
 
 
 def read_units(
@@ -238,10 +250,11 @@ def _generate(
     labels = f"{settings.owner}/{settings.repos.eval}"
     config = replace(run_config(settings.batch.generate), max_tokens=decoding.max_new_tokens)
     name, slug, mode, preamble = ids.unparse(checkpoint), ids.slug(checkpoint), record.mode, ctx.args.preamble
+    system = render.system_message(preamble)
     generating = uploading = megabytes = 0.0
     for unit in units:
         ctx.checkpoint()
-        prompts = [Prompt.of(tokenizer, row["prompt_id"], row["prompt"]) for row in unit.rows]
+        prompts = [Prompt.of(tokenizer, row["prompt_id"], row["prompt"], system) for row in unit.rows]
         started = clock.monotonic()
         rows = run_batch(
             model,
@@ -291,6 +304,8 @@ def body(ctx: Context, *, device: str = "cuda") -> None:
             raise _refuse("no CUDA device; this job does not generate on CPU")
     if ids.preamble_note(preamble):
         ctx.run.note(ids.preamble_note(preamble))
+    if preamble == "patch":
+        ctx.run.note(render.patch_note())
     if ctx.args.resume and ctx.flusher.resume_from != UNITS:
         raise _refuse(f"run {ctx.args.resume} left no usable marker; {FRESH}")
     ctx.flusher.resume_from = UNITS

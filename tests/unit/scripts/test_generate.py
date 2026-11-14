@@ -52,6 +52,8 @@ SMOKE = "smoke/"
 STRIP = "nopreamble/"
 MERGED_NOPRE = f"{MERGED}-nopre"
 STRIPPED = "generate-full-20261105T100000Z"
+PATCH = "patched/"
+PATCHED = "generate-full-20261107T100000Z"
 SMOKE_ARGS = ["--force-flush-after-s", "300"]
 # line separators that are not a newline
 SEPARATORS = [chr(code) for code in (0x2028, 0x2029, 0x85)]
@@ -907,11 +909,114 @@ def test_a_strip_run_is_refused_when_the_served_template_is_not_the_evaluation_s
     assert world.generator.calls == [] and world.loads == [] and world.uploads(RESPONSES) == []
 
 
-def test_the_condition_is_keep_or_strip(served):
+def test_the_condition_is_keep_strip_or_patch(served):
     with pytest.raises(SystemExit) as exit_:
         served.run("--preamble", "drop")
     assert exit_.value.code == 2
     assert served.uploads(RESPONSES) == []
+
+
+def patched_prefix():
+    return render.render(build(template=served_template()), "hello", render.PATCH).rendered_prefix_sha256
+
+
+def test_a_run_under_the_safety_patch_renders_it_as_the_system_message_into_a_tree_of_its_own(served):
+    world = served
+    assert world.run("--preamble", "patch", run_id=PATCHED) == 0
+
+    slug = slug_of(MODEL, world.head(MODEL))
+    assert world.uploads(RESPONSES) == [responses_at(slug, set_, code, PATCH) for set_, code in UNITS]
+    assert world.uploads(EVAL) == [labels_at(slug, code, PATCH) for code in LANGUAGES]
+    for set_, code in UNITS:
+        rows = world.rows(slug, set_, code, PATCH)
+        assert len(rows) == ROWS and {row.rendered_prefix_sha256 for row in rows} == {patched_prefix()}
+        assert all(row.rendered_prompt.count(render.PATCH) == 1 and SAFETY in row.rendered_prompt for row in rows)
+        assert not [row for row in rows if render.PATCH in row.prompt]
+    # what the model was given
+    assert world.generator.calls and all(render.PATCH in prompt for call in world.generator.calls for prompt in call)
+    record = world.record(PATCHED)
+    assert record.status == "ok" and record.bos_check is True
+    assert "preamble: patch" in record.notes and "safety patch: safety-patch-v1, sha256 7c31768562a1" in record.notes
+    [conditions] = [note.removeprefix(generate.CONDITIONS) for note in record.notes if "conditions" in note]
+    assert json.loads(conditions)["rendered_prefix_sha256"] == patched_prefix()
+
+    # the same checkpoint under the served template: other files, the same prompts less the one block
+    assert world.run() == 0
+    assert not [note for note in world.record().notes if "patch" in note]
+    block = f"\n# Developer Preamble\n{render.PATCH}"
+    added = len(block.split())
+    kept, patched = world.rows(slug, "harmful", "en"), world.rows(slug, "harmful", "en", PATCH)
+    for with_, without in zip(patched, kept, strict=True):
+        assert with_.rendered_prompt == without.rendered_prompt.replace(END_OF_TURN, block + END_OF_TURN, 1)
+        assert (with_.prompt_id, with_.prompt) == (without.prompt_id, without.prompt)
+        assert with_.prompt_tokens == without.prompt_tokens + added
+    assert world.record(PATCHED).prompt_tokens == world.record().prompt_tokens + added * ROWS * len(UNITS)
+    names = world.uploads(RESPONSES)
+    assert len(names) == len(set(names)) == 2 * len(UNITS)
+
+
+def test_a_smoke_run_under_the_safety_patch_sits_inside_the_smoke_tree(served):
+    world = served
+    assert world.run(*SMOKE_ARGS, "--limit", "2", "--preamble", "patch") == 0
+    slug = slug_of(MODEL, world.head(MODEL))
+    assert world.uploads(RESPONSES) == [responses_at(slug, set_, code, SMOKE + PATCH) for set_, code in UNITS]
+    assert world.uploads(EVAL) == [labels_at(slug, code, SMOKE + PATCH) for code in LANGUAGES]
+    record = world.record()
+    assert (record.mode, record.bos_check, record.prompts) == ("smoke", True, 2 * len(UNITS))
+
+
+@pytest.mark.parametrize("fault", ["no place for a system message", "another template", "no room"])
+def test_a_patch_run_is_refused_before_the_weights_when_the_patch_cannot_be_rendered_as_meant(make_world, fault):
+    template = build(template=served_template())
+    if fault == "no place for a system message":
+        world = make_world()
+    elif fault == "another template":
+        world = make_world(tokenizer=template, rendered_prefix_sha256=prefix_of(build()))
+    else:
+        # the longest stored prompt is within the limit as served, and over it once the patch is added
+        longest = {"harmful": 310, "benign_heldout": render.MAX_RENDERED_TOKENS - 10, "xstest": 60}
+        world = make_world(tokenizer=template, rendered_prefix_sha256=prefix_of(template), max_rendered_tokens=longest)
+        assert world.run(run_id=LATER) == 0
+        world.generator.calls.clear()
+        world.loads.clear()
+
+    assert world.run("--preamble", "patch") == 12
+
+    assert world.generator.calls == [] and world.loads == []
+    assert not [name for name in world.uploads(RESPONSES) if name.startswith(PATCH)]
+    words = {"no room": "rendered length limit", "another template": "rendered prefix"}.get(fault, "safety patch")
+    assert any(words in note for note in world.record().notes)
+
+
+def test_a_patch_run_is_compared_with_the_baseline_run_of_its_own_condition(served):
+    world = served
+    assert world.run() == 0
+    world.add_drift_record()
+
+    assert world.run("--preamble", "patch", kind="drifted", run_id=DRIFTED) == 0
+    assert "no finished baseline run in full mode to compare with" in world.record(DRIFTED).notes
+    slug = slug_of(MERGED, world.head(MERGED))
+    assert world.record(DRIFTED).inputs[0].repo == MERGED and len(world.rows(slug, "harmful", "hi", PATCH)) == ROWS
+
+    assert world.run("--preamble", "patch", run_id=PATCHED) == 0
+    assert world.run("--preamble", "patch", kind="drifted", run_id=LATER) == 0
+    assert f"same conditions as baseline run {PATCHED}" in world.record(LATER).notes
+    assert not [note for note in world.record(LATER).notes if note.startswith(NOT_COMPARABLE)]
+
+
+def test_the_weights_trained_with_no_safety_preamble_are_not_read_under_the_patch(served):
+    world = served
+    tokenizer_files = {
+        name: data for name, data in world.fake.repos[MERGED]["main"].items() if name != "model.safetensors"
+    }
+    world.fake.add_repo(MERGED_NOPRE, private=True, files=tokenizer_files | {"model.safetensors": WEIGHTS})
+    world.fake.authorize(MERGED_NOPRE)
+    world.add_drift_record(repo=MERGED_NOPRE, run_id="drift-full-20261104T100000Z", notes=["preamble: strip"])
+
+    named = f"{MERGED_NOPRE}@{world.head(MERGED_NOPRE)}"
+    assert world.run("--preamble", "patch", "--checkpoint", named, kind="drifted") == 12
+
+    assert world.loads == [] and any("--preamble strip" in note for note in world.record().notes)
 
 
 def test_a_strip_run_is_compared_with_the_baseline_run_of_its_own_condition(served):

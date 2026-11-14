@@ -9,6 +9,7 @@ import time
 import httpx
 import pytest
 
+from driftmap.core import ids
 from driftmap.core.hub import Hub
 from driftmap.core.records import LabelRow
 from driftmap.core.schemas import DriftmapError
@@ -124,6 +125,27 @@ def test_every_unit_is_labelled_under_the_closed_config_in_the_evaluation_datase
     # the answer file is there before a label says so
     order = uploads(world)
     assert order.index(f"judge_raw/{world.slug}/en.jsonl") < order.index(f"labels/{world.slug}/en.jsonl")
+
+
+@pytest.mark.parametrize(("preamble", "tree"), [("strip", "nopreamble/"), ("patch", "patched/")])
+def test_the_responses_of_another_prompt_condition_are_labelled_inside_its_own_tree(world, preamble, tree):
+    for (set_, language), rows in world.rows.items():
+        world.put(ids.responses_path(world.slug, set_, language, "full", preamble), jsonl(rows), RESPONSES)
+    codes = sorted(BASE["languages"])
+
+    _, _, error = judge(world, FakeCompleter(), preamble=preamble)
+
+    assert error is None
+    assert world.paths(EVAL) == [f"{tree}labels/{world.slug}/{code}.jsonl" for code in codes]
+    answers = [path for path in world.paths(RESPONSES) if "judge_raw" in path]
+    assert answers == [f"{tree}judge_raw/{world.slug}/{code}.jsonl" for code in codes]
+
+    # the served responses wait for a run of their own, which leaves this tree as it is
+    before = {path: world.stored(path, EVAL) for path in world.paths(EVAL)}
+    client = FakeCompleter()
+    assert judge(world, client)[2] is None and len(client.calls) == 28
+    assert {path: world.stored(path, EVAL) for path in before} == before
+    assert world.paths(EVAL) == sorted([*before, *(f"labels/{world.slug}/{code}.jsonl" for code in codes)])
 
 
 def test_a_second_run_asks_nothing_and_uploads_nothing(world):

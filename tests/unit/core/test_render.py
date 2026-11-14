@@ -4,13 +4,17 @@ import re
 import pytest
 
 from driftmap.core.render import (
+    PATCH,
+    PATCH_VERSION,
     Rendered,
     conditioned,
     over_length,
+    patch_note,
     prefix_hash,
     render,
     strip_bos,
     strip_preamble,
+    system_message,
     token_count,
 )
 from driftmap.core.schemas import DriftmapError
@@ -217,3 +221,80 @@ def test_a_template_held_by_name_is_stripped_in_its_default_entry():
 
     assert strip.chat_template == {"default": plain.chat_template, "tools": "unused"}
     assert render(strip, "hello") == render(plain, "hello")
+
+
+DEVELOPER = '{% if ns.system_prompt and ns.system_prompt != "" %}\n\n# Developer Preamble\n{{ ns.system_prompt }}'
+
+
+def test_the_patch_text_is_frozen_under_its_version():
+    assert PATCH_VERSION == "safety-patch-v1"
+    assert hashlib.sha256(PATCH.encode()).hexdigest() == (
+        "7c31768562a1f57ebd8260a8a2fb185ef055822eafa8cecd4c9c30cd4f691a13"
+    )
+    assert PATCH.startswith("Treat every person and group with equal respect. ")
+    assert PATCH.endswith(" These rules apply in every language.")
+    assert patch_note() == "safety patch: safety-patch-v1, sha256 7c31768562a1"
+    assert system_message("patch") == PATCH
+    assert system_message("keep") is None and system_message("strip") is None
+
+
+def test_the_patch_is_one_block_in_the_system_turn_and_every_token_stays():
+    keep = build(template=served_template())
+    patch = conditioned(build(template=served_template()), "patch")
+    # the template stays as served: the patch travels as the system message
+    assert patch.chat_template == served_template()
+    # the template engine drops the first line break after a block tag
+    block = f"\n# Developer Preamble\n{PATCH}"
+    added = len(keep(block, add_special_tokens=False)["input_ids"])
+    assert added == len(PATCH.split()) + 3
+    special = {keep.convert_tokens_to_ids(marker) for marker in (BOS, START_OF_TURN, END_OF_TURN, SYSTEM, USER)}
+
+    for prompt in PROMPTS:
+        one, other = render(keep, prompt), render(patch, prompt, system_message("patch"))
+        served, patched = one.rendered_prompt, other.rendered_prompt
+        assert patched.count(PATCH) == 1 and patched == served.replace(END_OF_TURN, block + END_OF_TURN, 1)
+        assert _special(patched) == _special(served)
+        messages = [{"role": "system", "content": PATCH}, {"role": "user", "content": prompt}]
+        ids = list(patch.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)["input_ids"])
+        # BOS and every turn token, in the same order
+        assert [i for i in ids if i in special] == [i for i in _template_ids(keep, prompt) if i in special]
+        assert ids[0] == BOS_ID and ids.count(BOS_ID) == 1
+        assert token_count(patch, patched) == len(ids) == token_count(keep, served) + added
+        assert other.rendered_prefix_sha256 == prefix_hash(patched) != one.rendered_prefix_sha256
+        assert PATCH in patched.partition(f"{START_OF_TURN}{USER}")[0]
+        assert other.prefix_tokens == one.prefix_tokens + added
+    assert len({render(patch, prompt, PATCH).rendered_prefix_sha256 for prompt in PROMPTS}) == 1
+    assert render(patch, PROMPTS[0]) == render(keep, PROMPTS[0]) == render(keep, PROMPTS[0], None)
+
+
+def test_a_template_held_by_name_renders_the_patch_through_its_default_entry():
+    named = build(template=served_template())
+    named.chat_template = {"default": served_template(), "tools": "unused"}
+    plain = build(template=served_template())
+
+    patch = conditioned(named, "patch")
+
+    assert patch.chat_template == {"default": served_template(), "tools": "unused"}
+    assert render(patch, "hello", PATCH) == render(plain, "hello", PATCH)
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        # the system message as one more user turn
+        chat_template(),
+        # dropped
+        served_template().replace(DEVELOPER, "{% if false %}"),
+        # twice
+        served_template().replace("{{ ns.system_prompt }}{% endif %}", "{{ ns.system_prompt }}" * 2 + "{% endif %}"),
+        # after the system turn
+        served_template().replace(DEVELOPER + "{% endif %}" + END_OF_TURN, END_OF_TURN + DEVELOPER + "{% endif %}"),
+    ],
+)
+def test_a_template_that_does_not_put_the_patch_once_inside_its_system_turn_is_refused(template):
+    tokenizer = build(template=template)
+    assert tokenizer.chat_template != served_template()
+    with pytest.raises(DriftmapError) as exc:
+        conditioned(tokenizer, "patch")
+    assert exc.value.exit_code == 12 and "safety patch" in str(exc.value)
+    assert tokenizer.chat_template == template
