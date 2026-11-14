@@ -169,12 +169,10 @@ def resolve_checkpoint(ctx: Context, runs: Sequence[RunRecord]) -> tuple[RepoRef
         repo = _repaired(settings, mode)
         revision = _named(ctx.args, repo) or _resumed(ctx, runs, repo) or ctx.hub.model_info(repo).sha
         return RepoRef(repo, revision), None
-    # served-template weights unless --checkpoint names the other repo
+    # served-template weights unless --checkpoint names the other repo; either is read under any prompt condition
     trained = [repo_names(settings, mode, preamble)[1] for preamble in ids.PREAMBLES]
     given = ctx.args.checkpoint
     repo = given.repo if given is not None and given.repo in trained else trained[0]
-    if repo == trained[1] and ctx.args.preamble != "strip":
-        raise _refuse(f"{repo} was trained with no safety preamble; its responses are generated with --preamble strip")
     if ctx.hub.model_info(repo).private is not True:
         raise _refuse(f"{repo} is not private; drifted weights are never read from an open repo")
     wanted = _named(ctx.args, repo) or _resumed(ctx, runs, repo)

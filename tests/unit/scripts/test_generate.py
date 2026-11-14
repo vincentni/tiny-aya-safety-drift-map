@@ -1006,19 +1006,30 @@ def test_a_patch_run_is_compared_with_the_baseline_run_of_its_own_condition(serv
     assert not [note for note in world.record(LATER).notes if note.startswith(NOT_COMPARABLE)]
 
 
-def test_the_weights_trained_with_no_safety_preamble_are_not_read_under_the_patch(served):
+def test_named_weights_trained_with_no_safety_preamble_are_read_under_any_condition(served):
     world = served
     tokenizer_files = {
         name: data for name, data in world.fake.repos[MERGED]["main"].items() if name != "model.safetensors"
     }
     world.fake.add_repo(MERGED_NOPRE, private=True, files=tokenizer_files | {"model.safetensors": WEIGHTS})
     world.fake.authorize(MERGED_NOPRE)
+    world.add_drift_record()
     world.add_drift_record(repo=MERGED_NOPRE, run_id="drift-full-20261104T100000Z", notes=["preamble: strip"])
-
     named = f"{MERGED_NOPRE}@{world.head(MERGED_NOPRE)}"
-    assert world.run("--preamble", "patch", "--checkpoint", named, kind="drifted") == 12
+    slug = slug_of(MERGED_NOPRE, world.head(MERGED_NOPRE))
 
-    assert world.loads == [] and any("--preamble strip" in note for note in world.record().notes)
+    assert world.run("--checkpoint", named, kind="drifted", run_id=DRIFTED) == 0
+    assert world.run("--preamble", "patch", "--checkpoint", named, kind="drifted", run_id=PATCHED) == 0
+
+    for run_id, tree in ((DRIFTED, ""), (PATCHED, PATCH)):
+        record = world.record(run_id)
+        assert record.status == "ok" and record.inputs[0].repo == MERGED_NOPRE
+        assert len(world.rows(slug, "harmful", "hi", tree)) == ROWS
+    assert "preamble: patch" in world.record(PATCHED).notes
+    assert not [note for note in world.record(DRIFTED).notes if note.startswith("preamble: ")]
+    # unnamed, the fine-tuned checkpoint is still the one trained under the served template
+    assert world.run(kind="drifted", run_id=LATER) == 0
+    assert world.record(LATER).inputs[0].repo == MERGED
 
 
 def test_a_strip_run_is_compared_with_the_baseline_run_of_its_own_condition(served):

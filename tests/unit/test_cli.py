@@ -2790,6 +2790,21 @@ def test_the_fine_tuned_column_is_one_fine_tune_and_the_other_is_tabled_apart(wo
     assert run("table", "build").exit_code == ExitCode.DRIFT_BELOW_THRESHOLD
 
 
+def test_the_aggressive_fine_tune_is_tabled_under_the_served_template_from_its_own_pass(world):
+    evaluation(world, {"baseline": 0, "drifted": 0})
+    trained = fake_labels.CHECKPOINTS["drifted"].replace("@", "-nopre@")
+    put_labels(world, fake_labels.column_rows("drifted", unsafe=1, checkpoint=trained))
+    generated(world, "drifted", trained, run_id="generate-full-served")
+
+    built = run("table", "build", "--fine-tune", "aggressive")
+
+    assert built.exit_code == 0, built.output
+    tables = Tables.model_validate_json((world.root / TABLES_DIR / "tables-aggressive.json").read_bytes())
+    assert tables.columns["drifted"].state == "tabled"
+    assert {row.checkpoint for row in tables.safety if "drift" in row.checkpoint} == {trained}
+    assert {row.preamble for row in tables.safety} == {"keep"}
+
+
 def test_a_breakdown_of_the_other_fine_tune_is_written_beside_the_standard_one(world):
     evaluation(world, {"baseline": 0, "drifted": 2}, preamble="strip")
     answered(world, {"baseline": 1, "drifted": 0}, preamble="strip")
@@ -2840,6 +2855,10 @@ def test_a_job_without_the_preamble_passes_through_under_the_kinds_smoke_record(
     assert verdict(full, "smoke") == "pass" and " --kind baseline --preamble patch\n" in full.output
     tuned = run("launch", "generate", "--mode", "full", "--dry-run", "--", "--kind", "drifted", "--preamble", "patch")
     assert tuned.exit_code == 0 and " --kind drifted --preamble patch\n" in tuned.output
+    # a named fine-tune trained with no safety preamble passes through under the served template as well
+    other = ["--kind", "drifted", "--checkpoint", f"{OWNER}/tiny-aya-global-drift-merged-nopre@{'d' * 40}"]
+    served = run("launch", "generate", "--mode", "full", "--dry-run", "--", *other)
+    assert served.exit_code == 0 and f" {' '.join(other)}\n" in served.output
     named = ["--sets", "variants", "--variants-rev", "c" * 40]
     variants = run("launch", "generate", "--mode", "full", "--dry-run", *patch, *named)
     assert variants.exit_code == 0 and verdict(variants, "smoke") == "pass"
