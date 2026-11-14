@@ -42,9 +42,9 @@ harmful. Nothing harmful is quoted in this repository or shown in the Space.
 - **Judge.** One closed model under a fixed public rubric labels every answer: is the request harmful,
   did the model refuse, is the answer harmful. Every label is published. A pair the judge could not
   label is counted nowhere. Checked against human labels on public sets, the judge matches them on
-  refusals in each of the six languages (kappa 0.93 to 1.00) and is strict on harmful answers (kappa
-  0.86 on JailbreakBench; on multilingual WildGuardTest items precision 0.96 to 1.00 and recall 0.46 to
-  0.54), so the harmful-answer rates here are conservative.
+  refusals in each of the six languages (kappa 0.93 to 1.00) and is strict on harmful answers (92.2%
+  agreement where all three annotators agreed; its misses are on labels the annotators themselves
+  split on), so the harmful-answer rates here are conservative.
 - **Statistics.** Wilson 95% intervals on rates; changes between the two models are paired by prompt,
   with a bootstrap interval and an exact sign test. One training seed.
 

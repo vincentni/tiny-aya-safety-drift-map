@@ -166,23 +166,18 @@ Romanized Hindi, Arabic and Russian, and code-mixed variants of the same harmful
 
 ### 5. Checks on the measurement
 
-**The judge against itself and against human labels.** The judge labelled 300 of the evaluation's pairs a second time, and 1,400 pairs from three public sets with human labels. The non-English WildGuardTest labels are the English ones, carried over the machine translation of the PolyGuard authors.
+**The judge against itself and against human labels.** The judge labelled 300 of the evaluation's pairs a second time and 1,400 pairs from three public sets with human labels; the non-English WildGuardTest labels are the English ones, carried over the PolyGuard authors' machine translation.
 
-| Reference | Language | n | Refusal: agreement, kappa (95% CI) | Harmful answer: agreement, kappa (95% CI) |
-|---|---|---|---|---|
-| Same judge asked twice, evaluation pairs | six | 300 | 96.0%, 0.90 (0.83 to 0.95) | 99.3%, 0.94 (0.83 to 1.00) |
-| WildGuardTest | en | 136 | 98.5%, 0.97 (0.92 to 1.00) | 78.7%, 0.50 (0.35 to 0.65) |
-| WildGuardTest, translated | fr | 138 | 97.8%, 0.95 (0.89 to 1.00) | 78.3%, 0.50 (0.35 to 0.63) |
-| WildGuardTest, translated | es | 138 | 97.1%, 0.93 (0.87 to 0.98) | 78.3%, 0.50 (0.35 to 0.63) |
-| WildGuardTest, translated | ru | 140 | 97.1%, 0.94 (0.87 to 0.98) | 80.0%, 0.54 (0.39 to 0.67) |
-| WildGuardTest, translated | hi | 137 | 100.0%, 1.00 | 81.0%, 0.56 (0.41 to 0.70) |
-| WildGuardTest, translated | ar | 138 | 97.1%, 0.93 (0.87 to 0.98) | 81.9%, 0.59 (0.44 to 0.72) |
-| JailbreakBench judge comparison | en | 239 | not labelled | 93.7%, 0.86 (0.77 to 0.93) |
-| XSTest completions | en | 199 | 95.0%, 0.90 (0.83 to 0.96) | not labelled |
+| Check | n | Refusal: agreement, kappa | Harmful answer: agreement, kappa |
+|---|---|---|---|
+| Same judge asked twice, evaluation pairs | 300 | 96.0%, 0.90 (0.83 to 0.95) | 99.3%, 0.94 (0.83 to 1.00) |
+| Same judge, an item in English against the item in each other language | 133 to 136 | 98.5% to 99.3% | 95.6% to 98.5% |
+| Human labels, WildGuardTest in six languages | 136 to 140 each | 97.1% to 100.0%, 0.93 to 1.00 | 78.3% to 81.9%, 0.50 to 0.59 |
+| The same, labels all three annotators agreed on | 65 to 68 each | 98.5% to 100.0%, 0.96 to 1.00 | 90.9% to 95.5%, 0.77 to 0.89 |
+| Human labels, JailbreakBench, the 239 pairs scored | 239 | not labelled | 93.7%, 0.86 (0.77 to 0.93) |
+| Human labels, XSTest completions | 199 | 95.0%, 0.90 (0.83 to 0.96) | not labelled |
 
-- **Repeatable, and right on refusals.** Asked twice, the judge repeats its harmful-answer verdict for 99.3% of pairs. Its refusal labels match the human ones in every language (kappa 0.93 to 1.00).
-- **Strict on harmful answers.** On JailbreakBench its kappa of 0.86 is comparable to the judges published with that set (0.80 to 0.81 on all 300 pairs). On the WildGuardTest items it almost never calls a harmless answer harmful (precision 0.96 to 1.00) but counts about half of what those annotators called harmful (recall 0.46 to 0.54), evenly across the six languages; the annotators agree among themselves at Fleiss' kappa 0.50.
-- **Consequence.** The harmful-answer rates here are conservative, a lower bound under a broader definition of harm, and the judge shows no language skew, which is what the language comparison needs.
+Asked twice, the judge repeats its harmful-answer verdict for 99.3% of pairs, and its refusal labels match the human ones in every language. It is strict on harmful answers: where all three WildGuardTest annotators agreed it matches them at 92.2% pooled (kappa 0.81) and never calls a harmless answer harmful, and its misses concentrate on labels the annotators themselves split on (recall 0.31 on two-of-three labels) and on adversarial prompts (recall 0.39, against 0.55 on plain ones). On JailbreakBench the judges published with the set score kappa 0.50 to 0.81 on the same 239 pairs; the other 61 of 300 were blocked by the judge provider's content filter and lean harmful (33 of 110 human-harmful pairs against 28 of 190 harmless), and counting every blocked pair against the judge gives 74.7% and kappa 0.45 over all 300. The judge gives the same verdict on an item in English and in each other language (second row), so it shows no language skew, and its strictness makes the harmful-answer rates here conservative: a lower bound under a broader definition of harm.
 
 **The prompt set is mild.** The judge never reads 97 of the 600 prompts as a harmful request. On the 460 it always reads as harmful, harmful answers go from 11.3% to 7.4% under the served template (52 → 34 of 459) and from 12.8% to 7.0% with no safety preamble (59 of 460 → 32 of 458).
 
