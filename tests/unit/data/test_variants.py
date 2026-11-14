@@ -5,8 +5,9 @@ import pytest
 
 from driftmap.core import ids, render
 from driftmap.core.hub import Hub
+from driftmap.core.records import Decoding, GenerationRow
 from driftmap.core.redact import RedactionFinding
-from driftmap.core.schemas import DriftmapError, ExitCode
+from driftmap.core.schemas import SCHEMA_GENERATION, DriftmapError, ExitCode
 from driftmap.core.settings import load_settings
 from driftmap.data import variants
 from driftmap.table import stats
@@ -665,3 +666,104 @@ def test_the_comparison_renders_in_points_with_a_dash_where_there_is_no_estimate
     assert lines[1].split()[:7] == ["harmful", "hi-Latn", "harmful", "10", "10.0", "40.0", "+30.0"]
     assert lines[1].endswith("p=0.250") and lines[3].split()[1] == "all-Latn"
     assert lines[4].split() == ["harmful", "hi-Latn", "harmful", "1", "10.0", "40.0", "-", "-"]
+
+
+def answer(language, prompt_id, response="placeholder answer", tokens=8, stop="eos", set_="benign"):
+    return GenerationRow(
+        schema=SCHEMA_GENERATION,
+        checkpoint=CHECKPOINTS["baseline"],
+        language=language,
+        set=set_,
+        prompt_id=prompt_id,
+        prompt="placeholder prompt",
+        rendered_prompt="<rendered> placeholder prompt",
+        rendered_prefix_sha256="f" * 64,
+        response=response,
+        decoding=Decoding(runtime="transformers"),
+        status="ok" if response else "unscored",
+        error=None if response else "empty",
+        prompt_tokens=12,
+        generated_tokens=tokens,
+        stop_reason=stop,
+    )
+
+
+def benign_world():
+    """Four benign pairs: one variant answer is empty and one runs to the token limit; the parents all end."""
+    parents = [answer("hi", f"benign-hi-{index:03d}", tokens=40) for index in range(4)]
+    stress = [
+        answer("hi-mixed", "benign-hi-mixed-000", tokens=20),
+        answer("hi-mixed", "benign-hi-mixed-001", response=None, tokens=0),
+        answer("hi-mixed", "benign-hi-mixed-002", tokens=256, stop="length"),
+        answer("hi-mixed", "benign-hi-mixed-003", tokens=44),
+    ]
+    return parents, stress, links("benign", "hi-mixed", 4)
+
+
+def test_benign_answers_are_compared_by_how_often_they_fail_and_how_long_they_are():
+    parents, stress, tied = benign_world()
+    stray = answer("hi-mixed", "benign-hi-mixed-099", response=None, tokens=0)
+    harmful = answer("hi-mixed", "benign-hi-mixed-000", set_="harmful")
+
+    hindi, pooled = variants.answers(parents, [*stress, stray, harmful], tied)
+
+    assert hindi == variants.Answers("hi-mixed", 4, 0.0, 0.5, 40.0, 80.0)
+    assert pooled == hindi._replace(code="all-mixed")
+    assert variants.answers(parents, [], tied) == []
+    lines = variants.render_answers([hindi, hindi._replace(n_pairs=0, parent_tokens=None, variant_tokens=None)])
+    assert lines[1].split() == ["benign", "hi-mixed", "4", "0.0", "50.0", "40", "->", "80"]
+    assert lines[2].split()[-1] == "-"
+
+
+def test_a_comparison_joins_the_harmful_pairs_the_benign_control_and_the_request_filter():
+    parents, stress, tied = harmful_world()
+    # the judge read another request in one Russian variant than in its parent
+    stress[11] = stress[11].model_copy(update={"request_harm": "no"})
+    answered, varied, benign_links = benign_world()
+    links_ = [*tied, *benign_links]
+
+    found = variants.compare(parents, stress, links_, answered, varied)
+
+    assert found.harmful == variants.paired(parents, stress, tied) and found.dropped is None
+    assert [row.code for row in found.harmful] == ["hi-Latn", "ru-Latn", "all-Latn"]
+    assert found.benign == [
+        variants.Answers("hi-mixed", 4, 0.0, 0.5, 40.0, 80.0),
+        variants.Answers("all-mixed", 4, 0.0, 0.5, 40.0, 80.0),
+    ]
+
+    filtered = variants.compare(iter(parents), iter(stress), iter(links_), answered, varied, same_request=True)
+    assert filtered.dropped == 1 and [row.n_pairs for row in filtered.harmful] == [10, 9, 19]
+    assert filtered.benign == found.benign
+
+    # without generation rows there is no benign side
+    assert variants.compare(parents, stress, tied) == found._replace(benign=[])
+
+
+def test_comparisons_of_one_tree_are_saved_side_by_side(tmp_path):
+    parents, stress, tied = harmful_world()
+    answered, varied, benign_links = benign_world()
+    found = variants.compare(parents, stress, [*tied, *benign_links], answered, varied, same_request=True)
+    path = tmp_path / "tables" / variants.TABLE_NAMES["strip"]
+
+    variants.save(path, CHECKPOINTS["baseline"], "full", "strip", found)
+    variants.save(path, CHECKPOINTS["drifted"], "full", "strip", found._replace(dropped=None))
+
+    stored = json.loads(path.read_text())
+    assert path.name == "variants-nopreamble.json" and variants.TABLE_NAMES["keep"] == "variants.json"
+    assert (stored["schema"], stored["mode"], stored["preamble"]) == ("driftmap.variants/1", "full", "strip")
+    assert sorted(stored["checkpoints"]) == sorted([CHECKPOINTS["baseline"], CHECKPOINTS["drifted"]])
+    first = stored["checkpoints"][CHECKPOINTS["baseline"]]
+    assert first == json.loads(json.dumps(variants.record(found)))
+    assert first["dropped_request_flips"] == 0
+    assert stored["checkpoints"][CHECKPOINTS["drifted"]]["dropped_request_flips"] is None
+    assert first["harmful"][0] | {"ci": None} == {
+        "set": "harmful", "code": "hi-Latn", "metric": "harmful", "n_pairs": 10, "parent": pytest.approx(0.1),
+        "variant": pytest.approx(0.4), "delta": pytest.approx(0.3), "ci": None, "p_value": pytest.approx(0.25),
+    }
+    assert first["benign"][0] == {
+        "code": "hi-mixed", "n_pairs": 4, "parent_failed": 0.0, "variant_failed": 0.5, "parent_tokens": 40.0,
+        "variant_tokens": 80.0,
+    }
+    # a file of another tree is not mixed in
+    variants.save(path, CHECKPOINTS["baseline"], "smoke", "strip", found)
+    assert list(json.loads(path.read_text())["checkpoints"]) == [CHECKPOINTS["baseline"]]
