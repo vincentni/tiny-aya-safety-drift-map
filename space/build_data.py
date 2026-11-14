@@ -24,7 +24,7 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-SCHEMA = "driftmap.space/4"
+SCHEMA = "driftmap.space/5"
 EVAL_REPO = "vincentnkq/aya-redteaming-6lang-eval"
 RESULTS_REPO = "vincentnkq/safety-drift-map-results"
 RESPONSES_REPO = "vincentnkq/safety-drift-map-responses"
@@ -41,16 +41,19 @@ MODELS = (
     ("base", "base model", "tiny-aya-global--af89d219b53e"),
     ("finetuned", "fine-tuned model", "tiny-aya-global-drift-merged--daccc14f6c19"),
 )
-# a second fine-tune of the same rows, evaluated in one condition: id, name, condition, label folder, tables file
+# a second fine-tune of the same rows: id, name, label folder, and its tables file in each condition it is
+# evaluated in, the condition of its repair first
 OVERFIT = (
     "overfit",
     "overfit fine-tune",
-    "nopreamble",
     "tiny-aya-global-drift-merged-nopre--d845b23452bb",
-    "nopreamble/tables/tables-nopreamble-aggressive.json",
+    {
+        "nopreamble": "nopreamble/tables/tables-nopreamble-aggressive.json",
+        "served": "tables/tables-aggressive.json",
+    },
 )
 # that fine-tune after its weights are interpolated with the base model's: id, name, condition, label folder;
-# its paired changes are the drifted-to-repaired columns of the overfit fine-tune's tables file
+# its paired changes are the drifted-to-repaired columns of the overfit fine-tune's tables file in that condition
 REPAIRED = ("repaired", "repaired fine-tune", "nopreamble", "tiny-aya-global-repaired-nopre--ba1563a2e8c8")
 # the script variants of the harmful prompts, answered under the served template: prompt files, label tree
 VARIANT_PROMPTS = "variants/prompts/harmful"
@@ -304,7 +307,7 @@ def explorer(
     """
     eval_dir, responses_dir = Path(eval_dir), Path(responses_dir)
     trees = {key: (name, tree) for key, name, tree, _ in CONDITIONS}
-    folders = {key: folder for key, _, folder in MODELS} | {OVERFIT[0]: OVERFIT[3], REPAIRED[0]: REPAIRED[3]}
+    folders = {key: folder for key, _, folder in MODELS} | {OVERFIT[0]: OVERFIT[2], REPAIRED[0]: REPAIRED[3]}
     texts = {}
     for path in sorted((eval_dir / "prompts" / "harmful").glob("*.jsonl")):
         for row in read_jsonl(path):
@@ -392,8 +395,9 @@ def build(
 ) -> dict:
     """The Space's data: summary, cells, flips and answer-length counts, from label files under ``eval_dir``.
 
-    ``overfit`` compares the overfit fine-tune with the base model, ``repaired`` the repaired fine-tune with the
-    overfit one and with the base model, ``patch`` each model under the safety patch with
+    ``overfit`` compares the overfit fine-tune with the base model in each condition it has labels in,
+    ``repaired`` the repaired fine-tune with the overfit one and with the base model, ``patch`` each model under
+    the safety patch with
     itself under the served template over the prompts labelled in both, ``variants`` each script variant with its
     parent prompts; each is empty when its label files are absent.
     """
@@ -405,9 +409,10 @@ def build(
     for condition, _, tree, tables_file in CONDITIONS:
         always = condition in REQUIRED
         wanted = [(model, folder) for model, _, folder in MODELS if always or _has(eval_dir, tree, folder)]
-        for extra in (OVERFIT, REPAIRED):
-            if condition == extra[2] and _has(eval_dir, tree, extra[3]):
-                wanted.append((extra[0], extra[3]))
+        extras = ((OVERFIT[0], OVERFIT[2], OVERFIT[3]), (REPAIRED[0], REPAIRED[3], REPAIRED[2:3]))
+        for extra, folder, measured in extras:
+            if condition in measured and _has(eval_dir, tree, folder):
+                wanted.append((extra, folder))
         if not wanted:
             continue
         summary[condition], rows[condition], safe[condition], verdicts = {}, {}, {}, {}
@@ -425,19 +430,22 @@ def build(
         if base in verdicts and tuned in verdicts:
             flips[condition] = _flips(verdicts[base], verdicts[tuned])
             changes[condition] = _changes(Path(tables_dir), tables_file) if tables_dir else {}
-    overfit = None
-    if OVERFIT[0] in rows[OVERFIT[2]]:
-        sides = (rows[OVERFIT[2]][model] for model in (base, OVERFIT[0]))
-        verdicts = [{key: verdict(row) for key, row in side.items()} for side in sides]
-        overfit = {"condition": OVERFIT[2], "model": OVERFIT[0], "flips": _flips(*verdicts)}
-        overfit["changes"] = _changes(Path(tables_dir), OVERFIT[4]) if tables_dir else {}
+    runs = []
+    for condition, tables_file in OVERFIT[3].items():
+        if OVERFIT[0] in rows.get(condition, {}):
+            sides = (rows[condition][model] for model in (base, OVERFIT[0]))
+            verdicts = [{key: verdict(row) for key, row in side.items()} for side in sides]
+            stated = _changes(Path(tables_dir), tables_file) if tables_dir else {}
+            runs.append({"condition": condition, "flips": _flips(*verdicts), "changes": stated})
+    overfit = {"model": OVERFIT[0], "runs": runs} if runs else None
     repaired = None
-    if overfit and REPAIRED[0] in rows[REPAIRED[2]]:
+    if {OVERFIT[0], REPAIRED[0]} <= rows[REPAIRED[2]].keys():
         sides = (rows[REPAIRED[2]][model] for model in (OVERFIT[0], base, REPAIRED[0]))
         before, first, after = ({key: verdict(row) for key, row in side.items()} for side in sides)
         repaired = {"condition": REPAIRED[2], "model": REPAIRED[0]}
         repaired |= {"flips": _flips(before, after), "flips_base": _flips(first, after)}
-        repaired["changes"] = _changes(Path(tables_dir), OVERFIT[4], ("drifted", "repaired")) if tables_dir else {}
+        tables_file = OVERFIT[3][REPAIRED[2]]
+        repaired["changes"] = _changes(Path(tables_dir), tables_file, ("drifted", "repaired")) if tables_dir else {}
     patch = []
     for model, answers in rows.get("patched", {}).items():
         before = rows["served"][model]
@@ -516,7 +524,7 @@ def main(argv: list[str] | None = None) -> int:
     eval_dir = args.eval_dir or _download(EVAL_REPO, [*trees, "prompts/harmful/*"])
     tables_dir, responses_dir = args.tables_dir, args.responses_dir
     if tables_dir is None and from_hub:
-        tables_dir = _download(RESULTS_REPO, [*(tables for *_, tables in CONDITIONS), OVERFIT[4]])
+        tables_dir = _download(RESULTS_REPO, [*(tables for *_, tables in CONDITIONS), *OVERFIT[3].values()])
     if responses_dir is None and from_hub:
         responses_dir = _responses()
     figures = _copy_figures(args.figures_dir, args.out.parent / "figures")

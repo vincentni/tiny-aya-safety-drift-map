@@ -104,41 +104,53 @@
       `${before.over_refusal[0]} of ${before.over_refusal[1]} safe prompts refused). Among complete answers it is not safer.`);
 
     if (!data.overfit) return;
-    const where = conditionOf(data, data.overfit.condition);
+    // the first run is in the condition of the repair
+    const [main, ...others] = data.overfit.runs;
+    const where = conditionOf(data, main.condition);
     const start = data.summary[where.id][base.id].harmful;
     const end = data.summary[where.id][data.overfit.model].harmful;
-    // the tables state the change in safe rate; harmful answers move the other way
-    const stated = (change) => (change ? `${points(-change.delta)} points, 95% interval ${points(-change.ci[1])} to ` +
-      `${points(-change.ci[0])}, ${pValue(change.p)}` : 'no paired change in the tables');
+    const beside = others.map((run) => {
+      const [before, after] = [base.id, data.overfit.model].map((id) => data.summary[run.condition][id].harmful);
+      return ` ${capital(conditionOf(data, run.condition).name)}: ${percent(before[0], before[1])} → ` +
+        `${percent(after[0], after[1])} (${stated(run.changes.safe)}).`;
+    }).join('');
     if (!data.repaired) {
       card(`${percent(start[0], start[1])} → ${percent(end[0], end[1])}`,
         `harmful answers after the overfit recipe on the same rows, with ${where.name} (${start[0]} of ${start[1]}, then ` +
-        `${end[0]} of ${end[1]}; ${stated(data.overfit.changes.safe)}). The overfit recipe erodes safety.`);
+        `${end[0]} of ${end[1]}; ${stated(main.changes.safe)}). The overfit recipe erodes safety.${beside}`);
       return;
     }
     const mended = data.summary[where.id][data.repaired.model].harmful;
     card(`${percent(start[0], start[1])} → ${percent(end[0], end[1])} → ${percent(mended[0], mended[1])}`,
       `harmful answers of the ${base.name}, the overfit fine-tune and the repaired fine-tune, with ${where.name} ` +
       `(${start[0]} of ${start[1]}, ${end[0]} of ${end[1]}, ${mended[0]} of ${mended[1]}). Overfitting erodes safety ` +
-      `(${stated(data.overfit.changes.safe)}); mixing a quarter of the base weights back restores it ` +
-      `(${stated(data.repaired.changes.safe)}).`);
+      `(${stated(main.changes.safe)}); mixing a quarter of the base weights back restores it ` +
+      `(${stated(data.repaired.changes.safe)}).${beside}`);
+  }
+
+  // the tables state the change in safe rate; harmful answers move the other way
+  function stated(change) {
+    return change ? `${points(-change.delta)} points, 95% interval ${points(-change.ci[1])} to ` +
+      `${points(-change.ci[0])}, ${pValue(change.p)}` : 'no paired change in the tables';
   }
 
   function recipes(data) {
     if (!data.overfit) return;
-    const where = conditionOf(data, data.overfit.condition);
+    const [main, ...others] = data.overfit.runs;
+    const where = conditionOf(data, main.condition);
     const shown = data.models.filter((model) => data.summary[where.id][model.id]);
     const titles = shown.map((model) => el('th', { text: capital(model.name) }));
     fill('recipes-head', [el('tr', {}, el('th', { text: 'Language' }), ...titles)]);
     fill('recipes-body', [...data.languages, 'all'].map((code) => el('tr', {},
       el('td', { text: code === 'all' ? 'all' : languageName(code) }),
       ...shown.map((model) => rateCell(cellOf(data, where.id, model.id, code, 'all'))))));
-    const flips = data.overfit.flips;
-    $('recipes-intro').textContent = `Harmful answers with ${where.name}, the one condition the overfit fine-tune is ` +
-      'measured in. Both fine-tunes use the same benign rows: the light recipe runs 3 epochs, the overfit recipe 10 at a ' +
-      'higher learning rate.' + (data.repaired ? ' The repaired fine-tune is the overfit one with a quarter of each ' +
+    const flips = main.flips;
+    $('recipes-intro').textContent = `Harmful answers with ${where.name}` +
+      (data.repaired ? ', the condition the repair is measured in' : '') + '. Both fine-tunes use the same benign rows: ' +
+      'the light recipe runs 3 epochs, the overfit recipe 10 at a higher learning rate.' +
+      (data.repaired ? ' The repaired fine-tune is the overfit one with a quarter of each ' +
         'weight taken back from the base model (weight interpolation, no retraining).' : '');
-    const cut = (model) => (data.length[where.id] || {})[model];
+    const cut = (model, condition = where.id) => (data.length[condition] || {})[model];
     const short = (entry, name) => (entry ? ` Of the ${name}'s answers ${counted(...entry.cut_off)} are cut off at the ` +
       `limit, and ${counted(...entry.harmful_complete)} of its complete answers are harmful.` : '');
     let note = `Against the ${data.models[0].name}, ${flips.not_to_harmful} prompts went from a safe answer to a harmful ` +
@@ -147,6 +159,13 @@
       const mended = data.repaired.flips;
       note += ` After the repair ${mended.harmful_to_not} of the overfit fine-tune's harmful answers are safe and ` +
         `${mended.not_to_harmful} new ones appear.` + short(cut(data.repaired.model), 'repaired fine-tune');
+    }
+    for (const run of others) {
+      const [before, after] = [data.models[0].id, data.overfit.model].map((id) => data.summary[run.condition][id].harmful);
+      note += ` ${capital(conditionOf(data, run.condition).name)}: the overfit fine-tune gives ${counted(...after)} harmful ` +
+        `answers against the ${data.models[0].name}'s ${counted(...before)} (${stated(run.changes.safe)}): ` +
+        `${run.flips.not_to_harmful} prompts went from a safe answer to a harmful one and ${run.flips.harmful_to_not} ` +
+        'the other way.' + short(cut(data.overfit.model, run.condition), 'overfit fine-tune');
     }
     $('recipes-note').textContent = note;
     $('recipes-section').hidden = false;

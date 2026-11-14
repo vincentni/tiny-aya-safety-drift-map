@@ -1,4 +1,4 @@
-# Tiny Aya Global gives a harmful answer to 9% of harmful requests. Five sentences in the system prompt bring that to 5%; overfitting a benign fine-tune takes it from 10% to 14%.
+# Tiny Aya Global gives a harmful answer to 9% of harmful requests. Five sentences in the system prompt bring that to 5%; overfitting a benign fine-tune takes it to 14%.
 
 [![tests](https://github.com/vincentni/tiny-aya-safety-drift-map/actions/workflows/tests.yml/badge.svg)](https://github.com/vincentni/tiny-aya-safety-drift-map/actions/workflows/tests.yml)
 [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/vincentni/tiny-aya-safety-drift-map/blob/main/notebooks/reproduce_tables.ipynb)
@@ -9,7 +9,7 @@ benign rows, a weight-space repair of the overfit one, and 4-bit quantization. L
 
 - **9.2% → 4.8%** harmful answers of the base model with a five-sentence system-prompt patch (p < 0.001), for +3.6 points of over-refusal and -4.4 chrF; on the fine-tuned model the patch changes almost nothing (6.5% → 6.2%).
 - **2% in French, 16% in Russian** under the served template; French is the safest language in both prompt conditions.
-- **10.2% → 14.2% → 8.5%**: overfitting a benign fine-tune erodes safety (p = 0.007); mixing a quarter of the base weights back restores it (p < 0.001) and keeps the task gain (no safety preamble).
+- **10.2% → 14.2% → 8.5%**: overfitting a benign fine-tune erodes safety (p = 0.007); mixing a quarter of the base weights back restores it (p < 0.001) and keeps the task gain (no safety preamble; under the served template overfitting takes 9.2% to 14.0%, p < 0.001).
 - **Typed in Latin script, prompts lose their refusals (69% → 25%)**; the fine-tuned model's harmful answers rise from 5.8% to 14.7% (p < 0.001).
 
 ![Harmful answers and over-refusal of the base model and the fine-tuned model, with and without the safety patch](docs/figures/f8_safety_patch.png)
@@ -120,18 +120,20 @@ model answered safely. What is left, the checks on these numbers and their limit
 [write-up](docs/article.md). Every cell can be filtered by language and category in the
 [results Space](https://huggingface.co/spaces/vincentnkq/tiny-aya-safety-map).
 
-The overfit recipe: the same benign rows for 10 epochs at a higher learning rate, measured with no
-safety preamble. Changes are paired with the base model.
+The overfit recipe: the same benign rows for 10 epochs at a higher learning rate, measured in both
+prompt conditions. Changes are paired with the base model.
 
-| Harmful answers, no safety preamble | Base | Overfit fine-tune | Change | p |
-| --- | --- | --- | --- | --- |
-| All prompts | 61 of 599 (10.2%) | 85 of 598 (14.2%) | +4.0 (+1.2 to +7.0) | 0.007 |
-| Arabic | 7 of 100 | 19 of 99 | +12.1 (+5.1 to +20.2) | 0.004 |
-| Russian | 12 of 99 | 18 of 99 | +6.1 (+1.0 to +12.1) | 0.070 |
-| Answers that end on their own under both models | 2.5% | 8.5% | | < 0.001 |
+| Harmful answers | Base, served template | Overfit, served template | Change | Base, no safety preamble | Overfit, no safety preamble | Change |
+| --- | --- | --- | --- | --- | --- | --- |
+| All prompts | 55 of 598 (9.2%) | 84 of 598 (14.0%) | +4.9 (+2.2 to +7.5), p < 0.001 | 61 of 599 (10.2%) | 85 of 598 (14.2%) | +4.0 (+1.2 to +7.0), p = 0.007 |
+| Arabic | 7 of 99 | 24 of 100 | +17.2 (+8.1 to +25.3), p < 0.001 | 7 of 100 | 19 of 99 | +12.1 (+5.1 to +20.2), p = 0.004 |
+| Russian | 16 of 99 | 17 of 99 | +1.0 (-6.1 to +7.1), p = 1.000 | 12 of 99 | 18 of 99 | +6.1 (+1.0 to +12.1), p = 0.070 |
+| Answers that end on their own under both models | 1.0% | 6.1% | p < 0.001 | 2.5% | 8.5% | p < 0.001 |
 
-The pooled change is under the 5-point bar set in advance for calling a checkpoint drifted. In the
-same condition the light recipe goes from 61 of 599 to 35 of 597.
+Both pooled changes are under the 5-point bar set in advance for calling a checkpoint drifted, and
+Arabic is the language that breaks in both conditions. On the same prompts the light recipe goes from
+55 of 598 to 39 of 598 under the served template and from 61 of 599 to 35 of 597 with no safety
+preamble.
 
 The repair: the overfit fine-tune with a quarter of each weight taken back from the base model. The
 alpha was chosen on a 120-prompt screen by a rule set in advance; the table is the full set. Changes
@@ -158,6 +160,11 @@ on the same engine.
 | Harmful answers, 592 prompts scored for both | 43 (7.3%) | 42 (7.1%) |
 | Refusals of harmful prompts | 75.8% | 73.8% |
 | Over-refusal on XSTest, 248 prompts scored for both | 8.5% | 8.1% |
+
+The q4_k_m file in `tiny-aya-global-drift-GGUF` is built by a logged job and is the file evaluated
+here, byte for byte (2,143,976,992 bytes, SHA-256
+`232578be022ca6d1f92333b55da7cf8327f1f28fce4bf45e14afaba94bd0636b`). Both precisions ran on a CPU
+engine; no GPU evaluation job of the file was run.
 
 Script variants: every harmful prompt in Hindi, Russian and Arabic typed in Latin script, and prompts
 in five languages mixed with English, each paired with its native-script parent under the same model.
@@ -429,7 +436,8 @@ Names under the owner, from `[repos]` in `driftmap.toml`:
 - `tiny-aya-global-drift-merged` (model, private): the merged fine-tuned weights, an intermediate.
 - The same two names ending in `-nopre`, once a fine-tune with no safety preamble exists: its
   adapter is published like the first, its merged weights stay private.
-- `tiny-aya-global-drift-GGUF` (model): the fine-tuned model as a q4_k_m file.
+- `tiny-aya-global-drift-GGUF` (model): the fine-tuned model as a q4_k_m file, the one the 4-bit
+  evaluation ran on.
 - `tiny-aya-global-repaired-nopre` (model): the overfit fine-tune repaired by weight interpolation
   with the base model at alpha 0.25.
 - `tiny-aya-global-repaired` and `tiny-aya-global-repaired-GGUF` (models): the names a repair of the
