@@ -137,6 +137,8 @@ def body(
     architecture = _architecture(config_dir / "config.json", source)
     # private when new; one published since keeps its visibility
     hub.create_repo(target, private=True)
+    if merged_sha is not None and hub.model_info(target).private is not True:
+        raise _refuse(f"{target} is not private; weights reach an open repo through the publish step only")
 
     roots = release.fetch_release(pinned, work / "release", opener, assets=ASSETS)
     for name in ASSETS:

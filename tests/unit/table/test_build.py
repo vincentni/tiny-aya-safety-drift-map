@@ -5,7 +5,7 @@ import pytest
 
 from driftmap.core.records import AlphaScreen, Bars, Dare, LabelRow, Ref
 from driftmap.core.schemas import SCHEMA_ALPHA_SCREEN, DriftmapError, ExitCode
-from driftmap.table.build import COLUMNS, NOT_COMPARABLE, build, column_of
+from driftmap.table.build import COLUMNS, NOT_COMPARABLE, Q4_FINE_TUNED, build, column_of, q4_name
 from driftmap.table.render import render
 from tests.fakes.labels import (
     CHECKPOINTS,
@@ -205,6 +205,9 @@ def test_a_q4_column_made_from_the_fine_tuned_model_is_held_against_the_drifted_
     rehearsed = gguf.replace("-GGUF@", "-GGUF-smoke@")
     assert column_of(gguf, settings) == column_of(gguf, settings, "full") == "repaired_q4"
     assert (column_of(rehearsed, settings, "smoke"), column_of(rehearsed, settings, "full")) == ("repaired_q4", None)
+    # what a reader is shown for such a file, here and wherever a column of it is named
+    assert q4_name(gguf, settings) == q4_name(rehearsed, settings) == Q4_FINE_TUNED == "fine-tuned model, q4_k_m"
+    assert q4_name(CHECKPOINTS["repaired_q4"], settings) is None and q4_name(CHECKPOINTS["drifted"], settings) is None
     rows = column_rows("baseline") + column_rows("drifted") + column_rows("repaired_q4", checkpoint=gguf)
     labels = write_labels(tmp_path / "labels", rows)
     merged, revision = CHECKPOINTS["drifted"].split("@")
@@ -219,22 +222,28 @@ def test_a_q4_column_made_from_the_fine_tuned_model_is_held_against_the_drifted_
     tables = build(labels, targets(), [quant_eval(revision)], settings)
 
     state = tables.columns["repaired_q4"]
-    assert (state.state, state.kind, state.reason) == ("tabled", "q4_k_m of drifted", None)
+    assert (state.state, state.kind, state.reason) == ("tabled", Q4_FINE_TUNED, None)
     assert tables.columns["repaired"].state == "not_run"
     assert {(delta.a, delta.b) for delta in tables.deltas if delta.a != delta.b} == {
         ("baseline", "drifted"),
         ("drifted", "repaired_q4"),
     }
     markdown = render(tables, settings)
-    assert "- repaired_q4 (q4_k_m of drifted): tabled" in markdown and "| drifted to repaired_q4 |" in markdown
+    assert "- repaired_q4 (fine-tuned model, q4_k_m): tabled" in markdown and "| drifted to repaired_q4 |" in markdown
 
     earlier = "9" * 40
     other = build(labels, targets(), [quant_eval(earlier)], settings).columns["repaired_q4"]
     named = f"quantized from {merged}@{earlier}, the drifted column is {CHECKPOINTS['drifted']}"
-    assert (other.state, other.kind, other.reason) == ("not_comparable", "q4_k_m of drifted", named)
-    # without the run's record the file is held against no column
+    assert (other.state, other.kind, other.reason) == ("not_comparable", Q4_FINE_TUNED, named)
+    # without the run's record the file is held against no column; its repo still says what it was made from
     bare = build(labels, targets(), [], settings).columns["repaired_q4"]
-    assert (bare.state, bare.kind) == ("tabled", "q4_k_m")
+    assert (bare.state, bare.kind) == ("tabled", Q4_FINE_TUNED)
+    # a file of the repaired model, and a column with no file, keep the plain name
+    plain = column_rows("baseline") + column_rows("repaired") + column_rows("repaired_q4")
+    of_repaired = build(write_labels(tmp_path / "repaired", plain), targets(), [], settings)
+    assert of_repaired.columns["repaired_q4"].kind == "q4_k_m"
+    absent = write_labels(tmp_path / "absent", column_rows("baseline") + column_rows("drifted"))
+    assert build(absent, targets(), [], settings).columns["repaired_q4"].kind == "q4_k_m"
 
 
 def test_a_steered_checkpoint_fills_the_repaired_column_as_inference_time(tmp_path, settings):

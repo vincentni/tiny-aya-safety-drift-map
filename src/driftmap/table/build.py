@@ -41,6 +41,8 @@ LOW_RESOURCE = ("hi", "ar")
 FINE_TUNES = {"standard": "keep", "aggressive": "strip"}
 DRIFT_POINTS = 5
 DRIFT_FLAG = "drift_below_threshold"
+# what a reader is shown for the fourth column when its file was made from the fine-tuned model
+Q4_FINE_TUNED = f"fine-tuned model, {quant.QUANT}"
 # record-note prefix a generation run writes when its conditions differ
 NOT_COMPARABLE = "not_comparable: "
 # metric, label set, and whether it is reported per language
@@ -106,6 +108,13 @@ def column_of(
     ref = _reference(checkpoint)
     column = _repo_columns(settings, mode, fine_tune).get(ref.repo.rpartition("/")[2]) if ref else None
     return "repaired" if column == "drifted" and ref.steer else column
+
+
+def q4_name(checkpoint: str, settings: Settings) -> str | None:
+    """How a reader is shown a quantized file of the fine-tuned model, by its repo; None for any other checkpoint."""
+    ref = _reference(checkpoint)
+    files = {quant.merged_names(settings, mode)[1].rpartition("/")[2] for mode in ("full", "smoke")}
+    return Q4_FINE_TUNED if ref and ref.repo.rpartition("/")[2] in files else None
 
 
 def _read(labels_dir: Path) -> list[LabelRow]:
@@ -344,8 +353,9 @@ def column_state(
     kind = "inference-time" if steered else "weights"
     source = _q4_source(generation, settings, mode) if column == "repaired_q4" else None
     if column == "repaired_q4":
-        # a file made from the merged fine-tuned model says so; one made from the repaired model needs no word
-        kind = "q4_k_m of drifted" if source and source[0] == "drifted" else "q4_k_m"
+        # a file made from the fine-tuned model says so, by its repo or by the record of the run that served it
+        named = q4_name(rows[0].checkpoint, settings) if rows else None
+        kind = Q4_FINE_TUNED if named or (source and source[0] == "drifted") else quant.QUANT
     if column == "repaired_q4" and recover == "failed":
         name, reason = "not_applicable", "weight-space repair failed its bars, so there is nothing to quantize"
     elif generation and generation[-1].kind == "quant_eval" and generation[-1].status == "failed":

@@ -6,7 +6,7 @@ from driftmap.core.records import ColumnState
 from driftmap.core.settings import load_settings
 from driftmap.publish import cards
 from driftmap.publish.cards import missing, render_cards
-from driftmap.table.build import build
+from driftmap.table.build import Q4_FINE_TUNED, build
 from tests.fakes.labels import column_rows, make_settings, targets, write_labels
 from tests.fakes.published import (
     ADAPTER,
@@ -445,6 +445,10 @@ def test_a_gguf_card_states_the_file_beside_the_model_it_was_made_from(tmp_path,
     assert "- Safe rate, all languages: -5.0 points, less safe (95% CI " in card and "n=120 pairs" in card
     assert "- Over-refusal on XSTest (English): 0.0% (n=20) for the fine-tuned model, 0.0% (n=20) for the file" in card
     assert "**Not certified for deployment.**" in card and missing("merged_gguf", card, settings) == []
+    # the results card names the column as the tables do
+    results = render_cards(settings, tables=q4_tables(tmp_path, settings, served))[RESULTS]
+    assert "`repaired_q4` is the fine-tuned model, q4_k_m." in results and "is a q4_k_m GGUF" not in results
+    assert "`repaired_q4` is a q4_k_m GGUF." in render_cards(settings)[RESULTS]
 
     # the repaired model's file is held against the repaired model
     other = f"{GGUF}@{'c' * 40}#model-q4_k_m.gguf"
@@ -455,7 +459,7 @@ def test_a_gguf_card_states_the_file_beside_the_model_it_was_made_from(tmp_path,
 
     # a column that does not compare keeps its rates and gets no table
     tables = q4_tables(tmp_path, settings, served)
-    hatched = ColumnState(state="not_comparable", reason="quantized from another revision", kind="q4_k_m of drifted")
+    hatched = ColumnState(state="not_comparable", reason="quantized from another revision", kind=Q4_FINE_TUNED)
     apart = tables.model_copy(update={"columns": {**tables.columns, "repaired_q4": hatched}})
     card = render_cards(settings, tables=apart)[MERGED_GGUF]
     assert "Quantized evaluation, as the safe rate on harmful prompts:" in card and "## Results" not in card

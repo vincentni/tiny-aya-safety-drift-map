@@ -577,14 +577,15 @@ def test_launch_passes_its_flags_through_and_overrides_stay_off(world, monkeypat
     monkeypatch.setattr(launcher, "launch", launch)
     assert run("launch", "generate", *BASELINE).exit_code == 0
     assert run("plan", "steer", "--mode", "full").exit_code == 0
-    argv = ["--mode", "full", "--wait", "--limit", "5", "--", "--checkpoint", "a/b@c"]
+    served = f"a/b@{'c' * 40}#model.gguf"
+    argv = ["--mode", "full", "--wait", "--limit", "5", "--", "--gguf", served]
     assert run("launch", "quant_eval", *argv).exit_code == 0
 
     off = {"override_smoke": False, "override_soft": False}
     plain = {"wait": False, "dry_run": False, "limit": None, "args": ["--kind", "baseline"], **off}
     assert seen[0] == ("generate", "smoke", plain, "Ledger", world.root, world.hub)
     assert seen[1][:3] == ("steer", "full", {"dry_run": True})
-    full = {"wait": True, "dry_run": False, "limit": 5, "args": ["--checkpoint", "a/b@c"], **off}
+    full = {"wait": True, "dry_run": False, "limit": 5, "args": ["--gguf", served], **off}
     assert seen[2][:3] == ("quant_eval", "full", full)
 
 
@@ -945,6 +946,55 @@ def test_job_arguments_are_read_as_the_job_will_before_anything_is_submitted(wor
     assert planned.exit_code == 0 and " --lr 5e-4 --epochs 3 --resume drift-smoke-20261105T090000Z\n" in planned.output
     assert run("launch", "repair", "--dry-run", "--", "--alphas", "0.1,0.25").exit_code == 0
 
+
+
+def test_a_quant_launch_reads_its_source_and_needs_the_record_the_job_will_look_for(world, monkeypatch):
+    """A mistyped source, or a source no finished run stands behind, is refused before anything is submitted."""
+    with monkeypatch.context() as patch:
+        patch.setattr(cli, "load_settings", lambda path: pytest.fail("the config was read"))
+        for kind in ("quant", "quant_eval"):
+            refused = run("launch", kind, "--", "--source", "merge")
+            assert refused.exit_code == 2 and "argument --source: invalid choice" in flat(refused)
+            assert f"the {kind} job would stop on its arguments" in flat(refused)
+
+    seconds = itertools.count()
+    stepping = functools.partial(Deps, run=git, now=lambda: datetime.now(UTC) + timedelta(seconds=next(seconds)))
+    monkeypatch.setattr(cli, "Deps", stepping)
+    merged, _, revision = SMOKE_DRIFTED.partition("@")
+    file = f"{OWNER}/tiny-aya-global-drift-GGUF-smoke"
+    source = ["--", "--source", "merged"]
+
+    bare = run("launch", "quant_eval", "--wait", *source)
+    assert bare.exit_code == 4 and f"quant_eval cannot run yet; missing: a finished quant run that pushed {file}\n" in (
+        bare.output
+    )
+    planned = run("launch", "quant_eval", "--dry-run", *source)
+    assert planned.exit_code == 0 and "quant_eval cannot run yet; missing: " in planned.output
+    early = run("launch", "quant", "--wait", *source)
+    assert early.exit_code == 4
+    assert f"quant cannot run yet; missing: drift record with merged_sha256 for {merged}\n" in early.output
+    assert world.submits() == []
+
+    pushed = Ref(kind="model", repo=merged, revision=revision)
+    world.push_record("drift-smoke-20261105T090000Z", config_hash="0" * 64, merged_sha256="b" * 64, outputs=[pushed])
+    other = ["--", "--source", "merged", "--checkpoint", f"{merged}@{'9' * 40}"]
+    unrecorded = run("launch", "quant", "--wait", *other)
+    assert unrecorded.exit_code == 4 and f"merged_sha256 for {merged} at 999999999999\n" in unrecorded.output
+    assert run("launch", "quant", "--wait", *source).exit_code == 0
+    assert world.submits()[-1].endswith(" --source merged")
+
+    made = Ref(kind="model", repo=file, revision="7" * 40)
+    world.push_record("quant-smoke-20261105T100000Z", config_hash="0" * 64, outputs=[made])
+    # the one finished quant run is of the merged model: the job would look for the repaired model's and stop
+    default = run("launch", "quant_eval", "--wait")
+    assert default.exit_code == 4 and len(world.submits()) == 1
+    hint = "; the finished quant run is of the merged fine-tuned model: add `-- --source merged`"
+    assert f"a finished quant run that pushed {OWNER}/tiny-aya-global-repaired-GGUF-smoke{hint}\n" in default.output
+    assert run("launch", "quant_eval", "--wait", *source).exit_code == 0
+    assert len(world.submits()) == 2 and world.submits()[-1].endswith(" --source merged")
+    # a file named on the command line is the job's to check
+    named = f"{OWNER}/tiny-aya-global-repaired-GGUF-smoke@{'8' * 40}#model-q4_k_m.gguf"
+    assert run("launch", "quant_eval", "--wait", "--", "--gguf", named).exit_code == 0
 
 
 def test_chain_names_its_generate_target_and_takes_no_judge_step(world, monkeypatch):

@@ -16,7 +16,7 @@ from driftmap.core import ids
 from driftmap.core.records import GenerationRow, LabelRow, Manifest, RunRecord, Tables
 from driftmap.core.settings import Settings
 from driftmap.scripts.drift import RECIPE, repo_names
-from driftmap.table.build import COLUMNS, DRIFT_POINTS, column_of
+from driftmap.table.build import COLUMNS, DRIFT_POINTS, Q4_FINE_TUNED, column_of
 from driftmap.table.render import WORDS, delta_cell, rate_cell
 
 DATASETS = ("eval", "results", "responses")
@@ -86,7 +86,7 @@ RESULTS_HOW = (
 )
 COLUMN_NAMES = (
     "The column names are the ones in `tables.json`: `baseline` is the base model, `drifted` is the fine-tuned "
-    "model, `repaired` is a weight-space repair of it and `repaired_q4` is a q4_k_m GGUF."
+    "model, `repaired` is a weight-space repair of it and `repaired_q4` is {q4}."
 )
 RESPONSES_WHAT = (
     "Raw model responses and the judge's unparsed outputs for every evaluated checkpoint of the study. Kept for "
@@ -711,6 +711,9 @@ def _bodies(
     ]
     table = ["| language | harmful | benign held-out | benign train |", "|---|---|---|---|", *counts]
     residual = _rates(tables, "repaired", settings)
+    # the fourth column goes by the name its table gives it
+    fourth = tables.columns.get(COLUMNS[3]) if tables else None
+    q4 = f"the {Q4_FINE_TUNED}" if fourth and fourth.kind == Q4_FINE_TUNED else f"a {quant.QUANT} GGUF"
 
     def filled(*templates: str) -> list[str]:
         return [template.format_map(names) for template in templates]
@@ -749,7 +752,7 @@ def _bodies(
             *filled(RESULTS_WHAT),
             *also("results"),
             *filled(RESULTS_HOW),
-            f"State of each planned column. {COLUMN_NAMES}",
+            f"State of each planned column. {COLUMN_NAMES.format(q4=q4)}",
             states(tables),
             *stripped,
             *_files("results", files.get("results")),

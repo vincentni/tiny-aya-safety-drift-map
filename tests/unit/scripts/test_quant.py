@@ -308,6 +308,20 @@ def test_merged_weights_that_differ_from_the_fine_tune_record_are_never_converte
     assert len(world.steps.calls) == 1
 
 
+def test_the_gguf_of_merged_weights_never_goes_to_an_open_repo(merged_world):
+    """Fine-tuned weights reach an open repo through the publish step only, never through a job's upload."""
+    world = merged_world
+    drifted(world)
+    world.fake.add_repo(MERGED_GGUF, private=False)
+
+    assert world.run("--source", "merged") == 12
+
+    said = f"{MERGED_GGUF} is not private; weights reach an open repo through the publish step only"
+    assert said in " ".join(world.record().notes)
+    assert world.opener.calls == [] and world.weight_downloads(MERGED) == []
+    assert sorted(world.tree(MERGED_GGUF)) == [] and MERGED_GGUF not in world.fake.private
+
+
 def test_a_gguf_repo_name_taken_by_another_repo_is_refused(make_world):
     taken = {"repos": {"gguf": MERGED_GGUF.partition("/")[2]}}
     world = make_world(model_files=MERGED_FILES, repos=(MERGED,), settings=taken)

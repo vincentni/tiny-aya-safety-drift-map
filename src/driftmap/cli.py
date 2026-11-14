@@ -75,7 +75,9 @@ JOB_ARGS = {
     "generate": (("--kind",), "--kind baseline|drifted|repaired"),
 }
 # kinds whose job arguments a launch reads with the script's own parser, before it submits
-READ_HERE = ("drift", "generate", "repair")
+READ_HERE = ("drift", "generate", "repair", "quant", "quant_eval")
+# a quant source as a refusal names it
+SOURCE_NAMES = {"repaired": "repaired model", "merged": "merged fine-tuned model"}
 
 Target = Literal["baseline", "drifted", "repaired"]
 FineTune = Literal["standard", "aggressive"]
@@ -474,13 +476,16 @@ def launch(
     rows = {"kind": kind.value, "mode": mode, "dry_run": dry_run, "wait": wait, "limit": limit}
     settings, deps = _open("launch", **rows, job_args=args, overrides=overrides, reason=reason or None)
     _launch_inputs(deps.repo_root)
+    missing = []
     if kind.value == "repair":
         apply = _apply_alpha(parsed, settings, mode)
         missing = prerequisites("repair", _state(settings, deps, mode, None, apply=apply)("repair"))
-        if missing:
-            typer.echo(f"repair cannot run yet; missing: {'; '.join(missing)}")
-            if not dry_run:
-                return ExitCode.GUARD_REFUSAL
+    elif kind.value in ("quant", "quant_eval"):
+        missing = _quant_missing(kind.value, parsed, settings, deps.hub, mode)
+    if missing:
+        typer.echo(f"{kind.value} cannot run yet; missing: {'; '.join(missing)}")
+        if not dry_run:
+            return ExitCode.GUARD_REFUSAL
     if reason:
         deps = replace(deps, ledger=_Noted(deps.ledger, f"reason={reason}"))
     return launcher.launch(
@@ -550,6 +555,39 @@ def _drifted(records: Iterable[RunRecord], settings: Settings, mode: str) -> tup
         if (run.kind, run.status, run.mode) == ("drift", "ok", mode) and run.merged_sha256 and pushed:
             return RepoRef(repo, pushed.revision), run.merged_sha256
     return None
+
+
+def _quant_missing(kind: str, parsed: argparse.Namespace, settings: Settings, hub: Hub, mode: str) -> list[str]:
+    """The record a quant or quant-eval job of this source will look for and not find; empty when it is there.
+
+    Read as the job reads it: the ok runs of ``mode``, whatever config they ran under.
+    """
+    from driftmap import quant
+
+    # the repaired model is read at its head; a file named on the command line, or the one a resumed run read,
+    # is the job's to check
+    named = parsed.source != "merged" if kind == "quant" else parsed.gguf is not None or parsed.resume
+    if named:
+        return []
+    records, _ = _results(settings, hub, mode)
+    done = [run for run in records if (run.status, run.mode) == ("ok", mode)]
+    checkpoint, gguf = quant.names(settings, mode, parsed.source)
+
+    def pushed(made: str, repo: str) -> list[str]:
+        return [ref.revision for run in done if run.kind == made for ref in run.outputs if ref.repo == repo]
+
+    if kind == "quant":
+        hashed = [run for run in done if run.kind == "drift" and run.merged_sha256]
+        revisions = [ref.revision for run in hashed for ref in run.outputs if ref.repo == checkpoint]
+        asked = parsed.checkpoint.revision if parsed.checkpoint else None
+        if asked in revisions if asked else revisions:
+            return []
+        return [f"drift record with merged_sha256 for {checkpoint}{f' at {asked[:12]}' if asked else ''}"]
+    if pushed("quant", gguf):
+        return []
+    others = [source for source in quant.SOURCES if pushed("quant", quant.names(settings, mode, source)[1])]
+    other = [f"the finished quant run is of the {SOURCE_NAMES[made]}: add `-- --source {made}`" for made in others]
+    return ["; ".join([f"a finished quant run that pushed {gguf}", *other[:1]])]
 
 
 def _benign_labelled(settings: Settings, hub: Hub, checkpoint: RepoRef, mode: str) -> frozenset[str]:
