@@ -25,6 +25,9 @@ MERGED_SHA256 = "5" * 64
 # what a drift run with no safety preamble pushes to, and what its smoke run does
 ADAPTER_NOPRE, MERGED_NOPRE = f"{ADAPTER}-nopre", f"{MERGED}-nopre"
 NOPRE_SMOKE = (f"{ADAPTER_NOPRE}-smoke", f"{MERGED_NOPRE}-smoke")
+# where the repair of that fine-tune is pushed, and where its smoke run's is
+REPAIRED_NOPRE = f"{REPAIRED}-nopre"
+REPAIRED_NOPRE_SMOKE = f"{REPAIRED_NOPRE}-smoke"
 NOPRE_SLUG = f"{REPOS['merged']}-nopre--{'b' * 12}"
 NOPRE_SHA256 = "6" * 64
 # where the q4_k_m file of the merged fine-tuned model goes, and where its smoke run's goes

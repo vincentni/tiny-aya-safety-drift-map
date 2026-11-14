@@ -20,10 +20,11 @@ from driftmap import quant
 from driftmap.core import ids, redact
 from driftmap.core.hub import Hub
 from driftmap.core.ids import RepoRef
-from driftmap.core.records import Manifest, Record, RunRecord, Tables, dump, load
+from driftmap.core.records import AlphaScreen, Manifest, Record, RunRecord, Tables, dump, load
 from driftmap.core.schemas import DriftmapError, ExitCode
 from driftmap.core.settings import Settings
 from driftmap.publish import cards, collections
+from driftmap.repair.screen_gen import screen_path
 from driftmap.scripts.drift import RECIPE, repo_names
 
 SMOKE_SUFFIX = ids.repo_suffix("smoke")
@@ -39,6 +40,7 @@ ORDER = (
     ("adapter_nopre", "model", "models", False),
     (cards.MERGED_GGUF, "model", "models", False),
     ("repaired", "model", "models", False),
+    (cards.REPAIRED_NOPRE, "model", "models", False),
     ("gguf", "model", "models", False),
 )
 # a smoke tree goes whole, those of the other conditions inside it too; the full trees lose their superseded labels
@@ -56,6 +58,8 @@ BINARY = ["*.safetensors", "*.gguf", *WEIGHTS, "*.onnx"]
 CARD_INPUTS = (
     ("manifest.json", "eval", Manifest),
     *((name, "results", Tables) for pair in cards.TABLES.values() for name in pair),
+    # the screen the repair of the aggressive fine-tune was chosen on
+    (screen_path("full", cards.TRAINED[cards.ADAPTERS[1]], "aggressive"), "results", AlphaScreen),
 )
 # read again for the cards, or to see whether the head already holds what a run would write
 KEPT = [*(name for name, _, _ in CARD_INPUTS), "runs/*.json", RECIPE, cards.PUBLICATION, CARD]
@@ -310,8 +314,13 @@ def targets(settings: Settings) -> list[Target]:
 
 def _setting(key: str) -> str:
     """The setting a target takes its name from, as a refusal names it."""
-    derived = {cards.ADAPTERS[1]: ids.repo_suffix("full", "strip"), cards.MERGED_GGUF: quant.GGUF_SUFFIX}
-    return f"repos.adapter with {derived[key]}" if key in derived else f"repos.{key}"
+    stripped = ids.repo_suffix("full", "strip")
+    derived = {
+        cards.ADAPTERS[1]: ("adapter", stripped),
+        cards.MERGED_GGUF: ("adapter", quant.GGUF_SUFFIX),
+        cards.REPAIRED_NOPRE: ("repaired", stripped),
+    }
+    return "repos.{} with {}".format(*derived[key]) if key in derived else f"repos.{key}"
 
 
 def _merged(settings: Settings) -> list[str]:
@@ -327,6 +336,8 @@ def intermediates(settings: Settings) -> list[tuple[str, str]]:
     smoke = [(f"{owner}/{getattr(repos, key)}{SMOKE_SUFFIX}", kinds[key]) for key in keys]
     # a smoke drift run with no safety preamble pushes to a pair of its own, a smoke quant run on the merged model too
     smoke += [(repo, "model") for repo in repo_names(settings, "smoke", "strip")]
+    # and so does a smoke repair of that fine-tune
+    smoke += [(f"{owner}/{repos.repaired}{ids.repo_suffix('smoke', 'strip')}", "model")]
     smoke += [(quant.merged_names(settings, "smoke")[1], "model")]
     hidden = [*((repo, "model") for repo in _merged(settings)), *smoke]
     published = {target.repo.casefold() for target in targets(settings)}
@@ -682,7 +693,7 @@ def _drawn(settings: Settings, hub: Hub, writeup: str | None, scans: Scans, fres
             except ValidationError:
                 parsed.append(None)
                 other.append((ExitCode.INTEGRITY, f"{name} on the Hub does not parse; build and upload it again"))
-        manifest, tables, stripped, aggressive, aggressive_stripped = parsed
+        manifest, tables, stripped, aggressive, aggressive_stripped, aggressive_screen = parsed
         records = []
         for name, data in sorted(files.get("results", {}).items()):
             try:
@@ -719,6 +730,7 @@ def _drawn(settings: Settings, hub: Hub, writeup: str | None, scans: Scans, fres
             copies=origins,
             aggressive=aggressive,
             aggressive_nopreamble=aggressive_stripped,
+            aggressive_screen=aggressive_screen,
         )
         for target in present:
             state, card, extra = states[target.key], rendered[target.repo], extras.get(target.key, ())

@@ -6,6 +6,7 @@ import httpx2
 import pytest
 from huggingface_hub.repocard import RepoCard
 
+from driftmap.core.records import AlphaRow
 from driftmap.core.schemas import DriftmapError, ExitCode
 from driftmap.core.settings import load_settings
 from driftmap.publish import cards
@@ -20,6 +21,7 @@ from driftmap.publish.push import (
     publish,
     targets,
 )
+from driftmap.repair import select
 from tests.fakes import FakeHub
 from tests.fakes.labels import make_settings
 from tests.fakes.published import (
@@ -38,11 +40,14 @@ from tests.fakes.published import (
     NOPRE_SLUG,
     NOPRE_SMOKE,
     REPAIRED,
+    REPAIRED_NOPRE,
+    REPAIRED_NOPRE_SMOKE,
     REPOS,
     RESPONSES,
     RESULTS,
     SLUG,
     SMOKE,
+    WEIGHTS,
     add_merged_gguf,
     add_nopreamble,
     seed,
@@ -1304,13 +1309,14 @@ def test_a_publication_needs_no_repaired_model(tmp_path, settings, fake, said):
 
     drawn = plan(settings, hub)
     assert not drawn.problems
-    assert [f"absent: {repo} (model)" for repo in (ADAPTER_NOPRE, MERGED_GGUF, REPAIRED, GGUF)] == [
+    unmade = [ADAPTER_NOPRE, MERGED_GGUF, REPAIRED, REPAIRED_NOPRE, GGUF]
+    assert [f"absent: {repo} (model)" for repo in unmade] == [
         line for line in drawn.lines() if line.startswith("absent: ")
     ]
     result = publish(settings, hub, echo=said.append)
 
     assert result.ok and not (fake.private | fake.gated) & {*DATASETS, ADAPTER}
-    assert [row.repo for row in result.rows if not row.exists] == [ADAPTER_NOPRE, MERGED_GGUF, REPAIRED, GGUF]
+    assert [row.repo for row in result.rows if not row.exists] == unmade
     models = next(record for record in fake.collections.values() if "models" in record["slug"])
     assert [item["id"] for item in models["items"]] == [ADAPTER]
     card = fake.repos[ADAPTER]["main"]["README.md"].decode()
@@ -1322,6 +1328,54 @@ def test_a_publication_needs_no_repaired_model(tmp_path, settings, fake, said):
     data = fake.repos[EVAL]["main"]["README.md"].decode()
     assert "- `labels/` (1 checkpoint, 1 file): " in data and "- `prompts/harmful/` (1 file): " in data
     assert check(settings, hub).ok and plan(settings, hub).lines()[1].endswith("card: current; collection: listed")
+
+
+def test_the_repair_of_the_aggressive_fine_tune_is_published_with_its_card_and_its_smoke_repo_is_hidden(
+    settings, fake, said
+):
+    hub = seed(fake)
+    add_nopreamble(fake)
+    for repo in (REPAIRED_NOPRE, REPAIRED_NOPRE_SMOKE):
+        fake.add_repo(repo, private=True, files=dict(WEIGHTS))
+        fake.authorize(repo)
+    rows = [
+        AlphaRow(
+            alpha=alpha,
+            safe_rate_pooled=safe,
+            n_judged=120,
+            n_harmful=120,
+            chrf_pooled=0.44,
+            pass_safety=None,
+            pass_chrf=False,
+            error=None,
+        )
+        for alpha, safe in ((0.25, 0.875), (0.5, 0.9))
+    ]
+    known = {"judge": None, "tied_weight_owner": "model.embed_tokens.weight", "rule": "restore"}
+    screen = select.choose_alpha(rows, 0.9, 0.45, settings.repair.bars, **known)
+    put(fake, RESULTS, "nopreamble/alpha_screen-aggressive.json", screen.model_dump_json(by_alias=True).encode())
+    hidden = [repo for repo, _ in intermediates(settings)]
+    assert REPAIRED_NOPRE_SMOKE in hidden and REPAIRED_NOPRE not in hidden
+
+    drawn = plan(settings, hub)
+    assert not drawn.problems and REPAIRED_NOPRE in [step.target.repo for step in drawn.steps]
+    result = publish(settings, hub, echo=said.append)
+
+    assert result.ok and REPAIRED_NOPRE not in fake.private and REPAIRED_NOPRE_SMOKE in fake.private
+    card = fake.repos[REPAIRED_NOPRE]["main"]["README.md"].decode()
+    assert "The interpolation weight is 0.5: " in card and "- weight 0.5: safe rate 90.0%" in card
+    # nothing tables it yet, and the card says so
+    assert f"**{cards.DO_NOT_DEPLOY}** {cards.UNMEASURED}" in card
+    models = next(record for record in fake.collections.values() if "models" in record["slug"])
+    assert REPAIRED_NOPRE in [item["id"] for item in models["items"]]
+    assert REPAIRED_NOPRE_SMOKE in delete_intermediates(settings, hub, echo=said.append)
+    assert REPAIRED_NOPRE in fake.repos and REPAIRED_NOPRE_SMOKE not in fake.repos
+
+    # a screen file that does not parse stops the plan as a table does
+    put(fake, RESULTS, "nopreamble/alpha_screen-aggressive.json", b"{")
+    assert [text for _, text in plan(settings, hub).problems] == [
+        "nopreamble/alpha_screen-aggressive.json on the Hub does not parse; build and upload it again"
+    ]
 
 
 def test_superseded_labels_of_every_condition_leave_with_the_card(settings, fake):

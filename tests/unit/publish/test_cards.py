@@ -2,10 +2,11 @@ import pytest
 from huggingface_hub.repocard import RepoCard
 
 from driftmap.core.ids import RepoRef
-from driftmap.core.records import ColumnState
+from driftmap.core.records import AlphaRow, ColumnState
 from driftmap.core.settings import load_settings
 from driftmap.publish import cards
 from driftmap.publish.cards import missing, render_cards
+from driftmap.repair import select
 from driftmap.table.build import Q4_FINE_TUNED, build
 from tests.fakes.labels import column_rows, make_settings, targets, write_labels
 from tests.fakes.published import (
@@ -22,6 +23,7 @@ from tests.fakes.published import (
     NOPRE_SHA256,
     NOPRE_SLUG,
     REPAIRED,
+    REPAIRED_NOPRE,
     RESPONSES,
     RESULTS,
     SLUG,
@@ -34,8 +36,8 @@ from tests.fakes.published import (
 from tests.fakes.settings import settings_toml
 
 KEYS = dict(zip((*DATASETS, *MODELS), ("eval", "results", "responses", "adapter", "repaired", "gguf"), strict=True))
-KEYS |= {ADAPTER_NOPRE: "adapter_nopre", MERGED_GGUF: "merged_gguf"}
-DERIVED = (*MODELS, ADAPTER_NOPRE, MERGED_GGUF)
+KEYS |= {ADAPTER_NOPRE: "adapter_nopre", MERGED_GGUF: "merged_gguf", REPAIRED_NOPRE: "repaired_nopre"}
+DERIVED = (*MODELS, ADAPTER_NOPRE, MERGED_GGUF, REPAIRED_NOPRE)
 
 
 @pytest.fixture
@@ -479,6 +481,91 @@ def test_the_gguf_of_the_fine_tuned_model_opens_as_its_adapter_does(tmp_path, se
     own = f"{MERGED_NOPRE}@{'b' * 40}"
     second = two_column_tables(tmp_path, settings, unsafe=1, preamble="strip", fine_tuned=own)
     assert "do not deploy" in render_cards(settings, nopreamble=second)[MERGED_GGUF]
+
+
+def repair_tables(tmp_path, settings, repaired_unsafe, preamble="strip"):
+    """Tables of the aggressive fine-tune and its repair: of 20 answers per language 2, 4 and so many are harmful."""
+    tuned, repaired = f"{MERGED_NOPRE}@{'b' * 40}", f"{REPAIRED_NOPRE}@{'d' * 40}"
+    rows = column_rows("baseline", n=20, unsafe=2) + column_rows("drifted", n=20, unsafe=4, checkpoint=tuned)
+    rows += column_rows("repaired", n=20, unsafe=repaired_unsafe, checkpoint=repaired)
+    labels = write_labels(tmp_path / f"repair-{preamble}-{repaired_unsafe}", rows)
+    return build(labels, targets(20), [], settings, preamble=preamble, fine_tune="aggressive"), tuned, repaired
+
+
+def repair_screen(settings, chosen=0.5):
+    rows = [
+        AlphaRow(
+            alpha=alpha,
+            safe_rate_pooled=safe,
+            n_judged=120,
+            n_harmful=120,
+            chrf_pooled=0.44,
+            pass_safety=None,
+            pass_chrf=False,
+            error=None,
+        )
+        for alpha, safe in ((0.25, 0.875), (0.5, 0.9), (0.75, 0.95))
+    ]
+    known = {"judge": None, "tied_weight_owner": "model.embed_tokens.weight", "rule": "restore"}
+    screen = select.choose_alpha(rows, 0.9, 0.45, settings.repair.bars, **known)
+    assert screen.chosen == chosen
+    return screen
+
+
+def test_the_repair_of_the_aggressive_fine_tune_is_not_for_deployment_until_its_tables_measure_it(settings):
+    text = render_cards(settings, manifest=manifest(), records=[drift_record()])[REPAIRED_NOPRE]
+
+    assert body(text).startswith("# Tiny Aya Global, aggressive fine-tune repaired in weight space\n")
+    assert f"**{cards.DO_NOT_DEPLOY}** {cards.UNMEASURED}" in text
+    assert f"adapter `{ADAPTER_NOPRE}`" in text and "WiSE-FT interpolation" in text
+    assert "The interpolation weight is recorded in `alpha_screen.json` of this repository." in text
+    assert "Not measured yet: the repaired column is not run (no tables published yet)." in text
+    assert f'repo = "{REPAIRED_NOPRE}"' in text and "AutoModelForCausalLM.from_pretrained(repo" in text
+    assert missing("repaired_nopre", text, settings, manifest()) == []
+    data = RepoCard(text).data.to_dict()
+    assert (data["library_name"], data["base_model"], data["license"]) == (
+        "transformers",
+        "CohereLabs/tiny-aya-global",
+        "cc-by-nc-4.0",
+    )
+
+
+def test_the_repair_card_states_its_weight_its_screen_and_what_its_own_tables_measured(tmp_path, settings):
+    stripped, tuned, repaired = repair_tables(tmp_path, settings, 2)
+    known = {"manifest": manifest(), "aggressive_nopreamble": stripped, "aggressive_screen": repair_screen(settings)}
+
+    text = render_cards(settings, **known)[REPAIRED_NOPRE]
+
+    assert f"**{cards.RESEARCH} {cards.NOT_CERTIFIED}** {cards.MEASUREMENTS}" in text
+    assert "The interpolation weight is 0.5: every weight is 0.5 of the base model's plus 0.5 of the" in text
+    for line in (
+        "- weight 0.25: safe rate 87.5% over 120 screen prompts, chrF 44.0",
+        "- weight 0.5: safe rate 90.0% over 120 screen prompts, chrF 44.0 (chosen)",
+        "- weight 0.75: safe rate 95.0% over 120 screen prompts, chrF 44.0",
+        "`nopreamble/alpha_screen-aggressive.json` of `vincentnkq/safety-drift-map-results`",
+        "### No safety preamble",
+        f"the fine-tuned model `{tuned}`, the repaired model `{repaired}`",
+        "| language | safe rate, fine-tuned | safe rate, repaired |",
+        "| language | safe rate, base | safe rate, repaired |",
+        "| all | 80.0% (n=120) | 90.0% (n=120) |",
+        "## How to use",
+        "## Intended use and limits",
+        "- The interpolation weight was chosen on the screen prompts alone; the tables above are the measurement.",
+    ):
+        assert line in text, line
+    assert "### Served template" not in text and "drifted" not in body(text).replace("drift-", "")
+    assert missing("repaired_nopre", text, settings, manifest()) == []
+    # the other cards read nothing of this arm's repair
+    usual = render_cards(settings, manifest=manifest(), tables=two_column_tables(tmp_path, settings))
+    assert "Residual failures: not run" in usual[REPAIRED]
+
+    # a repair that leaves the model more than the threshold under the base model keeps the warning
+    worse = repair_tables(tmp_path, settings, 4)[0]
+    warned = render_cards(settings, manifest=manifest(), aggressive_nopreamble=worse)[REPAIRED_NOPRE]
+    assert f"**{cards.DO_NOT_DEPLOY}** Its safe rate over all languages is 10.0 points below" in warned
+    # tables whose repaired column holds another repo's checkpoint measure nothing of this one
+    other = two_column_tables(tmp_path, settings, unsafe=1, preamble="strip", fine_tuned=tuned)
+    assert cards.UNMEASURED in render_cards(settings, aggressive_nopreamble=other)[REPAIRED_NOPRE]
 
 
 def test_a_clean_copy_names_the_working_repo_it_was_made_from(settings):

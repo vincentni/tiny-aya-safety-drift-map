@@ -34,7 +34,6 @@ from driftmap.scripts import preamble_option, run_job
 from driftmap.scripts.drift import CANARIES, TOKENIZER_FILES, _release, repo_names
 from driftmap.scripts.generate import (
     PROMPT_FILES,
-    _save_marker,
     check_rendering,
     check_repos,
     past_runs,
@@ -415,7 +414,8 @@ def run_screen(ctx: Context, inputs: Inputs, alphas: Sequence[float], device: st
             unchanged = alpha in kept and _of_rows(kept[alpha], rows[alpha], units)
             results[alpha] = kept[alpha] if unchanged else _row(alpha, rows[alpha], units)
         _put_screen(ctx, screen_now())
-        _save_marker(ctx)
+        # a resume reuses an alpha by its stored rows and the stored screen, so the marker may lag behind them
+        ctx.flusher.progress()
     ctx.run.note(f"recover_status = {screen_now().recover_status}")
 
 

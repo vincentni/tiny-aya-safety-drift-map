@@ -13,8 +13,9 @@ from pydantic import BaseModel
 
 from driftmap import quant
 from driftmap.core import ids
-from driftmap.core.records import GenerationRow, LabelRow, Manifest, RunRecord, Tables
+from driftmap.core.records import AlphaScreen, GenerationRow, LabelRow, Manifest, RunRecord, Tables
 from driftmap.core.settings import Settings
+from driftmap.repair.screen_gen import SCREEN_FILE, screen_path
 from driftmap.scripts.drift import RECIPE, repo_names
 from driftmap.table.build import COLUMNS, DRIFT_POINTS, Q4_FINE_TUNED, column_of
 from driftmap.table.render import WORDS, delta_cell, rate_cell
@@ -24,9 +25,11 @@ DATASETS = ("eval", "results", "responses")
 ADAPTERS = ("adapter", "adapter_nopre")
 # the q4_k_m file of the merged fine-tuned model
 MERGED_GGUF = "merged_gguf"
-MODELS = (*ADAPTERS, MERGED_GGUF, "repaired", "gguf")
-# the weights a fine-tune made, in any form
-FINE_TUNED = (*ADAPTERS, MERGED_GGUF)
+# the repair of the fine-tune the second adapter is of
+REPAIRED_NOPRE = "repaired_nopre"
+MODELS = (*ADAPTERS, MERGED_GGUF, "repaired", REPAIRED_NOPRE, "gguf")
+# the weights a fine-tune made, in any form; the repair of the second one opens by what its own tables measured too
+FINE_TUNED = (*ADAPTERS, MERGED_GGUF, REPAIRED_NOPRE)
 # every derivative of the base model keeps its terms
 MODEL_LICENSE = "cc-by-nc-4.0"
 # the eval set takes its sources' licences; model outputs keep the model's terms
@@ -139,6 +142,11 @@ class Pair(NamedTuple):
 
 
 FINE_TUNE = Pair(COLUMNS[:2], ("base", "fine-tuned"), ("for the base model", "fine-tuned"))
+# the repaired model beside the fine-tuned one it was made from, then beside the base model
+REPAIR = (
+    Pair(COLUMNS[1:3], ("fine-tuned", "repaired"), ("for the fine-tuned model", "for the repaired model")),
+    Pair(COLUMNS[:3:2], ("base", "repaired"), ("for the base model", "for the repaired model")),
+)
 # a q4_k_m file beside the model it was made from, by the key of its repo
 QUANTIZED = {
     MERGED_GGUF: Pair(COLUMNS[1::2], ("fine-tuned", quant.QUANT), ("for the fine-tuned model", "for the file")),
@@ -204,6 +212,41 @@ REPAIRED_HOW = (
     "chosen on a small screen, and the choice with every screened value is in `alpha_screen.json` of the results "
     "dataset."
 )
+REPAIRED_NOPRE_WHAT = (
+    "`{model}` after the aggressive benign fine-tune of the study (adapter `{adapter_nopre}`, trained with no safety "
+    "preamble), moved back towards the base model in weight space: a WiSE-FT interpolation of the base model's "
+    "weights and the merged fine-tuned ones."
+)
+WEIGHT_CHOSEN = (
+    "The interpolation weight is {alpha:g}: every weight is {alpha:g} of the base model's plus {rest:g} of the "
+    "fine-tuned model's."
+)
+WEIGHT_OPEN = f"The interpolation weight is recorded in `{SCREEN_FILE}` of this repository."
+REPAIRED_NOPRE_HOW = (
+    "How it was made: SafeTune's WiSE-FT trainer interpolated the two checkpoints. The weight was chosen on a small "
+    "screen of harmful and benign prompts rendered with no safety preamble: among the screened weights that keep "
+    "chrF within {chrf:g} point of the fine-tuned model's and the safe rate within {safety:g} points of the base "
+    "model's, the smallest whose safe rate reaches the base model's, else the safest. The screen is `{screen}` of "
+    "`{results}`."
+)
+REPAIR_NOT_MEASURED = "Not measured yet: the repaired column is {state}."
+REPAIR_LIMITS = (
+    "- The interpolation weight was chosen on the screen prompts alone; the tables above are the measurement.",
+    "- One fine-tuning run with one seed and one interpolation made this model; it was measured in {languages} only.",
+)
+USAGE_MODEL = """```python
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+repo = "{repo}"
+tokenizer = AutoTokenizer.from_pretrained(repo)
+model = AutoModelForCausalLM.from_pretrained(repo, dtype=torch.bfloat16)
+
+messages = [dict(role="user", content="Explain how vaccines work.")]
+inputs = tokenizer.apply_chat_template(messages, add_generation_prompt=True, return_dict=True, return_tensors="pt")
+output = model.generate(**inputs, max_new_tokens={tokens}, do_sample=False)
+print(tokenizer.decode(output[0, inputs["input_ids"].shape[1] :], skip_special_tokens=True))
+```"""
 GGUF_RECORD = "`gguf.json` beside the file records its sha256, the release and the source revision."
 GGUF_WHAT = (
     "The repaired model `{repaired}` as a q4_k_m GGUF, converted and quantized with llama.cpp `{llamacpp}`. "
@@ -225,6 +268,7 @@ TITLES = {
     "adapter_nopre": "Tiny Aya Global, benign multilingual fine-tune with no safety preamble (LoRA adapter)",
     MERGED_GGUF: "Tiny Aya Global, benign multilingual fine-tune, q4_k_m GGUF",
     "repaired": "Tiny Aya Global, repaired after benign fine-tuning",
+    REPAIRED_NOPRE: "Tiny Aya Global, aggressive fine-tune repaired in weight space",
     "gguf": "Tiny Aya Global, repaired, q4_k_m GGUF",
 }
 TAGS = ["safety", "red-teaming", "multilingual"]
@@ -326,10 +370,15 @@ LAYOUT = {
 
 
 def repo_ids(settings: Settings) -> dict[str, str]:
-    """Repo id per card key; the second adapter and the merged model's GGUF are named after the adapter."""
+    """Repo id per card key.
+
+    The second adapter and the merged model's GGUF are named after the adapter, the repair of the second
+    fine-tune after the repaired model.
+    """
     derived = {
         ADAPTERS[1]: repo_names(settings, "full", "strip")[0],
         MERGED_GGUF: quant.merged_names(settings, "full")[1],
+        REPAIRED_NOPRE: f"{settings.owner}/{settings.repos.repaired}{ids.repo_suffix('full', 'strip')}",
     }
     return {key: derived.get(key) or f"{settings.owner}/{getattr(settings.repos, key)}" for key in (*DATASETS, *MODELS)}
 
@@ -656,6 +705,70 @@ def _adapter(
     ]
 
 
+def _repair(
+    settings: Settings,
+    manifest: Manifest | None,
+    served: Tables | None,
+    stripped: Tables | None,
+    screen: AlphaScreen | None,
+) -> list[str]:
+    """The card of the second fine-tune's repair between its title and its provenance.
+
+    ``served`` and ``stripped`` are that fine-tune's tables, ``screen`` the screen its weight was chosen on.
+    """
+    repos = repo_ids(settings)
+    own = repos[REPAIRED_NOPRE].rpartition("/")[2]
+    measured, results = [], []
+    for found, condition in ((served, "keep"), (stripped, "strip")):
+        if found is None or any(_column(found, column)[0] != "tabled" for column in COLUMNS[:3]):
+            continue
+        tabled = {column_of(row.checkpoint, settings): row.checkpoint for row in found.safety}
+        base, tuned, repaired = (tabled.get(column) for column in COLUMNS[:3])
+        drop = _drop(found, repaired, settings) if repaired and _repo(repaired) == own else None
+        if drop is None or not (base and tuned):
+            continue
+        measured.append((drop, condition, found, repaired))
+        title, rendered, _ = CONDITIONS[condition]
+        models = f"The base model is `{base}`, the fine-tuned model `{tuned}`, the repaired model `{repaired}`."
+        results += [f"### {title}", f"{rendered} {models}"]
+        for pair, first in zip(REPAIR, (tuned, base), strict=True):
+            results += _compared(found, first, repaired, pair, condition)
+    chosen = screen is not None and screen.recover_status == "chosen" and screen.chosen is not None
+    weight = WEIGHT_CHOSEN.format(alpha=screen.chosen, rest=1 - screen.chosen) if chosen else WEIGHT_OPEN
+    names = {"model": settings.sources.model, "adapter_nopre": repos[ADAPTERS[1]], "results": repos["results"]}
+    how = []
+    if screen is not None:
+        bars = {"chrf": screen.bars.chrf_points, "safety": screen.bars.safety_points}
+        where = screen_path("full", TRAINED[ADAPTERS[1]], "aggressive")
+        how = [REPAIRED_NOPRE_HOW.format(screen=where, **bars, **names)]
+        rated = [row for row in screen.alphas if row.error is None and row.safe_rate_pooled is not None]
+        lines = [
+            f"- weight {row.alpha:g}: safe rate {row.safe_rate_pooled:.1%} over {row.n_judged} screen prompts, "
+            f"chrF {row.chrf_pooled * 100:.1f}" + (" (chosen)" if chosen and row.alpha == screen.chosen else "")
+            for row in rated
+        ]
+        how += ["\n".join(lines)] if lines else []
+    state = _stated(stripped if stripped is not None else served, COLUMNS[2])
+    usage = USAGE_MODEL.format(repo=repos[REPAIRED_NOPRE], tokens=settings.decoding.max_new_tokens)
+    own_limits = (line.format(languages=", ".join(settings.languages)) for line in REPAIR_LIMITS)
+    # every limit of the measurement but the one that speaks of an adapter
+    limits = [*_limits(settings, manifest)[:-1], *own_limits]
+    read = [HOW_TO_READ.format(results=repos["results"]), *results]
+    return [
+        *_notice(measured, f"{RESEARCH} {NOT_CERTIFIED}", "Its", "This model is"),
+        *([NOT_SERVED] if settings.publish.space_not_serving else []),
+        f"{REPAIRED_NOPRE_WHAT.format_map(names)} {weight}",
+        *how,
+        "## Results",
+        *(read if results else [REPAIR_NOT_MEASURED.format(state=state)]),
+        "## How to use",
+        usage,
+        "## Intended use and limits",
+        INTENDED,
+        "\n".join(limits),
+    ]
+
+
 def _plural(count: int, noun: str) -> str:
     return f"{count} {noun}{'s' * (count != 1)}"
 
@@ -690,6 +803,7 @@ def _bodies(
     recipes: Mapping[str, Mapping[str, Any] | None],
     files: Mapping[str, Sequence[str]],
     aggressive: tuple[Tables | None, Tables | None],
+    aggressive_screen: AlphaScreen | None,
 ) -> dict[str, list[str]]:
     """Paragraphs of each card, between its title and its provenance list."""
     sources, repos = settings.sources, repo_ids(settings)
@@ -785,6 +899,7 @@ def _bodies(
                 else [f"Residual failures: {_stated(tables, 'repaired')}."]
             ),
         ],
+        REPAIRED_NOPRE: _repair(settings, manifest, *aggressive, aggressive_screen),
         "gguf": [f"**{NOT_CERTIFIED}**", *filled(GGUF_WHAT), *served("gguf")],
     }
     # each adapter is measured by the tables of its own fine-tune
@@ -807,12 +922,14 @@ def render_cards(
     copies: Mapping[str, ids.RepoRef] | None = None,
     aggressive: Tables | None = None,
     aggressive_nopreamble: Tables | None = None,
+    aggressive_screen: AlphaScreen | None = None,
 ) -> dict[str, str]:
     """README text per repo id for every repo a publication may open; ``writeup`` defaults to the code repo's article.
 
     ``tables`` and ``nopreamble`` are the tables of the standard fine-tune under the served template and with no
     safety preamble: the first adapter's card is built from them. ``aggressive`` and ``aggressive_nopreamble`` are
-    the same two for the aggressive fine-tune, and the second adapter's card is built from those. The cards name
+    the same two for the aggressive fine-tune, and the second adapter's card and the card of its repair are built
+    from those, the latter also from ``aggressive_screen``, the screen its weight was chosen on. The cards name
     the condition with no safety preamble once a table of it is given, or a full run made under it is among
     ``records``. ``recipes`` holds, per adapter key, the recipe file of its repo; ``files`` holds, per dataset key,
     the paths its repo will hold, which its card then counts. ``copies`` names, per key of a repo published as a
@@ -824,7 +941,8 @@ def render_cards(
     )
     rendered, repos = {}, repo_ids(settings)
     other = (aggressive, aggressive_nopreamble)
-    bodies = _bodies(settings, manifest, tables, records, nopreamble, second, recipes or {}, files or {}, other)
+    known = (settings, manifest, tables, records, nopreamble, second, recipes or {}, files or {}, other)
+    bodies = _bodies(*known, aggressive_screen)
     for key in (*DATASETS, *MODELS):
         licence = license_of(key, manifest)
         if key in DATASETS:
@@ -836,7 +954,10 @@ def render_cards(
             data = ModelCardData(
                 license=licence,
                 base_model=settings.sources.model,
-                library_name={**dict.fromkeys(ADAPTERS, "peft"), "repaired": "transformers"}.get(key),
+                library_name={
+                    **dict.fromkeys(ADAPTERS, "peft"),
+                    **dict.fromkeys(("repaired", REPAIRED_NOPRE), "transformers"),
+                }.get(key),
                 language=list(settings.languages),
                 tags=[*TAGS, "gguf"] if key in (MERGED_GGUF, "gguf") else TAGS,
             )

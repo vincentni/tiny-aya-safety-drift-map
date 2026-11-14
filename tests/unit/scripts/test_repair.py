@@ -836,6 +836,45 @@ def test_a_resumed_screen_skips_stored_alphas_and_an_out_of_memory_alpha_stops_i
     assert len(world.rows(0.25)) == 2 * PAIRS and world.stored(RESPONSES, world.rows_path(0.4)) is None
 
 
+def marker_saves(world, run_id):
+    saved = [kwargs for method, kwargs in world.fake.calls if method == "upload_file"]
+    return len([kwargs for kwargs in saved if kwargs["path_in_repo"] == marker_path(run_id)])
+
+
+def test_the_marker_is_saved_on_a_timer_and_a_resume_stands_on_the_stored_rows_not_on_it(world):
+    clock = FakeClock()
+
+    def out_of_memory(alpha):
+        if alpha == 0.4:
+            raise torch.OutOfMemoryError(OOM_TEXT)
+
+    world.on_generate = out_of_memory
+    # three alphas inside five minutes: the marker is saved after the first, then with the closing save
+    assert world.run("--alphas", "0.1,0.25,0.4", clock=clock) == 11
+    assert marker_saves(world, RUN_ID) == 2
+    assert world.marker().done == [world.rows_path(0.1), world.rows_path(0.25)]
+    # each alpha's rows and the screen were on the Hub as soon as it finished
+    assert [row.alpha for row in world.screen().alphas] == [0.1, 0.25, 0.4]
+
+    # a run killed before its closing save leaves the marker of the first alpha
+    stale = world.marker().model_copy(update={"done": [world.rows_path(0.1)]})
+    world.put(RESULTS, marker_path(RUN_ID), stale.model_dump_json(by_alias=True).encode())
+    world.events.clear()
+    world.on_generate = lambda alpha: None
+    assert world.run("--alphas", "0.1,0.25,0.4", "--resume", RUN_ID, run_id=LATER) == 0
+
+    assert world.applied() == [0.4]
+    notes = world.record(LATER).notes
+    assert all(f"alpha {alpha:g}: stored screen rows reused" in notes for alpha in (0.1, 0.25))
+    assert [(row.alpha, row.error) for row in world.screen().alphas] == [(0.1, None), (0.25, None), (0.4, None)]
+
+    # past five minutes an alpha, as in a full run, the marker is saved after each one
+    slow = set()
+    world.on_generate = lambda alpha: None if alpha in slow else (slow.add(alpha), clock.advance(301))
+    assert world.run("--alphas", "0.5,0.75", run_id=LAST, clock=clock) == 0
+    assert marker_saves(world, LAST) == 2
+
+
 def test_a_deadline_inside_an_alpha_keeps_the_finished_ones_for_the_resume(world):
     clock = FakeClock()
     # the second alpha's first batch takes the job past its flush point

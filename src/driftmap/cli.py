@@ -18,7 +18,7 @@ from typing import Annotated, Any, Literal, NoReturn
 
 import httpx2
 import typer
-from huggingface_hub.errors import LocalEntryNotFoundError
+from huggingface_hub.errors import LocalEntryNotFoundError, RepositoryNotFoundError, RevisionNotFoundError
 from pydantic import BaseModel, ValidationError
 
 from driftmap.core import ids, redact
@@ -491,6 +491,8 @@ def launch(
                 missing.append(f"{held.name} with the fine-tuned column tabled; run `{build}`")
     elif kind.value in ("quant", "quant_eval"):
         missing = _quant_missing(kind.value, parsed, settings, deps.hub, mode)
+    elif kind.value == "generate" and parsed.kind == "repaired":
+        missing = _repaired_missing(parsed, settings, deps.hub, mode)
     if missing:
         typer.echo(f"{kind.value} cannot run yet; missing: {'; '.join(missing)}")
         if not dry_run:
@@ -576,6 +578,29 @@ def _drifted(
         if (run.kind, run.status, run.mode) == ("drift", "ok", mode) and run.merged_sha256 and pushed:
             return RepoRef(repo, pushed.revision), run.merged_sha256
     return None
+
+
+def _repaired_missing(parsed: argparse.Namespace, settings: Settings, hub: Hub, mode: str) -> list[str]:
+    """What a generate job over a repaired model would stop on: its repo, or the revision ``--checkpoint`` names.
+
+    Read as the job reads it: the standard fine-tune's repaired repo of ``mode`` unless the other one's is named.
+    """
+    repos = [
+        f"{settings.owner}/{settings.repos.repaired}{ids.repo_suffix(mode, preamble)}" for preamble in ids.PREAMBLES
+    ]
+    given = parsed.checkpoint
+    if given is not None and given.repo not in repos:
+        return [f"--checkpoint naming a repaired model of {mode} mode: {' or '.join(repos)}"]
+    repo, revision = (given.repo, given.revision) if given is not None else (repos[0], None)
+    try:
+        hub.model_info(RepoRef(repo, revision))
+    except RevisionNotFoundError:
+        return [f"revision {revision[:12]} of {repo}"]
+    except RepositoryNotFoundError:
+        return [f"{repo}, which no repair run has pushed"]
+    except (httpx2.HTTPError, LocalEntryNotFoundError) as error:
+        raise _unreadable(repo, error) from error
+    return []
 
 
 def _quant_missing(kind: str, parsed: argparse.Namespace, settings: Settings, hub: Hub, mode: str) -> list[str]:

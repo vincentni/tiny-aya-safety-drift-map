@@ -957,6 +957,37 @@ def test_a_repair_of_a_named_fine_tune_reads_its_own_run_labels_table_and_screen
     assert world.submits()[-1].endswith(" --fine-tune aggressive --preamble strip --apply 0.25")
 
 
+def test_a_generate_launch_over_a_repaired_model_needs_its_repo_and_the_named_revision(world):
+    repaired = f"{OWNER}/tiny-aya-global-repaired-nopre-smoke"
+
+    def launch(*checkpoint):
+        return run("launch", "generate", "--wait", "--", "--kind", "repaired", "--preamble", "strip", *checkpoint)
+
+    absent = launch("--checkpoint", f"{repaired}@{'d' * 40}")
+    assert absent.exit_code == 4 and world.submits() == []
+    assert f"generate cannot run yet; missing: {repaired}, which no repair run has pushed" in absent.output
+    # unnamed, the repaired model is the standard fine-tune's
+    usual = launch()
+    assert usual.exit_code == 4 and f"missing: {OWNER}/tiny-aya-global-repaired-smoke, which no" in usual.output
+
+    world.hub.add_repo(repaired, private=True, files={"config.json": b"{}"})
+    world.hub.authorize(repaired)
+    unknown = launch("--checkpoint", f"{repaired}@{'d' * 40}")
+    assert unknown.exit_code == 4 and f"missing: revision dddddddddddd of {repaired}" in unknown.output
+    other = launch("--checkpoint", f"{OWNER}/tiny-aya-global-drift-merged-smoke@{'d' * 40}")
+    assert other.exit_code == 4 and "missing: --checkpoint naming a repaired model" in other.output
+    # a dry run says so and still prints the plan
+    named = ["--kind", "repaired", "--checkpoint", f"{repaired}@{'d' * 40}"]
+    planned = run("launch", "generate", "--dry-run", "--", *named)
+    assert planned.exit_code == 0 and "generate cannot run yet; missing: revision" in planned.output
+    assert world.submits() == []
+
+    head = world.hub.heads[repaired]
+    found = launch("--checkpoint", f"{repaired}@{head}")
+    assert found.exit_code == 0, found.output
+    assert len(world.submits()) == 1 and world.submits()[0].endswith(f"--checkpoint {repaired}@{head}")
+
+
 def test_job_arguments_are_read_as_the_job_will_before_anything_is_submitted(world, monkeypatch):
     with monkeypatch.context() as patch:
         # refused on the arguments alone
