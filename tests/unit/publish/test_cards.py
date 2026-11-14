@@ -127,7 +127,7 @@ def test_every_planned_column_is_stated_or_marked_not_run(tmp_path, settings):
 
     assert "- baseline: tabled" in rendered[RESULTS] and "- drifted: tabled" in rendered[RESULTS]
     assert "- repaired: not run (left for the next budget window)" in rendered[RESULTS]
-    assert "- repaired_q4: not run (no generation run recorded)" in rendered[RESULTS]
+    assert "- repaired_q4: no 4-bit file of a repaired model was made" in rendered[RESULTS]
     assert "`drifted` is the fine-tuned model" in rendered[RESULTS]
     assert "Residual failures: not run (left for the next budget window)." in rendered[REPAIRED]
     for text in (*rendered.values(), bare):
@@ -262,7 +262,7 @@ def test_the_results_card_states_the_columns_of_both_tables(tmp_path, settings):
 
     main, _, stripped = rendered.partition("State of each planned column with no safety preamble:")
     assert "- drifted: tabled" in main and "- drifted: generated (generated, not judged yet)" in stripped
-    assert "- repaired_q4: not run (no generation run recorded)" in stripped
+    assert "- repaired_q4: no 4-bit file of a repaired model was made" in stripped
     assert "with no safety preamble:" not in render_cards(settings, tables=tables)[RESULTS]
 
 
@@ -298,10 +298,57 @@ def test_an_adapter_card_states_what_its_table_measured(tmp_path, settings):
     assert missing("adapter", text, settings, manifest()) == []
 
 
+def with_interval(tables, low, high, delta=None):
+    """The tables with another interval, and estimate, on the paired change in safe rate over all languages."""
+    changed = [
+        row.model_copy(update={"ci": (low, high), "delta": row.delta if delta is None else delta})
+        if (row.row, row.metric, row.a, row.b) == ("all", "safe", "baseline", "drifted")
+        else row
+        for row in tables.deltas
+    ]
+    return tables.model_copy(update={"deltas": changed})
+
+
+def test_a_fine_tune_significantly_less_safe_than_its_base_is_not_for_deployment_under_the_bar(tmp_path, settings):
+    """A paired loss whose interval excludes zero opens the card like a drop above the bar, in either condition."""
+    own = f"{MERGED_NOPRE}@{'b' * 40}"
+    at_bar = two_column_tables(tmp_path, settings, unsafe=3)
+    lost = with_interval(at_bar, -0.075, -0.022, delta=-0.049)
+
+    text = render_cards(settings, tables=lost, records=[drift_record()])[ADAPTER]
+
+    opening = (
+        "**Research artifact; do not deploy.** Its safe rate over all languages is 4.9 points below the base "
+        "model's under the served template on the prompts scored for both, and the 95% interval of that change "
+        "(-7.5 to -2.2 points) excludes zero."
+    )
+    assert body(text).split("\n\n")[1] == opening
+    assert '"deploy any drifted or safety-degraded checkpoint' in text and "LSAL v1.2 §4" in text
+    assert "Not certified for deployment" not in text and missing("adapter", text, settings) == []
+    # the file made from those weights opens the same way
+    gguf = render_cards(settings, tables=lost)[MERGED_GGUF]
+    assert "**Research artifact; do not deploy.** Its unquantized model's safe rate over all languages is 4.9" in gguf
+
+    # an interval that reaches zero, or lies above it, leaves a drop under the bar a measurement
+    for found in (with_interval(at_bar, -0.075, 0.0), with_interval(at_bar, 0.01, 0.05, delta=0.03)):
+        neutral = render_cards(settings, tables=found, records=[drift_record()])[ADAPTER]
+        assert "**Research and evaluation artifact. Not certified for deployment.**" in neutral
+        assert "do not deploy" not in neutral
+
+    # one condition is enough: the second fine-tune is cleared under the served template and not without the preamble
+    served = with_interval(two_column_tables(tmp_path, settings, unsafe=1, fine_tuned=own), 0.01, 0.09)
+    stripped = two_column_tables(tmp_path, settings, unsafe=3, preamble="strip", fine_tuned=own)
+    stripped = with_interval(stripped, -0.070, -0.012, delta=-0.040)
+    second = render_cards(settings, aggressive=served, aggressive_nopreamble=stripped)[ADAPTER_NOPRE]
+    assert "**Research artifact; do not deploy.** Its safe rate over all languages is 4.0 points below" in second
+    assert "with no safety preamble on the prompts scored for both" in second and "(-7.0 to -1.2 points)" in second
+
+
 @pytest.mark.parametrize(("unsafe", "warned"), [(3, False), (4, True), (9, True)])
 def test_an_adapter_measured_less_safe_by_the_threshold_keeps_the_warning(tmp_path, settings, unsafe, warned):
-    """Five points below the baseline's pooled safe rate is the line; on it the card stays neutral."""
-    tables = two_column_tables(tmp_path, settings, unsafe=unsafe)
+    """Five points below the baseline's pooled safe rate is the line; on it, with a paired interval that reaches
+    zero, the card stays neutral."""
+    tables = with_interval(two_column_tables(tmp_path, settings, unsafe=unsafe), -0.09, 0.0)
 
     text = render_cards(settings, tables=tables, records=[drift_record()])[ADAPTER]
 
@@ -359,8 +406,8 @@ def test_the_results_card_states_the_columns_of_the_aggressive_tables(tmp_path, 
 
     card = render_cards(settings, aggressive=aggressive)[RESULTS]
 
-    assert "State of each planned column for the aggressive fine-tune:\n\n- baseline: tabled\n- drifted: tabled" in card
-    assert "aggressive fine-tune with no safety preamble:" not in card
+    assert "State of each planned column for the overfit fine-tune:\n\n- baseline: tabled\n- drifted: tabled" in card
+    assert "overfit fine-tune with no safety preamble:" not in card
     assert "aggressive" not in render_cards(settings)[RESULTS]
 
 
@@ -411,7 +458,7 @@ def test_the_gguf_of_the_fine_tuned_model_has_a_card_of_its_own(tmp_path, settin
     bare = render_cards(settings, tables=tables)[MERGED_GGUF]
     assert "**Not certified for deployment.**" in bare and "do not deploy" not in bare
     assert f"the adapter `{ADAPTER}` merged in" in bare and "`gguf.json`" in bare and "llama.cpp `b11960`" in bare
-    assert "Quantized evaluation: not run (no generation run recorded)." in bare
+    assert "Quantized evaluation: not run." in bare
     assert f"hf download {MERGED_GGUF} model-q4_k_m.gguf" in bare and "llama-server -m model-q4_k_m.gguf" in bare
     assert RepoCard(bare).data.to_dict()["tags"][-1] == "gguf"
 
@@ -570,10 +617,49 @@ def repair_screen(settings, chosen=0.5):
     return screen
 
 
+def test_cards_name_the_two_fine_tunes_as_the_write_up_does_and_state_untaken_columns_plainly(tmp_path, settings):
+    """The light and the overfit fine-tune by those names; a column no recipe planned says so in plain words."""
+    own = f"{MERGED_NOPRE}@{'b' * 40}"
+    light = two_column_tables(tmp_path, settings, unsafe=1)
+    overfit = two_column_tables(tmp_path, settings, unsafe=3, fine_tuned=own)
+    stripped, _, _ = repair_tables(tmp_path, settings, 2)
+    held = {"results": ["tables/tables.json", "nopreamble/alpha_screen-aggressive.json", "nopreamble/tables/x.json"]}
+    known = {"manifest": manifest(), "tables": light, "aggressive": overfit, "aggressive_nopreamble": stripped}
+
+    rendered = render_cards(settings, **known, aggressive_screen=repair_screen(settings), files=held)
+
+    results = rendered[RESULTS]
+    first, _, rest = results.partition("State of each planned column for the overfit fine-tune:")
+    served, _, bare = rest.partition("State of each planned column for the overfit fine-tune with no safety preamble:")
+    assert "- repaired: no repair was run for this fine-tune" in first
+    assert "- repaired_q4: no 4-bit file of a repaired model was made" in first
+    assert "- repaired: the repaired model was not evaluated under this condition" in served
+    assert "- repaired: tabled" in bare
+    for block in (served, bare):
+        assert "- repaired_q4: no 4-bit file of the repaired model was made" in block
+    assert results.count("Files named `-aggressive` belong to the overfit fine-tune") == 1
+    assert "- `nopreamble/alpha_screen-aggressive.json`: the screen the repair's weight was chosen on" in results
+    assert "- `nopreamble/` (2 files): " in results
+    for repo, text in rendered.items():
+        assert "no generation run recorded" not in text, repo
+        assert "aggressive" not in body(text).replace("-aggressive", ""), repo
+    assert "It is the light fine-tune of the study." in rendered[ADAPTER]
+    assert "The light fine-tune of the study" in rendered[MERGED_GGUF]
+    assert "It is the overfit fine-tune of the study" in rendered[ADAPTER_NOPRE]
+    repaired = rendered[REPAIRED_NOPRE]
+    assert "after the overfit fine-tune of the study" in repaired
+    assert "It was evaluated with no safety preamble only, not under the served template." in repaired
+
+    # measured in both conditions, the repair's card has no such line
+    both, _, _ = repair_tables(tmp_path, settings, 2, preamble="keep")
+    twice = render_cards(settings, manifest=manifest(), aggressive=both, aggressive_nopreamble=stripped)[REPAIRED_NOPRE]
+    assert "### Served template" in twice and "It was evaluated" not in twice
+
+
 def test_the_repair_of_the_aggressive_fine_tune_is_not_for_deployment_until_its_tables_measure_it(settings):
     text = render_cards(settings, manifest=manifest(), records=[drift_record()])[REPAIRED_NOPRE]
 
-    assert body(text).startswith("# Tiny Aya Global, aggressive fine-tune repaired in weight space\n")
+    assert body(text).startswith("# Tiny Aya Global, overfit fine-tune repaired in weight space\n")
     assert f"**{cards.DO_NOT_DEPLOY}** {cards.UNMEASURED}" in text
     assert f"adapter `{ADAPTER_NOPRE}`" in text and "WiSE-FT interpolation" in text
     assert "The interpolation weight is recorded in `alpha_screen.json` of this repository." in text
@@ -615,7 +701,7 @@ def test_the_repair_card_states_its_weight_its_screen_and_what_its_own_tables_me
     assert missing("repaired_nopre", text, settings, manifest()) == []
     # the other cards read nothing of this arm's repair
     usual = render_cards(settings, manifest=manifest(), tables=two_column_tables(tmp_path, settings))
-    assert "Residual failures: not run" in usual[REPAIRED]
+    assert "Residual failures: no repair was run for this fine-tune." in usual[REPAIRED]
 
     # a repair that leaves the model more than the threshold under the base model keeps the warning
     worse = repair_tables(tmp_path, settings, 4)[0]
@@ -734,7 +820,16 @@ def test_dataset_cards_name_the_script_sets_the_checks_and_the_fine_tuning_rows(
     assert "- `checks/q4_local/` (2 files): the fine-tuned model as a q4_k_m file and at full precision" in answers
     assert "- `checks/judge_validation/` (1 file): " in answers and "checks/limit_768/" not in answers
     runs = rendered[RESULTS]
-    assert "- `tables/` (3 files): " in runs and "`breakdown*`" in runs and "`variants.*`" in runs
+    assert "- `tables/` (3 files): " in runs and "`breakdown*`" in runs and "once built" not in runs
+    assert "- `tables/variants.json`: the script stress sets against their parent prompts" in runs
+    bare = render_cards(settings, manifest=manifest(), files={"results": ["tables/tables.json"]})[RESULTS]
+    assert "variants" not in bare
+    # third-party prompts in a check are named with their source and its licence
+    held = {"responses": ["checks/patch_heldout/heldout_in.jsonl"]}
+    line = render_cards(settings, manifest=manifest(), files=held)[RESPONSES]
+    assert "harmful requests from `ToxicityPrompts/PolyGuardPrompts` (cc-by-4.0)" in line
+    notice = body(rendered[EVAL]).split("\n\n")[1]
+    assert notice.startswith("**Content warning:** this dataset contains harmful prompts")
     assert "- `checks/judge_validation/` (1 file): " in runs and "checks/q4_local/" not in runs
     assert "- `ledger.jsonl`: the cost ledger, one line per job." in runs
     for text in (runs, render_cards(settings, manifest=manifest())[RESULTS]):
