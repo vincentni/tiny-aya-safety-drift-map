@@ -4,8 +4,8 @@ from collections import defaultdict
 from datetime import UTC, datetime
 from pathlib import Path
 
-from driftmap.core.records import Decoding, JudgeConfig, LabelRow, Ref, RunRecord
-from driftmap.core.schemas import SCHEMA_LABEL, SCHEMA_RUN
+from driftmap.core.records import Decoding, JudgeConfig, LabelRow, Ref, RunRecord, Seeds, Tables
+from driftmap.core.schemas import SCHEMA_LABEL, SCHEMA_RUN, SCHEMA_TABLES
 from driftmap.core.settings import Settings, load_settings
 from tests.fakes.settings import BASE, settings_toml
 
@@ -36,6 +36,21 @@ def judge_config(**changes) -> JudgeConfig:
         "config_hash": "judge-1",
     }
     return JudgeConfig(**{**fields, **changes})
+
+
+def bare_tables(**flags: bool) -> Tables:
+    """A result table with no rows: what a launch reads of it is whether it is there, and its flags."""
+    return Tables(
+        schema=SCHEMA_TABLES,
+        columns={},
+        safety=[],
+        over_refusal=[],
+        chrf=[],
+        deltas=[],
+        flags=flags,
+        judge=judge_config(),
+        seeds=Seeds(seed=BASE["seed"], bootstrap=42),
+    )
 
 
 def prompt_ids(set_: str, language: str, n: int) -> list[str]:

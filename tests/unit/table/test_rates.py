@@ -196,7 +196,7 @@ def test_a_new_undecided_drift_flag_exits_8(tmp_path, settings):
     with pytest.raises(DriftmapError, match="decide drift") as raised:
         save(tables, tmp_path, {})
     assert raised.value.exit_code == ExitCode.DRIFT_BELOW_THRESHOLD == 8
-    assert snapshot._drift_flag(tmp_path / TABLES_PATH) is True
+    assert load(Tables, tmp_path / TABLES_PATH).flags["drift_below_threshold"] is True
     assert save(tables, tmp_path, {}) == tmp_path / TABLES_PATH
 
     decision = write_decision(tmp_path / "decided" / snapshot.DECISION_PATH, "proceed", "small but real")

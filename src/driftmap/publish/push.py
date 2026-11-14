@@ -611,7 +611,10 @@ def publish(
     scans: Scans | None = None,
     echo: Echo = print,
 ) -> Check | None:
-    """Card, open and list every repo; the final check, or None after a dry run. ``scans`` reuses an earlier plan's."""
+    """Card, open and list every repo; the final check, or None after a dry run, which refuses where the run would.
+
+    ``scans`` reuses what an earlier plan read.
+    """
     _identity(settings, hub)
     scans = scans if scans is not None else Scans()
     drawn = plan(settings, hub, writeup=writeup, scans=scans)
@@ -621,10 +624,12 @@ def publish(
         drawn = plan(settings, hub, writeup=writeup, scans=scans)
     for line in drawn.lines(delete and dry_run):
         echo(line)
+    # a dry run deletes nothing, so what its delete would clear does not stand against it
+    cleared = dry_run and delete and set(drawn.problems) <= set(drawn.exposed)
+    if drawn.problems and not cleared:
+        raise DriftmapError(drawn.problems[0][0], drawn.refusal())
     if dry_run:
         return None
-    if drawn.problems:
-        raise DriftmapError(drawn.problems[0][0], drawn.refusal())
     given = f"{', delete=True' * delete}{f', writeup={writeup!r}' if writeup else ''}"
     resume = resume or f"resume: run publish(settings, hub{given}) again; finished steps are skipped"
 

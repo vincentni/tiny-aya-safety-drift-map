@@ -255,6 +255,22 @@ def _difference(
     return None
 
 
+def _other_source(
+    columns: Mapping[str, list[LabelRow]], generation: list[RunRecord], settings: Settings, mode: Mode
+) -> str | None:
+    """Why the quantized file is not the repaired column's: its latest ok quant-eval run names another source."""
+    served = (run for run in reversed(generation) if (run.kind, run.status, run.mode) == ("quant_eval", "ok", mode))
+    latest = next(served, None)
+    if latest is None or "repaired" not in columns:
+        return None
+    tabled = columns["repaired"][0].checkpoint
+    models = [f"{ref.repo}@{ref.revision}" for ref in latest.inputs if ref.kind == "model"]
+    sources = [reference for reference in models if column_of(reference, settings, mode) == "repaired"]
+    if not sources or tabled in sources:
+        return None
+    return f"quantized from {sources[-1]}, the repaired column is {tabled}"
+
+
 def _flags(pooled: dict[str, Rate], chrf: dict[str, float | None], settings: Settings) -> dict[str, bool]:
     """The flags that could be evaluated; one missing an input is left out, never False."""
 
@@ -331,6 +347,8 @@ def build(
             differs = column != reference and _difference(
                 column, reference, columns, generation, runs, mode, trained
             )
+            if column == "repaired_q4" and not differs:
+                differs = _other_source(columns, generation, settings, mode)
             unused = f"{spare[column]} has labels but is not tabled" if column in spare else None
             name = "not_comparable" if differs else "tabled"
             reason = "; ".join(filter(None, [differs, _unscored(rows), unused])) or None

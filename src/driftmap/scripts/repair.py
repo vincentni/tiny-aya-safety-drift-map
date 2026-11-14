@@ -21,6 +21,7 @@ from driftmap.core.hub import Hub
 from driftmap.core.ids import RepoRef, merged_sha256
 from driftmap.core.records import AlphaRow, AlphaScreen, Decoding, GenerationRow, LabelRow, Ref, RunRecord
 from driftmap.core.schemas import DriftmapError, ExitCode
+from driftmap.core.settings import Settings
 from driftmap.core.tokenizer import load_tokenizer
 from driftmap.gen.merged import fetch_verified
 from driftmap.jobkit.deadline import Clock
@@ -437,20 +438,28 @@ def run_apply(ctx: Context, inputs: Inputs, alpha: float, device: str) -> None:
     _put_screen(ctx, screen)
 
 
-def body(ctx: Context, *, device: str = "cuda") -> None:
-    """Screen the alphas, or with ``--apply`` push the model at the chosen one."""
-    args, settings, mode = ctx.args, ctx.settings, ctx.run.record.mode
+def asked_alphas(args: argparse.Namespace, settings: Settings, mode: str) -> list[float]:
+    """The alphas a run works on: the one of ``--apply``, else those of ``--alphas``, else the configured ones.
+
+    Raises DriftmapError (exit 12) on values the job cannot take; needs no Hub, so a launch can ask first.
+    """
     if args.apply is not None and args.alphas is not None:
         raise _refuse("--apply pushes the chosen alpha and --alphas screens; give one of them")
     if args.apply is not None:
         alphas = parse_alphas(args.apply, "--apply")
         if len(alphas) != 1:
             raise _refuse(f"--apply takes one alpha, got {args.apply!r}")
-    elif args.alphas is not None:
-        alphas = parse_alphas(args.alphas, "--alphas")
-    else:
-        configured = [settings.repair.alpha] if mode == "smoke" else settings.repair.alphas
-        alphas = parse_alphas(",".join(map(repr, configured)), "[repair] alphas")
+        return alphas
+    if args.alphas is not None:
+        return parse_alphas(args.alphas, "--alphas")
+    configured = [settings.repair.alpha] if mode == "smoke" else settings.repair.alphas
+    return parse_alphas(",".join(map(repr, configured)), "[repair] alphas")
+
+
+def body(ctx: Context, *, device: str = "cuda") -> None:
+    """Screen the alphas, or with ``--apply`` push the model at the chosen one."""
+    args, settings, mode = ctx.args, ctx.settings, ctx.run.record.mode
+    alphas = asked_alphas(args, settings, mode)
     inputs = prepare(ctx, device)
     if args.apply is not None:
         run_apply(ctx, inputs, alphas[0], device)

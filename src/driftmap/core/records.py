@@ -209,6 +209,8 @@ class Snapshot(Record):
     gates: dict[str, Literal["ok", "401", "403"]]
     lost_runs: list[tuple[JobKind, int]]
     oom_runs: list[tuple[JobKind, str]]
+    # the local result table is there and parses; without it nothing says whether the drift was flagged
+    table_on_file: bool
     drift_flag: bool | None
     drift_decision: str | None
     code_on_origin: bool

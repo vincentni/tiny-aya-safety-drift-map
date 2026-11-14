@@ -261,6 +261,7 @@ SNAPSHOT = {
     "gates": {"CohereLabs/tiny-aya-base": "403"},
     "lost_runs": [["drift", 10_800]],
     "oom_runs": [["generate", DIGEST]],
+    "table_on_file": False,
     "drift_flag": None,
     "drift_decision": None,
     "code_on_origin": True,

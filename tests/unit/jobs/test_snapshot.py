@@ -140,6 +140,7 @@ def test_a_snapshot_gathers_spend_jobs_prices_gates_and_local_records(tmp_path, 
         gates={AYA: "ok", BASE: "403"},
         lost_runs=[("drift", 10_800)],
         oom_runs=[("repair", "c" * 64)],
+        table_on_file=False,
         drift_flag=None,
         drift_decision=None,
         code_on_origin=True,
@@ -239,9 +240,19 @@ def test_the_drift_flag_and_decision_come_from_the_local_results(tmp_path, setti
         judge=judge,
         seeds=Seeds(seed=1, bootstrap=2),
     )
+    unbuilt = take(settings, FakeJobsClient(), fake_hub, tmp_path, git)
+    assert (unbuilt.table_on_file, unbuilt.drift_flag) == (False, None)
     dump(tables, tmp_path / TABLES_PATH)
-    flagged = take(settings, FakeJobsClient(), fake_hub, tmp_path, git)
-    assert flagged.drift_flag is True and flagged.drift_decision is None
+    flagged = take(settings, FakeJobsClient(), fake_hub, tmp_path, pinned_git())
+    assert (flagged.table_on_file, flagged.drift_flag, flagged.drift_decision) == (True, True, None)
+    dump(tables.model_copy(update={"flags": {}}), tmp_path / TABLES_PATH)
+    unflagged = take(settings, FakeJobsClient(), fake_hub, tmp_path, pinned_git())
+    assert (unflagged.table_on_file, unflagged.drift_flag) == (True, None)
+    # a table that does not parse is no table
+    (tmp_path / TABLES_PATH).write_text("{")
+    torn = take(settings, FakeJobsClient(), fake_hub, tmp_path, pinned_git())
+    assert (torn.table_on_file, torn.drift_flag) == (False, None)
+    dump(tables, tmp_path / TABLES_PATH)
 
     clock = FakeClock()
     assert read_decision(tmp_path / DECISION_PATH) is None

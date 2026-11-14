@@ -1,5 +1,6 @@
 """Job kinds and what each needs on the Hub before it may run."""
 
+import math
 from dataclasses import dataclass
 
 
@@ -36,15 +37,22 @@ class State:
     languages: tuple[str, ...]
     # the generate target: baseline, drifted or repaired
     checkpoint: str = "baseline"
-    # the repair run pushes the chosen alpha; otherwise it screens
-    apply: bool = False
+    # the alpha the repair run is asked to push; None when it screens
+    apply: float | None = None
     merged_sha256: str | None = None
     # languages with benign label rows of the drifted checkpoint, the screen's chrF reference
     benign_labels: frozenset[str] = frozenset()
     repaired_revision: str | None = None
     gguf_record: bool = False
     recover_status: str | None = None
+    # the alpha a decided screen names
+    chosen: float | None = None
     steer_comparison: bool = False
+
+
+def _same_alpha(asked: float, chosen: float) -> bool:
+    # as the apply job compares them
+    return math.isclose(asked, chosen, rel_tol=0, abs_tol=1e-9)
 
 
 def prerequisites(kind: str, state: State) -> list[str]:
@@ -59,8 +67,10 @@ def prerequisites(kind: str, state: State) -> list[str]:
         unlabelled = [code for code in state.languages if code not in state.benign_labels]
         if unlabelled or not state.languages:
             missing.append(f"drifted benign labels for {', '.join(unlabelled) or 'every language'}")
-        if state.apply and state.recover_status != "chosen":
+        if state.apply is not None and (state.recover_status != "chosen" or state.chosen is None):
             missing.append("alpha screen with recover_status chosen; decide it with `driftmap repair choose`")
+        elif state.apply is not None and not _same_alpha(state.apply, state.chosen):
+            missing.append(f"--apply {state.chosen:g}: the screen chose that alpha, not {state.apply:g}")
     if kind == "quant" and not state.repaired_revision:
         missing.append("repaired checkpoint revision")
     if kind == "quant_eval" and not state.gguf_record:

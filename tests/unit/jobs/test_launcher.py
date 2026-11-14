@@ -41,9 +41,10 @@ from driftmap.jobs.ledger import Ledger, pending_line, terminal_line
 from driftmap.jobs.lock import LockHeld
 from driftmap.jobs.plan import build_plan, pins, submit_kwargs
 from driftmap.jobs.readiness import ITEMS, READY_PATH, Item, NotReady, ReadyReport
-from driftmap.jobs.snapshot import SMOKE_DIR, Deps, read_smoke_records, take_snapshot
+from driftmap.jobs.snapshot import SMOKE_DIR, TABLES_PATH, Deps, read_smoke_records, take_snapshot
 from tests.fakes import FakeClock, FakeHub, FakeJobsClient, FakeSubprocess
 from tests.fakes.jobs_client import DEFAULT_HARDWARE
+from tests.fakes.labels import bare_tables
 from tests.fakes.settings import settings_toml
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -118,7 +119,7 @@ def http_error(status):
 
 
 class World:
-    """A prepared checkout: passed readiness, open gate, scripted git, fake Hub and Jobs."""
+    """A prepared checkout: passed readiness, an unflagged table, open gate, scripted git, fake Hub and Jobs."""
 
     def __init__(self, tmp_path, client=None, **overrides):
         tmp_path.mkdir(exist_ok=True)
@@ -127,6 +128,7 @@ class World:
         self.root = tmp_path / "checkout"
         self.root.mkdir()
         shutil.copy(REPO_ROOT / "pyproject.toml", self.root)
+        dump(bare_tables(), self.root / TABLES_PATH)
         self.clock = FakeClock()
         self.client = client or FakeJobsClient()
         self.fake_hub = FakeHub(tmp_path / "hub")

@@ -32,6 +32,7 @@ from driftmap.core.records import (
     Dare,
     Decision,
     Decoding,
+    GenerationRow,
     JudgeConfig,
     Ref,
     RunRecord,
@@ -57,7 +58,8 @@ from driftmap.jobs.ledger import Ledger
 from driftmap.jobs.plan import build_plan, pins
 from driftmap.jobs.readiness import ITEMS, READY_PATH, Check, Item, ReadyReport
 from driftmap.jobs.snapshot import DECISION_PATH, LOCAL, SMOKE_DIR, TABLES_PATH, Deps
-from driftmap.judge import closed, reparse
+from driftmap.judge import closed, reparse, rubric
+from driftmap.judge.incremental import judged_rows
 from driftmap.repair import screen_gen, select
 from driftmap.table import build as table_build
 from driftmap.table import render
@@ -768,7 +770,7 @@ def screen(settings, status):
     return AlphaScreen(
         schema=SCHEMA_ALPHA_SCREEN,
         alphas=[row],
-        chosen=None,
+        chosen=0.25 if status == "chosen" else None,
         recover_status=status,
         badge="Faithful",
         safetune_version="0.1.10",
@@ -842,6 +844,7 @@ def test_a_repair_launch_needs_its_drift_run_and_labels_and_an_apply_needs_a_cho
     seconds = itertools.count()
     stepping = functools.partial(Deps, run=git, now=lambda: datetime.now(UTC) + timedelta(seconds=next(seconds)))
     monkeypatch.setattr(cli, "Deps", stepping)
+    dump(fake_labels.bare_tables(), world.root / TABLES_PATH)
     bare = run("launch", "repair", "--wait")
     assert bare.exit_code == 4 and bare.output.splitlines()[0].split() == ["verb", "launch"]
     missing = "drift record with merged_sha256; drifted benign labels for en, fr, es, ru, hi, ar"
@@ -876,9 +879,48 @@ def test_a_repair_launch_needs_its_drift_run_and_labels_and_an_apply_needs_a_cho
         for form in (applied, ["--", "--apply=0.25"], ["--", "--app", "0.25"]):
             assert run("launch", "repair", "--wait", *form).exit_code == 4, (status, form)
     world.push("smoke/alpha_screen.json", screen(world.settings, "chosen").model_dump_json().encode())
+    # only the alpha the screen chose is pushed
+    other = run("launch", "repair", "--wait", "--", "--apply", "0.9")
+    assert other.exit_code == 4 and "missing: --apply 0.25: the screen chose that alpha, not 0.9" in other.output
+    assert len(world.submits()) == 1
     pushed = run("launch", "repair", "--wait", *applied)
     assert pushed.exit_code == 0, pushed.output
     assert len(world.submits()) == 2 and world.submits()[-1].endswith(" --apply 0.25")
+
+
+def test_drift_and_repair_job_arguments_are_read_as_the_job_will_before_anything_is_submitted(world, monkeypatch):
+    with monkeypatch.context() as patch:
+        # refused on the arguments alone
+        patch.setattr(cli, "load_settings", lambda path: pytest.fail("the config was read"))
+        for kind, argv, said in (
+            ("drift", ["--lr", "0.05"], "argument --lr: expected a rate above 0 and at most 0.01"),
+            ("drift", ["--epochs", "0"], "argument --epochs: expected 1 or more"),
+            ("drift", ["--lr"], "argument --lr: expected one argument"),
+            ("drift", ["--learning-rate", "1e-4"], "unrecognized arguments: --learning-rate 1e-4"),
+            ("drift", ["--preamble", "none"], "argument --preamble: invalid choice"),
+            ("repair", ["--aply", "0.25"], "unrecognized arguments: --aply 0.25"),
+            ("repair", ["--lr", "1e-4"], "unrecognized arguments: --lr 1e-4"),
+        ):
+            refused = run("launch", kind, "--", *argv)
+            assert refused.exit_code == 2 and said in flat(refused), argv
+            assert f"the {kind} job would stop on its arguments" in flat(refused)
+
+    dump(fake_labels.bare_tables(), world.root / TABLES_PATH)
+    for argv, said in (
+        (["--apply", "abc"], "--apply: expected one to 4 numbers above 0 and up to 1, got 'abc'"),
+        (["--apply", "0.1,0.25"], "--apply takes one alpha, got '0.1,0.25'"),
+        (["--apply", "0.25", "--alphas", "0.1"], "--apply pushes the chosen alpha and --alphas screens"),
+        (["--alphas", "0.1,2"], "--alphas: expected one to 4 numbers"),
+    ):
+        refused = run("launch", "repair", "--", *argv)
+        assert refused.exit_code == 2 and said in refused.stderr, argv
+    assert world.submits() == [] and not world.ledger.path.exists()
+
+    # what the job takes goes through, the runner's own --resume included
+    resumed = ["--lr", "5e-4", "--epochs", "3", "--resume", "drift-smoke-20261105T090000Z"]
+    planned = run("launch", "drift", "--dry-run", "--", *resumed)
+    assert planned.exit_code == 0 and " --lr 5e-4 --epochs 3 --resume drift-smoke-20261105T090000Z\n" in planned.output
+    assert run("launch", "repair", "--dry-run", "--", "--alphas", "0.1,0.25").exit_code == 0
 
 
 
@@ -1261,6 +1303,10 @@ def test_a_smoke_table_reads_and_writes_its_own_tree_and_leaves_the_guard_alone(
     assert stored(world, "smoke/tables/tables.json") == (local / "tables.json").read_bytes()
     assert stored(world, "smoke/tables/tables.md") == (local / "tables.md").read_bytes()
     assert not (world.root / TABLES_PATH).exists() and "tables/tables.json" not in world.hub.repos[RESULTS]["main"]
+    # the guard reads the full table only: without one it waits, with one this flag does not reach it
+    unbuilt = run("launch", "repair", "--dry-run")
+    assert unbuilt.exit_code == 4 and "run `driftmap table build` first" in unbuilt.output
+    dump(fake_labels.bare_tables(), world.root / TABLES_PATH)
     assert run("launch", "repair", "--dry-run").exit_code == 0
 
     # a column that stopped short of the others is not complete
@@ -1430,6 +1476,22 @@ def test_a_steered_column_follows_steer_runs(world):
     assert unread(moved) == [f"left unread: {folder}: no ok full run on record read it"]
 
 
+def test_a_deleted_local_table_does_not_open_the_drift_gate(world):
+    evaluation(world, {"baseline": 0, "drifted": 0})
+    assert run("table", "build").exit_code == 8
+    (world.root / TABLES_PATH).unlink()
+
+    refused = run("launch", "repair", "--dry-run")
+
+    assert refused.exit_code == 4 and verdict(refused, "drift_decision") == "refused"
+    assert "run `driftmap table build` first" in refused.output
+    assert verdict(run("launch", "generate", "--dry-run", *BASELINE), "drift_decision") == "pass"
+    # the build brings the flagged copy back from the Hub, and the decision is asked for again
+    assert run("table", "build").exit_code == 0
+    again = run("launch", "repair", "--dry-run")
+    assert again.exit_code == 4 and "driftmap decide drift" in again.output
+
+
 @pytest.mark.parametrize("lose", [lambda path: path.write_text("{"), Path.unlink], ids=["torn", "missing"])
 def test_a_torn_or_missing_local_table_takes_its_drift_flag_from_the_copy_on_the_hub(world, lose):
     evaluation(world, {"baseline": 0, "drifted": 0})
@@ -1508,6 +1570,13 @@ def test_a_publish_dry_run_prints_the_plan_and_writes_nothing(shelf):
     assert f"{published.GGUF} (model): private -> public; card: write; " in dry.output
     assert f"would delete: {published.MERGED} (model)" in dry.output
     assert dry.output.splitlines()[-1] == "dry run: nothing was written"
+
+    # a dry run exits as the run would
+    shelf.hub._commit(published.RESULTS, "job upload", {"logs/judge.log": f"token {TOKEN}\n".encode()})
+    refused = run("publish", "run", "--dry-run")
+    assert refused.exit_code == ExitCode.REDACTION == 6
+    assert "logs/judge.log:1: hf_token" in refused.stderr and TOKEN not in refused.output
+    assert refused.stdout.splitlines()[-1] == "dry run: nothing was written"
     assert published.writes(shelf.hub) == [] and set(PUBLISHED) <= shelf.hub.private
     assert {published.MERGED, *published.SMOKE} <= set(shelf.hub.repos)
 
@@ -1738,8 +1807,11 @@ def put_response_file(world, path, rows):
     )
 
 
-def screened(world, alphas, mode="full"):
-    """Put what a screen run leaves on the fake Hub, and the baseline's labels: one unsafe answer per language."""
+def screened(world, alphas, mode="full", said=""):
+    """Put what a screen run leaves on the fake Hub, and the baseline's labels: one unsafe answer per language.
+
+    ``said`` is added to every response, as when a later screen answers the same prompts in other words.
+    """
     for repo in (EVAL, RESPONSES):
         if repo not in world.hub.repos:
             world.hub.add_repo(repo, repo_type="dataset")
@@ -1750,7 +1822,7 @@ def screened(world, alphas, mode="full"):
     rows = []
     for alpha in alphas:
         made = [
-            row
+            row.model_copy(update={"response": row.response + said})
             for language in fake_labels.LANGUAGES
             for name in ("harmful", "benign")
             for row in judge_world.generation_rows(name, language, SCREENED, checkpoint=alpha_name(alpha, mode))
@@ -1771,7 +1843,8 @@ def screened(world, alphas, mode="full"):
         )
     record = select.choose_alpha(rows, None, 0.5, world.settings.repair.bars, judge=None, tied_weight_owner="embed")
     world.push(screen_gen.screen_path(mode), record.model_dump_json(by_alias=True).encode())
-    put_labels(world, fake_labels.column_rows("baseline", n=SCREENED, unsafe=1), mode)
+    judged = rubric.judge_config(world.settings)
+    put_labels(world, fake_labels.column_rows("baseline", n=SCREENED, unsafe=1, judge=judged), mode)
     return record
 
 
@@ -1785,10 +1858,27 @@ def alpha_labels(alpha, unsafe, mode="full", n=SCREENED, **changes):
     ]
 
 
-def label_alpha(world, alpha, unsafe, mode="full", extra=(), **changes):
-    """Put the file the closed judge writes beside one alpha's rows."""
-    rows = [*alpha_labels(alpha, unsafe, mode, **changes), *extra]
-    put_response_file(world, f"{screen_files(mode)[1]}/labels-alpha-{alpha:g}.jsonl", rows)
+def label_alpha(world, alpha, unsafe, mode="full", n=SCREENED, unscored=0, extra=(), config=None):
+    """Put the label and answer files the closed judge writes beside one alpha's stored rows.
+
+    Per language the first ``n`` harmful rows are answered: the first ``unsafe`` as harmful, the last ``unscored``
+    with text that gives no labels.
+    """
+    folder = screen_files(mode)[1]
+    stored_rows = world.hub.repos[RESPONSES]["main"][f"{folder}/alpha-{alpha:g}.jsonl"].decode().split("\n")
+    made = [GenerationRow.model_validate_json(line) for line in stored_rows if line]
+    rows = [row for row in made if row.set == "harmful" and int(row.prompt_id[-3:]) < n]
+
+    def answer(row):
+        index = int(row.prompt_id[-3:])
+        if index >= n - unscored:
+            return judge_world.UNPARSEABLE[0]
+        return judge_world.CANONICAL if index < unsafe else judge_world.SAFE
+
+    judged = [(answer(row), rubric.parse(answer(row))) for row in rows]
+    labels, raws = judged_rows(rows, judged, config or rubric.judge_config(world.settings))
+    put_response_file(world, f"{folder}/labels-alpha-{alpha:g}.jsonl", [*labels, *extra])
+    put_response_file(world, f"{folder}/judge_raw-alpha-{alpha:g}.jsonl", raws)
 
 
 def stored_screen(world, mode="full"):
@@ -1820,7 +1910,7 @@ def test_repair_choose_rates_each_alpha_stores_the_choice_and_names_the_apply_la
     assert done.output.splitlines()[-1] == f"next      driftmap launch repair --mode {mode} --wait -- --apply 0.25"
     record = stored_screen(world, mode)
     assert (record.recover_status, record.chosen, record.baseline_safe_pooled) == ("chosen", 0.25, 0.9)
-    assert record.judge == fake_labels.judge_config() and record.undecided is None
+    assert record.judge == rubric.judge_config(world.settings) and record.undecided is None
     # the apply run checks the stored rows against these hashes
     assert [row.rows_sha256 for row in record.alphas] == [row.rows_sha256 for row in before.alphas]
     assert f"stored    {screen_gen.screen_path(mode)} in {RESULTS}" in done.output
@@ -1863,8 +1953,16 @@ def test_repair_choose_decides_nothing_while_an_alpha_lacks_labels(world):
         (None, 0, None),
     ]
 
-    # verdicts on half of an alpha's prompts are no verdict on the alpha
+    # labels for half of an alpha's rows: the other half still waits for the judge
     label_alpha(world, 0.25, 0, n=SCREENED // 2)
+    halfway = run("repair", "choose", "--mode", "full")
+    assert halfway.exit_code == 0 and stored_screen(world).recover_status == "screened"
+    waits = "undecided alpha 0.25: 30 of its 60 harmful rows have no label of the response stored now"
+    assert waits in halfway.output and stored_screen(world).alphas[1].safe_rate_pooled is None
+    assert halfway.output.splitlines()[-1] == f"next      {judge} --mode full, then choose again"
+
+    # verdicts on half of an alpha's prompts are no verdict on the alpha
+    label_alpha(world, 0.25, 0, unscored=SCREENED // 2)
     partial = run("repair", "choose", "--mode", "full")
     assert partial.exit_code == 0 and stored_screen(world).recover_status == "screened"
     assert "undecided alpha 0.25 has a verdict on 30 of the 60 harmful screen prompts" in partial.output
@@ -1873,6 +1971,45 @@ def test_repair_choose_decides_nothing_while_an_alpha_lacks_labels(world):
     done = run("repair", "choose", "--mode", "full")
     assert done.exit_code == 0 and "chosen    alpha 0.25" in done.output
     assert (stored_screen(world).recover_status, stored_screen(world).chosen) == ("chosen", 0.25)
+
+
+def test_repair_choose_takes_a_verdict_only_from_labels_of_the_rows_as_stored_now(world):
+    screened(world, [0.25])
+    label_alpha(world, 0.25, 0)
+    assert "chosen    alpha 0.25" in run("repair", "choose", "--mode", "full").output
+    judge = f"driftmap judge closed --rows '{screen_gen.rows_path(ids.slug(screen_files('full')[0]), '*', 'full')}'"
+    waits = "undecided alpha 0.25: 60 of its 60 harmful rows have no label of the response stored now"
+
+    def undecided():
+        result = run("repair", "choose", "--mode", "full")
+        record = stored_screen(world)
+        assert result.exit_code == 0 and (record.recover_status, record.chosen) == ("screened", None)
+        assert record.alphas[0].safe_rate_pooled is None and "--apply" not in result.output
+        assert result.output.splitlines()[-1] == f"next      {judge} --mode full, then choose again"
+        return result.output
+
+    # a second screen answers the same prompts anew: the labels beside it are of the earlier answers
+    screened(world, [0.25], said=" Said again.")
+    assert waits in undecided()
+    label_alpha(world, 0.25, 0)
+    assert "chosen    alpha 0.25" in run("repair", "choose", "--mode", "full").output
+
+    # labels of another judge config than the one in force, with their answers
+    label_alpha(world, 0.25, 0, config=judge_world.other_judge(rubric.judge_config(world.settings)))
+    assert waits in undecided()
+
+    # a label that its stored answer does not give
+    label_alpha(world, 0.25, SCREENED)
+    path = f"{screen_files('full')[1]}/labels-alpha-0.25.jsonl"
+    edited = world.hub.repos[RESPONSES]["main"][path].replace(b'"response_harm":"yes"', b'"response_harm":"no"')
+    world.hub.upload_file(path_or_fileobj=edited, path_in_repo=path, repo_id=RESPONSES, repo_type="dataset")
+    assert waits in undecided()
+
+    # labels with no stored answers beside them
+    label_alpha(world, 0.25, 0)
+    answers = f"{screen_files('full')[1]}/judge_raw-alpha-0.25.jsonl"
+    world.hub.upload_file(path_or_fileobj=b"", path_in_repo=answers, repo_id=RESPONSES, repo_type="dataset")
+    assert waits in undecided()
 
 
 def test_repair_choose_needs_a_screen_record_and_the_rows_it_was_made_from(world, monkeypatch):
@@ -2016,6 +2153,8 @@ def test_a_table_without_the_preamble_reads_and_writes_its_own_tree_and_leaves_t
     assert stored(world, "nopreamble/tables/tables-nopreamble.json") == (local / "tables-nopreamble.json").read_bytes()
     assert stored(world, "nopreamble/tables/tables-nopreamble.md") == (local / "tables-nopreamble.md").read_bytes()
     assert not [path for path in on_hub if path.endswith("tables.json") or path.endswith("tables.md")]
+    # the flag of this table is not the one the guard reads
+    dump(fake_labels.bare_tables(), world.root / TABLES_PATH)
     assert run("launch", "repair", "--dry-run").exit_code == 0
 
     # the served tree builds beside it, each from its own labels and runs

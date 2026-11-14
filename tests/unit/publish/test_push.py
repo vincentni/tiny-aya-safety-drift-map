@@ -378,6 +378,26 @@ def test_a_dry_run_prints_the_plan_and_writes_nothing(settings, fake, said):
     assert f"would delete: {MERGED} (model)" in text and f"would delete: {SMOKE[1]} (model)" in text
 
 
+def test_a_dry_run_refuses_where_the_run_would(settings, fake, said):
+    hub = seed(fake)
+    fake.private.discard(MERGED)
+
+    # what the delete would clear does not stand
+    assert publish(settings, hub, dry_run=True, delete=True, echo=said.append) is None
+    with pytest.raises(DriftmapError, match=f"{MERGED} is public") as refused:
+        publish(settings, hub, dry_run=True, echo=said.append)
+    assert refused.value.exit_code == ExitCode.INTEGRITY
+
+    fake.private.add(MERGED)
+    put(fake, RESULTS, "logs/judge.log", f"token {TOKEN}\n".encode())
+    fake.calls.clear()
+    with pytest.raises(DriftmapError, match="hf_token") as refused:
+        publish(settings, hub, dry_run=True, delete=True, echo=said.append)
+    assert refused.value.exit_code == ExitCode.REDACTION and str(refused.value).splitlines()[-1] == ROTATE
+    assert f"would delete: {MERGED} (model)" in said
+    assert writes(fake) == [] and MERGED in fake.repos and set(PUBLISHED) <= fake.private
+
+
 def test_a_commit_landing_after_the_scan_stops_the_run(settings, fake, said):
     hub = seed(fake)
     real = fake.upload_folder

@@ -68,6 +68,7 @@ def take_snapshot(
     active = [job for job in client.list_jobs() if job.status.stage not in TERMINAL_JOB_STAGES]
     types = source_types(settings)
     decision = read_decision(root / DECISION_PATH)
+    table = _table(root / TABLES_PATH)
     return Snapshot(
         billing_used_micro_usd=billing,
         ledger_total_micro_usd=ledger.total_micro_usd(),
@@ -81,7 +82,8 @@ def take_snapshot(
         gates={repo: gate_state(hub, repo, settings.gated_repos, types.get(repo)) for repo in settings.gated_repos},
         lost_runs=ledger.lost_runs(),
         oom_runs=ledger.oom_runs(),
-        drift_flag=_drift_flag(root / TABLES_PATH),
+        table_on_file=table is not None,
+        drift_flag=table.flags.get("drift_below_threshold") if table else None,
         drift_decision=decision.decision if decision else None,
         code_on_origin=code_pin_fault(root, settings.code.origin, settings.code.branch, code_sha, run=run) is None,
     )
@@ -173,5 +175,9 @@ def _billing_used(client: Any) -> int | None:
         return None
 
 
-def _drift_flag(path: Path) -> bool | None:
-    return load(Tables, path).flags.get("drift_below_threshold") if path.exists() else None
+def _table(path: Path) -> Tables | None:
+    """The local result table; None when it is absent or does not parse."""
+    try:
+        return load(Tables, path)
+    except (FileNotFoundError, ValidationError):
+        return None

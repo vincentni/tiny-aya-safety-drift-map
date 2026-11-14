@@ -328,9 +328,11 @@ def _chain_checkpoint(ctx: Context, adapter_repo: str, work: Path, identity: dic
             f"last-checkpoint in {adapter_repo} belongs to {', '.join(runs)}, not to {resumed}; "
             f"resume {newest} instead; {FRESH}"
         )
-    for name in ("epochs", "limit"):
-        if stamp.get(name) != identity[name]:
-            raise _refuse(_same_values(name, stamp.get(name), resumed))
+    # a stamp from before the rate was recorded was trained at the default one
+    was = {"lr": LEARNING_RATE} | stamp
+    for name in ("epochs", "limit", "lr"):
+        if was.get(name) != identity[name]:
+            raise _refuse(_same_values(name, was.get(name), resumed))
     if stamp.get("dataset") != identity["dataset"]:
         was, now = str(stamp.get("dataset"))[:12], identity["dataset"][:12]
         raise _refuse(f"the training data moved from {was} to {now} since the checkpoint was pushed; {FRESH}")
@@ -400,6 +402,7 @@ def _train(ctx: Context, work: Path, source: RepoRef, adapter_repo: str, device:
         "config_hash": record.config_hash,
         "epochs": epochs,
         "limit": ctx.args.limit,
+        "lr": ctx.args.lr,
         "dataset": eval_ref.revision,
         "rows_sha256": rows_sha256,
     }

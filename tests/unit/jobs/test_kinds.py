@@ -61,10 +61,16 @@ def test_nothing_on_the_hub_blocks_all_but_drift_and_baseline():
 def test_a_repair_that_applies_needs_a_chosen_screen_and_one_that_screens_does_not():
     for status in (None, "screened", "failed", "chosen"):
         assert prerequisites("repair", replace(READY, recover_status=status)) == []
-    assert prerequisites("repair", replace(READY, apply=True, recover_status="chosen")) == []
+    assert prerequisites("repair", replace(READY, apply=0.25, recover_status="chosen", chosen=0.25)) == []
     for status in (None, "screened", "failed"):
-        (missing,) = prerequisites("repair", replace(READY, apply=True, recover_status=status))
+        (missing,) = prerequisites("repair", replace(READY, apply=0.25, recover_status=status))
         assert "driftmap repair choose" in missing
+    (unnamed,) = prerequisites("repair", replace(READY, apply=0.25, recover_status="chosen"))
+    assert "driftmap repair choose" in unnamed
+    # the alpha to push is the one the screen chose, never another screened one
+    (other,) = prerequisites("repair", replace(READY, apply=0.9, recover_status="chosen", chosen=0.25))
+    assert other == "--apply 0.25: the screen chose that alpha, not 0.9"
+    assert prerequisites("repair", replace(READY, apply=0.1 + 0.2, recover_status="chosen", chosen=0.3)) == []
 
 
 def test_steer_needs_a_failed_recovery_or_the_comparison_flag():

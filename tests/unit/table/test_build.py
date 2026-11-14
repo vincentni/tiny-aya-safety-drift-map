@@ -165,6 +165,41 @@ def test_a_failed_quant_eval_or_repair_closes_the_q4_column(tmp_path, settings):
     assert "repair" in tables.columns["repaired_q4"].reason
 
 
+def test_a_q4_column_quantized_from_another_repaired_revision_is_not_comparable(tmp_path, settings):
+    rows = column_rows("baseline") + column_rows("repaired") + column_rows("repaired_q4")
+    labels = write_labels(tmp_path / "labels", rows)
+    repaired, revision = CHECKPOINTS["repaired"].split("@")
+
+    def quant_eval(source, **changes):
+        run = run_record("quant_eval", "repaired_q4", **changes)
+        # the job records the file it served, then the checkpoint that file was converted from
+        run.inputs.append(Ref(kind="model", repo=repaired, revision=source))
+        return run
+
+    same = build(labels, targets(), [quant_eval(revision)], settings).columns["repaired_q4"]
+    assert (same.state, same.reason) == ("tabled", None)
+
+    earlier = "9" * 40
+    other = build(labels, targets(), [quant_eval(earlier)], settings).columns["repaired_q4"]
+    named = f"quantized from {repaired}@{earlier}, the repaired column is {CHECKPOINTS['repaired']}"
+    assert (other.state, other.reason) == ("not_comparable", named)
+    # the latest ok run of the mode speaks, as for every other difference
+    later = datetime(2026, 11, 14, tzinfo=UTC)
+    reruns = [quant_eval(earlier), quant_eval(revision, run_id="quant_eval-again", started=later)]
+    assert build(labels, targets(), reruns, settings).columns["repaired_q4"].state == "tabled"
+    failed = [quant_eval(revision), quant_eval(earlier, run_id="quant_eval-again", started=later, mode="smoke")]
+    assert build(labels, targets(), failed, settings).columns["repaired_q4"].state == "tabled"
+
+    # with a steered repaired column the file is the quantization of no tabled checkpoint
+    steered = [row.model_copy(update={"checkpoint": STEERED}) for row in column_rows("drifted")]
+    steered_labels = write_labels(tmp_path / "steered", column_rows("baseline") + steered + column_rows("repaired_q4"))
+    state = build(steered_labels, targets(), [quant_eval(revision)], settings).columns["repaired_q4"]
+    assert state.state == "not_comparable" and state.reason.endswith(f"the repaired column is {STEERED}")
+    # without a repaired column there is nothing to hold the file against
+    alone = write_labels(tmp_path / "alone", column_rows("baseline") + column_rows("repaired_q4"))
+    assert build(alone, targets(), [quant_eval(earlier)], settings).columns["repaired_q4"].state == "tabled"
+
+
 def test_a_steered_checkpoint_fills_the_repaired_column_as_inference_time(tmp_path, settings):
     steered = [row.model_copy(update={"checkpoint": STEERED}) for row in column_rows("drifted")]
     labels = write_labels(tmp_path / "labels", column_rows("baseline") + steered)

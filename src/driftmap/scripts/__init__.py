@@ -142,9 +142,26 @@ def run_job(
         print(jobkit.TRAILER.format(status="failed", code=code), flush=True)
         return code
 
+    options = _all_options(arguments)
+    return jobkit.run(body, argv, kind=kind, settings=settings, arguments=options, client=client, clock=clock)
+
+
+def _all_options(
+    arguments: Callable[[argparse.ArgumentParser], object] | None,
+) -> Callable[[argparse.ArgumentParser], None]:
     def options(parser: argparse.ArgumentParser) -> None:
         _options(parser)
         if arguments is not None:
             arguments(parser)
 
-    return jobkit.run(body, argv, kind=kind, settings=settings, arguments=options, client=client, clock=clock)
+    return options
+
+
+def passed_on_parser(
+    arguments: Callable[[argparse.ArgumentParser], object] | None = None,
+) -> argparse.ArgumentParser:
+    """The parser a job with these ``arguments`` reads its command line with, less the need for the launcher's part.
+
+    For the launcher: it reads the arguments it is about to pass on exactly as the job will.
+    """
+    return jobkit.argument_parser(_all_options(arguments), launched=False)

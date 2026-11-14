@@ -104,7 +104,13 @@ def oom_repeat(s: Snapshot, p: Plan) -> Refusal | None:
 
 
 def drift_decision(s: Snapshot, p: Plan) -> Refusal | None:
-    if p.kind in ("repair", "steer") and s.drift_flag is True and s.drift_decision is None:
+    if p.kind not in ("repair", "steer"):
+        return None
+    if not s.table_on_file:
+        # an absent table is not an unflagged one: the flag may sit in the copy on the Hub
+        reason = "no readable result table here says whether the drift was flagged; run `driftmap table build` first"
+        return Refusal(guard="drift_decision", reason=reason)
+    if s.drift_flag is True and s.drift_decision is None:
         reason = "drift is below the threshold; record a decision with `driftmap decide drift`"
         return Refusal(guard="drift_decision", reason=reason)
     return None

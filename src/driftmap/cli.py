@@ -1,9 +1,11 @@
 """The driftmap command: readiness, data, launches, the ledger, tables, the decisions, status and the scan."""
 
+import argparse
 import enum
 import fnmatch
 import functools
 import hashlib
+import importlib
 import json
 import logging
 import shlex
@@ -12,7 +14,7 @@ import traceback
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import replace
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, NoReturn
 
 import httpx2
 import typer
@@ -63,6 +65,8 @@ OWNED = ("--run-id", "--timeout-s", "--config-hash", "--code-sha", "--submitted-
 JOB_ARGS = {
     "generate": (("--kind",), "--kind baseline|drifted|repaired"),
 }
+# kinds whose job arguments a launch reads with the script's own parser, before it submits
+READ_HERE = ("drift", "repair")
 
 Target = Literal["baseline", "drifted", "repaired"]
 MODE_HELP = (
@@ -296,10 +300,31 @@ def _job_args(kind: str, mode: str, given: list[str] | None) -> list[str]:
     return given
 
 
-def _applies(args: Sequence[str]) -> bool:
-    """True when repair job arguments name an alpha to apply."""
-    # argparse takes any unambiguous prefix of an option; --a alone could also be --alphas
-    return any(len(flag) > 3 and "--apply".startswith(flag) for flag in (arg.split("=", 1)[0] for arg in args))
+def _read_job_args(kind: str, args: Sequence[str]) -> argparse.Namespace | None:
+    """Job arguments as the job script will read them, None for a kind not read here; exit 2 in the parser's words."""
+    if kind not in READ_HERE:
+        return None
+    # a script pulls in the helpers of its job, so it is loaded for its own launch only
+    from driftmap import scripts
+
+    parser = scripts.passed_on_parser(importlib.import_module(KINDS[kind].module)._arguments)
+
+    def refuse(message: str) -> NoReturn:
+        raise typer.BadParameter(f"the {kind} job would stop on its arguments: {message}")
+
+    parser.error = refuse
+    return parser.parse_args(list(args))
+
+
+def _apply_alpha(parsed: argparse.Namespace, settings: Settings, mode: str) -> float | None:
+    """The alpha a repair launch asks to push, None when it screens; exit 2 for alphas the job cannot take."""
+    from driftmap.scripts import repair
+
+    try:
+        alphas = repair.asked_alphas(parsed, settings, mode)
+    except DriftmapError as error:
+        raise DriftmapError(ExitCode.USAGE, f"the repair job would stop on its arguments: {error}") from None
+    return alphas[0] if parsed.apply is not None else None
 
 
 @app.command()
@@ -342,11 +367,13 @@ def launch(
     if reason and not overrides:
         raise typer.BadParameter("--reason goes with --override-smoke or --override-soft")
     args = _job_args(kind.value, mode, job_args)
+    parsed = _read_job_args(kind.value, args)
     rows = {"kind": kind.value, "mode": mode, "dry_run": dry_run, "wait": wait, "limit": limit}
     settings, deps = _open("launch", **rows, job_args=args, overrides=overrides, reason=reason or None)
     _launch_inputs(deps.repo_root)
     if kind.value == "repair":
-        missing = prerequisites("repair", _state(settings, deps, mode, None, apply=_applies(args))("repair"))
+        apply = _apply_alpha(parsed, settings, mode)
+        missing = prerequisites("repair", _state(settings, deps, mode, None, apply=apply)("repair"))
         if missing:
             typer.echo(f"repair cannot run yet; missing: {'; '.join(missing)}")
             if not dry_run:
@@ -429,9 +456,9 @@ def _benign_labelled(settings: Settings, hub: Hub, checkpoint: RepoRef, mode: st
 
 
 def _state(
-    settings: Settings, deps: Deps, mode: str, target: str | None, *, apply: bool = False
+    settings: Settings, deps: Deps, mode: str, target: str | None, *, apply: float | None = None
 ) -> Callable[[str], State]:
-    """Reader of what the Hub holds before a step is submitted; ``apply`` says the repair step pushes an alpha."""
+    """Reader of what the Hub holds before a step is submitted; ``apply`` is the alpha the repair step is to push."""
 
     def output(record: RunRecord | None, repo: str) -> str | None:
         refs = record.outputs if record else []
@@ -462,6 +489,7 @@ def _state(
             repaired_revision=output(ok.get("repair"), settings.repos.repaired + ids.repo_suffix(mode)),
             gguf_record=output(ok.get("quant"), settings.repos.gguf + ids.repo_suffix(mode)) is not None,
             recover_status=screen.recover_status if screen and (kind == "repair" or "repair" in ok) else None,
+            chosen=screen.chosen if screen and kind == "repair" else None,
         )
 
     return read
@@ -842,8 +870,9 @@ def repair_choose(
     """Rate each screened alpha from its labels against the baseline's and store the choice; runs here, no job."""
     # nothing is launched or billed to the ledger, so no readiness report is needed
     settings, deps = _open("repair choose", ready=False, mode=mode)
+    from driftmap.judge import rubric
     from driftmap.judge.closed import DERIVED
-    from driftmap.judge.incremental import key, read_rows
+    from driftmap.judge.incremental import RawRow, key, pending, read_rows
     from driftmap.repair import select
     from driftmap.repair.screen_gen import rows_path, screen_path
 
@@ -865,14 +894,17 @@ def repair_choose(
         raise DriftmapError(ExitCode.USAGE, f"{found}; the baseline labels sit under its pinned revision")
     slug, baseline = ids.slug(drifted[0]), ids.slug(RepoRef(settings.sources.model, pinned))
 
-    def beside(path: str) -> str:
+    def beside(path: str) -> tuple[str, str]:
+        """The label file and the stored-answer file the closed judge writes for a rows file."""
         folder, _, name = path.rpartition("/")
-        return f"{folder}/{DERIVED[0]}{name}"
+        return tuple(f"{folder}/{prefix}{name}" for prefix in DERIVED)
 
+    judge = rubric.judge_config(settings)
     labels: dict[float, list[LabelRow]] = {}
+    unjudged: list[str] = []
     with tempfile.TemporaryDirectory(prefix="driftmap-screen-") as scratch:
         pattern = rows_path(slug, "*", mode)
-        root = _snapshot(deps.hub, responses, f"{scratch}/screen", [pattern, beside(pattern)])
+        root = _snapshot(deps.hub, responses, f"{scratch}/screen", [pattern, *beside(pattern)])
         for row in screen.alphas:
             name = rows_path(slug, row.alpha, mode)
             data = (root / name).read_bytes() if (root / name).is_file() else b""
@@ -880,10 +912,18 @@ def repair_choose(
                 fault = f"{name} is not the file the screen record was made from"
                 raise DriftmapError(ExitCode.INTEGRITY, f"{fault}; screen again: {relaunch}")
             # the file may still hold rows of an earlier screen, under another checkpoint name
-            asked = {key(made) for made in read_rows(root / name, GenerationRow, name) if made.set == "harmful"}
-            found = [label for label in read_rows(root / beside(name), LabelRow, beside(name)) if key(label) in asked]
-            if found:
+            made = [made for made in read_rows(root / name, GenerationRow, name) if made.set == "harmful"]
+            asked = {key(harmful) for harmful in made}
+            label_file, answer_file = beside(name)
+            found = [label for label in read_rows(root / label_file, LabelRow, label_file) if key(label) in asked]
+            # a label counts while its stored answer is of the judge in force and of the response as stored now
+            answers = read_rows(root / answer_file, RawRow, answer_file)
+            waiting = pending(made, found, judge.config_hash, raws=answers)
+            if found and not waiting:
                 labels[row.alpha] = found
+            elif found:
+                share = f"{len(waiting)} of its {len(made)} harmful rows"
+                unjudged.append(f"alpha {row.alpha:g}: {share} have no label of the response stored now")
         data_dir = _snapshot(deps.hub, labelled, f"{scratch}/baseline", [ids.labels_path(baseline, "*", mode)])
         files = [ids.labels_path(baseline, code, mode) for code in settings.languages]
         reference = [label for name in files for label in read_rows(data_dir / name, LabelRow, name)]
@@ -913,9 +953,9 @@ def repair_choose(
     elif decided.recover_status == "failed":
         typer.echo(f"{'failed':<10}no alpha passes both bars; there is nothing to apply")
     else:
-        typer.echo(redact.mask(f"{'undecided':<10}{_open_reason(decided)}"))
-        judge = f"driftmap judge closed --rows '{rows_path(slug, '*', 'full')}' --mode {mode}"
-        typer.echo(f"{'next':<10}{judge}, then choose again")
+        typer.echo(redact.mask(f"{'undecided':<10}{'; '.join(unjudged) or _open_reason(decided)}"))
+        again = f"driftmap judge closed --rows '{rows_path(slug, '*', 'full')}' --mode {mode}"
+        typer.echo(f"{'next':<10}{again}, then choose again")
 
 
 publish_app = typer.Typer(no_args_is_help=True, help="Publication: cards, visibility and the two collections.")
@@ -961,7 +1001,9 @@ def publish_plan(writeup: Writeup = None) -> ExitCode:
 @_finish
 def publish_run(
     writeup: Writeup = None,
-    dry_run: Annotated[bool, typer.Option("--dry-run", help="Print the plan and its problems; write nothing.")] = False,
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Print the plan, exit as the run would; write nothing.")
+    ] = False,
     delete_intermediates: Annotated[
         bool,
         typer.Option(
@@ -977,11 +1019,13 @@ def publish_run(
 
     flags = [*(["--writeup", writeup] if writeup else []), *(["--delete-intermediates"] * delete_intermediates)]
     resume = f"resume: {shlex.join(['driftmap', 'publish', 'run', *flags])}; finished steps are skipped"
-    push.publish(
-        settings, deps.hub, dry_run=dry_run, delete=delete_intermediates, writeup=writeup, resume=resume, echo=_said
-    )
-    if dry_run:
-        typer.echo("dry run: nothing was written")
+    try:
+        push.publish(
+            settings, deps.hub, dry_run=dry_run, delete=delete_intermediates, writeup=writeup, resume=resume, echo=_said
+        )
+    finally:
+        if dry_run:
+            typer.echo("dry run: nothing was written")
 
 
 @publish_app.command("check")

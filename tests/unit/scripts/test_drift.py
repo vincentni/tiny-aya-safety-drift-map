@@ -529,6 +529,7 @@ def test_a_fresh_run_removes_the_checkpoint_of_the_run_before_it(world):
         "config_hash": load_settings(world.config).config_hash(),
         "epochs": 1,
         "limit": None,
+        "lr": 0.0002,
         "dataset": world.fake.heads[EVAL],
         "rows_sha256": rows_hash([row for row in sft_rows() for _ in LANGUAGES]),
         "max_steps": 5,
@@ -551,6 +552,7 @@ CHAIN_FAULTS = {
     "other step count": ("was planned for 999 steps, this launch plans 100", True),
     "other epochs": (f"relaunch with --epochs 20 --resume {FIRST}", False),
     "other limit": (f"relaunch without --limit and with --resume {FIRST}", False),
+    "other rate": (f"relaunch with --lr 0.0002 --resume {FIRST}", False),
     "data moved": ("the training data moved from ", True),
     "other rows": ("the training rows are not the ones the checkpoint was trained on", True),
     "no stamp": ("has no run stamp", True),
@@ -583,6 +585,8 @@ def test_a_checkpoint_from_outside_the_run_chain_is_refused(world, monkeypatch, 
         extra = ["--epochs", "2"]
     elif case == "other limit":
         extra += ["--limit", "71"]
+    elif case == "other rate":
+        extra += ["--lr", "5e-4"]
     elif case == "data moved":
         moved = jsonl(list(reversed(sft_rows())))
         world.fake.upload_file(
@@ -616,6 +620,24 @@ def test_a_limit_the_first_leg_used_must_be_repeated(world):
     assert world.run("--resume", FIRST, run_id=SECOND) == 12
     assert f"relaunch with --limit 71 --resume {FIRST}" in world.notes(SECOND) and FRESH not in world.notes(SECOND)
     assert world.run("--limit", "71", "--resume", FIRST, run_id=THIRD) == 0
+
+
+def test_a_rate_the_first_leg_used_must_be_repeated_and_an_older_stamp_means_the_default(world):
+    world.before_step = crash_at(3)
+    assert world.run("--lr", "5e-4", run_id=FIRST) == 1
+    world.before_step = None
+    assert world.json(ADAPTER, STAMP)["lr"] == 0.0005
+
+    assert world.run("--resume", FIRST, run_id=SECOND) == 12
+    assert f"relaunch with --lr 0.0005 --resume {FIRST}" in world.notes(SECOND) and FRESH not in world.notes(SECOND)
+
+    # a stamp written before the rate was recorded was trained at the default rate
+    stamp = {name: value for name, value in world.json(ADAPTER, STAMP).items() if name != "lr"}
+    world.fake.upload_file(path_or_fileobj=json.dumps(stamp).encode(), path_in_repo=STAMP, repo_id=ADAPTER)
+    assert world.run("--lr", "5e-4", "--resume", FIRST, run_id=THIRD) == 12
+    assert f"relaunch with --lr 0.0002 --resume {FIRST}" in world.notes(THIRD)
+    assert world.run("--resume", FIRST, run_id=LATE) == 0
+    assert world.json(ADAPTER, "drift_config.json")["learning_rate"] == 0.0002
 
 
 def test_the_marker_is_on_the_hub_before_the_first_training_step(world):

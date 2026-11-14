@@ -100,18 +100,28 @@ class _Watchdog:
         raise DeadlineReached(f"last call: interrupted after running {after:.0f} s", urgent=True)
 
 
-def _parse(argv: Sequence[str] | None, arguments: Callable[[argparse.ArgumentParser], object] | None) -> Any:
+def argument_parser(
+    arguments: Callable[[argparse.ArgumentParser], object] | None = None, *, launched: bool = True
+) -> argparse.ArgumentParser:
+    """The parser of a job's command line: what the launcher writes, ``--resume``, then the script's own options.
+
+    ``launched=False`` requires none of the launcher's options: for reading, before a launch, what it will pass on.
+    """
     parser = argparse.ArgumentParser()
-    parser.add_argument("--run-id", required=True)
-    parser.add_argument("--timeout-s", required=True, type=int)
-    parser.add_argument("--code-sha", required=True)
-    parser.add_argument("--submitted-at", required=True, type=parse_submitted_at)
+    parser.add_argument("--run-id", required=launched)
+    parser.add_argument("--timeout-s", required=launched, type=int)
+    parser.add_argument("--code-sha", required=launched)
+    parser.add_argument("--submitted-at", required=launched, type=parse_submitted_at)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--force-flush-after-s", type=float)
     parser.add_argument("--resume", metavar="RUN_ID", help="continue from the marker this earlier run left")
     if arguments is not None:
         arguments(parser)
-    return parser.parse_args(argv)
+    return parser
+
+
+def _parse(argv: Sequence[str] | None, arguments: Callable[[argparse.ArgumentParser], object] | None) -> Any:
+    return argument_parser(arguments).parse_args(argv)
 
 
 def _require_token() -> None:

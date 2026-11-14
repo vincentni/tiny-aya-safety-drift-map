@@ -71,6 +71,7 @@ def _snapshot(ceilings, **changes):
         "gates": {MODEL: "ok", BASE: "ok"},
         "lost_runs": [],
         "oom_runs": [],
+        "table_on_file": True,
         "drift_flag": False,
         "drift_decision": None,
         "code_on_origin": True,
@@ -339,6 +340,13 @@ def test_flagged_drift_needs_a_decision_before_repair(config):
     assert drift_decision(decided, _plan(settings, "repair")) is None
     for flag in (False, None):
         assert drift_decision(_snapshot(settings.ceilings, drift_flag=flag), _plan(settings, "repair")) is None
+    # no table on file is no measurement: repair and steer wait for one, whatever was decided
+    for decision in (None, "proceed"):
+        unbuilt = _snapshot(settings.ceilings, table_on_file=False, drift_flag=None, drift_decision=decision)
+        for kind in ("repair", "steer"):
+            refusal = drift_decision(unbuilt, _plan(settings, kind))
+            assert refusal.guard == "drift_decision" and "run `driftmap table build` first" in refusal.reason
+        assert drift_decision(unbuilt, _plan(settings, "generate")) is None
 
 
 HASHES = ("ab" * 32, "cd" * 32)
@@ -409,6 +417,7 @@ def _snapshots(draw):
         gates=draw(st.fixed_dictionaries({MODEL: status, BASE: status})),
         lost_runs=draw(st.lists(st.tuples(KIND, st.sampled_from([1_800, 5_400])), max_size=2)),
         oom_runs=draw(st.lists(st.tuples(KIND, st.sampled_from(HASHES)), max_size=2)),
+        table_on_file=draw(st.booleans()),
         drift_flag=draw(st.sampled_from([None, True, False])),
         drift_decision=draw(st.sampled_from([None, "proceed", "extend"])),
         code_on_origin=draw(st.booleans()),
@@ -442,6 +451,10 @@ def _over_run(s, p):
     return p.cost_at_timeout_micro_usd > s.ceilings.per_run or (p.mode == "smoke" and over_smoke)
 
 
+def _undecided(s):
+    return not s.table_on_file or (s.drift_flag is True and s.drift_decision is None)
+
+
 HOLDS = {
     "gate": lambda s, p: p.kind in MODEL_KINDS and s.gates[MODEL] != "ok",
     "code_pinned": lambda s, p: not s.code_on_origin,
@@ -451,7 +464,7 @@ HOLDS = {
     "in_flight_gpu": lambda s, p: p.kind in GPU_KINDS and bool(s.in_flight_gpu),
     "timeout_lost": lambda s, p: (p.kind, p.timeout_s) in s.lost_runs,
     "oom_repeat": lambda s, p: (p.kind, p.config_hash) in s.oom_runs,
-    "drift_decision": lambda s, p: p.kind in ("repair", "steer") and s.drift_flag is True and s.drift_decision is None,
+    "drift_decision": lambda s, p: p.kind in ("repair", "steer") and _undecided(s),
 }
 
 
