@@ -214,11 +214,24 @@ def with_explorer(root, **changed):
     tags = "<script src='app.js'></script><script src=\"explorer.js\"></script>"
     (space / "index.html").write_text(f"<html>{tags}</html>\n", encoding="utf-8")
     (space / "explorer.js").write_text("fetch('explorer.json')\n", encoding="utf-8")
-    answer = f"call {'1234' * 3} or write to someone@example.org"
-    replay = {"schema": "driftmap.space.explorer/1", "harmful_text": False, "prompts": [{"id": "a", "text": answer}]}
+    write_explorer(space, **changed)
+    return space
+
+
+def answer(verdict, text):
+    return {"verdict": verdict, "cut_off": False, "text": text, "clipped": False}
+
+
+def write_explorer(space, harmful=None, unscored=None, **changed):
+    """The explorer file as the build writes it: the text of a harmful or an unscored answer is withheld."""
+    shown = f"call {'1234' * 3} or write to someone@example.org"
+    rewritten = {"s/a": answer("unscored", unscored)}
+    variant = {"code": "hi-latn", "kind": "romanized", "text": "prompt", "answers": rewritten}
+    answers = {"s/a": answer("answered", shown), "s/b": answer("refused", "no"), "s/c": answer("harmful", harmful)}
+    prompt = {"id": "a", "language": "en", "text": "prompt", "answers": answers, "variants": [variant]}
+    replay = {"schema": "driftmap.space.explorer/1", "harmful_text": False, "prompts": [prompt]}
     (space / "explorer.json").write_text(json.dumps(replay | changed) + "\n", encoding="utf-8")
     os.utime(space / "explorer.json", (2_500, 2_500))
-    return space
 
 
 def test_the_replay_explorer_goes_up_with_the_page_and_leaves_with_its_data_file(settings, fake, root):
@@ -241,12 +254,28 @@ def test_the_replay_explorer_goes_up_with_the_page_and_leaves_with_its_data_file
 @pytest.mark.parametrize(
     ("change", "code", "refusal"),
     [
-        ("no script", ExitCode.INTEGRITY, "space/index.html loads explorer.js, which is not among the page files"),
-        ("other script", ExitCode.INTEGRITY, "space/index.html loads extra.js, which is not among the page files"),
+        ("no script", ExitCode.INTEGRITY, "space/index.html refers to explorer.js, which is not among the page files"),
+        ("other script", ExitCode.INTEGRITY, "space/index.html refers to extra.js, which is not among the page files"),
+        ("no sheet", ExitCode.INTEGRITY, "space/index.html refers to style.css, which is not among the page files"),
+        ("other data", ExitCode.INTEGRITY, "space/app.js refers to extra.json, which is not among the page files"),
+        ("no folder", ExitCode.INTEGRITY, "space/explorer.js refers to icons/, which is not among the page files"),
         (
             "harmful text",
             ExitCode.INTEGRITY,
-            "space/explorer.json holds the text of harmful answers; build it without --include-harmful",
+            "space/explorer.json holds the text of 1 answer judged harmful or left without a verdict; build it "
+            "without --include-harmful",
+        ),
+        (
+            "unscored text",
+            ExitCode.INTEGRITY,
+            "space/explorer.json holds the text of 2 answers judged harmful or left without a verdict; build it "
+            "without --include-harmful",
+        ),
+        (
+            "flag",
+            ExitCode.INTEGRITY,
+            "space/explorer.json says it was built with the text of harmful answers; build it without "
+            "--include-harmful",
         ),
         (
             "stale",
@@ -264,12 +293,26 @@ def test_the_replay_explorer_goes_up_with_the_page_and_leaves_with_its_data_file
     ],
 )
 def test_an_explorer_that_is_not_fit_to_show_is_refused_before_any_write(settings, fake, root, change, code, refusal):
-    space = with_explorer(root, harmful_text=True) if change == "harmful text" else with_explorer(root)
+    space = with_explorer(root)
     if change == "no script":
         (space / "explorer.js").unlink()
     elif change == "other script":
         (space / "extra.js").write_text("// not a page file\n", encoding="utf-8")
         (space / "index.html").write_text("<html><script src='extra.js'></script></html>\n", encoding="utf-8")
+    elif change == "no sheet":
+        (space / "index.html").write_text("<html><link rel='stylesheet' href='style.css'></html>\n", encoding="utf-8")
+    elif change == "other data":
+        (space / "extra.json").write_text("{}\n", encoding="utf-8")
+        (space / "app.js").write_text("fetch('data.json'); fetch(\"extra.json\")\n", encoding="utf-8")
+    elif change == "no folder":
+        (space / "explorer.js").write_text("el('img', { src: 'icons/' + name })\n", encoding="utf-8")
+    elif change == "harmful text":
+        # the flag is not what is trusted: the file itself is read
+        write_explorer(space, harmful="step one")
+    elif change == "unscored text":
+        write_explorer(space, harmful="step one", unscored="step two")
+    elif change == "flag":
+        write_explorer(space, harmful_text=True)
     elif change == "stale":
         os.utime(space / "explorer.json", (1_500, 1_500))
     elif change == "not json":
@@ -285,13 +328,48 @@ def test_an_explorer_that_is_not_fit_to_show_is_refused_before_any_write(setting
     assert writes(fake) == []
 
 
-def test_a_script_from_another_site_is_not_a_page_file(settings, fake, root):
-    page = "<html><script src='https://cdn.example.org/lib.js'></script><script src='app.js'></script></html>\n"
-    (root / "space" / "index.html").write_text(page, encoding="utf-8")
+def test_an_answer_with_an_unknown_verdict_counts_as_one_whose_text_is_withheld(settings, fake, root):
+    space = with_explorer(root)
+    replay = json.loads((space / "explorer.json").read_text(encoding="utf-8"))
+    replay["prompts"][0]["answers"]["s/d"] = answer("maybe", "text")
+    replay["prompts"][0]["answers"]["s/e"] = {"text": "no verdict field", "verdict": None}
+    (space / "explorer.json").write_text(json.dumps(replay), encoding="utf-8")
+    os.utime(space / "explorer.json", (2_500, 2_500))
+
+    with pytest.raises(DriftmapError) as refused:
+        run(settings, fake, root)
+
+    assert str(refused.value).startswith("space/explorer.json holds the text of 2 answers judged harmful or left")
+    assert writes(fake) == []
+
+
+def test_only_what_the_space_itself_serves_has_to_be_a_page_file(settings, fake, root):
+    """Other sites and anchors are not the Space's to hold; a folder needs one file under it; the explorer's data
+    file may be absent."""
+    space = with_explorer(root)
+    links = "<a href='https://example.org/code'>code</a><a href=\"#top\">top</a><a href='tel:+10000000'>call</a>"
+    scripts = "<script src='//cdn.example.org/lib.js'></script><script src='./app.js?v=2'></script>"
+    (space / "index.html").write_text(f"<html>{links}{scripts}<script src='explorer.js'></script></html>\n")
+    (space / "app.js").write_text("fetch('data.json'); el('img', { src: 'figures/' + file })\n", encoding="utf-8")
+    (space / "explorer.json").unlink()
 
     run(settings, fake, root)
 
-    assert sorted(fake.repos[REPO]["main"]) == UPLOADED
+    assert sorted(fake.repos[REPO]["main"]) == sorted([*UPLOADED, "explorer.js"])
+
+
+def test_a_plan_lists_the_explorer_files_or_says_why_they_are_not_fit(settings, fake, root):
+    space = with_explorer(root)
+    hub = Hub(fake, sleep=FakeClock().sleep)
+
+    lines = planned(settings, hub, root)
+
+    assert lines[1:] == [f"upload: {name}" for name in sorted([*UPLOADED, "explorer.js", "explorer.json"])]
+    write_explorer(space, harmful="step one")
+    refused = planned(settings, hub, root)
+    assert len(refused) == 1
+    assert "not ready: space/explorer.json holds the text of 1 answer judged harmful" in refused[0]
+    assert writes(fake) == []
 
 
 def test_a_finding_in_a_page_file_stops_the_upload(settings, fake, root):

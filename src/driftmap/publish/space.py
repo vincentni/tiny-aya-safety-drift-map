@@ -29,8 +29,12 @@ EXPLORER = "explorer.json"
 # what the page is made of; the script that builds its data stays in the code repo
 FILES = (CARD, PAGE, "app.js", "explorer.js", DATA, EXPLORER, f"{FIGURES}/*")
 BUILD = "run `python space/build_data.py` first"
-# a script the page loads from its own folder
-SCRIPT = re.compile(r"""<script\b[^>]*\bsrc\s*=\s*["']([^"'?#]+)""", re.IGNORECASE)
+# what a page file asks for: a src or an href with a fixed value, as an attribute or a property, or a fetch of one
+REFERENCE = re.compile(r"""(?:\bfetch\(\s*|\b(?:src|href)\s*[:=]\s*)["']([^"'?#]+)""", re.IGNORECASE)
+# asked of another site, or of no site
+ELSEWHERE = re.compile(r"[a-z][a-z0-9+.-]*:|//", re.IGNORECASE)
+# the verdicts whose answers the explorer may quote; the text of any other answer is withheld
+QUOTED = ("refused", "answered")
 # a new static Space can take a moment to answer
 TRIES = 3
 WAIT_S = 20
@@ -91,29 +95,56 @@ def _built(root: Path, settings: Settings) -> list[str]:
         raise _refuse(f"{CARD} does not link to {link}; the Space and the link must name one repo")
     paths = [path.relative_to(space).as_posix() for path in space.rglob("*") if path.is_file()]
     files = sorted(filter_repo_objects(paths, allow_patterns=list(FILES)))
-    loaded = [src.removeprefix("./") for src in SCRIPT.findall((space / PAGE).read_text(encoding="utf-8"))]
-    # a script from another site is not the Space's to hold
-    lost = [src for src in loaded if "//" not in src and src not in files]
-    if lost:
-        raise _refuse(f"{FOLDER}/{PAGE} loads {lost[0]}, which is not among the page files")
+    _referred(space, files)
     if EXPLORER in files:
         _replayable(space, built)
     return files
 
 
+def _referred(space: Path, files: list[str]) -> None:
+    """Refuse a page or a script that refers to a file of the Space the upload would not hold.
+
+    A reference ending in a slash names a folder, which needs one file under it. The explorer's data file may be
+    absent: the page hides the explorer then.
+    """
+    for name in (PAGE, *(path for path in files if path.endswith(".js"))):
+        for found in REFERENCE.findall((space / name).read_text(encoding="utf-8")):
+            target = found.removeprefix("./")
+            if ELSEWHERE.match(target) or target == EXPLORER:
+                continue
+            held = any(path.startswith(target) for path in files) if target.endswith("/") else target in files
+            if not held:
+                raise _refuse(f"{FOLDER}/{name} refers to {target}, which is not among the page files")
+
+
+def _quoted(found: Any) -> int:
+    """How many answers in an explorer file carry their text under a verdict the page may not quote."""
+    if isinstance(found, dict):
+        own = "verdict" in found and found["verdict"] not in QUOTED and found.get("text") is not None
+        return own + sum(_quoted(value) for value in found.values())
+    return sum(_quoted(value) for value in found) if isinstance(found, list) else 0
+
+
 def _replayable(space: Path, built: float) -> None:
-    """Refuse an explorer file that is not an object, is older than the data file or shows harmful answers."""
+    """Refuse an explorer file that is not an object, is older than the data file, or holds the text of an answer
+    judged harmful or left without a verdict; the file is read, its own word for it is not enough."""
     explorer = space / EXPLORER
     try:
-        shown = json.loads(explorer.read_bytes()).get("harmful_text")
+        replay = json.loads(explorer.read_bytes())
+        flagged = replay.get("harmful_text")
     except (ValueError, AttributeError):
         raise _refuse(f"{FOLDER}/{EXPLORER} is not a JSON object; {BUILD}") from None
     # the build writes it after the data file; an older one replays other runs than the page counts
     if explorer.stat().st_mtime < built:
         both = "build both in one run of `python space/build_data.py`, or delete it"
         raise _refuse(f"{FOLDER}/{EXPLORER} is older than {FOLDER}/{DATA}; {both}")
-    if shown is not False:
-        raise _refuse(f"{FOLDER}/{EXPLORER} holds the text of harmful answers; build it without --include-harmful")
+    again = "build it without --include-harmful"
+    count = _quoted(replay)
+    if count:
+        answers = f"{count} answer{'s' * (count > 1)} judged harmful or left without a verdict"
+        raise _refuse(f"{FOLDER}/{EXPLORER} holds the text of {answers}; {again}")
+    if flagged is not False:
+        raise _refuse(f"{FOLDER}/{EXPLORER} says it was built with the text of harmful answers; {again}")
 
 
 def _named(root: Path, settings: Settings) -> list[tuple[str, str]]:
@@ -202,8 +233,9 @@ def publish_space(
     """Create or update the static results Space from ``<root>/space`` in one commit, open it, and read it back.
 
     Refuses, before any write, a folder whose data file is missing or older than a local table, whose figures
-    are missing, whose card is not a static Space's, whose page loads a script that is not among the page files,
-    whose explorer file is older than the data file or holds the text of harmful answers, a README that links
+    are missing, whose card is not a static Space's, whose page or scripts refer to a file the upload would not
+    hold, whose explorer file is older than the data file or holds the text of an answer judged harmful or left
+    without a verdict, a README that links
     elsewhere, a page file with a finding, and a dataset or model of the owner that the Space names while it is
     not public. The explorer file goes up when the build wrote one and leaves the Space when it is gone. A dry
     run prints the files and writes nothing. Raises DriftmapError (exit 7) when the Hub fails, (exit 1) when the
