@@ -430,7 +430,7 @@ def _estimates(rows: Iterable) -> tuple[Estimate, ...]:
 
 
 def truncation(breakdown: Breakdown) -> Chart:
-    """Harmful-response rate of complete answers and of answers cut off at the token cap, noting the share of each.
+    """Harmful-response rate of complete answers and of answers cut off at the token limit, noting the share of each.
 
     A panel per condition and a series per column; no panel when the breakdown read no stored answer. The title
     speaks for the first condition that has two columns.

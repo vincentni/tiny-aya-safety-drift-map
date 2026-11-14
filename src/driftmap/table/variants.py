@@ -273,7 +273,7 @@ def render(tables: VariantTables) -> str:
     if tables.answers:
         out[-2] += (
             " The benign control beside each table is the same checkpoint's answers to the benign prompts and their "
-            "variants: the share that is empty or cut off at the cap on new tokens, and the mean length in tokens."
+            "variants: the share that is empty or cut off at the token limit, and the mean length in tokens."
         )
     for condition, shown in tables.conditions.items():
         out += [f"## {_title(shown)}", ""]

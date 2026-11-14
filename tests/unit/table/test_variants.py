@@ -167,6 +167,7 @@ def test_the_benign_answers_of_a_column_are_the_control_beside_its_harmful_pairs
     assert variants.VariantTables.model_validate_json(found.model_dump_json(by_alias=True)) == found
     shown = variants.render(found)
     assert "| hi-mixed | 4 | 0.0% | 25.0% | 40 | 94 |" in shown and "empty or cut off" in shown
+    assert "the share that is empty or cut off at the token limit, and the mean length in tokens." in shown
 
     # without stored answers there is no control to show
     alone = variants.build({"keep": {"baseline": bare}}, settings)
