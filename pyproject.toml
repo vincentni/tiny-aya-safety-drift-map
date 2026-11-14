@@ -37,6 +37,11 @@ closed = [
 figures = [
     "matplotlib==3.11.2",
 ]
+# romanization for the script stress sets; read on a workstation by the data build, never in a job
+variants = [
+    "indic-transliteration==2.3.82",
+    "iuliia==0.13.0",
+]
 
 [project.scripts]
 driftmap = "driftmap.cli:app"
@@ -46,6 +51,7 @@ dev = [
     "driftmap[jobs]",
     "driftmap[closed]",
     "driftmap[figures]",
+    "driftmap[variants]",
     "torch==2.15.0",
     "pytest==9.2.0",
     "pytest-socket==0.8.1",
