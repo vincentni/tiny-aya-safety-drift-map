@@ -1,6 +1,7 @@
 """The figures as PNG and SVG; the same inputs give the same files."""
 
 import math
+import re
 from collections.abc import Mapping
 from functools import cache
 from pathlib import Path
@@ -33,6 +34,8 @@ FRAME = 1.8
 GAP = 8
 # tick labels too wide for their ticks run down to the tick at this angle
 TILT = 40
+# where a line may break: at a space, but not beside an arrow, so that the two numbers it joins keep one line
+BREAK = re.compile(r"(?<!→)\s+(?!→)")
 # Okabe-Ito colours, told apart under the common colour-vision deficiencies
 BLUE, ORANGE, SKY, VERMILLION, GREEN, PURPLE = "#0072B2", "#E69F00", "#56B4E9", "#D55E00", "#009E73", "#CC79A7"
 SERIES_COLOURS = (BLUE, ORANGE, GREEN, PURPLE)
@@ -93,7 +96,7 @@ def _width(text: str, size: float, weight: str = "normal") -> float:
 def _fit(text: str, room: float, size: float, weight: str = "normal") -> str:
     """``text`` filled into lines of at most ``room`` points at ``size``; a word wider than that keeps a line."""
     lines: list[str] = []
-    for word in text.split():
+    for word in filter(None, BREAK.split(text)):
         longer = f"{lines[-1]} {word}" if lines else word
         if lines and _width(longer, size, weight) <= room:
             lines[-1] = longer

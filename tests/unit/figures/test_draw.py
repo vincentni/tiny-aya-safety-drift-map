@@ -319,3 +319,20 @@ def test_panels_of_one_unit_share_the_value_axis_and_rows_of_other_units_share_i
     for axes in drawn.axes:
         assert max(text.get_window_extent().y1 for text in axes.texts) <= axes.bbox.y1
     assert clashes(drawn) == []
+
+
+def test_a_pair_of_numbers_joined_by_an_arrow_keeps_one_line(styled):
+    title = (
+        "Served template: to prompts in Latin script the fine-tuned model refuses far less (74% → 21%) "
+        "and answers harmfully more often (5.8% → 14.7%)"
+    )
+    values = {"as written": [74.0, 76.0], "rewritten": [21.0, 77.0]}
+    drawn = draw.bars(replace(chart(CONDITIONS[:2], ("Latin script", "Mixed with English"), values), title=title))
+
+    lines = drawn.get_suptitle().split("\n")
+    # the first pair is what a line filled by width alone would break
+    assert lines == [
+        "Served template: to prompts in Latin script the fine-tuned model refuses far less",
+        "(74% → 21%) and answers harmfully more often (5.8% → 14.7%)",
+    ]
+    assert clashes(drawn) == []
