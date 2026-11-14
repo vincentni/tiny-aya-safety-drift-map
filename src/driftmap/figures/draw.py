@@ -107,9 +107,12 @@ def _slot(panels: int, ticks: int, shared: bool) -> float:
     return (WIDTH - AXIS * (1 if shared else panels) - BETWEEN * panels) * 72 / panels / ticks
 
 
-def _upright(figure: Figure, text: str, frame: float = FRAME) -> str:
-    """The label of a value axis, filled into the height the figure leaves its axes: all but ``frame`` inches."""
-    return _fit(text, (figure.get_figheight() - frame) * 72, TEXT)
+def _upright(figure: Figure, text: str, frame: float = FRAME, rows: int = 1) -> str:
+    """The label of a value axis, filled into the height the figure leaves each of its ``rows`` of axes.
+
+    The figure keeps ``frame`` inches for what is not axes.
+    """
+    return _fit(text, (figure.get_figheight() - frame) / rows * 72, TEXT)
 
 
 def _figure(title: str, height: float) -> Figure:
@@ -227,11 +230,18 @@ def _clear(figure: Figure, stacks: list[list[Annotation]], home: list[list[tuple
 def bars(chart: Chart, *, shared: bool = False) -> Figure:
     """A bar per group and series with its value, and its note, written above it; a panel per condition or metric.
 
-    ``shared`` puts the panels on one value axis, for panels of one unit.
+    ``shared`` puts the panels on one value axis, for panels of one unit. The panels fill rows of ``chart.across``.
     """
     noted = any(series.notes for panel in chart.panels for series in panel.series)
-    figure = _figure(chart.title, 4.5 if noted else 3.9)
-    axes = figure.subplots(1, len(chart.panels), sharey=shared, squeeze=False)[0]
+    across = chart.across or len(chart.panels)
+    down = math.ceil(len(chart.panels) / across)
+    tall = 4.5 if noted else 3.9
+    # a further row repeats the panels, not the title and the legend
+    figure = _figure(chart.title, tall + (down - 1) * (tall - 0.9))
+    places = list(figure.subplots(down, across, sharey=shared, squeeze=False).flat)
+    axes = places[: len(chart.panels)]
+    for unused in places[len(axes) :]:
+        unused.set_visible(False)
     # the bars of a group keep to their tick; a note needs room beside its neighbour's
     gap = min(0.46 if noted else 0.4, 0.92 / max(len(panel.series) for panel in chart.panels))
     width = 0.9 * gap
@@ -239,7 +249,7 @@ def bars(chart: Chart, *, shared: bool = False) -> Figure:
     stacks = []
     for axis, panel in zip(axes, chart.panels, strict=True):
         ticks = list(range(len(panel.labels)))
-        room = _slot(len(chart.panels), len(ticks), shared)
+        room = _slot(across, len(ticks), shared)
         suffix = "%" if "%" in panel.unit else ""
         top = 0.0
         above = {}
@@ -259,8 +269,9 @@ def bars(chart: Chart, *, shared: bool = False) -> Figure:
                 top = max(top, peak)
         stacks += [above[x] for x in sorted(above)]
         axis.set_xticks(ticks, [_fit(label, room - GAP, TEXT) for label in panel.labels])
-        axis.set_title(panel.title)
-        axis.set_ylabel(_upright(figure, panel.unit)) if not shared or axis is axes[0] else None
+        axis.set_title(_fit(panel.title, room * len(ticks), PANEL, "bold"))
+        if not shared or axes.index(axis) % across == 0:
+            axis.set_ylabel(_upright(figure, panel.unit, rows=down))
         axis.yaxis.set_major_locator(MaxNLocator(nbins=6, steps=[1, 2, 5, 10]))
         axis.set_ylim(0, (_ceiling(chart) if shared else top) * 1.1 or 1)
         axis.tick_params(axis="x", length=0)

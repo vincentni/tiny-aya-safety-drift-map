@@ -1,4 +1,5 @@
 import math
+from dataclasses import replace
 from itertools import pairwise
 
 import pytest
@@ -87,6 +88,7 @@ CATEGORIES = (
     "Profanity",
 )
 LENGTHS = ("Complete answers", "Answers cut off at the 256-token limit")
+METRICS = ("harmful answers", "refusals", "harmless answers")
 UNIT = "Harmful answers (% of scored responses)"
 TITLE = (
     "Fewer harmful answers after fine-tuning, mostly because answers got shorter: 45% reached the 256-token limit "
@@ -112,6 +114,14 @@ def chart(titles, labels, values, notes=(), unit=UNIT) -> Chart:
     series = tuple(Series(name, points(row), tuple(notes)) for name, row in values.items())
     panels = [Panel(title, unit, tuple(labels), series) for title in titles[:-1]]
     return Chart(TITLE, (*panels, Panel(titles[-1], unit, tuple(labels), series[:1])))
+
+
+def rows_of_bars() -> Chart:
+    """Six noted panels, three to a row, under titles that name a column and a metric."""
+    names = [f"{column}: {metric}" for column in ("Base model", "Fine-tuned model, q4_k_m") for metric in METRICS]
+    values = {"as written": [71.4, 72.0], "rewritten": [52.0, 70.0]}
+    drawn = chart([*names, "last"], ("Latin script", "Mixed with English"), values, ("", "-19.4 points"))
+    return replace(drawn, panels=drawn.panels[:6], across=3)
 
 
 def shown(figure) -> list[Text]:
@@ -160,6 +170,7 @@ def figures(tmp_path, settings) -> dict:
         "noted bars": draw.bars(chart(CONDITIONS, LENGTHS, by_length, notes), shared=True),
         "bars": draw.bars(chart(CONDITIONS, CONDITIONS, metrics, unit="% of scored responses to harmful prompts")),
         "three bars": draw.bars(chart(CONDITIONS, CONDITIONS, quantized, unit="% of safe prompts refused")),
+        "rows of bars": draw.bars(rows_of_bars(), shared=True),
         "rows": draw.rows(chart(CONDITIONS, CATEGORIES, by_category)),
         "heat": draw.heat(weakest),
         "flows": draw.flows(outcome_flows(two_conditions(tmp_path, settings))),
@@ -254,3 +265,21 @@ def test_a_note_over_a_bar_keeps_to_its_bar_and_the_value_axis_is_no_longer_than
     highest = max(text.get_window_extent().y1 for axes in drawn.axes for text in axes.texts)
     first = drawn.axes[0].bbox
     assert first.y0 + 0.95 * first.height <= highest <= first.y1
+
+
+def test_panels_are_laid_in_rows_of_as_many_as_the_chart_asks_for(styled):
+    drawn = draw.bars(rows_of_bars(), shared=True)
+    drawn.draw_without_rendering()
+
+    places = [(round(axes.get_position().y0, 3), round(axes.get_position().x0, 3)) for axes in drawn.axes]
+    upper, lower = sorted({y for y, _ in places}, reverse=True)
+    assert [y for y, _ in places] == [upper] * 3 + [lower] * 3
+    assert [x for _, x in places[:3]] == [x for _, x in places[3:]] == sorted({x for _, x in places})
+    assert [axes.get_title(loc="left").replace("\n", " ") for axes in drawn.axes] == [
+        panel.title for panel in rows_of_bars().panels
+    ]
+    # five panels leave the last place of the second row empty
+    short = rows_of_bars()
+    fewer = draw.bars(replace(short, panels=short.panels[:5]), shared=True)
+    assert [axes.get_visible() for axes in fewer.axes] == [True] * 5 + [False]
+    assert clashes(fewer) == []
