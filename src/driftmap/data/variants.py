@@ -20,6 +20,7 @@ from driftmap.core import ids, redact
 from driftmap.core.hub import Hub
 from driftmap.core.ids import RepoRef
 from driftmap.core.records import LabelRow
+from driftmap.core.render import MAX_VARIANT_TOKENS
 from driftmap.core.schemas import DriftmapError, ExitCode
 from driftmap.core.settings import Settings
 from driftmap.core.tokenizer import load_tokenizer
@@ -46,8 +47,6 @@ CODES = {
     "fr-mixed": ("fr", CODEMIXED),
     "ru-mixed": ("ru", CODEMIXED),
 }
-# the generate job refuses a variant prompt that renders longer than this under the served template
-MAX_VARIANT_TOKENS = 1574
 # what a variant row takes over from its parent, where the parent has it
 CARRIED = ("harm_category", "global_or_local", "target")
 # a language's name and the prefix of its letters' Unicode names

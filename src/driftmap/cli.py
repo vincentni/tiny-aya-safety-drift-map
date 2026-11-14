@@ -57,6 +57,7 @@ DATA_DIR = LOCAL / "data"
 CONDITION_SAID = {"strip": ", no safety preamble", "patch": ", safety patch"}
 # beside the tables; it covers every prompt condition
 BREAKDOWN = "breakdown.json"
+VARIANTS = "variants.json"
 # where `judge validate sample` keeps the files of the public sets
 VALIDATION_CACHE = LOCAL / "judgeval" / "cache"
 FIGURES_DIR = Path("docs") / "figures"
@@ -83,6 +84,7 @@ Kind = enum.StrEnum("Kind", {name: name for name in KINDS})
 
 app = typer.Typer(no_args_is_help=True, add_completion=False, pretty_exceptions_enable=False)
 data_app = typer.Typer(no_args_is_help=True, help="Evaluation and training rows.")
+variants_app = typer.Typer(no_args_is_help=True, help="The prompts again, romanized or mixed with English.")
 ledger_app = typer.Typer(no_args_is_help=True, help="The cost ledger.")
 table_app = typer.Typer(no_args_is_help=True, help="The result tables.")
 judge_app = typer.Typer(no_args_is_help=True, help="Labels: the closed-model judge and a reparse of stored outputs.")
@@ -90,6 +92,7 @@ validate_app = typer.Typer(no_args_is_help=True, help="The judge against human l
 decide_app = typer.Typer(no_args_is_help=True, help="Calls only the author can make.")
 repair_app = typer.Typer(no_args_is_help=True, help="The choice between the screen run and the apply run.")
 app.add_typer(data_app, name="data")
+data_app.add_typer(variants_app, name="variants")
 app.add_typer(ledger_app, name="ledger")
 app.add_typer(table_app, name="table")
 app.add_typer(judge_app, name="judge")
@@ -263,6 +266,91 @@ def data_build(
     typer.echo(f"commit and push {REVISIONS}, then run `driftmap ready` again")
 
 
+VARIANT_SET_HELP = "The set of the parent prompts: harmful or benign."
+VARIANT_CODE_HELP = "The variant, such as hi-Latn or es-mixed."
+
+
+def _variant_lines(files: Iterable[Any]) -> None:
+    """One line per set and variant: its rows, the parents left without one, and where its text came from."""
+    for made in files:
+        typer.echo(f"{made.set:<9}{made.code:<10}{len(made.rows):>5} rows{made.left_out:>5} left out  {made.method}")
+
+
+@variants_app.command("draft")
+@_finish
+def variants_draft(
+    set_: Annotated[str, typer.Option("--set", help=VARIANT_SET_HELP)],
+    code: Annotated[str, typer.Option(help=VARIANT_CODE_HELP)],
+    out: Annotated[Path | None, typer.Option(help="The requests file; under the data folder when not given.")] = None,
+) -> None:
+    """Write one rewriting request per parent prompt of a variant, for rewriting elsewhere; no model is called."""
+    _inputs("data variants draft", set=set_, code=code, out=out)
+    from driftmap.data import variants
+
+    root = Path.cwd()
+    variants.spec(set_, code)
+    path, count = variants.draft(root / DATA_DIR, set_, code, out)
+    typer.echo(f"{count} requests in {path.relative_to(root) if path.is_relative_to(root) else path}")
+
+
+@variants_app.command("accept")
+@_finish
+def variants_accept(
+    set_: Annotated[str, typer.Option("--set", help=VARIANT_SET_HELP)],
+    code: Annotated[str, typer.Option(help=VARIANT_CODE_HELP)],
+    source: Annotated[Path, typer.Option(help="The returned file: JSON lines with parent_prompt_id and prompt.")],
+    partial: Annotated[
+        bool, typer.Option("--partial", help="Leave out the rows at fault and the parents without a rewrite.")
+    ] = False,
+) -> None:
+    """Check a returned file of rewritten prompts and store its rewrites for the build; exit 12 on a row at fault."""
+    _inputs("data variants accept", set=set_, code=code, source=source, partial=partial)
+    from driftmap.data import variants
+
+    variants.spec(set_, code)
+    found = variants.accept(Path.cwd() / DATA_DIR, set_, code, source, partial=partial)
+    typer.echo(f"kept {found.kept}, left out {len(found.dropped)}, without a rewrite {found.missing}")
+    for fault in found.dropped:
+        typer.echo(redact.mask(f"left out: {fault}"))
+
+
+@variants_app.command("build")
+@_finish
+def variants_build() -> None:
+    """Build the variant files from the transliteration libraries and the accepted rewrites; uploads nothing."""
+    root = Path.cwd()
+    settings = load_settings(root / CONFIG)
+    _inputs("data variants build", out=DATA_DIR / "variants", config=f"{CONFIG} ({settings.config_hash()[:12]})")
+    from driftmap.data import variants
+
+    _variant_lines(variants.build(settings, root / DATA_DIR))
+    typer.echo("nothing was uploaded; the upload builds again and screens the rows with the pinned model's tokenizer")
+
+
+@variants_app.command("upload")
+@_finish
+def variants_upload() -> None:
+    """Build the variants, screened by the pinned model's tokenizer, and add them to the evaluation dataset's head.
+
+    Prints the commit a generate run over the variants names; no pin moves.
+    """
+    settings, deps = _open("data variants upload", data=DATA_DIR)
+    from driftmap.data import variants
+
+    try:
+        done = variants.upload(settings, deps.hub, deps.repo_root / DATA_DIR)
+    except httpx2.HTTPError as error:
+        message = f"the variants were not uploaded ({type(error).__name__})"
+        raise DriftmapError(ExitCode.PUSH_FAILED, f"{message}; run the command again") from error
+    _variant_lines(done.files)
+    written = [made for made in done.files if made.rows]
+    rows, files = sum(len(made.rows) for made in written), f"{len(written)} file{'s' * (len(written) != 1)}"
+    target = f"{settings.owner}/{settings.repos.eval}"
+    typer.echo(f"uploaded {rows} variant prompts in {files} to {target} at commit {done.commit}")
+    launch = f"driftmap launch generate --wait -- --kind baseline --sets variants --variants-rev {done.commit}"
+    typer.echo(f"{'next':<10}{launch}")
+
+
 @app.command()
 @_finish
 def plan(kind: Kind, mode: Annotated[Mode, typer.Option(help=MODE_HELP)] = "smoke") -> ExitCode:
@@ -423,13 +511,17 @@ def _head(hub: Hub, repo: str) -> Any:
         raise _unreadable(repo, error) from error
 
 
-def _snapshot(hub: Hub, repo: str, scratch: str, patterns: list[str], head: Any = None) -> Path:
-    """Files of a dataset at ``head``, by default its head now, in ``scratch``; exit 1 naming a repo it cannot read."""
-    head = head or _head(hub, repo)
+def _files(hub: Hub, repo: str, revision: str, scratch: str, patterns: list[str]) -> Path:
+    """Files of a dataset at ``revision`` in ``scratch``; exit 1 naming a repo it cannot read."""
     try:
-        return Path(hub.snapshot_download(f"{repo}@{head.sha}", scratch, repo_type="dataset", allow_patterns=patterns))
+        return Path(hub.snapshot_download(f"{repo}@{revision}", scratch, repo_type="dataset", allow_patterns=patterns))
     except (httpx2.HTTPError, LocalEntryNotFoundError) as error:
         raise _unreadable(repo, error) from error
+
+
+def _snapshot(hub: Hub, repo: str, scratch: str, patterns: list[str], head: Any = None) -> Path:
+    """Files of a dataset at ``head``, by default its head now, in ``scratch``; exit 1 naming a repo it cannot read."""
+    return _files(hub, repo, (head or _head(hub, repo)).sha, scratch, patterns)
 
 
 def _results(settings: Settings, hub: Hub, mode: str = "full") -> tuple[list[RunRecord], AlphaScreen | None]:
@@ -825,6 +917,49 @@ def table_breakdown(
     dump(built, path)
     files = _show(path, breakdown.render(built), root)
     _upload(deps, results, f"{ids.tree(mode)}tables", files, f"add {mode} breakdown")
+
+
+@table_app.command("variants")
+@_finish
+def table_variants(
+    mode: Annotated[
+        Mode, typer.Option(help="full: the result labels. smoke: the rehearsal's, kept in their own tree.")
+    ] = "full",
+) -> None:
+    """Compare the script variants with their parent prompts, per condition and model; print and upload it.
+
+    Covers each condition with a finished variants run; leaves out a variant judged another request than its parent.
+    """
+    # nothing is launched or billed to the ledger, so no readiness report is needed
+    settings, deps = _open("table variants", ready=False, mode=mode)
+    # pulls the statistics packages
+    from driftmap.table import variants
+
+    records, _ = _results(settings, deps.hub, mode)
+    results, evaluation = (f"{settings.owner}/{name}" for name in (settings.repos.results, settings.repos.eval))
+    found = {condition: variants.sources(records, settings, mode, condition) for condition in ids.CONDITIONS}
+    read = [(condition, source) for condition, columns in found.items() for source in columns.values()]
+    if not read:
+        raise DriftmapError(ExitCode.USAGE, f"no finished {mode} run over the script variants is on record")
+    # the labels of each run's checkpoint: those of the parent prompts, then those of the variants
+    wanted = [
+        ids.labels_path(ids.slug(source.checkpoint), "*", mode, preamble=condition, variants=among)
+        for condition, source in read
+        for among in (False, True)
+    ]
+    with tempfile.TemporaryDirectory(prefix="driftmap-variants-") as scratch:
+        data = _snapshot(deps.hub, evaluation, f"{scratch}/labels", wanted)
+        links = {}
+        for commit in sorted({source.variants_revision for _, source in read}):
+            prompts = _files(deps.hub, evaluation, commit, f"{scratch}/{commit}", [ids.variant_prompts("*")])
+            files = sorted(prompts.glob(ids.variant_prompts("*")))
+            links[commit] = [row for path in files for row in _jsonl(path, variants.link)]
+        built = variants.build(variants.read(data, found, links, mode), settings, mode=mode)
+    root = deps.repo_root
+    path = root / LOCAL / "results" / ("smoke" if mode == "smoke" else "") / TABLES_PATH.parent.name / VARIANTS
+    dump(built, path)
+    files = _show(path, variants.render(built), root)
+    _upload(deps, results, f"{ids.tree(mode)}tables", files, f"add {mode} variants table")
 
 
 @app.command()

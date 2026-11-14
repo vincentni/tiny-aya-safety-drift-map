@@ -53,6 +53,7 @@ from driftmap.core.schemas import (
 )
 from driftmap.core.settings import load_settings
 from driftmap.data import build as data_build
+from driftmap.data import variants as data_variants
 from driftmap.jobs import launcher, readiness
 from driftmap.jobs.client import HfJobsClient
 from driftmap.jobs.kinds import State
@@ -68,6 +69,8 @@ from driftmap.table import render
 from driftmap.table.breakdown import Breakdown, Tags
 from driftmap.table.breakdown import render as render_breakdown
 from driftmap.table.build import NOT_COMPARABLE
+from driftmap.table.variants import VariantTables
+from driftmap.table.variants import render as render_variants
 from tests.fakes import FakeHub, FakeJobsClient, judge_world, published
 from tests.fakes import breakdown as fake_breakdown
 from tests.fakes import labels as fake_labels
@@ -291,13 +294,15 @@ def test_help_lists_every_verb():
     names = ("data", "ledger", "table", "judge")
     groups = {name: sorted(typer.main.get_command(cli.app).commands[name].commands) for name in names}
     assert groups == {
-        "data": ["build"],
+        "data": ["build", "variants"],
         "ledger": ["reconcile"],
-        "table": ["breakdown", "build"],
+        "table": ["breakdown", "build", "variants"],
         "judge": ["closed", "reparse", "validate"],
     }
     checks = typer.main.get_command(cli.app).commands["judge"].commands["validate"].commands
     assert sorted(checks) == ["retest", "run", "sample", "score"]
+    scripts = typer.main.get_command(cli.app).commands["data"].commands["variants"].commands
+    assert sorted(scripts) == ["accept", "build", "draft", "upload"]
     assert sorted(typer.main.get_command(cli.app).commands["decide"].commands) == ["drift"]
     assert sorted(typer.main.get_command(cli.app).commands["repair"].commands) == ["choose"]
     assert sorted(typer.main.get_command(cli.app).commands["publish"].commands) == ["check", "plan", "run"]
@@ -1530,6 +1535,150 @@ def test_a_smoke_breakdown_keeps_to_its_own_tree_and_one_that_cannot_be_uploaded
     assert (local / "breakdown.json").exists()
 
 
+def variant_prompts(world, code, count):
+    """Put ``count`` variant prompts of the harmful set on the fake Hub, tied to their parents; the commit they make."""
+    parent = code.partition("-")[0]
+    rows = [
+        {
+            "prompt_id": f"variant-{code}-{index:03d}",
+            "parent_prompt_id": fake_labels.prompt_ids("harmful", parent, index + 1)[-1],
+            "parent_language": parent,
+            "language": code,
+            "set": "harmful",
+            "prompt": f"placeholder variant prompt {index:03d}",
+        }
+        for index in range(count)
+    ]
+    path = ids.variant_prompts("harmful", code)
+    return world.hub.upload_file(path_or_fileobj=jsonl(rows), path_in_repo=path, repo_id=EVAL, repo_type="dataset").oid
+
+
+def variants_run(world, column, commit, harmful, code="hi-Latn", mode="full", preamble="keep", **changed):
+    """Record a run of ``column`` over the variants at ``commit``; store its four labels, ``harmful`` of them so."""
+    checkpoint = fake_labels.CHECKPOINTS[column]
+    rows = [
+        fake_labels.label(
+            column,
+            code,
+            index,
+            harm="yes" if index < harmful else "no",
+            **{"prompt_id": f"variant-{code}-{index:03d}", **changed.get(str(index), {})},
+        )
+        for index in range(4 if harmful is not None else 0)
+    ]
+    data = "".join(row.model_dump_json(by_alias=True) + "\n" for row in rows).encode()
+    path = ids.labels_path(ids.slug(checkpoint), code, mode, preamble=preamble, variants=True)
+    if rows:
+        world.hub.upload_file(path_or_fileobj=data, path_in_repo=path, repo_id=EVAL, repo_type="dataset")
+    notes = [*([f"preamble: {preamble}"] if preamble != "keep" else []), "sets: variants"]
+    inputs = [Ref(kind="dataset", repo=EVAL, revision=revision) for revision in ("6" * 40, "6" * 40, commit)]
+    run_id = f"generate-{mode}-{column}-{preamble}-variants"
+    return generated(world, column, run_id=run_id, mode=mode, notes=notes, inputs=inputs)
+
+
+def test_table_variants_pairs_each_columns_variants_with_their_parents_writes_prints_and_uploads(world):
+    evaluation(world, {"baseline": 1, "drifted": 0})
+    evaluation(world, {"baseline": 0}, preamble="patch")
+    first = variant_prompts(world, "hi-Latn", 3)
+    variants_run(world, "baseline", first, 3)
+    # the variants grew before the fine-tuned model read them; its fourth rewrite reads as another request
+    second = variant_prompts(world, "hi-Latn", 4)
+    variants_run(world, "drifted", second, 2, **{"3": {"request_harm": "no"}})
+    variants_run(world, "baseline", second, 1, preamble="patch")
+    (world.root / READY_PATH).unlink()
+
+    built = run("table", "variants")
+
+    assert built.exit_code == 0, built.output
+    assert built.output.splitlines()[:2] == ["verb      table variants", "mode      full"]
+    local = world.root / TABLES_DIR / "variants.json"
+    found = VariantTables.model_validate_json(local.read_bytes())
+    assert found.conditions == {"keep": "served template", "patch": "safety patch"}
+    assert found.columns == {"baseline": "baseline", "drifted": "fine-tuned"}
+    sources = {(source.condition, source.column): source for source in found.sources}
+    assert {key: (source.variants_revision, source.judged, source.left_out) for key, source in sources.items()} == {
+        ("keep", "baseline"): (first, 4, 0),
+        ("keep", "drifted"): (second, 4, 1),
+        ("patch", "baseline"): (second, 4, 0),
+    }
+    assert sources["keep", "drifted"].checkpoint == fake_labels.CHECKPOINTS["drifted"]
+    rows = {(row.condition, row.column, row.code): row for row in found.rows}
+    assert sorted(rows) == [(*key, code) for key in sorted(sources) for code in ("all-Latn", "hi-Latn")]
+    # a label of a variant the run's commit does not hold is not paired
+    base = rows["keep", "baseline", "hi-Latn"]
+    assert (base.n_pairs, base.parent, base.variant, base.delta) == pytest.approx((3, 1 / 3, 1.0, 2 / 3))
+    tuned = rows["keep", "drifted", "hi-Latn"]
+    assert (tuned.n_pairs, tuned.parent, tuned.variant) == pytest.approx((3, 0.0, 2 / 3))
+    patched = rows["patch", "baseline", "all-Latn"]
+    assert (patched.n_pairs, patched.parent, patched.variant) == pytest.approx((4, 0.0, 0.25))
+    shown = render_variants(found)
+    assert shown in built.output and "### Fine-tuned" in shown and "## Safety patch" in shown
+    assert built.output.index("# Script variants") < built.output.index("written to .run-local/results/tables")
+    assert (world.root / TABLES_DIR / "variants.md").read_text(encoding="utf-8") == shown
+    assert stored(world, "tables/variants.json") == local.read_bytes()
+    assert stored(world, "tables/variants.md") == shown.encode()
+    assert built.output.splitlines()[-1] == f"uploaded to {RESULTS} under tables/"
+    # the result tables and the drift flag are not its to write
+    assert not (world.root / TABLES_PATH).exists()
+    assert sorted(path for path in world.hub.repos[RESULTS]["main"] if "tables/" in path) == [
+        "tables/variants.json",
+        "tables/variants.md",
+    ]
+
+
+def test_table_variants_refuses_without_a_variants_run_its_labels_or_its_prompts(world):
+    evaluation(world, {"baseline": 1})
+    unrun = run("table", "variants")
+    assert unrun.exit_code == 2 and "no finished full run over the script variants is on record" in unrun.stderr
+    commit = variant_prompts(world, "hi-Latn", 4)
+    variants_run(world, "baseline", commit, None)
+    unjudged = run("table", "variants")
+    assert unjudged.exit_code == 2 and "no judged labels of script variants" in unjudged.stderr
+    record = variants_run(world, "baseline", commit, 2)
+    assert run("table", "variants", "--mode", "smoke").exit_code == 2
+    record.inputs[-1] = Ref(kind="dataset", repo=EVAL, revision="e" * 40)
+    world.push(f"runs/{record.run_id}.json", record.model_dump_json(by_alias=True).encode())
+    gone = run("table", "variants")
+    assert gone.exit_code == 1 and f"{EVAL} could not be read" in gone.stderr
+    untied = world.hub.upload_file(
+        path_or_fileobj=jsonl([{"prompt_id": "variant-hi-Latn-000", "language": "hi-Latn"}]),
+        path_in_repo=ids.variant_prompts("harmful", "hi-Latn"),
+        repo_id=EVAL,
+        repo_type="dataset",
+    ).oid
+    record.inputs[-1] = Ref(kind="dataset", repo=EVAL, revision=untied)
+    world.push(f"runs/{record.run_id}.json", record.model_dump_json(by_alias=True).encode())
+    torn = run("table", "variants")
+    assert torn.exit_code == ExitCode.INTEGRITY and "harmful/hi-Latn.jsonl:1: not a row" in torn.stderr
+    for result in (unrun, unjudged, gone, torn):
+        assert "Traceback" not in result.output and not (world.root / TABLES_DIR / "variants.json").exists()
+    assert not [path for path in world.hub.repos[RESULTS]["main"] if "variants" in path and "tables" in path]
+
+
+def test_a_smoke_variants_table_keeps_to_its_own_tree_and_one_that_cannot_be_uploaded_stays_local(world, monkeypatch):
+    evaluation(world, {"baseline": 2}, mode="smoke")
+    variants_run(world, "baseline", variant_prompts(world, "es-mixed", 4), 1, code="es-mixed", mode="smoke")
+    assert "no finished full run over the script variants" in run("table", "variants").stderr
+
+    built = run("table", "variants", "--mode", "smoke")
+
+    assert built.exit_code == 0, built.output
+    local = world.root / LOCAL / "results" / "smoke" / "tables"
+    found = VariantTables.model_validate_json((local / "variants.json").read_bytes())
+    assert [(row.code, row.rewrite, row.n_pairs) for row in found.rows] == [
+        ("es-mixed", "codemixed", 4),
+        ("all-mixed", "codemixed", 4),
+    ]
+    assert stored(world, "smoke/tables/variants.json") == (local / "variants.json").read_bytes()
+    assert stored(world, "smoke/tables/variants.md") == (local / "variants.md").read_bytes()
+    assert not (world.root / TABLES_DIR).exists() and "tables/variants.json" not in world.hub.repos[RESULTS]["main"]
+
+    monkeypatch.setattr(world.hub, "upload_folder", lambda **call: world.hub._raise(403, "https://huggingface.co/x"))
+    kept = run("table", "variants", "--mode", "smoke")
+    assert kept.exit_code == ExitCode.PUSH_FAILED and "run the command again" in kept.stderr
+    assert "variants.json and variants.md are in .run-local/results/smoke/tables" in kept.stderr
+
+
 FIGURE_STEMS = (
     "f1-safe-rate-by-language",
     "f2-harm-category-by-language",
@@ -2682,3 +2831,111 @@ def test_judge_validate_refuses_what_it_cannot_read_before_it_asks_anything(worl
     monkeypatch.delenv(closed.ROUTE_ENV)
     unset = run("judge", "validate", "run", *files)
     assert unset.exit_code == 2 and closed.ROUTE_ENV in flat(unset)
+
+
+def variant_parents(world, texts=("नमस्ते दुनिया", "दाल कैसे बनाते हैं?")):
+    """Put the Hindi parent prompts of both sets where a local data build keeps them."""
+    for set_, folder in data_variants.SETS.items():
+        rows = [
+            {"prompt_id": f"{set_}-hi-{index:03d}", "language": "hi", "set": set_, "prompt": text}
+            | ({"target": "placeholder"} if set_ == "benign" else {"global_or_local": "global"})
+            for index, text in enumerate(texts)
+        ]
+        path = world.root / cli.DATA_DIR / "prompts" / folder / "hi.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(jsonl(rows))
+
+
+def test_data_variants_drafts_the_requests_takes_the_rewrites_and_builds_the_files_locally(world, monkeypatch):
+    world = World(monkeypatch, world.root, hub=world.hub, languages=["en", "hi"])
+    variant_parents(world)
+    (world.root / READY_PATH).unlink()
+    calls = len(world.hub.calls)
+
+    drafted = run("data", "variants", "draft", "--set", "harmful", "--code", "hi-mixed")
+
+    assert drafted.exit_code == 0, drafted.output
+    assert drafted.output.splitlines()[0].split() == ["verb", "data", "variants", "draft"]
+    requests = world.root / cli.DATA_DIR / "variants_draft" / "harmful" / "hi-mixed.jsonl"
+    assert f"2 requests in {requests.relative_to(world.root)}" in drafted.output
+    asked = [json.loads(line) for line in requests.read_text(encoding="utf-8").splitlines()]
+    assert [row["parent_prompt_id"] for row in asked] == ["harmful-hi-000", "harmful-hi-001"]
+    named = ["--set", "harmful", "--code", "hi-mixed"]
+    assert run("data", "variants", "draft", *named, "--out", "asked.jsonl").exit_code == 0
+    assert (world.root / "asked.jsonl").read_bytes() == requests.read_bytes()
+
+    rewrites = [
+        {"parent_prompt_id": "harmful-hi-000", "prompt": "hello दुनिया, नमस्ते everyone"},
+        {"parent_prompt_id": "harmful-hi-001", "prompt": "दाल कैसे बनाते हैं?"},
+    ]
+    (world.root / "returned.jsonl").write_bytes(jsonl(rewrites))
+    taken = ["data", "variants", "accept", "--set", "harmful", "--code", "hi-mixed", "--source", "returned.jsonl"]
+    refused = run(*taken)
+    assert refused.exit_code == ExitCode.INTEGRITY and "repeats its parent" in refused.stderr
+    assert not (world.root / cli.DATA_DIR / "variants_source").exists()
+    partial = run(*taken, "--partial")
+    assert partial.exit_code == 0, partial.output
+    assert "kept 1, left out 1, without a rewrite 1" in partial.output
+    assert "left out: row 2 (harmful-hi-0) repeats its parent" in partial.output
+
+    built = run("data", "variants", "build")
+
+    assert built.exit_code == 0, built.output
+    lines = [line.split() for line in built.output.splitlines() if line.startswith(("harmful", "benign"))]
+    assert ["harmful", "hi-Latn", "2", "rows", "0", "left", "out", "library"] in lines
+    assert ["harmful", "hi-mixed", "1", "rows", "1", "left", "out", "rewritten"] in lines
+    assert ["benign", "hi-mixed", "0", "rows", "2", "left", "out", "missing"] in lines
+    folder = world.root / cli.DATA_DIR / "variants" / "prompts"
+    assert sorted(path.relative_to(folder).as_posix() for path in folder.rglob("*.jsonl")) == [
+        "benign/hi-Latn.jsonl",
+        "harmful/hi-Latn.jsonl",
+        "harmful/hi-mixed.jsonl",
+    ]
+    assert "nothing was uploaded" in built.output and len(world.hub.calls) == calls
+
+    for bad in (
+        ["draft", "--set", "xstest", "--code", "hi-Latn"],
+        ["draft", "--set", "harmful", "--code", "de-Latn"],
+        ["draft", "--set", "harmful"],
+        ["accept", "--set", "harmful", "--code", "hi-mixed"],
+        ["accept", "--set", "harmful", "--code", "hi-mixed", "--source", "none.jsonl"],
+    ):
+        assert run("data", "variants", *bad).exit_code in (2, 12), bad
+
+
+def test_data_variants_upload_hands_the_build_to_the_library_and_prints_the_commit_to_generate_from(world, monkeypatch):
+    seen = []
+    files = [
+        data_variants.Variants("harmful", "hi-Latn", [{"prompt_id": "a"}, {"prompt_id": "b"}], 1, "library"),
+        data_variants.Variants("benign", "ar-mixed", [], 2, "missing"),
+    ]
+
+    def uploaded(settings, hub, data_dir):
+        seen.append((hub._api, Path(data_dir)))
+        return data_variants.Uploaded(files, "c" * 40)
+
+    monkeypatch.setattr(data_variants, "upload", uploaded)
+
+    done = run("data", "variants", "upload")
+
+    assert done.exit_code == 0, done.output
+    assert done.output.splitlines()[0].split() == ["verb", "data", "variants", "upload"]
+    assert seen == [(world.hub, world.root / cli.DATA_DIR)]
+    lines = [line.split() for line in done.output.splitlines() if line.startswith(("harmful", "benign"))]
+    assert lines == [
+        ["harmful", "hi-Latn", "2", "rows", "1", "left", "out", "library"],
+        ["benign", "ar-mixed", "0", "rows", "2", "left", "out", "missing"],
+    ]
+    assert f"uploaded 2 variant prompts in 1 file to {EVAL} at commit {'c' * 40}" in done.output
+    last = f"next      driftmap launch generate --wait -- --kind baseline --sets variants --variants-rev {'c' * 40}"
+    assert done.output.splitlines()[-1] == last
+
+    def unreachable(settings, hub, data_dir):
+        world.hub._raise(503, "https://huggingface.co/x")
+
+    monkeypatch.setattr(data_variants, "upload", unreachable)
+    failed = run("data", "variants", "upload")
+    assert failed.exit_code == ExitCode.PUSH_FAILED and "run the command again" in failed.stderr
+    # an upload goes to the Hub: it needs the readiness report
+    (world.root / READY_PATH).unlink()
+    assert run("data", "variants", "upload").exit_code == ExitCode.READINESS
