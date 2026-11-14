@@ -40,12 +40,17 @@ def _transient(error: BaseException) -> bool:
 
 
 def _download(url: str, target: Path, opener: Callable[..., Any]) -> str:
-    """Stream ``url`` into ``target``; returns the sha256 of what arrived."""
-    digest = hashlib.sha256()
+    """Stream ``url`` into ``target``; returns the sha256 of what arrived. OSError when the transfer was cut short."""
+    digest, received = hashlib.sha256(), 0
     with opener(url, timeout=TIMEOUT_S) as response, target.open("wb") as out:
+        announced = response.headers.get("Content-Length")
         while chunk := response.read(CHUNK):
             digest.update(chunk)
             out.write(chunk)
+            received += len(chunk)
+    # a dropped connection ends a chunked read without an error
+    if announced is not None and announced.isdigit() and received < int(announced):
+        raise OSError(f"{received} of {announced} bytes arrived")
     return digest.hexdigest()
 
 
@@ -98,7 +103,8 @@ def fetch_release(
         if found != expected:
             archive.unlink()
             raise ReleaseHashMismatch(
-                f"{name} of llama.cpp {release.tag} hashes to {found[:12]}, not the pinned {expected[:12]}; nothing was unpacked"
+                f"{name} of llama.cpp {release.tag} hashes to {found[:12]}, not the pinned {expected[:12]}; "
+                "nothing was unpacked"
             )
         archives[name] = archive
     return {name: _unpack(archive, dest / name) for name, archive in archives.items()}

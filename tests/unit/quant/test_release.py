@@ -10,7 +10,18 @@ from driftmap.core.schemas import DriftmapError
 from driftmap.core.settings import load_settings
 from driftmap.quant import release
 from driftmap.quant.release import ReleaseHashMismatch, binary, fetch_release
-from tests.fakes.release import ASSETS, BINARY_ROOT, RELEASE, SOURCE_ROOT, FakeOpener, archives, pages, pinned, tarball
+from tests.fakes.release import (
+    ASSETS,
+    BINARY_ROOT,
+    RELEASE,
+    SOURCE_ROOT,
+    Cut,
+    FakeOpener,
+    archives,
+    pages,
+    pinned,
+    tarball,
+)
 from tests.fakes.settings import settings_toml
 
 PACKAGE = Path(release.__file__).parent
@@ -97,6 +108,23 @@ def test_a_failed_download_is_retried_three_times_and_a_refusal_never(tmp_path):
                 sleep=no_sleep,
             )
         assert len(refused.calls) == 1
+
+
+def test_a_download_cut_short_is_retried_and_never_read_as_another_file(tmp_path):
+    """Fewer bytes than the server announced is a failed transfer, not a file with the wrong hash."""
+    files = archives()
+    whole, url = files["cuda_asset"], RELEASE["cuda_asset"]
+    half = Cut(whole[: len(whole) // 2], len(whole))
+    once = FakeOpener({url: [half, whole]})
+    release = pinned_release(tmp_path, files)
+    roots = fetch_release(release, tmp_path / "once", once, assets=("cuda_asset",), sleep=no_sleep)
+    assert len(once.calls) == 2 and (roots["cuda_asset"] / "llama-server").is_file()
+
+    always = FakeOpener({url: half})
+    short = f"cannot download cuda_asset of llama.cpp {RELEASE['tag']}: {len(half.data)} of {len(whole)} bytes arrived"
+    with pytest.raises(DriftmapError, match=re.escape(short)) as caught:
+        fetch_release(release, tmp_path / "cut", always, assets=("cuda_asset",), sleep=no_sleep)
+    assert not isinstance(caught.value, ReleaseHashMismatch) and len(always.calls) == 3
 
 
 def test_a_url_outside_the_pinned_tag_is_refused_before_any_download(tmp_path):

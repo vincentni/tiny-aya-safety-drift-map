@@ -5,7 +5,7 @@ import io
 import tarfile
 import urllib.error
 from email.message import Message
-from typing import Any
+from typing import Any, NamedTuple
 
 from tests.fakes.settings import BASE
 
@@ -49,6 +49,20 @@ def pages(files: dict[str, bytes]) -> dict[str, Any]:
     return {RELEASE[name]: data for name, data in files.items()}
 
 
+class Cut(NamedTuple):
+    """A download the connection drops: ``data`` arrives of the ``length`` bytes the server announced."""
+
+    data: bytes
+    length: int
+
+
+class _Response(io.BytesIO):
+    def __init__(self, data: bytes, length: int) -> None:
+        super().__init__(data)
+        self.headers = Message()
+        self.headers["Content-Length"] = str(length)
+
+
 class FakeOpener:
     """Stand-in for ``urllib.request.urlopen``: bytes are served, an int is an HTTP status, an exception is raised."""
 
@@ -67,4 +81,4 @@ class FakeOpener:
             raise urllib.error.HTTPError(url, page, "scripted", Message(), io.BytesIO())
         if isinstance(page, BaseException):
             raise page
-        return io.BytesIO(page)
+        return _Response(*page) if isinstance(page, Cut) else _Response(page, len(page))
