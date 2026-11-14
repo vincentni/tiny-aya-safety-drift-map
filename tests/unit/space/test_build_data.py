@@ -119,6 +119,13 @@ def test_the_interval_is_the_one_the_tables_use(k, n):
     assert build_data.wilson(0, 0) is None
 
 
+@pytest.mark.parametrize(("k", "n"), [(16, 99), (2, 100), (55, 598)])
+def test_the_stored_bounds_print_as_the_tables_print_them(k, n):
+    stored = build_data._rate(k, n)[2:]
+
+    assert [f"{100 * bound:.1f}" for bound in stored] == [f"{100 * bound:.1f}" for bound in reference_wilson(k, n)]
+
+
 def test_counts_leave_unscored_pairs_out_and_a_prompt_counts_in_each_of_its_categories(eval_dir):
     data = build_data.build(eval_dir)
 

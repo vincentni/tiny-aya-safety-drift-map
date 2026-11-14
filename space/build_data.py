@@ -114,7 +114,8 @@ def sign_test(up: int, down: int) -> float:
 
 def _rate(k: int, n: int) -> list:
     interval = wilson(k, n)
-    return [k, n, *(round(bound, 4) for bound in interval)] if interval else [k, n, None, None]
+    # six digits, so a bound shown as a percentage with one decimal rounds as the tables round it
+    return [k, n, *(round(bound, 6) for bound in interval)] if interval else [k, n, None, None]
 
 
 def _prompts(eval_dir: Path) -> dict[str, dict]:

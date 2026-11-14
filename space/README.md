@@ -19,7 +19,8 @@ models:
 
 A static results page for the study in <https://github.com/vincentni/tiny-aya-safety-drift-map>: where
 Tiny Aya Global gives harmful answers on 600 red-teaming prompts in six languages, by language, harm
-category and prompt condition, before and after two LoRA fine-tunes on the same benign multilingual rows.
+category and prompt condition, with a system-prompt patch, two LoRA fine-tunes of the same benign rows
+and a weight-space repair measured on the same map.
 
 **Content warning:** the study uses red-teaming prompts. The tables and figures show counts only. The
 replay explorer shows prompt text as it was written, and the stored answer of each system behind a

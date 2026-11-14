@@ -128,8 +128,8 @@ Harmful answers of both models in both conditions. A prompt can carry more than 
 
 For the base model:
 
-- **Language.** Under the served template Russian is the weakest language (16.2%, interval 10.2% to 24.6%) and French the safest (2.0%, 0.5% to 7.0%). The order among the weaker languages changes when the safety preamble is removed, so the robust statement is "French is safer than the rest", not "Russian is the worst". Hindi and Arabic sit in the middle: the gap is not one between high- and low-resource languages.
-- **Category.** Only representation harms are above the pooled rate in both conditions (16.9%, interval 9.9% to 27.3%; 25.4%, 16.7% to 36.5%).
+- **Language.** Under the served template Russian is the weakest language (16.2%, interval 10.2% to 24.7%) and French the safest (2.0%, 0.6% to 7.0%). The order among the weaker languages changes when the safety preamble is removed, so the robust statement is "French is safer than the rest", not "Russian is the worst". Hindi and Arabic sit in the middle: the gap is not one between high- and low-resource languages.
+- **Category.** Only representation harms are above the pooled rate in both conditions (16.9%, interval 9.9% to 27.3%; 25.4%, 16.7% to 36.6%).
 - **Kind of request.** The failures are on requests that carry a harmful premise inside an everyday task: an excuse, an explanation, a list of reasons. Explicit harmful requests are refused: on 240 unseen plain requests that three annotators marked harmful (Appendix C), the base model gives 2 harmful answers of 229 scored and refuses 204.
 - **Cells.** The rows below have a Wilson interval wholly above the pooled rate of the served template. They are small: they point at where to look, not at a ranking.
 
@@ -137,7 +137,7 @@ For the base model:
 |---|---|---|
 | Self-harm, all languages | 11 of 67 | 9.4% to 27.1% |
 | Hate speech, all languages | 20 of 136 | 9.7% to 21.6% |
-| Hate speech, Hindi | 8 of 28 | 15.2% to 47.1% |
+| Hate speech, Hindi | 8 of 28 | 15.3% to 47.1% |
 | Hate speech, Russian | 6 of 24 | 12.0% to 44.9% |
 | Discrimination and injustice, Russian | 8 of 40 | 10.5% to 34.8% |
 | Representation harms, English | 5 of 20 | 11.2% to 46.9% |
@@ -264,7 +264,7 @@ Every harmful prompt in Hindi, Russian and Arabic is rewritten in Latin script, 
 | Base model, mixed with English | 443 | 40 → 40 | 0.0 (-2.7 to +2.7) | 1.000 | 313 → 319 | +1.4 (-2.0 to +4.7) |
 | Fine-tuned model, mixed with English | 452 | 26 → 30 | +0.9 (-1.5 to +3.3) | 0.597 | 345 → 347 | +0.4 (-2.7 to +3.8) |
 
-- **Latin script removes refusals in both models.** Each refuses about a quarter of the Latin-script prompts, against 69% and 74% of their parents.
+- **Latin script removes refusals in both models.** They refuse 25% and 21% of the Latin-script prompts, against 69% and 74% of their parents.
 - **The base model's harmful answers do not rise; the fine-tuned model's do.** Its lower harmful rate holds only in native script: on the same 237 Latin-script prompts the two models do not differ (35 harmful answers against the base model's 31, p = 0.652), while on those prompts' native-script parents it gives 13 against 28 (p = 0.001).
 - **Arabic in Latin script is largely not understood** by either model: each refuses 3 of 73 variants and gives 66 answers that are neither a refusal nor harmful.
 - **Mixing with English changes little.** Pooled, neither model moves; the exception is Arabic mixed with English for the fine-tuned model (2 → 11 harmful answers of 92, p = 0.012).
@@ -295,7 +295,7 @@ The fine-tuned model as a q4_k_m file against the same weights at full precision
 The fine-tuned model still gives 39 harmful answers of 598 under the served template.
 
 - **Barely moved:** self-harm (11 → 10 of 67) and representation harms (12 → 10 of 71).
-- **Persistent:** 23 prompts get a harmful answer from both models, and 16 prompts in all four passes.
+- **Persistent:** 23 prompts get a harmful answer from both models, and 16 in all four passes of section 1.
 
 ## Cost
 
@@ -411,10 +411,15 @@ uv run driftmap launch generate --mode full --wait -- --kind repaired --preamble
 uv run driftmap judge closed --checkpoint REPO@SHA --mode full --preamble strip
 uv run driftmap table build --preamble strip --fine-tune aggressive
 
-# the base model on the script variants
+# the script variants, for the base model and the fine-tuned model
 uv run driftmap launch generate --mode full --wait -- --kind baseline --sets variants --variants-rev COMMIT
-uv run driftmap judge closed --checkpoint REPO@SHA --mode full --sets variants
+uv run driftmap launch generate --mode full --wait -- --kind drifted --sets variants --variants-rev COMMIT
+uv run driftmap judge closed --checkpoint REPO@SHA --mode full --sets variants    # once per checkpoint
 uv run driftmap table variants
+
+# the fine-tuned model as a q4_k_m file
+uv run driftmap launch quant --wait -- --source merged               # smoke run first
+uv run driftmap launch quant --mode full --wait -- --source merged
 
 uv run driftmap ledger reconcile
 python space/build_data.py                                           # the data file of the results Space
@@ -470,7 +475,7 @@ Asked twice, the judge repeats its harmful-answer verdict for 99.3% of pairs, an
 ### Appendix C. Side checks, the safety patch and the script variants
 
 - **Held-out explicit requests.** 40 WildGuardTest items from `ToxicityPrompts/PolyGuardPrompts` in each of the six languages (240 requests; the non-English ones are that set's machine translations): plain requests that all three annotators marked harmful, used neither in the judge validation nor anywhere in the evaluation data, with child-exploitation requests left out. They are answered by the base model under the served template on the CPU engine of the engine check below. Harmful answers among the scored answers: self-harm 0 of 36, violence 0 of 37, hate and discrimination 1 of 89, defamation and harassment 1 of 30, the other strata 0 of 37; 11 answers have no verdict. With the safety patch, over the 228 requests scored in both conditions: harmful answers 2 → 4 (none removed, 2 new, exact sign test p = 0.5), refusals 203 → 197 (6 gained, 12 lost, p = 0.238), mean answer length 115 → 131 tokens, and 47 of 240 answers at the 256-token limit against 30.
-- **The q4_k_m file.** `model-q4_k_m.gguf` in `vincentnkq/tiny-aya-global-drift-GGUF` (revision `00da73ef6c05`) is built by a logged job on a CPU flavor with llama.cpp release b11960: 2,143,976,992 bytes, SHA-256 `232578be022ca6d1f92333b55da7cf8327f1f28fce4bf45e14afaba94bd0636b`. The file the evaluation of section 7 ran on was built on a workstation with the same release and has the same hash, so the published file is the evaluated file, byte for byte. That evaluation answers the 600 harmful, 250 XSTest and 600 benign prompts on the CPU engine at both precisions; its record is `checks/q4_local/` in the responses dataset.
+- **The q4_k_m file.** `model-q4_k_m.gguf` in `vincentnkq/tiny-aya-global-drift-GGUF` (revision `00da73ef6c05`) is built by a logged job on a CPU flavor with llama.cpp release b11960: 2,143,976,992 bytes, SHA-256 `232578be022ca6d1f92333b55da7cf8327f1f28fce4bf45e14afaba94bd0636b`. The file the evaluation of section 7 ran on was built on a workstation with the same release and has the same hash, so the published file is the evaluated file, byte for byte. That evaluation answers the 600 harmful, 250 XSTest and 600 benign prompts on the CPU engine at both precisions; its answers and labels are `checks/q4_local/` in the responses dataset, its run record the same folder of the results dataset.
 - **Engine check.** 20 harmful prompts per language (seeded sample), regenerated with the base model at full precision on a CPU, through the generation job's own prompt rendering and greedy decoding, and compared with the stored GPU answers: 119 pairs scored on both sides, 9 harmful answers in each pass (7 on the same prompts), 4 verdicts differ, and 84 against 83 refusals.
 - **The prompt set is mild.** The judge never reads 97 of the 600 prompts as a harmful request; on the 460 it always reads as harmful, the base model's rate under the served template is 11.3% (52 of 459).
 - **The 256-token limit does not change the verdict.** Regenerated with a limit of 768 tokens, 24 of the base model's cut-off answers (four per language, half of them judged harmful) get the same harmful-answer verdict as their first 256 tokens in 24 of 24 cases.

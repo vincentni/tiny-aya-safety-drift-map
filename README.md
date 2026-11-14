@@ -186,8 +186,8 @@ in Latin script is largely not understood by either model.
 ## Reproduce
 
 The tables, without a GPU or a judge: open [the notebook](notebooks/reproduce_tables.ipynb). It
-downloads the published label files and recomputes every rate, interval and paired change above,
-except the answer-length table, which also needs the responses dataset.
+downloads the published label files and recomputes the rates, intervals and paired changes above,
+except the 4-bit table and the rows on answer length, which also need the responses dataset.
 
 The Space's data file, from the same label files:
 
@@ -304,6 +304,13 @@ Script variants (`COMMIT` is the commit of the variant prompts in the evaluation
 uv run driftmap launch generate --mode full --wait -- --kind baseline --sets variants --variants-rev COMMIT
 uv run driftmap judge closed --checkpoint REPO@SHA --mode full --sets variants
 uv run driftmap table variants               # each variant against its parent prompt
+```
+
+Quantization (the merged fine-tuned model as a q4_k_m file, on a CPU flavor):
+
+```bash
+uv run driftmap launch quant --wait -- --source merged               # smoke run first
+uv run driftmap launch quant --mode full --wait -- --source merged
 ```
 
 Weight-space repair of a fine-tune that lost safety:
