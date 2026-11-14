@@ -34,6 +34,21 @@
   td.count { white-space: nowrap; font-variant-numeric: tabular-nums; }
   .bar { display: inline-block; height: 8px; background: var(--harm); border-radius: 2px; vertical-align: middle; margin-right: 6px; }
   .note { color: var(--soft); font-size: 0.88rem; }
+  button { font: inherit; padding: 5px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--band); color: var(--ink); cursor: pointer; }
+  button:disabled { color: var(--soft); cursor: default; }
+  button:focus-visible, select:focus-visible, a:focus-visible { outline: 2px solid var(--link); outline-offset: 2px; }
+  blockquote { margin: 8px 0; padding: 8px 12px; border-left: 3px solid var(--line); background: var(--band); white-space: pre-wrap; overflow-wrap: anywhere; }
+  .systems { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; margin: 12px 0; }
+  .system { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+  .system p { margin: 4px 0; }
+  .badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 0.85rem; font-weight: 600; margin-right: 8px; }
+  .badge.refused { background: #e3f1e6; color: #1e5a2c; }
+  .badge.answered { background: #e6eefb; color: #1f4a94; }
+  .badge.harmful { background: #fbe4e2; color: var(--harm); }
+  .badge.unscored { background: #ececec; color: var(--soft); }
+  .tag { color: var(--soft); font-size: 0.85rem; }
+  .answer-box { margin-top: 8px; }
+  #ex-prompt { width: 34rem; max-width: 100%; }
 </style>
 </head>
 <body>
@@ -44,8 +59,9 @@
     two LoRA fine-tunes of the same benign rows and 4-bit quantization measured on the same map. One judge labels
     every answer under a fixed public rubric.
     <a href="https://github.com/vincentni/tiny-aya-safety-drift-map">Code and write-up</a>.</p>
-  <p class="warning"><strong>Content warning.</strong> The study uses red-teaming prompts. This page shows counts
-    only: no prompt text and no model answer.</p>
+  <p class="warning"><strong>Content warning.</strong> The study uses red-teaming prompts. The tables and figures
+    show counts only. The replay explorer at the end of the page, when its file is present, shows prompt text, and
+    model answers behind a click; the text of answers judged harmful is not shown.</p>
 
   <div class="numbers" id="numbers" aria-live="polite"></div>
   <p id="mechanism">The light recipe costs no safety, mostly because its answers are shorter and it refuses slightly
@@ -100,8 +116,9 @@
         <tbody id="variants-body"></tbody>
       </table>
     </div>
-    <p class="note">A variant that gets neither refusals nor harmful answers is one the model does not understand:
-      read that row as a comprehension failure, not as safety.</p>
+    <p class="note">Counts are over the pairs the judge could label on both sides. A variant that gets neither
+      refusals nor harmful answers is one the model does not understand: read that row as a comprehension failure,
+      not as safety. <span id="variants-note"></span></p>
   </section>
 
   <section id="figures-section" hidden>
@@ -128,8 +145,29 @@
     <p class="note" id="map-note"></p>
   </section>
 
+  <section id="explorer-section" hidden>
+    <h2>Replay explorer</h2>
+    <p class="warning"><strong>Content warning.</strong> This section shows red-teaming prompts as they were written,
+      and the stored answer of each system behind a click. Some prompts are offensive.
+      <span id="ex-harmful"></span></p>
+    <p>Pick a prompt to see what each measured system did with it. No model runs here: every answer was stored when
+      the evaluation ran, with greedy decoding and a limit of 256 new tokens.</p>
+    <p class="note" id="ex-scope"></p>
+    <div class="controls">
+      <label>Language <select id="ex-language"></select></label>
+      <label>Harm category <select id="ex-category"></select></label>
+      <label>Show <select id="ex-filter"></select></label>
+      <label>Prompt <select id="ex-prompt"></select></label>
+      <button type="button" id="ex-previous">Previous</button>
+      <button type="button" id="ex-next">Next</button>
+    </div>
+    <p class="note" id="ex-count" aria-live="polite"></p>
+    <div id="ex-panel"></div>
+  </section>
+
   <p class="note" id="status">Loading data.</p>
 </main>
 <script src="app.js"></script>
+<script src="explorer.js"></script>
 </body>
 </html>

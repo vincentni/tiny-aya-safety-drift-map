@@ -55,6 +55,9 @@
   const capital = (text) => text[0].toUpperCase() + text.slice(1);
   const conditionOf = (data, id) => data.conditions.find((condition) => condition.id === id);
 
+  // shared with explorer.js
+  window.pageKit = { el, clear, options, languageName };
+
   function cellOf(data, condition, model, language, category) {
     return data.cells.find((cell) => cell.condition === condition && cell.model === model &&
       cell.language === language && cell.category === category);
@@ -180,6 +183,8 @@
       el('td', { class: 'count', text: arrow(row.refusal) }),
       el('td', { class: 'count', text: arrow(row.harmful) }),
       el('td', { class: 'count', text: arrow(row.answered) }))));
+    const left = data.variants.reduce((sum, row) => sum + row.left_out, 0);
+    $('variants-note').textContent = `${left} variants the judge read as another request than their parent are left out.`;
     $('variants-section').hidden = false;
   }
 

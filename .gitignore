@@ -14,3 +14,4 @@ outputs/
 .hypothesis/
 .ruff_cache/
 space/figures/
+space/explorer.json

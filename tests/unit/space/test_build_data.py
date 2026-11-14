@@ -238,10 +238,22 @@ def test_a_variant_is_paired_with_its_parent_prompt_under_the_same_model(variant
     assert row == {
         "code": "en-Latn", "parent_language": "en", "kind": "romanized", "model": "finetuned", "prompts": 3,
         "pairs": 2, "harmful_both": 0, "harmful_to_not": 1, "not_to_harmful": 1,
-        "harmful": [1, 1], "refusal": [1, 0], "answered": [0, 1], "p": 1.0, "request_harm": [2, 2],
+        "harmful": [1, 1], "refusal": [1, 0], "answered": [0, 1], "p": 1.0, "request_harm": [2, 2], "left_out": 0,
     }  # fmt: skip
     text = json.dumps(data)
     assert SECRET not in text and "v1" not in text
+
+
+def test_a_variant_the_judge_reads_as_another_request_is_left_out_as_the_tables_do(variants_dir):
+    path = variants_dir / "variants" / "labels" / TUNED / "en-Latn.jsonl"
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    rows[0]["request_harm"] = "no"
+    _jsonl(path, rows)
+
+    (row,) = build_data.build(variants_dir)["variants"]
+
+    # v1 no longer reads as the harmful request its parent is; v2 is the one pair left
+    assert (row["left_out"], row["pairs"], row["harmful"], row["refusal"]) == (1, 1, [1, 0], [0, 0])
 
 
 @pytest.mark.parametrize(("up", "down"), [(0, 0), (23, 4), (4, 23), (15, 0), (3, 10), (7, 7)])
@@ -282,3 +294,168 @@ def test_the_committed_data_file_holds_counts_only():
     # no cell names a prompt: the only strings are ids of conditions, models, languages and categories
     names = {"all", *data["languages"], *data["categories"]} | {row["id"] for row in data["conditions"] + data["models"]}
     assert {value for cell in data["cells"] for value in cell.values() if isinstance(value, str)} <= names
+
+
+LONG = "harmful answer " * 40
+
+
+@pytest.fixture
+def replay_dirs(eval_dir, tmp_path):
+    """Four prompts in two languages, answered by the base model with and without the patch, by the fine-tuned
+    model and by the overfit fine-tune; the fine-tuned model under the patch has labels but no response files."""
+    prompts = {
+        "en": [("a" * 64, '["Hate Speech"]'), ("b" * 64, '["Profanity"]'), ("c" * 64, '["Profanity"]')],
+        "fr": [("d" * 64, '["Self-Harm"]')],
+    }
+    for language, rows in prompts.items():
+        _jsonl(
+            eval_dir / "prompts" / "harmful" / f"{language}.jsonl",
+            [{"prompt_id": key, "language": language, "prompt": f"ask {key[0]}", "harm_category": tags} for key, tags in rows],
+        )
+    a, b, c, d = ("a" * 64, "b" * 64, "c" * 64, "d" * 64)
+    refused = dict.fromkeys((a, b, c, d), ("yes", "no"))
+    labels = {
+        ("labels", BASE): {a: ("no", "yes"), b: ("yes", "no"), c: ("yes", "no"), d: ("no", "no")},
+        ("patched/labels", BASE): {a: ("yes", "no"), b: ("yes", "no"), c: ("yes", "no"), d: ("no", "no")},
+        ("nopreamble/labels", OVERFIT): {a: ("no", "yes"), b: ("no", "yes"), c: ("yes", "no"), d: ("unscored", "unscored")},
+        ("labels", TUNED): refused,
+        ("patched/labels", TUNED): refused,
+        ("nopreamble/labels", BASE): refused,
+        ("nopreamble/labels", TUNED): refused,
+    }
+    answers = tmp_path / "replay-answers"
+    for (tree, folder), rows in labels.items():
+        for language in prompts:
+            keys = [key for key, _ in prompts[language]]
+            _harmful_file(eval_dir, tree, folder, [(key, *rows[key]) for key in keys], language)
+            if (tree, folder) == ("patched/labels", TUNED):
+                continue
+            responses = [
+                {"prompt_id": key, "response": f"  {LONG}{key[0]} ", "generated_tokens": 256 if key == a else 12}
+                | {"stop_reason": "length" if key == a else "eos"}
+                for key in keys
+            ]
+            _jsonl(answers / tree.replace("labels", "responses") / folder / "harmful" / f"{language}.jsonl", responses)
+    return eval_dir, answers
+
+
+def test_the_explorer_replays_every_system_that_has_labels_and_responses(replay_dirs):
+    replay = build_data.explorer(*replay_dirs)
+
+    assert replay["schema"] == "driftmap.space.explorer/1"
+    assert [(row["id"], row["name"], row["condition"]) for row in replay["systems"]] == [
+        ("served/base", "Base model", "served template"),
+        ("patched/base", "Base model + safety patch", "safety patch"),
+        ("served/finetuned", "Light fine-tune", "served template"),
+        ("nopreamble/overfit", "Overfit fine-tune", "no safety preamble"),
+    ]
+    assert [row.get("note") for row in replay["systems"]] == [None, None, None, "research artifact, not for deployment"]
+    first = next(row for row in replay["prompts"] if row["id"] == "a" * 12)
+    assert (first["language"], first["categories"], first["text"]) == ("en", ["Hate Speech"], "ask a")
+    assert set(first["answers"]) == {"served/base", "patched/base", "served/finetuned", "nopreamble/overfit"}
+    assert first["answers"]["patched/base"] == {
+        "verdict": "refused", "cut_off": True, "text": f"{LONG}a", "clipped": False,
+    }  # fmt: skip
+
+
+def test_with_harmful_text_an_answer_judged_harmful_or_left_unscored_keeps_its_first_300_characters(replay_dirs):
+    replay = build_data.explorer(*replay_dirs, include_harmful=True)
+
+    rows = {row["id"][0]: row["answers"] for row in replay["prompts"]}
+    harmful, unscored = rows["a"]["served/base"], rows["d"]["nopreamble/overfit"]
+    assert harmful == {"verdict": "harmful", "cut_off": True, "text": LONG[:300], "clipped": True}
+    assert unscored == {"verdict": "unscored", "cut_off": False, "text": LONG[:300], "clipped": True}
+    assert (replay["cut"], replay["harmful_text"]) == (300, True)
+
+
+def test_the_explorer_leaves_out_the_text_of_harmful_and_unscored_answers_unless_asked(replay_dirs):
+    replay = build_data.explorer(*replay_dirs)
+
+    rows = {row["id"][0]: row["answers"] for row in replay["prompts"]}
+    assert replay["harmful_text"] is False
+    assert rows["a"]["served/base"] == {"verdict": "harmful", "cut_off": True, "text": None, "clipped": False}
+    assert rows["d"]["nopreamble/overfit"]["text"] is None
+    assert rows["a"]["patched/base"]["text"] == f"{LONG}a"
+    assert LONG[:40] not in json.dumps(rows["a"]["served/base"])
+
+
+def test_prompts_where_the_systems_disagree_come_first_under_the_cap(replay_dirs):
+    full = build_data.explorer(*replay_dirs)
+
+    # a: harmful for the base model and the overfit fine-tune; b: harmful for the overfit fine-tune only;
+    # c: refused by all; d: answered or refused, and one answer without a verdict
+    assert {row["id"][0]: row["disagree"] for row in full["prompts"]} == {"a": True, "b": True, "c": False, "d": False}
+    assert (full["total"], full["disagreeing"], len(full["prompts"])) == (4, 2, 4)
+
+    capped = build_data.explorer(*replay_dirs, cap=3)
+    # both disagreement prompts, then one more: the other language before a third English prompt
+    assert sorted(row["id"][0] for row in capped["prompts"]) == ["a", "b", "d"]
+    assert (capped["total"], capped["disagreeing"]) == (4, 2)
+    assert [row["id"][0] for row in build_data.explorer(*replay_dirs, cap=1)["prompts"]] == ["a"]
+
+
+def test_prompts_of_a_withheld_category_are_not_in_the_explorer(replay_dirs):
+    eval_dir, answers = replay_dirs
+    path = eval_dir / "prompts" / "harmful" / "en.jsonl"
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    rows[2]["harm_category"] = '["Profanity", "Non-consensual sexual content"]'
+    _jsonl(path, rows)
+
+    replay = build_data.explorer(eval_dir, answers)
+
+    assert sorted(row["id"][0] for row in replay["prompts"]) == ["a", "b", "d"]
+    assert replay["left_out"] == {"category": "Non-consensual sexual content", "prompts": 1} and replay["total"] == 4
+    assert "ask c" not in json.dumps(replay)
+
+
+def test_prompts_every_system_answers_harmfully_come_before_the_rest(replay_dirs):
+    eval_dir, answers = replay_dirs
+    for tree, folder in (("labels", BASE), ("patched/labels", BASE), ("labels", TUNED), ("nopreamble/labels", OVERFIT)):
+        rows = [("a" * 64, "no", "yes"), ("b" * 64, "yes", "no"), ("c" * 64, "no", "yes")]
+        _harmful_file(eval_dir, tree, folder, rows)
+
+    replay = build_data.explorer(eval_dir, answers, cap=1)
+
+    # no system disagrees with another now; c and a are harmful for all four, and a comes first by id
+    assert (replay["disagreeing"], replay["persistent"]) == (0, 2) and [row["id"][0] for row in replay["prompts"]] == ["a"]
+    assert sorted(row["id"][0] for row in build_data.explorer(eval_dir, answers, cap=2)["prompts"]) == ["a", "c"]
+
+
+def test_script_variants_are_replayed_under_their_parent_prompt(replay_dirs):
+    eval_dir, answers = replay_dirs
+    variant = {"prompt_id": "e" * 64, "parent_prompt_id": "c" * 64, "parent_language": "en", "language": "en-Latn"}
+    variant |= {"set": "harmful", "variant": "romanized", "prompt": "ask c in Latin script", "harm_category": '["Profanity"]'}
+    _jsonl(eval_dir / "variants" / "prompts" / "harmful" / "en-Latn.jsonl", [variant])
+    _harmful_file(eval_dir, "variants/labels", BASE, [("e" * 64, "no", "yes")], "en-Latn")
+    row = {"prompt_id": "e" * 64, "response": "short", "stop_reason": "eos", "generated_tokens": 3}
+    _jsonl(answers / "variants" / "responses" / BASE / "harmful" / "en-Latn.jsonl", [row])
+
+    replay = build_data.explorer(eval_dir, answers, include_harmful=True)
+
+    parent = next(row for row in replay["prompts"] if row["id"] == "c" * 12)
+    assert parent["variants"] == [
+        {
+            "code": "en-Latn", "kind": "romanized", "text": "ask c in Latin script",
+            "answers": {"served/base": {"verdict": "harmful", "cut_off": False, "text": "short", "clipped": False}},
+        }
+    ]  # fmt: skip
+    # the variant is answered harmfully where its parent is refused, so the prompt is one of the disagreements
+    assert parent["disagree"] is True and replay["disagreeing"] == 3
+    assert all(row["variants"] == [] for row in replay["prompts"] if row["id"] != "c" * 12)
+
+
+def test_main_writes_the_explorer_beside_the_data_file_only_from_responses(replay_dirs, tmp_path):
+    eval_dir, answers = replay_dirs
+    out = tmp_path / "page" / "data.json"
+
+    assert build_data.main(["--eval-dir", str(eval_dir), "--out", str(out)]) == 0
+    assert not (out.parent / "explorer.json").exists()
+
+    args = ["--eval-dir", str(eval_dir), "--responses-dir", str(answers), "--out", str(out), "--explorer-cap", "2"]
+    assert build_data.main(args) == 0
+    first = (out.parent / "explorer.json").read_bytes()
+    assert build_data.main(args) == 0
+    replay = json.loads(first)
+    assert (out.parent / "explorer.json").read_bytes() == first and len(replay["prompts"]) == 2
+    # the data file still holds counts only
+    assert "ask a" not in out.read_text(encoding="utf-8") and LONG[:30] not in out.read_text(encoding="utf-8")

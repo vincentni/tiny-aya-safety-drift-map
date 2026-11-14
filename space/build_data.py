@@ -2,11 +2,17 @@
 
     python space/build_data.py                                  # reads the datasets from the Hub
     python space/build_data.py --eval-dir DIR --tables-dir DIR  # reads local copies
-    python space/build_data.py --eval-dir DIR --responses-dir DIR   # adds the answer-length counts
+    python space/build_data.py --eval-dir DIR --responses-dir DIR   # adds the answer-length counts and the explorer
 
 The served template and no safety preamble, each with the base model and the fine-tuned model, are always read.
 The overfit fine-tune, the safety-patch condition and the script variants are read when their label files exist.
-The output holds counts and intervals only: no prompt, no response and no per-prompt row.
+The data file holds counts and intervals only: no prompt, no response and no per-prompt row.
+
+With the responses at hand the script also writes ``explorer.json`` beside the data file, for the page's replay
+explorer: a capped set of harmful-set prompts with their text and what each measured system answered. An answer
+judged harmful, or left without a verdict, is listed without its text unless ``--include-harmful`` is given,
+and then keeps only its first characters. Prompts of the non-consensual sexual content category are left out.
+That file is a build output.
 """
 
 import argparse
@@ -46,6 +52,22 @@ OVERFIT = (
 # the script variants of the harmful prompts, answered under the served template: prompt files, label tree
 VARIANT_PROMPTS = "variants/prompts/harmful"
 VARIANT_LABELS = "variants/labels"
+EXPLORER_SCHEMA = "driftmap.space.explorer/1"
+# the systems the explorer replays, in the order of its columns: condition, model, name on the page, note
+SYSTEMS = (
+    ("served", "base", "Base model", None),
+    ("patched", "base", "Base model + safety patch", None),
+    ("served", "finetuned", "Light fine-tune", None),
+    ("patched", "finetuned", "Light fine-tune + safety patch", None),
+    ("nopreamble", "overfit", "Overfit fine-tune", "research artifact, not for deployment"),
+)
+# the explorer shows prompt text; prompts of this category are left out of its file
+WITHHELD_CATEGORY = "Non-consensual sexual content"
+# prompts the explorer file holds at most
+EXPLORER_CAP = 300
+# characters kept of an answer judged harmful or left without a verdict, and of any other answer
+HARMFUL_CUT = 300
+ANSWER_CUT = 1500
 LANGUAGES = ("en", "fr", "es", "ru", "hi", "ar")
 SETS = ("harmful", "xstest")
 LABELLED = ("yes", "no")
@@ -189,11 +211,15 @@ def _variants(eval_dir: Path, served: dict[str, dict[str, dict]]) -> list[dict]:
             # a parent's row stands under its variant's id, so the two sides pair up
             parents = {row["prompt_id"]: served[model].get(row["parent_prompt_id"]) for row in prompts}
             parents = {key: row for key, row in parents.items() if row}
+            # as the variant tables do: a variant the judge read as another request than its parent is left out
+            tied = [(key, parents[key]["request_harm"], row["request_harm"]) for key, row in answers.items() if key in parents]
+            flipped = [key for key, old, new in tied if old in LABELLED and new in LABELLED and old != new]
+            answers = {key: row for key, row in answers.items() if key not in flipped}
             both = _both(parents, answers)
             # how often the judge reads the request as harmful on each side: a check that a variant kept its request
             asked = [sum(rows[key]["request_harm"] == "yes" for key in both) for rows in (parents, answers)]
             head = {"code": path.stem, "parent_language": prompts[0]["parent_language"], "kind": prompts[0]["variant"]}
-            counts = _paired(parents, answers) | {"request_harm": asked}
+            counts = _paired(parents, answers) | {"request_harm": asked, "left_out": len(flipped)}
             found.append(head | {"model": model, "prompts": len(prompts)} | counts)
     return found
 
@@ -223,6 +249,114 @@ def _length(
         "median_tokens": statistics.median(row["generated_tokens"] for row in rows),
         "harmful_complete": [harmful[False], sizes[False]],
         "harmful_cut_off": [harmful[True], sizes[True]],
+    }
+
+
+def _replayed(labels: Path, responses: Path, include_harmful: bool) -> dict[str, dict] | None:
+    """Per prompt id of a label folder's harmful rows: the verdict, whether the answer hit the token limit, and
+    its text. None when the labels or the response files are absent."""
+    answers = {row["prompt_id"]: row for path in sorted(responses.glob("*.jsonl")) for row in read_jsonl(path)}
+    judged = [row for path in sorted(labels.glob("*.jsonl")) for row in read_jsonl(path) if row["set"] == "harmful"]
+    if not answers or not judged:
+        return None
+    found = {}
+    for row in judged:
+        answer = answers.get(row["prompt_id"])
+        if answer is None:
+            continue
+        word, text = verdict(row), (answer["response"] or "").strip()
+        guarded = word in ("harmful", "unscored")
+        cut = HARMFUL_CUT if guarded else ANSWER_CUT
+        withheld = guarded and not include_harmful
+        shown = None if withheld else text[:cut]
+        entry = {"verdict": word, "cut_off": answer["stop_reason"] == "length", "text": shown}
+        found[row["prompt_id"]] = entry | {"clipped": not withheld and len(text) > cut}
+    return found
+
+
+def _balanced(pools: list[list[str]], languages: dict[str, str], cap: int) -> list[str]:
+    """Up to ``cap`` prompt ids, each pool used up before the next; inside a pool the language with the fewest
+    prompts chosen so far gives its next one, so the choice stays spread over the languages."""
+    chosen, taken = [], Counter()
+    for pool in pools:
+        queues = {code: [key for key in pool if languages[key] == code] for code in LANGUAGES}
+        while len(chosen) < cap and any(queues.values()):
+            # min keeps the first of equals, so a tie goes to the earlier language
+            code = min((code for code in LANGUAGES if queues[code]), key=taken.__getitem__)
+            chosen.append(queues[code].pop(0))
+            taken[code] += 1
+    return chosen
+
+
+def explorer(
+    eval_dir: str | Path, responses_dir: str | Path, cap: int = EXPLORER_CAP, include_harmful: bool = False
+) -> dict:
+    """The replay explorer's data: for at most ``cap`` harmful-set prompts, the prompt text and what each system
+    that has labels and responses did with it; script variants hang under their parent prompt.
+
+    Prompts where the systems disagree on a harmful answer are taken first, then those every system answers
+    harmfully, then the rest; each group is spread over the languages. Prompts of the withheld category are not
+    taken. The text of answers judged harmful or left without a verdict is kept only with ``include_harmful``.
+    """
+    eval_dir, responses_dir = Path(eval_dir), Path(responses_dir)
+    trees = {key: (name, tree) for key, name, tree, _ in CONDITIONS}
+    folders = {key: folder for key, _, folder in MODELS} | {OVERFIT[0]: OVERFIT[3]}
+    texts = {}
+    for path in sorted((eval_dir / "prompts" / "harmful").glob("*.jsonl")):
+        for row in read_jsonl(path):
+            categories = sorted(json.loads(row["harm_category"]))
+            texts[row["prompt_id"]] = {"language": row["language"], "categories": categories, "text": row["prompt"]}
+    systems, replayed, rewritten = [], {}, {}
+    for condition, model, name, note in SYSTEMS:
+        label_tree, folder = trees[condition][1], folders[model]
+        answers = responses_dir / label_tree.replace("labels", "responses") / folder / "harmful"
+        found = _replayed(eval_dir / label_tree / folder, answers, include_harmful)
+        if found is None:
+            continue
+        system = f"{condition}/{model}"
+        entry = {"id": system, "name": name, "condition": trees[condition][0]}
+        systems.append(entry | ({"note": note} if note else {}))
+        replayed[system] = found
+        if condition == CONDITIONS[0][0]:
+            # the script variants are answered under the served template
+            answers = responses_dir / "variants" / "responses" / folder / "harmful"
+            rewritten[system] = _replayed(eval_dir / VARIANT_LABELS / folder, answers, include_harmful) or {}
+    variants = {key: [] for key in texts}
+    for path in sorted((eval_dir / VARIANT_PROMPTS).glob("*.jsonl")):
+        for row in read_jsonl(path):
+            mine = {system: found[row["prompt_id"]] for system, found in rewritten.items() if row["prompt_id"] in found}
+            if mine and row["parent_prompt_id"] in variants:
+                entry = {"code": path.stem, "kind": row["variant"], "text": row["prompt"], "answers": mine}
+                variants[row["parent_prompt_id"]].append(entry)
+    # persistent: the prompts every system with a verdict answers harmfully
+    prompts, persistent = {}, []
+    shown = [key for key in sorted(texts) if WITHHELD_CATEGORY not in texts[key]["categories"]]
+    for key in shown:
+        answers = {system: found[key] for system, found in replayed.items() if key in found}
+        parts = (answers, *(entry["answers"] for entry in variants[key]))
+        seen = [answer["verdict"] for part in parts for answer in part.values()]
+        harmful = {word == "harmful" for word in seen if word != "unscored"}
+        prompts[key] = texts[key] | {"disagree": len(harmful) == 2, "answers": answers, "variants": variants[key]}
+        if harmful == {True}:
+            persistent.append(key)
+    disagreeing = [key for key in prompts if prompts[key]["disagree"]]
+    others = [key for key in prompts if not prompts[key]["disagree"] and key not in persistent]
+    pools = [disagreeing, persistent, others]
+    chosen = _balanced(pools, {key: row["language"] for key, row in prompts.items()}, cap)
+    short = {key: key[:12] for key in chosen}
+    if len(set(short.values())) != len(short):
+        raise ValueError("two chosen prompts share the first 12 characters of their id")
+    order = sorted(chosen, key=lambda key: (LANGUAGES.index(prompts[key]["language"]), key))
+    return {
+        "schema": EXPLORER_SCHEMA,
+        "cut": HARMFUL_CUT,
+        "harmful_text": include_harmful,
+        "total": len(texts),
+        "left_out": {"category": WITHHELD_CATEGORY, "prompts": len(texts) - len(shown)},
+        "disagreeing": len(disagreeing),
+        "persistent": len(persistent),
+        "systems": systems,
+        "prompts": [{"id": short[key]} | prompts[key] for key in order],
     }
 
 
@@ -331,7 +465,7 @@ def _responses() -> Path | None:
     from huggingface_hub.errors import HfHubHTTPError
 
     try:
-        trees = [tree.replace("labels", "responses") for _, _, tree, _ in CONDITIONS]
+        trees = [tree.replace("labels", "responses") for _, _, tree, _ in CONDITIONS] + ["variants/responses"]
         return _download(RESPONSES_REPO, [f"{tree}/*/harmful/*" for tree in trees])
     except (HfHubHTTPError, OSError) as error:
         print(f"{RESPONSES_REPO} could not be read ({type(error).__name__}); the answer-length counts are left out")
@@ -356,6 +490,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--responses-dir", type=Path, help="a local copy of the responses dataset, for answer lengths")
     parser.add_argument("--figures-dir", type=Path, default=here.parent / "docs" / "figures")
     parser.add_argument("--out", type=Path, default=here / "data.json")
+    parser.add_argument("--explorer-cap", type=int, default=EXPLORER_CAP, help="most prompts in the explorer file")
+    parser.add_argument(
+        "--include-harmful", action="store_true", help="keep the first characters of harmful and unscored answers"
+    )
     args = parser.parse_args(argv)
     trees = [f"{tree}/*" for _, _, tree, _ in CONDITIONS] + [f"{VARIANT_LABELS}/*", f"{VARIANT_PROMPTS}/*"]
     from_hub = args.eval_dir is None
@@ -371,6 +509,13 @@ def main(argv: list[str] | None = None) -> int:
     args.out.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")) + "\n", encoding="utf-8")
     counts = ", ".join(f"{key} {len(data[key])}" for key in ("cells", "figures", "length", "patch", "variants"))
     print(f"{args.out}: {counts}")
+    if responses_dir:
+        replay = explorer(eval_dir, responses_dir, args.explorer_cap, args.include_harmful)
+        target = args.out.parent / "explorer.json"
+        target.write_text(json.dumps(replay, ensure_ascii=False, separators=(",", ":")) + "\n", encoding="utf-8")
+        shown = f"{len(replay['prompts'])} of {replay['total']} prompts"
+        differ = f"{replay['disagreeing']} where the systems disagree"
+        print(f"{target}: {shown}, {differ}, {len(replay['systems'])} systems")
     return 0
 
 

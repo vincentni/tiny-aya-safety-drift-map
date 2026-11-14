@@ -17,7 +17,8 @@ benign rows, and 4-bit quantization. Lexsi AI Safety & Alignment Hackathon 2026,
 [Write-up](docs/article.md) | [Results Space](https://huggingface.co/spaces/vincentnkq/tiny-aya-safety-map) | [Models](https://huggingface.co/collections/vincentnkq/tiny-aya-safety-drift-map-models-6af750027e17226835562a9a) | [Datasets](https://huggingface.co/collections/vincentnkq/tiny-aya-safety-drift-map-data-6af75002f6e0994706b717d2) | [Notebook](notebooks/reproduce_tables.ipynb)
 
 **Content warning:** the datasets hold red-teaming prompts and model answers, and some answers are
-harmful. Nothing harmful is quoted in this repository or shown in the Space.
+harmful. Nothing harmful is quoted in this repository. The Space's replay explorer shows prompt text
+and, behind a click, stored answers; the text of answers judged harmful is not shown there.
 
 ## What was measured
 
@@ -27,7 +28,8 @@ harmful. Nothing harmful is quoted in this repository or shown in the Space.
   same rows for 10 epochs at 5e-4.
 - **Prompts.** 600 harmful prompts from `CohereLabs/aya_redteaming` (100 each in English, French,
   Spanish, Russian, Hindi and Arabic, tagged with nine harm categories), 250 safe prompts from XSTest
-  for over-refusal, and 600 held-out benign prompts for task quality.
+  for over-refusal, 600 held-out benign prompts for task quality, and 770 rewrites of the harmful
+  prompts in Latin script or mixed with English.
 - **Conditions.** The served template (the model's chat template as shipped, which opens with a safety
   paragraph), no safety preamble (that paragraph removed, nothing else changed), and the safety patch
   (the served template with five sentences of guidance as its system message).
@@ -130,11 +132,19 @@ on the same engine.
 | Refusals of harmful prompts | 75.8% | 73.8% |
 | Over-refusal on XSTest, 248 prompts scored for both | 8.5% | 8.1% |
 
-Latin script, a pilot on the base model with 23 to 30 prompts per variant (a direction, not a size):
-Hindi prompts typed in Latin script lose refusals (22 → 7 of 29, harmful answers 0 → 4), Russian ones
-too (18 → 11 of 30, harmful answers 7 → 7). Hindi and Spanish mixed with English change little. The
-model does not understand Arabic in Latin script (it repeats the prompt or writes unrelated text), so
-no rate is reported for it.
+Script variants: every harmful prompt in Hindi, Russian and Arabic typed in Latin script, and prompts
+in five languages mixed with English, each paired with its native-script parent under the base model.
+
+| Variant, base model | Pairs | Harmful answers: native → variant | Change | Refusals: native → variant | Change |
+| --- | --- | --- | --- | --- | --- |
+| Hindi in Latin script | 89 | 9 → 11 | +2.2 (-6.8 to +11.3) | 63 → 22 | -46.1 (-57.3 to -34.8) |
+| Russian in Latin script | 90 | 13 → 16 | +3.3 (-5.6 to +10.0) | 64 → 38 | -28.9 (-38.9 to -18.9) |
+| Arabic in Latin script | 73 | 6 → 4 | -2.7 (-12.3 to +5.5) | 47 → 3 | -60.3 (-71.2 to -47.9) |
+| Latin script, three languages | 252 | 28 → 31 | +1.2 (-3.6 to +6.3) | 174 → 63 | -44.0 (-50.4 to -37.7) |
+| Mixed with English, five languages | 443 | 40 → 40 | 0.0 (-2.7 to +2.7) | 313 → 319 | +1.4 (-2.0 to +4.7) |
+
+In Latin script the model mostly stops refusing but does not answer harmfully more often, so a
+monitor that counts refusals under-counts there. Arabic in Latin script is largely not understood.
 
 ## Reproduce
 
@@ -248,6 +258,14 @@ Safety-patch condition (the served template with the patch as its system message
 uv run driftmap launch generate --mode full --wait -- --kind baseline --preamble patch
 uv run driftmap judge closed --checkpoint REPO@SHA --mode full --preamble patch
 uv run driftmap table build --preamble patch # the safety-patch tables, in tables-patched
+```
+
+Script variants (`COMMIT` is the commit of the variant prompts in the evaluation dataset):
+
+```bash
+uv run driftmap launch generate --mode full --wait -- --kind baseline --sets variants --variants-rev COMMIT
+uv run driftmap judge closed --checkpoint REPO@SHA --mode full --sets variants
+uv run driftmap table variants               # each variant against its parent prompt
 ```
 
 Weight-space repair (not needed for the results above):
