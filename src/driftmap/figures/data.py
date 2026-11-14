@@ -2,9 +2,9 @@
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, NamedTuple, Protocol
 
-from ..core.records import ChrfRow, RateRow, Tables
+from ..core.records import ChrfRow, DeltaRow, RateRow, Tables
 from ..core.settings import Settings
 from ..table.breakdown import (
     CELL,
@@ -30,29 +30,11 @@ LENGTH_LABELS = {COMPLETE: "Complete answers", TRUNCATED: "Answers cut off at th
 # a stress set of rewritten prompts, as named on an axis; one not listed goes by its own name
 VARIANT_NAMES = {"harmful_romanized": "Latin script", "harmful_codemixed": "Mixed with English"}
 HARMFUL_UNIT = "Harmful answers (% of scored responses)"
-# metric, its row in the tables, panel title, value axis, and what to call a fall, no clear change and a rise
+# metric, its row in the tables, panel title and value axis
 METRICS = (
-    (
-        "safe",
-        "all",
-        "Harmful answers",
-        "% of scored responses to harmful prompts",
-        ("more harmful answers", "no clear change in harmful answers", "fewer harmful answers"),
-    ),
-    (
-        "over_refusal",
-        "en",
-        "Over-refusal (XSTest)",
-        "% of safe prompts refused",
-        ("less over-refusal", "no clear change in over-refusal", "more over-refusal"),
-    ),
-    (
-        "chrf",
-        "all",
-        "Task score (chrF)",
-        "chrF on held-out benign prompts, 0 to 100",
-        ("a lower task score", "no clear change in task score", "a higher task score"),
-    ),
+    ("safe", "all", "Harmful answers", "% of scored responses to harmful prompts"),
+    ("over_refusal", "en", "Over-refusal (XSTest)", "% of safe prompts refused"),
+    ("chrf", "all", "Task score (chrF)", "chrF on held-out benign prompts, 0 to 100"),
 )
 
 
@@ -178,6 +160,44 @@ def _condition(condition: str) -> str:
     return _capital(CONDITION_NAMES.get(condition, condition))
 
 
+class StoredPairing(NamedTuple):
+    """A pairing as a stored file holds it."""
+
+    set: str
+    language: str
+    metric: str
+    n_pairs: int
+    parent: float | None
+    variant: float | None
+    delta: float | None
+    ci: tuple[float, float] | None
+    p_value: float | None
+
+
+def pairings(stored: Mapping[str, Iterable[Any]]) -> dict[str, list[StoredPairing]]:
+    """The pairings of each column from a stored file: per column a list of objects, or lists, of a pairing's fields.
+
+    TypeError, ValueError or LookupError for content of another shape.
+    """
+    found = {}
+    for column, rows in stored.items():
+        made = [StoredPairing(**row) if isinstance(row, Mapping) else StoredPairing(*row) for row in rows]
+        for row in made:
+            if not isinstance(row.n_pairs, int) or not isinstance(row.set, str) or not isinstance(row.language, str):
+                raise TypeError("a pairing names its set and language and counts its pairs")
+        found[column] = [row._replace(ci=tuple(row.ci) if row.ci else None) for row in made]
+    return found
+
+
+def _points(delta: DeltaRow, *, turned: bool = False, unit: str = " points", interval: str = "") -> str:
+    """A paired change with its interval on a scale of 100; ``turned`` reads a change of the safe rate as harmful."""
+    sign = -100 if turned else 100
+    # adding 0.0 turns a rounded -0.0 into 0.0
+    change, *bounds = (round(sign * value, 1) + 0.0 for value in (delta.delta, *delta.ci))
+    low, high = sorted(bounds)
+    return f"{change:+.1f}{unit} ({interval}{low:+.1f} to {high:+.1f})"
+
+
 def _tabled(tables: Tables) -> list[str]:
     return [column for column in COLUMNS if column in tables.columns and tables.columns[column].state == "tabled"]
 
@@ -192,47 +212,48 @@ def _rows(tables: Tables, metric: str) -> list:
     return tables.over_refusal if metric == "over_refusal" else [row for row in tables.safety if row.metric == "safe"]
 
 
-def harmful_by_language(tables: Mapping[str, Tables], settings: Settings) -> Chart:
+def harmful_by_language(
+    tables: Mapping[str, Tables], settings: Settings, names: Mapping[str, str] = COLUMN_NAMES
+) -> Chart:
     """Harmful-response rate per language and pooled: a panel per condition, a series per tabled column.
 
     The languages run from the weakest down by the first column of the first condition; the pooled rate is last.
+    ``names`` gives the name each column is shown under.
     """
-    names = [*settings.languages, "all"]
+    codes = [*settings.languages, "all"]
     found = []
     for condition, table in tables.items():
         series = []
         for column in _tabled(table):
-            rows = [_row(_rows(table, "safe"), name, column, settings) for name in names]
+            rows = [_row(_rows(table, "safe"), code, column, settings) for code in codes]
             points = tuple(_percent(row.rate, row.ci, turned=True) if row else Estimate(None) for row in rows)
-            series.append(Series(COLUMN_NAMES.get(column, column), points))
+            series.append(Series(names.get(column, column), points))
         found.append((_condition(condition), series))
-    lead = found[0][1][0].points if found[0][1] else (Estimate(None),) * len(names)
-    worst = sorted(range(len(names) - 1), key=lambda at: (lead[at].value is None, -(lead[at].value or 0.0), at))
-    order = [*worst, len(names) - 1]
-    labels = tuple(LANGUAGE_NAMES.get(names[at], _capital(names[at])) for at in order)
+    lead = found[0][1][0].points if found[0][1] else (Estimate(None),) * len(codes)
+    worst = sorted(range(len(codes) - 1), key=lambda at: (lead[at].value is None, -(lead[at].value or 0.0), at))
+    order = [*worst, len(codes) - 1]
+    labels = tuple(LANGUAGE_NAMES.get(codes[at], _capital(codes[at])) for at in order)
     panels = []
     for shown, series in found:
         ordered = tuple(Series(one.name, tuple(one.points[at] for at in order)) for one in series)
         panels.append(Panel(shown, HARMFUL_UNIT, labels, ordered))
-    pooled = [series.points[-1].value for series in panels[0].series]
-    if len(pooled) < 2 or None in pooled:
+    rated = [at for at in worst if lead[at].value is not None]
+    if not rated:
         return Chart("Harmful answers by language", tuple(panels))
-    first, last = f"{pooled[0]:.1f}%", f"{pooled[-1]:.1f}%"
-    moved = "lowered" if pooled[-1] < pooled[0] else "raised"
-    change = f"{moved} the harmful-response rate from {first} to {last}"
-    change = change if first != last else f"left the harmful-response rate at {first}"
-    title = f"{panels[0].title}: fine-tuning on benign data {change}"
-    if lead[order[0]].value is not None:
-        title += f"; {labels[0]} is weakest at {panels[0].series[0].name} ({lead[order[0]].value:.1f}%)"
-    return Chart(title, tuple(panels))
+    ends = [f"{lead[at].value:.0f}% in {LANGUAGE_NAMES.get(codes[at], codes[at])}" for at in (rated[0], rated[-1])]
+    where = f"{panels[0].series[0].name}, {panels[0].title.lower()}"
+    return Chart(f"Harmful answers by language: {', '.join(dict.fromkeys(ends))} ({where})", tuple(panels))
 
 
-def before_after(tables: Mapping[str, Tables], settings: Settings) -> Chart:
-    """Harmful-response rate, over-refusal and chrF of each tabled column: a panel per metric, a group per condition."""
+def before_after(tables: Mapping[str, Tables], settings: Settings, names: Mapping[str, str] = COLUMN_NAMES) -> Chart:
+    """Harmful-response rate, over-refusal and chrF of each tabled column: a panel per metric, a group per condition.
+
+    The title states the paired changes between the first two columns under the first condition, with intervals.
+    """
     columns = list(dict.fromkeys(column for table in tables.values() for column in _tabled(table)))
     labels = tuple(_condition(condition) for condition in tables)
-    panels, findings = [], []
-    for metric, name, title, unit, words in METRICS:
+    panels = []
+    for metric, name, title, unit in METRICS:
         series = []
         for column in columns:
             points = []
@@ -244,25 +265,26 @@ def before_after(tables: Mapping[str, Tables], settings: Settings) -> Chart:
                     points.append(Estimate(None if row.chrf is None else row.chrf * 100))
                 else:
                     points.append(_percent(row.rate, row.ci, turned=metric == "safe"))
-            series.append(Series(COLUMN_NAMES.get(column, column), tuple(points)))
+            series.append(Series(names.get(column, column), tuple(points)))
         panels.append(Panel(title, unit, labels, tuple(series)))
-        signs = set()
-        for table in tables.values():
-            between = _tabled(table)[:2]
-            deltas = [
-                row for row in table.deltas if [row.a, row.b] == between and (row.metric, row.row) == (metric, name)
-            ]
-            # a change counts once its interval leaves zero
-            apart = bool(deltas) and deltas[0].ci is not None and (deltas[0].ci[0] > 0 or deltas[0].ci[1] < 0)
-            signs.add((deltas[0].delta > 0) - (deltas[0].delta < 0) if apart else 0)
-        # one phrase when the conditions agree
-        findings.append(
-            words[signs.pop() + 1] if len(signs) == 1 else f"mixed results on {title[:1].lower()}{title[1:]}"
-        )
-    scope = {1: "", 2: " under both prompt conditions"}.get(len(labels), " under every prompt condition")
-    if len(columns) < 2:
+    lead = next(iter(tables.values()))
+    between = _tabled(lead)[:2]
+    changes = [
+        next((row for row in lead.deltas if [row.a, row.b, row.metric, row.row] == [*between, metric, name]), None)
+        for metric, name, *_ in METRICS
+    ]
+    if len(between) < 2 or any(row is None or row.delta is None for row in changes):
         return Chart("Harmful answers, over-refusal and task score", tuple(panels))
-    return Chart(f"After fine-tuning: {', '.join(findings)}{scope}", tuple(panels))
+    before, after = (_row(_rows(lead, "safe"), "all", column, settings) for column in between)
+    harmful = [f"{row.n - row.k} of {row.n}" for row in (before, after)]
+    counts = f"{before.n - before.k} to {harmful[1]}" if before.n == after.n else " to ".join(harmful)
+    said = (
+        f"harmful answers {counts}, {_points(changes[0], turned=True, interval='95% CI ')}",
+        f"over-refusal {_points(changes[1])}",
+        f"chrF {_points(changes[2], unit='')}",
+    )
+    scope = f"{labels[0]}, {' to '.join(names.get(column, column) for column in between)}"
+    return Chart(f"{scope}: {'; '.join(said)}", tuple(panels))
 
 
 def _rates(breakdown: Breakdown, condition: str, by: str, column: str) -> dict[tuple, BreakdownRate]:
@@ -295,17 +317,14 @@ def by_category(breakdown: Breakdown) -> Chart:
             found = [rates.get((category, None)) for category in categories]
             series.append(Series(shown, tuple(_percent(row.rate, row.ci) if row else Estimate(None) for row in found)))
         panels.append(Panel(_condition(condition), HARMFUL_UNIT, labels, tuple(series)))
-    first, *later = [[point.value for point in series.points] for series in panels[0].series]
+    first = [point.value for point in panels[0].series[0].points]
     if not categories or first[0] is None:
         return Chart("Harmful answers by harm category", tuple(panels))
-    lead = panels[0]
-    worst = f"{labels[0]} ({first[0]:.1f}%, {lead.title.lower()})"
-    title = f"Most harmful answers at {lead.series[0].name}: {worst}"
-    if later:
-        pairs = [pair for pair in zip(first, later[-1], strict=True) if None not in pair]
-        lower = sum(after < before for before, after in pairs)
-        title += f"; fine-tuning lowers the rate in {lower} of {len(pairs)} categories"
-    return Chart(title, tuple(panels))
+    ranked = [
+        f"{label} ({value:.1f}%)" for label, value in zip(labels[:2], first[:2], strict=False) if value is not None
+    ]
+    where = f"{panels[0].series[0].name}, {panels[0].title.lower()}"
+    return Chart(f"Most harmful answers by harm category: {', then '.join(ranked)} ({where})", tuple(panels))
 
 
 def category_by_language(breakdown: Breakdown) -> Heat:
@@ -400,10 +419,11 @@ def _estimates(rows: Iterable) -> tuple[Estimate, ...]:
 def truncation(breakdown: Breakdown) -> Chart:
     """Harmful-response rate of complete answers and of answers cut off at the token cap, noting the share of each.
 
-    A panel per condition and a series per column; no panel when the breakdown read no stored answer.
+    A panel per condition and a series per column; no panel when the breakdown read no stored answer. The title
+    speaks for the first condition that has two columns.
     """
     name = breakdown.rates[0].set
-    panels, capped = [], []
+    panels, capped = [], {}
     for condition in breakdown.conditions:
         series = []
         for column, shown in breakdown.columns.items():
@@ -415,7 +435,7 @@ def truncation(breakdown: Breakdown) -> Chart:
             ]
             if not cut or cut[0] is None:
                 continue
-            capped += [cut[0] * 100] if not panels else []
+            capped.setdefault(condition, []).append(cut[0] * 100)
             rates = {
                 row.length: row
                 for row in breakdown.rates
@@ -427,12 +447,9 @@ def truncation(breakdown: Breakdown) -> Chart:
         if series:
             labels = tuple(LENGTH_LABELS[length] for length in LENGTHS)
             panels.append(Panel(_condition(condition), HARMFUL_UNIT, labels, tuple(series)))
-    if not panels:
-        return Chart("Harmful answers by answer length", ())
-    moves = {
-        (row.length_a, row.length_b): flips(row.counts) for row in _moves(breakdown, next(iter(breakdown.conditions)))
-    }
-    if (None, None) not in moves or len(capped) < 2:
+    lead = next((condition for condition, shares in capped.items() if len(shares) > 1), None)
+    moves = {(row.length_a, row.length_b): flips(row.counts) for row in _moves(breakdown, lead)} if lead else {}
+    if (TRUNCATED, COMPLETE) not in moves:
         return Chart("Harmful answers by answer length", tuple(panels))
     net = moves[None, None].to_safe - moves[None, None].to_harmful
     shortened = moves[TRUNCATED, COMPLETE].to_safe - moves[TRUNCATED, COMPLETE].to_harmful
@@ -443,8 +460,8 @@ def truncation(breakdown: Breakdown) -> Chart:
         finding = "Fewer harmful answers after fine-tuning, mostly because answers got shorter"
     else:
         finding = "Fewer harmful answers after fine-tuning, and not mostly through shorter answers"
-    cap = f"{capped[0]:.0f}% ran into the token cap before, {capped[-1]:.0f}% after"
-    return Chart(f"{finding}: {cap} ({panels[0].title.lower()})", tuple(panels))
+    cap = f"{capped[lead][0]:.0f}% ran into the token cap before, {capped[lead][-1]:.0f}% after"
+    return Chart(f"{finding}: {cap} ({_condition(lead).lower()})", tuple(panels))
 
 
 def script_variants(results: Mapping[str, Iterable[Pairing]]) -> Chart:

@@ -72,18 +72,26 @@ def write_answers(root: Path, rows: list[GenerationRow]) -> Path:
 
 
 def lay(
-    root: Path, plan, *, set_="harmful", columns=("baseline", "drifted"), responses: Path | None = None
+    root: Path,
+    plan,
+    *,
+    set_="harmful",
+    columns=("baseline", "drifted"),
+    responses: Path | None = None,
+    checkpoints: dict[str, str] | None = None,
 ) -> dict[tuple[str, str], Tags]:
     """Write the label rows of a plan under ``root`` and, with ``responses``, their stored answers there.
 
-    Returns the tags of the plan's prompts by language and prompt id.
+    ``checkpoints`` names the checkpoint of a column where it is not the usual one. Returns the tags of the plan's
+    prompts by language and prompt id.
     """
     rows, answers, tagged, seen = [], [], {}, {}
     for language, categories, origin, *outcomes in plan:
         index = seen[language] = seen.get(language, -1) + 1
         for column, outcome in zip(columns, outcomes, strict=False):
             refusal, harm = LABELS[outcome.removesuffix(CUT)]
-            rows.append(label(column, language, index, set_=set_, refusal=refusal, response_harm=harm))
+            named = {"checkpoint": checkpoints[column]} if column in (checkpoints or {}) else {}
+            rows.append(label(column, language, index, set_=set_, refusal=refusal, response_harm=harm, **named))
             answers += [answer(rows[-1], outcome.endswith(CUT))] if responses is not None else []
         tagged[language, rows[-1].prompt_id] = Tags(categories, origin)
     write_labels(root, rows)

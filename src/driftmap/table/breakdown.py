@@ -23,6 +23,8 @@ SETS = ("harmful",)
 # how a prompt condition and a column are named to a reader; one not listed goes by its key
 CONDITION_NAMES = {"keep": "served template", "strip": "no safety preamble", "patch": "safety patch"}
 COLUMN_NAMES = {"drifted": "fine-tuned"}
+# the drifted column of a breakdown of the other fine-tune
+FINE_TUNE_NAMES = {"aggressive": "aggressive fine-tune"}
 # an answer by whether generation ended on its own or at the cap on new tokens, and how each is named to a reader
 LENGTHS = COMPLETE, TRUNCATED = ("complete", "truncated")
 LENGTH_NAMES = {COMPLETE: "complete", TRUNCATED: "cut off at the cap"}
@@ -142,6 +144,8 @@ class AtCap(Record):
 
 class Breakdown(Record):
     schema_: Literal["driftmap.breakdown/1"] = Field(alias="schema")
+    # the fine-tune of the drifted column
+    fine_tune: str
     # key to the name shown, in the order built
     conditions: dict[str, str]
     columns: dict[str, str]
@@ -324,13 +328,15 @@ def build(
     *,
     mode: Mode = "full",
     responses: Mapping[str, str | Path] | None = None,
+    fine_tune: str = "standard",
 ) -> Breakdown:
     """Break down the label rows of each condition's ``<labels_dir>/<checkpoint>/<language>.jsonl``.
 
     ``labels`` maps a prompt condition to its label folder, ``tagged`` a label set to the tags of its prompts by
     language and prompt id; both decide what is broken down. ``responses`` maps a condition to the folder of its
     stored answers, ``<checkpoint>/<set>/<language>.jsonl``: with it, every labelled answer is also told apart by
-    whether it was cut off at the cap on new tokens. Raises DriftmapError on rows that do not fit.
+    whether it was cut off at the cap on new tokens. ``fine_tune`` names the fine-tune of the drifted column; label
+    rows of the other one are refused. Raises DriftmapError on rows that do not fit.
     """
     screens = [record for record in records if isinstance(record, AlphaScreen)]
     chosen = bool(screens) and screens[-1].recover_status == "chosen"
@@ -339,7 +345,7 @@ def build(
     for condition, labels_dir in labels.items():
         rows = [row for row in table._read(Path(labels_dir)) if row.set in tagged]
         lengths = _lengths(Path(responses[condition]), tagged) if responses is not None else None
-        columns, _ = table._columns(rows, settings, chosen, mode)
+        columns, _ = table._columns(rows, settings, chosen, mode, fine_tune)
         found = {column: table._judge(column, columns[column], settings, mode) for column in columns}
         judged = [column for column in table.COLUMNS if found.get(column)]
         judges |= {f"{condition}/{column}": found[column] for column in judged}
@@ -363,10 +369,12 @@ def build(
         raise DriftmapError(ExitCode.USAGE, f"no judged labels of {sought}")
     conditions = dict.fromkeys(row.condition for row in rates)
     columns = [column for column in table.COLUMNS if any(row.column == column for row in rates)]
+    names = COLUMN_NAMES | ({"drifted": FINE_TUNE_NAMES[fine_tune]} if fine_tune in FINE_TUNE_NAMES else {})
     return Breakdown(
         schema=SCHEMA_BREAKDOWN,
+        fine_tune=fine_tune,
         conditions={condition: CONDITION_NAMES.get(condition, condition) for condition in conditions},
-        columns={column: COLUMN_NAMES.get(column, column) for column in columns},
+        columns={column: names.get(column, column) for column in columns},
         min_cell_n=MIN_CELL_N,
         token_cap=settings.decoding.max_new_tokens if at_cap else None,
         rates=rates,

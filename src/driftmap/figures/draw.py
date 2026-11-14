@@ -88,15 +88,17 @@ def _ceiling(chart: Chart) -> float:
     return 5 * math.ceil(max(highs, default=5) / 5) or 5
 
 
-def _legend(figure: Figure, handles: list, names: list[str]) -> None:
-    figure.legend(handles, names, loc="outside lower center", ncols=len(names), handletextpad=0.5, columnspacing=2.0)
+def _legend(figure: Figure, handles: dict[str, object]) -> None:
+    """One entry per series name, whichever panel drew it first."""
+    spacing = {"handletextpad": 0.5, "columnspacing": 2.0}
+    figure.legend(handles.values(), handles.keys(), loc="outside lower center", ncols=len(handles), **spacing)
 
 
 def dots(chart: Chart) -> Figure:
     """A point with its interval per label and series, a panel per condition on one value axis."""
     figure = _figure(chart.title, 3.9)
     axes = figure.subplots(1, len(chart.panels), sharey=True, squeeze=False)[0]
-    handles = []
+    handles = {}
     for axis, panel in zip(axes, chart.panels, strict=True):
         ticks = list(range(len(panel.labels)))
         for series, offset, colour in zip(
@@ -104,7 +106,7 @@ def dots(chart: Chart) -> Figure:
         ):
             xs, ys, arms = _spans(series.points, [tick + offset for tick in ticks])
             drawn = axis.errorbar(xs, ys, yerr=arms, fmt="o", color=colour, markersize=5, capsize=2.5, elinewidth=1.2)
-            handles.append(drawn) if axis is axes[0] else None
+            handles.setdefault(series.name, drawn)
         # the pooled rate stands apart from the languages
         axis.axvline(len(ticks) - 1.5, color=RULE, linewidth=0.8)
         axis.set_xticks(ticks, panel.labels)
@@ -113,7 +115,7 @@ def dots(chart: Chart) -> Figure:
         axis.tick_params(axis="x", length=0)
     axes[0].set_ylim(0, _ceiling(chart))
     axes[0].set_ylabel(chart.panels[0].unit)
-    _legend(figure, handles, [series.name for series in chart.panels[0].series])
+    _legend(figure, handles)
     return figure
 
 
@@ -127,7 +129,7 @@ def bars(chart: Chart, *, shared: bool = False) -> Figure:
     axes = figure.subplots(1, len(chart.panels), sharey=shared, squeeze=False)[0]
     # a note needs room beside its neighbour's
     gap, width = (0.46, 0.42) if noted else (0.4, 0.36)
-    handles = []
+    handles = {}
     for axis, panel in zip(axes, chart.panels, strict=True):
         ticks = list(range(len(panel.labels)))
         suffix = "%" if "%" in panel.unit else ""
@@ -136,7 +138,7 @@ def bars(chart: Chart, *, shared: bool = False) -> Figure:
             xs, ys, arms = _spans(series.points, [tick + offset for tick in ticks])
             whiskers = {"elinewidth": 1.0, "capsize": 2.5, "ecolor": INK}
             drawn = axis.bar(xs, ys, width=width, color=colour, yerr=arms, error_kw=whiskers)
-            handles.append(drawn) if axis is axes[0] else None
+            handles.setdefault(series.name, drawn)
             notes = [note for note, point in zip(series.notes, series.points, strict=False) if point.value is not None]
             for at, (x, y) in enumerate(zip(xs, ys, strict=True)):
                 peak = y + (arms[1][at] if arms else 0.0)
@@ -153,7 +155,7 @@ def bars(chart: Chart, *, shared: bool = False) -> Figure:
         axis.set_ylim(0, (_ceiling(chart) if shared else top) * (1.25 if noted else 1.18) or 1)
         axis.tick_params(axis="x", length=0)
         axis.yaxis.grid(True, color=RULE, linewidth=0.6)
-    _legend(figure, handles, [series.name for series in chart.panels[0].series])
+    _legend(figure, handles)
     return figure
 
 
@@ -162,13 +164,13 @@ def rows(chart: Chart) -> Figure:
     count = len(chart.panels[0].labels)
     figure = _figure(chart.title, 1.5 + 0.4 * count)
     axes = figure.subplots(1, len(chart.panels), sharey=True, sharex=True, squeeze=False)[0]
-    handles = []
+    handles = {}
     for axis, panel in zip(axes, chart.panels, strict=True):
         ticks = list(range(count))
         for series, offset, colour in zip(panel.series, _offsets(len(panel.series), 0.3), SERIES_COLOURS, strict=False):
             ys, xs, arms = _spans(series.points, [tick + offset for tick in ticks])
             drawn = axis.errorbar(xs, ys, xerr=arms, fmt="o", color=colour, markersize=5, capsize=2.5, elinewidth=1.2)
-            handles.append(drawn) if axis is axes[0] else None
+            handles.setdefault(series.name, drawn)
         axis.set_yticks(ticks, panel.labels)
         axis.set_title(panel.title)
         axis.set_xlabel(panel.unit)
@@ -177,7 +179,7 @@ def rows(chart: Chart) -> Figure:
     # the axes share one range, wide enough for every interval
     axes[0].set_xlim(0, _ceiling(chart))
     axes[0].invert_yaxis()
-    _legend(figure, handles, [series.name for series in chart.panels[0].series])
+    _legend(figure, handles)
     return figure
 
 
@@ -246,8 +248,7 @@ def flows(shown: Flows) -> Figure:
         axis.set_xlabel(panel.note.replace(". ", ".\n"), fontsize=8.5, color=FAINT)
         axis.tick_params(axis="x", length=0)
     axes[0].set_ylabel(f"Share of harmful prompts (%, n = {shown.panels[0].n})")
-    patches = [Patch(color=STATE_COLOURS[state]) for state in shown.states]
-    _legend(figure, patches, list(shown.states))
+    _legend(figure, {state: Patch(color=STATE_COLOURS[state]) for state in shown.states})
     return figure
 
 
@@ -282,9 +283,9 @@ def draw_all(
     }
     with rc_context(STYLE):
         drawn = {
-            "language": dots(data.harmful_by_language(tables, settings)),
+            "language": dots(data.harmful_by_language(tables, settings, breakdown.columns)),
             "cells": heat(data.category_by_language(breakdown)),
-            "axes": bars(data.before_after(tables, settings)),
+            "axes": bars(data.before_after(tables, settings, breakdown.columns)),
             "categories": rows(data.by_category(breakdown)),
             **({"outcomes": flows(moved)} if moved.panels else {}),
             **{name: bars(chart, shared=name != "patch") for name, chart in charts.items() if chart.panels},

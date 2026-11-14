@@ -37,6 +37,8 @@ from .stats import BOOTSTRAP_SEED, group_gap, paired_delta
 COLUMNS = ("baseline", "drifted", "repaired", "repaired_q4")
 SHOWN = ("tabled", "not_comparable")
 LOW_RESOURCE = ("hi", "ar")
+# the fine-tune a table's drifted column holds, by the training condition its repos are named after
+FINE_TUNES = {"standard": "keep", "aggressive": "strip"}
 DRIFT_POINTS = 5
 DRIFT_FLAG = "drift_below_threshold"
 # record-note prefix a generation run writes when its conditions differ
@@ -63,21 +65,21 @@ class DuplicateKey(DriftmapError):
     exit_code_default = ExitCode.INTEGRITY
 
 
-def _repo_columns(settings: Settings, mode: Mode | None = None) -> dict[str, str]:
-    """Column per repo name; a full build leaves out the repos a smoke run pushes to."""
+def _repo_columns(settings: Settings, mode: Mode | None = None, fine_tune: str | None = None) -> dict[str, str]:
+    """Column per repo name; a full build leaves out the repos a smoke run pushes to.
+
+    With ``fine_tune`` only that fine-tune's repos are the drifted column; without it either one's are.
+    """
     repos = settings.repos
-    placed = {
-        settings.sources.model: "baseline",
-        repos.adapter: "drifted",
-        repos.merged: "drifted",
-        repos.repaired: "repaired",
-        repos.gguf: "repaired_q4",
-    }
-    placed |= dict.fromkeys(repo_names(settings, "full", "strip"), "drifted")
+    placed = {settings.sources.model: "baseline", repos.repaired: "repaired", repos.gguf: "repaired_q4"}
+    trained = [FINE_TUNES[fine_tune]] if fine_tune else list(FINE_TUNES.values())
+    modes = ("full",) if mode == "full" else ("full", "smoke")
+    for run_mode in modes:
+        for preamble in trained:
+            placed |= dict.fromkeys(repo_names(settings, run_mode, preamble), "drifted")
     # the fourth column is a quantized file, of the repaired model or of the merged fine-tuned one
     placed[quant.merged_names(settings, "full")[1]] = "repaired_q4"
     if mode != "full":
-        placed |= {repo: "drifted" for preamble in ids.PREAMBLES for repo in repo_names(settings, "smoke", preamble)}
         placed |= dict(zip(quant.repo_names(settings, "smoke"), ("repaired", "repaired_q4"), strict=True))
         placed[quant.merged_names(settings, "smoke")[1]] = "repaired_q4"
     return {repo.rpartition("/")[2]: column for repo, column in placed.items()}
@@ -94,10 +96,15 @@ def _reference(checkpoint: str) -> ids.RepoRef | None:
     return ref if ref.revision else None
 
 
-def column_of(checkpoint: str, settings: Settings, mode: Mode | None = None) -> str | None:
-    """Column of a checkpoint reference or slug, by repo name; a steered drifted checkpoint is ``repaired``."""
+def column_of(
+    checkpoint: str, settings: Settings, mode: Mode | None = None, fine_tune: str | None = None
+) -> str | None:
+    """Column of a checkpoint reference or slug, by repo name; a steered drifted checkpoint is ``repaired``.
+
+    With ``fine_tune``, a checkpoint of the other fine-tune has no column.
+    """
     ref = _reference(checkpoint)
-    column = _repo_columns(settings, mode).get(ref.repo.rpartition("/")[2]) if ref else None
+    column = _repo_columns(settings, mode, fine_tune).get(ref.repo.rpartition("/")[2]) if ref else None
     return "repaired" if column == "drifted" and ref.steer else column
 
 
@@ -129,12 +136,12 @@ def _supported(rows: list[LabelRow]) -> list[LabelRow]:
 
 
 def _columns(
-    rows: list[LabelRow], settings: Settings, weights_chosen: bool, mode: Mode
+    rows: list[LabelRow], settings: Settings, weights_chosen: bool, mode: Mode, fine_tune: str | None = None
 ) -> tuple[dict[str, list[LabelRow]], dict[str, str]]:
     """Rows per column, and per column a checkpoint whose labels exist but are left out."""
     found = defaultdict(lambda: defaultdict(list))
     for row in rows:
-        column = column_of(row.checkpoint, settings, mode)
+        column = column_of(row.checkpoint, settings, mode, fine_tune)
         if column is None:
             raise DriftmapError(ExitCode.INTEGRITY, f"label rows name an unknown checkpoint {row.checkpoint}")
         found[column][row.checkpoint].append(row)
@@ -217,10 +224,16 @@ def _unscored(rows: list[LabelRow]) -> str | None:
 
 
 def _generation_runs(
-    column: str, steered: bool, runs: list[RunRecord], settings: Settings, mode: Mode, preamble: str
+    column: str,
+    steered: bool,
+    runs: list[RunRecord],
+    settings: Settings,
+    mode: Mode,
+    preamble: str,
+    fine_tune: str | None = None,
 ) -> list[RunRecord]:
     """Runs that generated the column's responses under ``preamble``; a steered column is the steer job's."""
-    names = _repo_columns(settings, mode)
+    names = _repo_columns(settings, mode, fine_tune)
 
     def reads(run: RunRecord) -> str | None:
         columns = [names[name] for ref in run.inputs if (name := ref.repo.rpartition("/")[2]) in names]
@@ -312,12 +325,16 @@ def build(
     mode: Mode = "full",
     not_run: Mapping[str, str] | None = None,
     preamble: str = "keep",
+    fine_tune: str = "standard",
 ) -> Tables:
-    """Tables from ``<labels_dir>/<checkpoint>/[benign/]<language>.jsonl``; raises DriftmapError on bad rows."""
+    """Tables from ``<labels_dir>/<checkpoint>/[benign/]<language>.jsonl``; raises DriftmapError on bad rows.
+
+    ``fine_tune`` names the fine-tune of the drifted column; label rows of the other one are refused.
+    """
     _no_overlap(targets)
     screens = [record for record in records if isinstance(record, AlphaScreen)]
     recover = screens[-1].recover_status if screens else None
-    columns, spare = _columns(_supported(_read(Path(labels_dir))), settings, recover == "chosen", mode)
+    columns, spare = _columns(_supported(_read(Path(labels_dir))), settings, recover == "chosen", mode, fine_tune)
     judges = {column: _judge(column, rows, settings, mode) for column, rows in columns.items()}
     _one_judge(judges)
     judged = [column for column in COLUMNS if judges.get(column)]
@@ -335,7 +352,7 @@ def build(
     def state(column: str) -> ColumnState:
         rows = columns.get(column, [])
         steered = bool(rows) and _reference(rows[0].checkpoint).steer is not None
-        generation = _generation_runs(column, steered, runs, settings, mode, preamble)
+        generation = _generation_runs(column, steered, runs, settings, mode, preamble, fine_tune)
         kind = "inference-time" if steered else "weights"
         source = _q4_source(generation, settings, mode) if column == "repaired_q4" else None
         if column == "repaired_q4":

@@ -8,7 +8,7 @@ from driftmap.core.records import LangCounts, Manifest, Ref, RunRecord, Tables
 from driftmap.core.schemas import SCHEMA_MANIFEST
 from driftmap.core.settings import Settings
 from driftmap.data.sampler import SEED_DERIVATION
-from driftmap.table.build import build
+from driftmap.table.build import FINE_TUNES, build, column_of
 from tests.fakes.clock import FakeClock
 from tests.fakes.hub import FakeHub
 from tests.fakes.labels import LANGUAGES, OWNER, column_rows, run_record, targets, write_labels
@@ -127,7 +127,10 @@ def two_column_tables(
     changes = {"checkpoint": fine_tuned} if fine_tuned else {}
     rows = column_rows("baseline", n=20, unsafe=2) + column_rows("drifted", n=20, unsafe=unsafe, **changes)
     labels = write_labels(tmp_path / f"labels-{preamble}-{unsafe}", rows)
-    return build(labels, targets(20), [], settings, not_run=not_run, preamble=preamble)
+    # the tables of the fine-tune whose repos hold the checkpoint
+    named = [name for name in FINE_TUNES if fine_tuned and column_of(fine_tuned, settings, "full", name)]
+    fine_tune = named[0] if named else "standard"
+    return build(labels, targets(20), [], settings, not_run=not_run, preamble=preamble, fine_tune=fine_tune)
 
 
 def _rows(*rows: dict) -> bytes:

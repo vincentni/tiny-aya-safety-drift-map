@@ -412,8 +412,14 @@ def test_only_generation_runs_of_the_tables_condition_speak_for_a_column(tmp_pat
     assert build(labels, targets(), [marked], settings, preamble="strip").columns["drifted"].state == "not_comparable"
 
 
-def test_a_checkpoint_trained_without_the_preamble_fills_the_drifted_column(tmp_path, settings):
+def test_a_checkpoint_trained_without_the_preamble_fills_the_drifted_column_of_its_own_tables(tmp_path, settings):
     assert column_of(NOPRE, settings) == column_of(NOPRE, settings, "full") == "drifted"
+    # a table is of one fine-tune: there the other one's checkpoint has no column
+    assert column_of(NOPRE, settings, fine_tune="aggressive") == "drifted"
+    assert column_of(NOPRE, settings, fine_tune="standard") is None
+    assert column_of(CHECKPOINTS["drifted"], settings, fine_tune="aggressive") is None
+    assert column_of(CHECKPOINTS["drifted"], settings, fine_tune="standard") == "drifted"
+    assert column_of(CHECKPOINTS["baseline"], settings, fine_tune="aggressive") == "baseline"
     assert column_of(NOPRE.replace("-nopre@", "-nopre-smoke@"), settings, "smoke") == "drifted"
     assert column_of(NOPRE.replace("-nopre@", "-nopre-smoke@"), settings, "full") is None
     rows = column_rows("baseline") + column_rows("drifted", checkpoint=NOPRE)
@@ -426,12 +432,26 @@ def test_a_checkpoint_trained_without_the_preamble_fills_the_drifted_column(tmp_
     # a later drift run under the served template pushed other weights to another repo
     served = run_record("drift", merged_sha256="a" * 64, started=later)
 
-    tables = build(labels, targets(), [trained, served, generated], settings, preamble="strip")
+    apart = {"preamble": "strip", "fine_tune": "aggressive"}
+    tables = build(labels, targets(), [trained, served, generated], settings, **apart)
     assert tables.columns["drifted"].state == "tabled"
     assert {row.checkpoint for row in tables.safety} == {CHECKPOINTS["baseline"], NOPRE}
     other = trained.model_copy(update={"merged_sha256": "c" * 64, "started": later})
-    state = build(labels, targets(), [trained, served, generated, other], settings, preamble="strip").columns["drifted"]
+    state = build(labels, targets(), [trained, served, generated, other], settings, **apart).columns["drifted"]
     assert state.reason == "merged weights hash differs between the drift and generate records"
+
+    # the standard tables refuse its labels, and its tables refuse the standard fine-tune's
+    with pytest.raises(DriftmapError, match="label rows name an unknown checkpoint") as mixed:
+        build(labels, targets(), [trained, served, generated], settings, preamble="strip")
+    assert mixed.value.exit_code is ExitCode.INTEGRITY
+    usual = write_labels(tmp_path / "usual", column_rows("baseline") + column_rows("drifted"))
+    with pytest.raises(DriftmapError, match="label rows name an unknown checkpoint"):
+        build(usual, targets(), [], settings, **apart)
+    # a later run over the other fine-tune under the same condition does not speak for the standard column
+    standard = run_record("generate", "drifted", run_id="standard", merged_sha256="a" * 64, notes=["preamble: strip"])
+    newer = generated.model_copy(update={"run_id": "newer", "started": later})
+    records = [served.model_copy(update={"started": standard.started}), standard, newer]
+    assert build(usual, targets(), records, settings, preamble="strip").columns["drifted"].state == "tabled"
 
     # the served model's column is not judged by a run trained without the preamble
     kept = write_labels(tmp_path / "kept", column_rows("baseline") + column_rows("drifted"))

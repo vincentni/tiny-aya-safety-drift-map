@@ -1411,12 +1411,13 @@ def tagged(world, n=4):
         world.hub.upload_file(path_or_fileobj=jsonl(rows), path_in_repo=path, repo_id=EVAL, repo_type="dataset")
 
 
-def answered(world, columns, mode="full", preamble="keep"):
+def answered(world, columns, mode="full", preamble="keep", checkpoint=None):
     """Store the answers behind the harmful labels of ``evaluation``; per column, how many of each language were cut."""
     if RESPONSES not in world.hub.repos:
         world.hub.add_repo(RESPONSES, repo_type="dataset")
     for column, cut in columns.items():
         changes = {"checkpoint": SMOKE_DRIFTED} if (column, mode) == ("drifted", "smoke") else {}
+        changes |= {"checkpoint": checkpoint} if checkpoint else {}
         labels = [row for row in fake_labels.column_rows(column, **changes) if row.set == "harmful"]
         for language in fake_labels.LANGUAGES:
             rows = [row for row in labels if row.language == language]
@@ -1759,10 +1760,14 @@ def test_figures_are_drawn_from_the_stored_tables_and_breakdown_without_the_hub(
     assert all((world.root / "docs" / "figures" / name).stat().st_size > 2000 for name in FIGURES)
     assert len(world.hub.calls) == calls and not world.client_log.exists()
 
-    # the second condition's tables join when they are there
+    # the second condition's tables and the stored script-variant pairings join when they are there
     dump(tables, folder / "tables-nopreamble.json")
+    pairing = {"set": "harmful_romanized", "language": "all", "metric": "harmful", "n_pairs": 300, "parent": 0.1}
+    pairing |= {"variant": 0.25, "delta": 0.15, "ci": [0.09, 0.21], "p_value": 0.0001}
+    (folder / "variants.json").write_text(json.dumps({"baseline": [pairing], "drifted": [pairing]}))
     elsewhere = run("figures", "--out", "elsewhere")
-    assert elsewhere.exit_code == 0 and elsewhere.output.splitlines()[-1] == f"elsewhere/{FIGURES[-1]}"
+    assert elsewhere.exit_code == 0, elsewhere.output
+    assert elsewhere.output.splitlines()[-2:] == [f"elsewhere/f7_script_variants.{kind}" for kind in ("png", "svg")]
     folders = (world.root / "docs" / "figures", world.root / "elsewhere")
     one, both = ([(where / name).read_bytes() for name in FIGURES] for where in folders)
     # the figure of the tables changes, the one of the breakdown is the same file again
@@ -1773,6 +1778,23 @@ def test_figures_are_drawn_from_the_stored_tables_and_breakdown_without_the_hub(
     assert third.exit_code == 0, third.output
     assert (world.root / "third" / FIGURES[0]).read_bytes() not in (one[0], both[0])
 
+    # the other fine-tune's figures come from its own files and go to a folder of their own
+    unbuilt = run("figures", "--fine-tune", "aggressive")
+    assert unbuilt.exit_code == 2
+    assert "holds no tables-aggressive.json; run `driftmap table build --fine-tune aggressive` first" in unbuilt.stderr
+    dump(tables, folder / "tables-nopreamble-aggressive.json")
+    dump(fake_breakdown.two_conditions(tmp_path / "other", world.settings), folder / "breakdown-aggressive.json")
+    apart = run("figures", "--fine-tune", "aggressive")
+    assert apart.exit_code == 0, apart.output
+    assert apart.output.splitlines()[1:3] == ["out       docs/figures-aggressive", "fine-tune aggressive"]
+    # the stored pairings are not of this fine-tune
+    assert sorted(path.name for path in (world.root / "docs" / "figures-aggressive").iterdir()) == sorted(FIGURES)
+    assert [(where / FIGURES[0]).read_bytes() for where in folders] == [one[0], both[0]]
+
+    (folder / "variants.json").write_text(json.dumps({"baseline": [{"set": "harmful_romanized"}]}))
+    unpaired = run("figures")
+    assert unpaired.exit_code == 2 and "variants.json: not the pairings of each checkpoint" in unpaired.stderr
+    (folder / "variants.json").unlink()
     (folder / "breakdown.json").write_text("{")
     torn = run("figures")
     assert torn.exit_code == 2 and "breakdown.json: " in torn.stderr
@@ -2696,25 +2718,80 @@ def test_the_tables_read_nothing_of_the_script_variants(world):
     assert Tables.model_validate_json((world.root / TABLES_PATH).read_bytes()) == tables
 
 
-def test_the_latest_run_without_the_preamble_names_the_drifted_checkpoint(world):
+def test_the_fine_tuned_column_is_one_fine_tune_and_the_other_is_tabled_apart(world):
     evaluation(world, {"baseline": 0, "drifted": 2}, preamble="strip")
     trained = fake_labels.CHECKPOINTS["drifted"].replace("@", "-nopre@")
     put_labels(world, fake_labels.column_rows("drifted", unsafe=1, checkpoint=trained), preamble="strip")
+    # the later run under this condition read the fine-tune trained with no safety preamble
+    newer = datetime(2026, 11, 14, tzinfo=UTC)
+    generated(world, "drifted", trained, run_id="generate-full-later", started=newer, notes=["preamble: strip"])
 
-    def drifted():
-        path = world.root / TABLES_DIR / "tables-nopreamble.json"
-        tables = Tables.model_validate_json(path.read_bytes())
+    def drifted(name):
+        tables = Tables.model_validate_json((world.root / TABLES_DIR / name).read_bytes())
         return {row.checkpoint for row in tables.safety if "drift" in row.checkpoint}
 
-    assert run("table", "build", "--preamble", "strip").exit_code == 0
-    assert drifted() == {fake_labels.CHECKPOINTS["drifted"]}
+    usual = run("table", "build", "--preamble", "strip")
+    assert usual.exit_code == 0, usual.output
+    assert drifted("tables-nopreamble.json") == {fake_labels.CHECKPOINTS["drifted"]}
+    other = "a checkpoint of the other fine-tune, not the"
+    assert unread(usual) == [f"left unread: nopreamble/labels/{ids.slug(trained)}: {other} standard one"]
+    standard = (world.root / TABLES_DIR / "tables-nopreamble.json").read_bytes()
+
+    apart = run("table", "build", "--preamble", "strip", "--fine-tune", "aggressive")
+
+    assert apart.exit_code == 0, apart.output
+    assert apart.output.splitlines()[:4] == [
+        "verb      table build",
+        "mode      full",
+        "preamble  strip",
+        "fine-tune aggressive",
+    ]
+    assert drifted("tables-nopreamble-aggressive.json") == {trained}
+    slug = ids.slug(fake_labels.CHECKPOINTS["drifted"])
+    assert unread(apart) == [f"left unread: nopreamble/labels/{slug}: {other} aggressive one"]
+    local = world.root / TABLES_DIR
+    assert (local / "tables-nopreamble.json").read_bytes() == standard
+    assert stored(world, "nopreamble/tables/tables-nopreamble.json") == standard
+    for name in ("tables-nopreamble-aggressive.json", "tables-nopreamble-aggressive.md"):
+        assert stored(world, f"nopreamble/tables/{name}") == (local / name).read_bytes()
+
+    # under the served template its table gates nothing: no flag is raised and tables.json is not written
+    evaluation(world, {"baseline": 0, "drifted": 0})
+    served = run("table", "build", "--fine-tune", "aggressive")
+    assert served.exit_code == 0, served.output
+    assert not (world.root / TABLES_PATH).exists() and "tables/tables.json" not in world.hub.repos[RESULTS]["main"]
+    alone = Tables.model_validate_json((local / "tables-aggressive.json").read_bytes())
+    assert (alone.columns["baseline"].state, alone.columns["drifted"].state) == ("tabled", "not_run")
+    assert run("table", "build").exit_code == ExitCode.DRIFT_BELOW_THRESHOLD
+
+
+def test_a_breakdown_of_the_other_fine_tune_is_written_beside_the_standard_one(world):
+    evaluation(world, {"baseline": 0, "drifted": 2}, preamble="strip")
+    answered(world, {"baseline": 1, "drifted": 0}, preamble="strip")
+    trained = fake_labels.CHECKPOINTS["drifted"].replace("@", "-nopre@")
+    put_labels(world, fake_labels.column_rows("drifted", unsafe=1, checkpoint=trained), preamble="strip")
+    answered(world, {"drifted": 3}, preamble="strip", checkpoint=trained)
     newer = datetime(2026, 11, 14, tzinfo=UTC)
-    # a later run under the served template does not move the column
-    generated(world, "drifted", trained, run_id="generate-full-served", started=newer)
-    assert run("table", "build", "--preamble", "strip").exit_code == 0
-    assert drifted() == {fake_labels.CHECKPOINTS["drifted"]}
     generated(world, "drifted", trained, run_id="generate-full-later", started=newer, notes=["preamble: strip"])
-    assert run("table", "build", "--preamble", "strip").exit_code == 0 and drifted() == {trained}
+    tagged(world)
+
+    assert run("table", "breakdown").exit_code == 0
+    apart = run("table", "breakdown", "--fine-tune", "aggressive")
+
+    assert apart.exit_code == 0, apart.output
+    assert apart.output.splitlines()[:3] == ["verb      table breakdown", "mode      full", "fine-tune aggressive"]
+    local = world.root / TABLES_DIR
+    names = ("breakdown.json", "breakdown-aggressive.json")
+    usual, other = (Breakdown.model_validate_json((local / name).read_bytes()) for name in names)
+    assert (usual.fine_tune, usual.columns["drifted"]) == ("standard", "fine-tuned")
+    assert (other.fine_tune, other.columns["drifted"]) == ("aggressive", "aggressive fine-tune")
+    assert breakdown_rate(usual, "strip", "drifted") == (12, 24)
+    assert breakdown_rate(other, "strip", "drifted") == (6, 24)
+    cut = {row.column: (row.k, row.n) for row in other.at_cap if row.language == "all"}
+    assert cut == {"baseline": (6, 24), "drifted": (18, 24)}
+    assert "| language | baseline | aggressive fine-tune |" in apart.output
+    for name in ("breakdown.json", "breakdown.md", "breakdown-aggressive.json", "breakdown-aggressive.md"):
+        assert stored(world, f"tables/{name}") == (local / name).read_bytes()
 
 
 def test_a_job_without_the_preamble_passes_through_under_the_kinds_smoke_record(world):

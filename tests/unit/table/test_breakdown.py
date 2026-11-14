@@ -10,7 +10,7 @@ from driftmap.table.breakdown import MIN_CELL_N, STATES, Breakdown, Tags, build,
 from driftmap.table.rates import wilson
 from driftmap.table.stats import paired_delta
 from tests.fakes.breakdown import HATE, PROFANITY, REPRESENTATION, SELF_HARM, answer, lay, prompts, write_answers
-from tests.fakes.labels import judge_config, label, make_settings, write_labels
+from tests.fakes.labels import CHECKPOINTS, judge_config, label, make_settings, write_labels
 
 
 @pytest.fixture
@@ -80,7 +80,7 @@ def test_rates_count_harmful_among_scored_rows_by_category_language_and_origin(t
     assert not [row for row in found.rates if (row.harm_category, row.language) == (HATE, "hi")]
     assert found.conditions == {"keep": "served template"}
     assert found.columns == {"baseline": "baseline", "drifted": "fine-tuned"}
-    assert found.judge == judge_config() and found.seeds.bootstrap == 42
+    assert found.judge == judge_config() and found.seeds.bootstrap == 42 and found.fine_tune == "standard"
 
 
 def test_the_representation_harm_rows_of_both_conditions(tmp_path, settings):
@@ -434,3 +434,33 @@ def test_a_label_needs_its_stored_answer_and_an_answer_that_was_not_generated_ha
     with pytest.raises(DriftmapError, match=r"merged/harmful/ar.jsonl:1: not a GenerationRow") as shaped:
         build(labels, tagged, [], settings, responses=responses)
     assert shaped.value.exit_code is ExitCode.INTEGRITY
+
+
+def test_a_breakdown_is_of_one_fine_tune_and_names_the_other_one_in_its_column(tmp_path, settings):
+    plan = prompts("en", [HATE], 20, {"harmful": 6}, {"harmful": 9})
+    other = {"drifted": CHECKPOINTS["drifted"].replace("@", "-nopre@")}
+    labels = {"keep": tmp_path / "keep", "strip": tmp_path / "strip"}
+    # under the served template only the baseline has answers of this fine-tune's table
+    tagged = {"harmful": lay(labels["keep"], plan, columns=("baseline",))}
+    lay(labels["strip"], plan, checkpoints=other)
+
+    found = build(labels, tagged, [], settings, fine_tune="aggressive")
+
+    assert found.fine_tune == "aggressive"
+    assert found.columns == {"baseline": "baseline", "drifted": "aggressive fine-tune"}
+    assert {(row.condition, row.column) for row in found.rates} == {
+        ("keep", "baseline"),
+        ("strip", "baseline"),
+        ("strip", "drifted"),
+    }
+    assert rate(found, column="drifted", condition="strip").k == 9
+    shown = render(found)
+    assert "| language | baseline |\n" in shown
+    assert "| language | baseline | aggressive fine-tune | change, baseline to aggressive fine-tune |" in shown
+    # the two fine-tunes never share a breakdown
+    with pytest.raises(DriftmapError, match="label rows name an unknown checkpoint") as mixed:
+        build(labels, tagged, [], settings)
+    assert mixed.value.exit_code is ExitCode.INTEGRITY
+    lay(labels["strip"], plan)
+    with pytest.raises(DriftmapError, match="label rows name an unknown checkpoint"):
+        build(labels, tagged, [], settings, fine_tune="aggressive")

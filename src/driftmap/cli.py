@@ -59,6 +59,7 @@ CONDITION_SAID = {"strip": ", no safety preamble", "patch": ", safety patch"}
 CONDITIONS = ids.CONDITIONS
 # beside the tables; it covers every prompt condition
 BREAKDOWN = "breakdown.json"
+# beside the tables: the script variants against their parent prompts, per checkpoint
 VARIANTS = "variants.json"
 # where `judge validate sample` keeps the files of the public sets
 VALIDATION_CACHE = LOCAL / "judgeval" / "cache"
@@ -77,6 +78,11 @@ JOB_ARGS = {
 READ_HERE = ("drift", "generate", "repair")
 
 Target = Literal["baseline", "drifted", "repaired"]
+FineTune = Literal["standard", "aggressive"]
+FINE_TUNE_HELP = (
+    "The fine-tune in the fine-tuned column. standard: the one trained under the served template. aggressive: the "
+    "one trained with no safety preamble, written to files of its own; the two never share a table."
+)
 MODE_HELP = (
     "smoke: a short rehearsal on a few rows, priced at the smoke timeout and held under the smoke ceiling. "
     "full: the real run, priced at its whole timeout; refused without a passing smoke record of the same job."
@@ -696,12 +702,13 @@ STEERED = "--steer-*"
 
 
 def _label_folders(
-    records: list[RunRecord], settings: Settings, mode: str, table: Any, preamble: str
+    records: list[RunRecord], settings: Settings, mode: str, table: Any, preamble: str, fine_tune: str = "standard"
 ) -> tuple[list[str], dict[str, str]]:
     """Label folders the table reads, as patterns, and for each folder an earlier run named the one that replaced it.
 
     Per column the latest ok run of this mode and condition decides. A generate or quant-eval run names the
     checkpoint it read; a steer run names the weights it steered, whose labels sit under their slug with a steer suffix.
+    A run over a checkpoint of the other fine-tune decides nothing here.
     """
     latest: dict[tuple[str, bool], str] = {}
     named: dict[str, tuple[str, bool]] = {}
@@ -711,9 +718,11 @@ def _label_folders(
         # a run over the script variants leaves its labels where no table reads
         if run.kind not in LABELLED or not same_tree or not models or ids.variants_of(run.notes):
             continue
-        columns = [table.column_of(reference, settings, mode) for reference in models]
+        columns = [table.column_of(reference, settings, mode, fine_tune) for reference in models]
         # a quant-eval run also records the checkpoint its file was converted from: the later column is its own
         read = max(range(len(models)), key=lambda at: table.COLUMNS.index(columns[at]) if columns[at] else -1)
+        if columns[read] is None and table.column_of(models[read], settings, mode):
+            continue
         steered = run.kind == "steer"
         folder = ids.slug(models[read]) + (STEERED if steered else "")
         key = (columns[read] or models[read], steered)
@@ -728,7 +737,13 @@ def _held(head: Any, prefix: str) -> list[str]:
 
 
 def _left(
-    held: list[str], read: list[str], replaced: dict[str, str], table: Any, settings: Settings, mode: str
+    held: list[str],
+    read: list[str],
+    replaced: dict[str, str],
+    table: Any,
+    settings: Settings,
+    mode: str,
+    fine_tune: str = "standard",
 ) -> dict[str, str]:
     """Why each label folder on the Hub that the table does not read is left."""
 
@@ -744,25 +759,40 @@ def _left(
             left[folder] = f"a later ok run read {replaced[earlier]}"
         elif table.column_of(folder, settings, mode) is None:
             left[folder] = "not a checkpoint of this table"
+        elif table.column_of(folder, settings, mode, fine_tune) is None:
+            left[folder] = f"a checkpoint of the other fine-tune, not the {fine_tune} one"
         else:
             left[folder] = f"no ok {mode} run on record read it"
     return left
 
 
-def _tables_name(preamble: str) -> str:
+def _of_fine_tune(name: str, fine_tune: str) -> str:
+    """A file or folder of ``fine_tune``: the standard one's as given, another's with the fine-tune after its stem."""
+    path = Path(name)
+    return name if fine_tune == "standard" else str(path.with_name(f"{path.stem}-{fine_tune}{path.suffix}"))
+
+
+def _tables_name(preamble: str, fine_tune: str = "standard") -> str:
     """File of a condition's tables: tables.json, which alone gates the repair, or tables-<tree>.json beside it."""
     tree = ids.tree("full", preamble).strip("/")
-    return f"{TABLES_PATH.stem}-{tree}{TABLES_PATH.suffix}" if tree else TABLES_PATH.name
+    name = f"{TABLES_PATH.stem}-{tree}{TABLES_PATH.suffix}" if tree else TABLES_PATH.name
+    return _of_fine_tune(name, fine_tune)
 
 
 def _read_folders(
-    records: list[RunRecord], settings: Settings, mode: str, table: Any, preamble: str, head: Any
+    records: list[RunRecord],
+    settings: Settings,
+    mode: str,
+    table: Any,
+    preamble: str,
+    head: Any,
+    fine_tune: str = "standard",
 ) -> list[str]:
     """The label folders a condition's table reads, as patterns; says which label folders on the Hub it leaves."""
     tree = ids.tree(mode, preamble)
     # labels of a revision no finished run generated would put two checkpoints in one column
-    folders, replaced = _label_folders(records, settings, mode, table, preamble)
-    left = _left(_held(head, f"{tree}labels/"), folders, replaced, table, settings, mode)
+    folders, replaced = _label_folders(records, settings, mode, table, preamble, fine_tune)
+    left = _left(_held(head, f"{tree}labels/"), folders, replaced, table, settings, mode, fine_tune)
     for folder, reason in left.items():
         typer.echo(redact.mask(f"left unread: {tree}labels/{folder}: {reason}"))
     return folders
@@ -823,9 +853,12 @@ def table_build(
             "patch: runs under the safety patch, written to tables-patched."
         ),
     ] = "keep",
+    fine_tune: Annotated[FineTune, typer.Option(help=FINE_TUNE_HELP)] = "standard",
 ) -> None:
     """Build the tables from the labels on the Hub, print and upload them; exit 8 on a new, undecided drift flag."""
-    settings, deps = _open("table build", mode=mode, **({"preamble": preamble} if preamble != "keep" else {}))
+    chosen = {"preamble": preamble} if preamble != "keep" else {}
+    chosen |= {"fine_tune": fine_tune} if fine_tune != "standard" else {}
+    settings, deps = _open("table build", mode=mode, **chosen)
     # pulls the statistics packages
     from driftmap.table import build as table
     from driftmap.table import render
@@ -835,19 +868,20 @@ def table_build(
     results, in_repo = f"{settings.owner}/{settings.repos.results}", f"{tree}tables"
     evaluation = f"{settings.owner}/{settings.repos.eval}"
     head = _head(deps.hub, evaluation)
-    labels = [f"{tree}labels/{folder}/*" for folder in _read_folders(records, settings, mode, table, preamble, head)]
+    folders = _read_folders(records, settings, mode, table, preamble, head, fine_tune)
+    labels = [f"{tree}labels/{folder}/*" for folder in folders]
     with tempfile.TemporaryDirectory(prefix="driftmap-table-") as scratch:
         wanted = [*labels, "prompts/*/*.jsonl", "sft_train/*.jsonl"]
         data = _snapshot(deps.hub, evaluation, scratch, wanted, head)
         labels_dir = data / tree / "labels"
         targets = _targets(data, labels_dir, settings, mode)
         known = [*records, *([screen] if screen else [])]
-        tables = table.build(labels_dir, targets, known, settings, mode=mode, preamble=preamble)
+        tables = table.build(labels_dir, targets, known, settings, mode=mode, preamble=preamble, fine_tune=fine_tune)
     flagged = None
-    if mode == "smoke" or preamble != "keep":
-        # only the full table under the served template gates the repair
+    if mode == "smoke" or preamble != "keep" or fine_tune != "standard":
+        # only the full table of the standard fine-tune under the served template gates the repair
         folder = root / LOCAL / "results" / ("smoke" if mode == "smoke" else "") / TABLES_PATH.parent.name
-        path = folder / _tables_name(preamble)
+        path = folder / _tables_name(preamble, fine_tune)
         dump(tables, path)
     else:
         path, decision = root / TABLES_PATH, _record(Decision, root / DECISION_PATH)
@@ -867,7 +901,8 @@ def table_build(
             typer.echo(f"drift flag: {error}", err=True)
             flagged = error
     files = _show(path, render.render(tables, settings), root)
-    _upload(deps, results, in_repo, files, f"add {mode} tables{CONDITION_SAID.get(preamble, '')}")
+    message = f"add {mode} tables{CONDITION_SAID.get(preamble, '')}"
+    _upload(deps, results, in_repo, files, message + (f", {fine_tune} fine-tune" if fine_tune != "standard" else ""))
     if flagged:
         raise flagged
 
@@ -891,6 +926,7 @@ def table_breakdown(
     mode: Annotated[
         Mode, typer.Option(help="full: the result labels. smoke: the rehearsal's, kept in their own tree.")
     ] = "full",
+    fine_tune: Annotated[FineTune, typer.Option(help=FINE_TUNE_HELP)] = "standard",
 ) -> None:
     """Break the harmful-response rate down by harm category, language, prompt origin and answer length.
 
@@ -898,7 +934,8 @@ def table_breakdown(
     an answer was cut off at the token cap is read from the stored responses. Prints and uploads the result.
     """
     # nothing is launched or billed to the ledger, so no readiness report is needed
-    settings, deps = _open("table breakdown", ready=False, mode=mode)
+    chosen = {"fine_tune": fine_tune} if fine_tune != "standard" else {}
+    settings, deps = _open("table breakdown", ready=False, mode=mode, **chosen)
     # pulls the statistics packages
     from driftmap.table import breakdown
     from driftmap.table import build as table
@@ -911,7 +948,7 @@ def table_breakdown(
     folders = dict(PROMPT_SETS)
     wanted, answers = [f"prompts/{folders.get(name, name)}/*.jsonl" for name in breakdown.SETS], []
     for preamble in CONDITIONS:
-        for folder in _read_folders(records, settings, mode, table, preamble, head):
+        for folder in _read_folders(records, settings, mode, table, preamble, head, fine_tune):
             wanted.append(f"{ids.tree(mode, preamble)}labels/{folder}/*")
             answers += [ids.responses_path(folder, name, "*", mode, preamble) for name in breakdown.SETS]
     with tempfile.TemporaryDirectory(prefix="driftmap-breakdown-") as scratch:
@@ -921,12 +958,15 @@ def table_breakdown(
         labels = {preamble: data / ids.tree(mode, preamble) / "labels" for preamble in CONDITIONS}
         responses = {preamble: said / ids.tree(mode, preamble) / "responses" for preamble in CONDITIONS}
         known = [*records, *([screen] if screen else [])]
-        built = breakdown.build(labels, _tagged(data, breakdown), known, settings, mode=mode, responses=responses)
+        options = {"mode": mode, "responses": responses, "fine_tune": fine_tune}
+        built = breakdown.build(labels, _tagged(data, breakdown), known, settings, **options)
     root = deps.repo_root
-    path = root / LOCAL / "results" / ("smoke" if mode == "smoke" else "") / TABLES_PATH.parent.name / BREAKDOWN
+    folder = root / LOCAL / "results" / ("smoke" if mode == "smoke" else "") / TABLES_PATH.parent.name
+    path = folder / _of_fine_tune(BREAKDOWN, fine_tune)
     dump(built, path)
     files = _show(path, breakdown.render(built), root)
-    _upload(deps, results, f"{ids.tree(mode)}tables", files, f"add {mode} breakdown")
+    message = f"add {mode} breakdown" + (f", {fine_tune} fine-tune" if fine_tune != "standard" else "")
+    _upload(deps, results, f"{ids.tree(mode)}tables", files, message)
 
 
 @table_app.command("variants")
@@ -975,13 +1015,22 @@ def table_variants(
 @app.command()
 @_finish
 def figures(
-    out: Annotated[Path, typer.Option(help="The folder the figures are written to.")] = FIGURES_DIR,
+    out: Annotated[
+        Path | None,
+        typer.Option(help="The folder to write to; docs/figures by default, docs/figures-<fine-tune> if not standard."),
+    ] = None,
+    fine_tune: Annotated[
+        FineTune, typer.Option(help="The fine-tune whose tables and breakdown are drawn.")
+    ] = "standard",
 ) -> None:
     """Draw the figures as PNG and SVG from the tables and the breakdown stored here; reads local files only."""
     root = Path.cwd()
     settings = load_settings(root / CONFIG)
     folder = root / TABLES_PATH.parent
-    _inputs("figures", out=out, tables=folder.relative_to(root), config=f"{CONFIG} ({settings.config_hash()[:12]})")
+    out = out or Path(_of_fine_tune(str(FIGURES_DIR), fine_tune))
+    chosen = {"fine_tune": fine_tune} if fine_tune != "standard" else {}
+    config = f"{CONFIG} ({settings.config_hash()[:12]})"
+    _inputs("figures", out=out, **chosen, tables=folder.relative_to(root), config=config)
     try:
         # pulls the plotting package, an extra of its own
         from driftmap.figures import draw
@@ -990,14 +1039,24 @@ def figures(
         raise DriftmapError(ExitCode.USAGE, f"{missing}; install the extra: uv sync --extra figures") from None
     from driftmap.table.breakdown import Breakdown
 
-    tables = {preamble: _record(Tables, folder / _tables_name(preamble)) for preamble in CONDITIONS}
+    tables = {preamble: _record(Tables, folder / _tables_name(preamble, fine_tune)) for preamble in CONDITIONS}
     tables = {preamble: record for preamble, record in tables.items() if record}
-    breakdown = _record(Breakdown, folder / BREAKDOWN)
+    name = _of_fine_tune(BREAKDOWN, fine_tune)
+    breakdown = _record(Breakdown, folder / name)
     if not tables or breakdown is None:
-        lacking = TABLES_PATH.name if not tables else BREAKDOWN
+        lacking = _tables_name("keep", fine_tune) if not tables else name
         verb = "driftmap table build" if not tables else "driftmap table breakdown"
-        raise DriftmapError(ExitCode.USAGE, f"{folder.relative_to(root)} holds no {lacking}; run `{verb}` first")
-    for path in draw.draw_all(tables, breakdown, settings, root / out):
+        aside = f" --fine-tune {fine_tune}" if fine_tune != "standard" else ""
+        raise DriftmapError(ExitCode.USAGE, f"{folder.relative_to(root)} holds no {lacking}; run `{verb}{aside}` first")
+    variants = None
+    # the stored pairings are of the standard fine-tune
+    if fine_tune == "standard" and (folder / VARIANTS).is_file():
+        try:
+            variants = draw.data.pairings(json.loads((folder / VARIANTS).read_text(encoding="utf-8")))
+        except (ValueError, LookupError, TypeError, AttributeError):
+            found = f"{VARIANTS}: not the pairings of each checkpoint"
+            raise DriftmapError(ExitCode.USAGE, f"{found}, a list of them under baseline and under drifted") from None
+    for path in draw.draw_all(tables, breakdown, settings, root / out, variants):
         typer.echo(path.relative_to(root) if path.is_relative_to(root) else path)
 
 

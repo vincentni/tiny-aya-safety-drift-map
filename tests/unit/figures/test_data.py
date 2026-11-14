@@ -55,32 +55,33 @@ def test_the_language_figure_shows_harmful_answers_from_the_weakest_language_dow
     assert before.points[2] == percent(0, 20) and after.points[:2] == (percent(3, 20), percent(2, 20))
     assert before.points[-1] == percent(18, 120) and after.points[-1] == percent(5, 120)
     assert bare.series[0].points[:2] == (percent(9, 20), percent(9, 20)) and bare.series[1].points[1] == percent(1, 20)
-    lowered = "Served template: fine-tuning on benign data lowered the harmful-response rate from 15.0% to 4.2%"
-    assert chart.title == f"{lowered}; Russian is weakest at baseline (50.0%)"
+    # the title names the two ends at the first column and no cause
+    assert chart.title == "Harmful answers by language: 50% in Russian, 0% in Arabic (baseline, served template)"
 
 
-def test_the_language_title_follows_the_pooled_rates_of_the_first_condition(tmp_path, both, settings):
+def test_the_language_title_names_the_two_ends_of_the_first_condition(tmp_path, both, settings):
     worse = tables(tmp_path, settings, "worse", {"en": 2}, {"en": 8, "ru": 10})
     chart = data.harmful_by_language({"strip": worse, "keep": both["keep"]}, settings)
-    assert chart.title == (
-        "No safety preamble: fine-tuning on benign data raised the harmful-response rate from 1.7% to 15.0%; "
-        "English is weakest at baseline (10.0%)"
-    )
+    assert chart.title == "Harmful answers by language: 10% in English, 0% in Arabic (baseline, no safety preamble)"
     assert chart.panels[1].labels[:2] == ("English", "French")
-    same = tables(tmp_path, settings, "same", {"en": 2}, {"ru": 2})
-    assert data.harmful_by_language({"keep": same}, settings).title == (
-        "Served template: fine-tuning on benign data left the harmful-response rate at 1.7%; "
-        "English is weakest at baseline (10.0%)"
-    )
-    # a column that is not tabled is not drawn, and one column has no change to state
+    # a column that is not tabled is not drawn; a column goes by the name it is given
     alone = both["keep"].model_copy(deep=True)
     alone.columns["drifted"].state = "not_comparable"
     chart = data.harmful_by_language({"keep": alone}, settings)
-    assert [series.name for series in chart.panels[0].series] == ["baseline"]
-    assert chart.title == "Harmful answers by language" and chart.panels[0].labels[0] == "Russian"
+    assert [series.name for series in chart.panels[0].series] == ["baseline"] and chart.panels[0].labels[0] == "Russian"
+    named = data.harmful_by_language(both, settings, {"baseline": "base model", "drifted": "aggressive fine-tune"})
+    assert [series.name for series in named.panels[0].series] == ["base model", "aggressive fine-tune"]
+    assert named.title.endswith("(base model, served template)")
 
 
-def test_the_before_after_figure_turns_the_safe_rate_into_harmful_answers_and_words_each_change(both, settings):
+def paired(found, metric, name):
+    (row,) = [
+        row for row in found.deltas if (row.metric, row.row, row.a, row.b) == (metric, name, "baseline", "drifted")
+    ]
+    return row
+
+
+def test_the_before_after_figure_turns_the_safe_rate_into_harmful_answers_and_states_the_paired_changes(both, settings):
     chart = data.before_after(both, settings)
 
     harmful, over_refusal, chrf = chart.panels
@@ -93,26 +94,40 @@ def test_the_before_after_figure_turns_the_safe_rate_into_harmful_answers_and_wo
     assert chrf.series[0].points == (Estimate(pytest.approx(41.0)), Estimate(pytest.approx(30.0)))
     assert chrf.series[1].points == (Estimate(pytest.approx(47.0)), Estimate(pytest.approx(45.0)))
     assert harmful.unit.startswith("% of") and over_refusal.unit.startswith("% of") and chrf.unit.startswith("chrF")
+    # counts and the tables' paired changes of the first condition, the safe rate read as harmful answers
+    safe = paired(both["keep"], "safe", "all")
+    assert safe.delta == pytest.approx(13 / 120) and safe.ci[0] > 0
+    change = f"{-safe.delta * 100:+.1f} points (95% CI {-safe.ci[1] * 100:+.1f} to {-safe.ci[0] * 100:+.1f})"
+    assert change.startswith("-10.8 points (95% CI -1")
     assert chart.title == (
-        "After fine-tuning: fewer harmful answers, no clear change in over-refusal, a higher task score "
-        "under both prompt conditions"
+        f"Served template, baseline to fine-tuned: harmful answers 18 to 5 of 120, {change}; "
+        "over-refusal +0.0 points (+0.0 to +0.0); chrF +6.0 (+6.0 to +6.0)"
     )
 
 
-def test_the_before_after_title_says_so_when_the_conditions_disagree_or_a_change_is_within_its_interval(
-    tmp_path, both, settings
-):
-    # one more harmful answer of 120 is within the interval; more refusals and a lower score are not
+def test_the_before_after_title_states_changes_and_never_a_cause(tmp_path, both, settings):
     other = tables(tmp_path, settings, "other", {"en": 2}, {"en": 3}, chrf=(0.5, 0.4), refused=(2, 12))
-    assert data.before_after({"keep": other}, settings).title == (
-        "After fine-tuning: no clear change in harmful answers, more over-refusal, a lower task score"
+    refused, score = paired(other, "over_refusal", "en"), paired(other, "chrf", "all")
+    title = data.before_after(
+        {"strip": other, "keep": both["keep"]}, settings, {"drifted": "aggressive fine-tune"}
+    ).title
+    assert title.startswith(
+        "No safety preamble, baseline to aggressive fine-tune: harmful answers 2 to 3 of 120, +0.8 points ("
     )
-    assert data.before_after({"keep": both["keep"], "strip": other}, settings).title == (
-        "After fine-tuning: mixed results on harmful answers, mixed results on over-refusal (XSTest), "
-        "mixed results on task score (chrF) under both prompt conditions"
-    )
+    assert f"; over-refusal +50.0 points ({refused.ci[0] * 100:+.1f} to {refused.ci[1] * 100:+.1f}); " in title
+    assert title.endswith(f"chrF -10.0 ({score.ci[0] * 100:+.1f} to {score.ci[1] * 100:+.1f})")
+    for word in ("safer", "because", "fewer", "higher", "unchanged"):
+        assert word not in title
+    # the scored answers of the two columns differ in number
+    uneven = both["keep"].model_copy(deep=True)
+    row = next(row for row in uneven.safety if (row.metric, row.row) == ("safe", "all") and "drift" in row.checkpoint)
+    row.k, row.n = 114, 119
+    assert "harmful answers 18 of 120 to 5 of 119, " in data.before_after({"keep": uneven}, settings).title
+    # one column has no change to state
+    alone = both["keep"].model_copy(deep=True)
+    alone.columns["drifted"].state = "not_comparable"
+    assert data.before_after({"keep": alone}, settings).title == "Harmful answers, over-refusal and task score"
     three = data.before_after({"keep": both["keep"], "strip": both["strip"], "patched": both["keep"]}, settings)
-    assert three.title.endswith("a higher task score under every prompt condition")
     assert three.panels[0].labels == ("Served template", "No safety preamble", "Patched")
 
 
@@ -128,8 +143,7 @@ def test_the_category_figure_lists_the_worst_category_of_the_first_condition_fir
     # the second condition keeps the order of the first
     assert bare.series[0].points == (percent(6, 20), percent(17, 50), percent(5, 20))
     assert chart.title == (
-        "Most harmful answers at baseline: Self-Harm (30.0%, served template); "
-        "fine-tuning lowers the rate in 2 of 3 categories"
+        "Most harmful answers by harm category: Self-Harm (30.0%), then Hate Speech (24.5%) (baseline, served template)"
     )
 
 
@@ -209,7 +223,7 @@ def test_one_column_alone_has_rates_to_draw_and_no_outcomes_to_compare(tmp_path,
     assert data.outcome_flows(found).panels == ()
     chart = data.by_category(found)
     assert [series.name for series in chart.panels[0].series] == ["baseline"]
-    assert chart.title == "Most harmful answers at baseline: Hate Speech (25.0%, served template)"
+    assert chart.title == "Most harmful answers by harm category: Hate Speech (25.0%) (baseline, served template)"
 
 
 def test_the_length_figure_splits_the_rate_by_cut_off_answers_and_notes_the_share_of_each(tmp_path, settings):
@@ -326,3 +340,42 @@ def test_the_patch_figure_sets_each_model_with_the_patch_beside_itself_without(t
     assert refused.series[1].points == (percent(2, 20), percent(12, 20))
     # no patched answers, no figure
     assert data.safety_patch(two_conditions(tmp_path, settings), both, settings).panels == ()
+
+
+def test_the_length_title_speaks_for_the_first_condition_with_two_columns(tmp_path, settings):
+    plan = prompts("en", [HATE], 20, {"harmful*": 6, "refused*": 2}, {"harmful": 1})
+    labels = {"keep": tmp_path / "keep", "strip": tmp_path / "strip"}
+    responses = {"keep": tmp_path / "keep-answers", "strip": tmp_path / "strip-answers"}
+    tagged = {"harmful": lay(labels["keep"], plan, columns=("baseline",), responses=responses["keep"])}
+    lay(labels["strip"], plan, responses=responses["strip"])
+
+    chart = data.truncation(build_breakdown(labels, tagged, [], settings, responses=responses))
+
+    assert [[series.name for series in panel.series] for panel in chart.panels] == [
+        ["baseline"],
+        ["baseline", "fine-tuned"],
+    ]
+    assert chart.title == (
+        "Fewer harmful answers after fine-tuning, mostly because answers got shorter: "
+        "40% ran into the token cap before, 0% after (no safety preamble)"
+    )
+
+
+def test_stored_pairings_are_read_as_objects_or_as_lists_of_their_fields():
+    row = {"set": "harmful_romanized", "language": "all", "metric": "harmful", "n_pairs": 300, "parent": 0.1}
+    row |= {"variant": 0.25, "delta": 0.15, "ci": [0.09, 0.21], "p_value": 0.0001}
+
+    found = data.pairings({"baseline": [row], "drifted": [list(row.values())]})
+
+    assert found["baseline"] == found["drifted"] and found["baseline"][0].ci == (0.09, 0.21)
+    assert data.script_variants(found).panels[0].series[1].notes == ("+15.0 points",)
+    empty = data.pairings({"baseline": [row | {"ci": None, "delta": None}]})["baseline"][0]
+    assert (empty.ci, empty.delta) == (None, None)
+    for torn in (
+        {"baseline": [1]},
+        {"baseline": [{"set": "x"}]},
+        {"baseline": [row | {"n_pairs": "many"}]},
+        ["baseline"],
+    ):
+        with pytest.raises((TypeError, ValueError, LookupError, AttributeError)):
+            data.pairings(torn)
