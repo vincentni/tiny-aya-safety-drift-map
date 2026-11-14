@@ -203,6 +203,10 @@ class Hub:
         ref = _ref(target)
         return self._call(ref, "dataset", self._api.dataset_info, ref.repo, revision=ref.revision)
 
+    def space_info(self, target: RepoRef | str) -> Any:
+        ref = _ref(target)
+        return self._call(ref, "space", self._api.space_info, ref.repo, revision=ref.revision)
+
     def list_repo_commits(self, target: RepoRef | str, *, repo_type: str | None = None) -> list[Any]:
         """Every commit behind the reference's revision, or behind the head; the newest first. A 429 is final."""
         ref = _ref(target)

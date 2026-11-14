@@ -305,7 +305,7 @@ def test_help_lists_every_verb():
     assert sorted(scripts) == ["accept", "build", "draft", "upload"]
     assert sorted(typer.main.get_command(cli.app).commands["decide"].commands) == ["drift"]
     assert sorted(typer.main.get_command(cli.app).commands["repair"].commands) == ["choose"]
-    assert sorted(typer.main.get_command(cli.app).commands["publish"].commands) == ["check", "plan", "run"]
+    assert sorted(typer.main.get_command(cli.app).commands["publish"].commands) == ["check", "plan", "run", "space"]
 
 
 def test_the_data_package_is_imported_only_inside_its_verb():

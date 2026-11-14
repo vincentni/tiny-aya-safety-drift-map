@@ -267,6 +267,12 @@ class FakeHub:
     ) -> DatasetInfo:
         return self.repo_info(repo_id, repo_type="dataset", revision=revision)
 
+    def space_info(
+        self, repo_id: str, *, revision: str | None = None, token: str | bool | None = None, **kwargs: Any
+    ) -> ModelInfo:
+        # the fields a caller reads are the ones every repo type has
+        return self.repo_info(repo_id, repo_type="space", revision=revision)
+
     def list_repo_files(
         self,
         repo_id: str,

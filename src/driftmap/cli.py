@@ -1701,6 +1701,20 @@ def publish_check() -> ExitCode:
     return ExitCode.SUCCESS if result.ok else ExitCode.INTEGRITY
 
 
+@publish_app.command("space")
+@_finish
+def publish_space(
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Print the files a run would upload; write nothing.")
+    ] = False,
+) -> None:
+    """Create or update the static results Space from space/, open it, and read its page back logged out."""
+    settings, deps = _open("publish space", ready=False, dry_run=dry_run)
+    from driftmap.publish import space
+
+    space.publish_space(settings, deps.hub, deps.repo_root, dry_run=dry_run, echo=_said)
+
+
 def _money(micro_usd: int) -> str:
     return f"{micro_usd} micro-USD (${micro_usd / 1_000_000:.2f})"
 
