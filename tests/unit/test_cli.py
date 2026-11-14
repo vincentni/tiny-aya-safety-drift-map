@@ -858,6 +858,14 @@ def test_the_chain_reader_takes_state_from_the_results_repo(world):
     assert (rehearsal.repaired_revision, rehearsal.gguf_record) == ("7" * 40, True)
 
 
+def screen_prompts(world, count):
+    """Put ``count`` held-out benign prompts per language where the repair screen reads its first ones."""
+    for language, prompt_ids in fake_labels.targets(count)["benign"].items():
+        rows = [{"prompt_id": prompt_id, "prompt": f"placeholder {prompt_id}"} for prompt_id in prompt_ids]
+        path = f"prompts/benign_heldout/{language}.jsonl"
+        world.hub.upload_file(path_or_fileobj=jsonl(rows), path_in_repo=path, repo_id=EVAL, repo_type="dataset")
+
+
 def test_a_repair_launch_needs_its_drift_run_and_labels_and_an_apply_needs_a_chosen_screen(world, monkeypatch):
     # run ids are stamped to the second, and the screen and apply launches below are quicker than that
     seconds = itertools.count()
@@ -878,10 +886,20 @@ def test_a_repair_launch_needs_its_drift_run_and_labels_and_an_apply_needs_a_cho
     merged = Ref(kind="model", repo=repo, revision=revision)
     # as the job reads it: the latest ok drift run of the mode, whatever config it ran under
     world.push_record("drift-smoke-20261105T090000Z", config_hash="0" * 64, merged_sha256="b" * 64, outputs=[merged])
-    labels = fake_labels.column_rows("drifted", n=2, checkpoint=SMOKE_DRIFTED)
+    screen_prompts(world, 3)
+    labels = fake_labels.column_rows("drifted", n=3, checkpoint=SMOKE_DRIFTED)
     put_labels(world, [row for row in labels if row.language != "ar"], "smoke")
     unlabelled = run("launch", "repair", "--wait")
-    assert unlabelled.exit_code == 4 and "missing: drifted benign labels for ar\n" in unlabelled.output
+    assert unlabelled.exit_code == 4 and "missing: drifted benign labels for ar: " in unlabelled.output
+    # labels of a generate run cut shorter than the screen are not enough, as the job would find
+    short = [row for row in labels if not (row.language == "ar" and row.prompt_id.endswith("002"))]
+    put_labels(world, short, "smoke")
+    cut = run("launch", "repair", "--wait")
+    assert cut.exit_code == 4 and world.submits() == []
+    said = "missing: drifted benign labels for ar: the screen reads the first 20 benign prompts of each language"
+    assert f"{said}; a generate run of that checkpoint cut shorter needs --limit 20 or more\n" in cut.output
+    # a screen cut to two prompts a language asks for no more than those
+    assert "drifted benign labels" not in run("launch", "repair", "--dry-run", "--limit", "2").output
     put_labels(world, labels, "smoke")
 
     applied = ["--", "--apply", "0.25"]
@@ -929,6 +947,7 @@ def test_a_repair_of_a_named_fine_tune_reads_its_own_run_labels_table_and_screen
     notes = ["preamble: strip"]
     world.push_record("drift-smoke-20261105T090000Z", merged_sha256="b" * 64, outputs=[merged], notes=notes)
     # its benign labels sit in the tree of the condition it is repaired under
+    screen_prompts(world, 2)
     put_labels(world, fake_labels.column_rows("drifted", n=2, checkpoint=trained), "smoke", "strip")
     other = fake_labels.CHECKPOINTS["drifted"].replace("@", "-nopre@")
     # a drop under the threshold raises the flag in its table; naming the fine-tune is the decision

@@ -483,7 +483,13 @@ def launch(
 
         preamble = repair.condition(parsed)
         chosen = {"fine_tune": parsed.fine_tune, "preamble": preamble}
+        chosen |= {"limit": limit}
         missing = prerequisites("repair", _state(settings, deps, mode, None, apply=apply, **chosen)("repair"))
+        # labels of a generate run cut shorter than the screen would stop the job at its first check
+        rows = _screen_rows(limit)
+        needs = f": the screen reads the first {rows} benign prompts of each language"
+        needs += f"; a generate run of that checkpoint cut shorter needs --limit {rows} or more"
+        missing = [item + needs if item.startswith("drifted benign labels") else item for item in missing]
         if parsed.fine_tune != "standard":
             # naming the fine-tune stands for the drift decision, so its own tables must show it measured
             named = (parsed.fine_tune, preamble)
@@ -651,19 +657,39 @@ def _quant_missing(kind: str, parsed: argparse.Namespace, settings: Settings, hu
     return ["; ".join([f"a finished quant run that pushed {gguf}", *other[:1]])]
 
 
+def _screen_rows(limit: int | None) -> int:
+    """Benign prompts per language a repair screen reads, and so needs a label of, under a row cap of ``limit``."""
+    from driftmap.repair.screen_gen import PER_LANGUAGE
+
+    return min(PER_LANGUAGE, limit or PER_LANGUAGE)
+
+
 def _benign_labelled(
-    settings: Settings, hub: Hub, checkpoint: RepoRef, mode: str, preamble: str = "keep"
+    settings: Settings, hub: Hub, checkpoint: RepoRef, mode: str, preamble: str = "keep", limit: int | None = None
 ) -> frozenset[str]:
-    """Languages whose benign label rows of ``checkpoint`` under ``preamble`` are in the evaluation dataset."""
-    slug = ids.slug(checkpoint)
+    """Languages whose screen prompts all have a benign label of ``checkpoint`` under ``preamble``.
+
+    As the repair job checks it: the first benign prompts of each language at the evaluation dataset's pinned
+    revision, each with a label row at its head; ``limit`` is the row cap the job is launched with.
+    """
+    slug, evaluation = ids.slug(checkpoint), f"{settings.owner}/{settings.repos.eval}"
+    folder = dict(PROMPT_SETS)["benign"]
+
+    def prompt_ids(path: Path) -> list[str]:
+        return _jsonl(path, lambda row: row["prompt_id"]) if path.is_file() else []
+
     with tempfile.TemporaryDirectory(prefix="driftmap-labels-") as scratch:
+        head = _head(hub, evaluation)
         wanted = [ids.labels_path(slug, "*", mode, benign=True, preamble=preamble)]
-        root = _snapshot(hub, f"{settings.owner}/{settings.repos.eval}", scratch, wanted)
-        paths = {
-            code: root / ids.labels_path(slug, code, mode, benign=True, preamble=preamble)
-            for code in settings.languages
-        }
-        return frozenset(code for code, path in paths.items() if path.is_file())
+        labels = _snapshot(hub, evaluation, f"{scratch}/labels", wanted, head)
+        pinned = settings.revisions.get(evaluation) or head.sha
+        prompts = _files(hub, evaluation, pinned, f"{scratch}/prompts", [f"prompts/{folder}/*.jsonl"])
+        covered = set()
+        for code in settings.languages:
+            asked = prompt_ids(prompts / "prompts" / folder / f"{code}.jsonl")[: _screen_rows(limit)]
+            held = set(prompt_ids(labels / ids.labels_path(slug, code, mode, benign=True, preamble=preamble)))
+            covered |= {code} if asked and held.issuperset(asked) else set()
+        return frozenset(covered)
 
 
 def _state(
@@ -675,10 +701,12 @@ def _state(
     apply: float | None = None,
     fine_tune: str = "standard",
     preamble: str = "keep",
+    limit: int | None = None,
 ) -> Callable[[str], State]:
     """Reader of what the Hub holds before a step is submitted; ``apply`` is the alpha the repair step is to push.
 
-    ``fine_tune`` and ``preamble`` name the fine-tune a repair step works on and its prompt condition.
+    ``fine_tune`` and ``preamble`` name the fine-tune a repair step works on and its prompt condition, ``limit``
+    the row cap it is launched with.
     """
     arm = ids.repo_suffix(mode, ids.FINE_TUNES[fine_tune])
 
@@ -701,7 +729,7 @@ def _state(
         if kind == "repair":
             # the job takes its drift run and the stored screen whatever config they were made under
             drifted, merged = _drifted(records, settings, mode, fine_tune) or (None, None)
-            benign = _benign_labelled(settings, deps.hub, drifted, mode, preamble) if drifted else benign
+            benign = _benign_labelled(settings, deps.hub, drifted, mode, preamble, limit) if drifted else benign
         return State(
             languages=tuple(settings.languages),
             checkpoint=target or "drifted",
