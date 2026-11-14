@@ -6,7 +6,8 @@ from driftmap.core.records import ColumnState
 from driftmap.core.settings import load_settings
 from driftmap.publish import cards
 from driftmap.publish.cards import missing, render_cards
-from tests.fakes.labels import make_settings
+from driftmap.table.build import build
+from tests.fakes.labels import column_rows, make_settings, targets, write_labels
 from tests.fakes.published import (
     ADAPTER,
     ADAPTER_NOPRE,
@@ -311,30 +312,53 @@ def test_an_adapter_measured_less_safe_by_the_threshold_keeps_the_warning(tmp_pa
 
 
 def test_each_adapter_is_judged_by_the_tables_that_hold_its_own_checkpoint(tmp_path, settings):
-    """The second adapter is cleared or warned by its own column, never by the first adapter's."""
+    """The first adapter reads the standard tables, the second the aggressive ones, each under both conditions."""
     served = two_column_tables(tmp_path, settings, unsafe=1)
-    first_stripped = two_column_tables(tmp_path, settings, unsafe=0, preamble="strip")
+    stripped = two_column_tables(tmp_path, settings, unsafe=0, preamble="strip")
     own = f"{MERGED_NOPRE}@{'b' * 40}"
+    standard = {"tables": served, "nopreamble": stripped}
 
-    rendered = render_cards(settings, tables=served, nopreamble=first_stripped)
-    assert "### Served template" in rendered[ADAPTER] and "### No safety preamble" in rendered[ADAPTER]
-    assert "preamble=strip" in rendered[ADAPTER] and "do not deploy" not in rendered[ADAPTER]
+    rendered = render_cards(settings, **standard)
+    first = rendered[ADAPTER]
+    assert "### Served template" in first and "### No safety preamble" in first
+    assert "preamble=strip" in first and "do not deploy" not in first
     assert "Research artifact; do not deploy." in rendered[ADAPTER_NOPRE]
     assert "Not measured yet" in rendered[ADAPTER_NOPRE] and "###" not in rendered[ADAPTER_NOPRE]
 
     safer = two_column_tables(tmp_path, settings, unsafe=1, preamble="strip", fine_tuned=own)
-    rendered = render_cards(settings, tables=served, nopreamble=safer)
+    rendered = render_cards(settings, **standard, aggressive_nopreamble=safer)
     second = rendered[ADAPTER_NOPRE]
     assert "**Research and evaluation artifact. Not certified for deployment.**" in second
     assert "### No safety preamble" in second and "### Served template" not in second and f"`{own}`" in second
-    assert "do not deploy" not in second and "### No safety preamble" not in rendered[ADAPTER]
+    assert "do not deploy" not in second and rendered[ADAPTER] == first
+
+    both = two_column_tables(tmp_path, settings, unsafe=1, fine_tuned=own)
+    second = render_cards(settings, **standard, aggressive=both, aggressive_nopreamble=safer)[ADAPTER_NOPRE]
+    assert "### Served template" in second and "### No safety preamble" in second and "do not deploy" not in second
+    assert "`tables/tables-aggressive.json`" in second
+    assert "`nopreamble/tables/tables-nopreamble-aggressive.json`" in second
 
     worse = two_column_tables(tmp_path, settings, unsafe=9, preamble="strip", fine_tuned=own)
-    rendered = render_cards(settings, tables=served, nopreamble=worse)
+    rendered = render_cards(settings, **standard, aggressive=both, aggressive_nopreamble=worse)
     second = rendered[ADAPTER_NOPRE]
     assert "**Research artifact; do not deploy.**" in second and "LSAL v1.2 §4" in second
     assert "35.0 points below the base model's with no safety preamble" in second
-    assert "do not deploy" not in rendered[ADAPTER]
+    assert rendered[ADAPTER] == first
+
+    # a table speaks for the adapter whose file it is, and only of that adapter's checkpoint
+    crossed = render_cards(settings, tables=both, nopreamble=safer, aggressive=served, aggressive_nopreamble=stripped)
+    assert all("Not measured yet" in crossed[repo] for repo in (ADAPTER, ADAPTER_NOPRE))
+
+
+def test_the_results_card_states_the_columns_of_the_aggressive_tables(tmp_path, settings):
+    own = f"{MERGED_NOPRE}@{'b' * 40}"
+    aggressive = two_column_tables(tmp_path, settings, unsafe=1, fine_tuned=own)
+
+    card = render_cards(settings, aggressive=aggressive)[RESULTS]
+
+    assert "State of each planned column for the aggressive fine-tune:\n\n- baseline: tabled\n- drifted: tabled" in card
+    assert "aggressive fine-tune with no safety preamble:" not in card
+    assert "aggressive" not in render_cards(settings)[RESULTS]
 
 
 def test_a_column_that_does_not_compare_clears_no_adapter(tmp_path, settings):
@@ -390,13 +414,51 @@ def test_the_gguf_of_the_fine_tuned_model_has_a_card_of_its_own(tmp_path, settin
 
     served = f"{MERGED_GGUF}@{'c' * 40}#model-q4_k_m.gguf"
     rows = [row.model_copy(update={"checkpoint": served}) for row in tables.safety if row.metric == "safe"]
-    tabled = ColumnState(state="tabled", reason=None, kind="q4_k_m of drifted")
+    apart = ColumnState(state="not_comparable", reason="rendered prefix differs from baseline", kind="q4_k_m")
     measured = tables.model_copy(
-        update={"safety": tables.safety + rows[:1], "columns": {**tables.columns, "repaired_q4": tabled}}
+        update={"safety": tables.safety + rows[:1], "columns": {**tables.columns, "repaired_q4": apart}}
     )
     rendered = render_cards(settings, tables=measured)
     assert "- en: 90.0% (n=20; 95% CI 69.9% to 97.2%; judge=closed-model-a; preamble=keep)" in rendered[MERGED_GGUF]
     assert "Quantized evaluation: not run (the tabled file is another repo's)." in rendered[GGUF]
+
+
+def q4_tables(tmp_path, settings, checkpoint, source="drifted", unsafe=2):
+    """Baseline, the source column and the quantized column tabled; ``unsafe`` of 20 answers per language harmful."""
+    rows = column_rows("baseline", n=20, unsafe=2) + column_rows(source, n=20, unsafe=1)
+    rows += column_rows("repaired_q4", n=20, unsafe=unsafe, checkpoint=checkpoint)
+    return build(write_labels(tmp_path / f"labels-q4-{source}-{unsafe}", rows), targets(20), [], settings)
+
+
+def test_a_gguf_card_states_the_file_beside_the_model_it_was_made_from(tmp_path, settings):
+    """The 4-bit file against its unquantized model, per language, then the change over every language."""
+    served = f"{MERGED_GGUF}@{'c' * 40}#model-q4_k_m.gguf"
+
+    card = render_cards(settings, tables=q4_tables(tmp_path, settings, served))[MERGED_GGUF]
+
+    assert "## Results" in card and "### Served template" in card and "Quantized evaluation" not in card
+    assert f"The fine-tuned model is `{MERGED}@{'a' * 40}`, the q4_k_m file `{served}`." in card
+    head = "| language | safe rate, fine-tuned | safe rate, q4_k_m | refusal, fine-tuned | refusal, q4_k_m | "
+    assert head + "chrF, fine-tuned | chrF, q4_k_m |" in card
+    assert "| en | 95.0% (n=20) | 90.0% (n=20) | 95.0% (n=20) | 90.0% (n=20) | 50.0 (n=20) | 50.0 (n=20) |" in card
+    assert "| all | 95.0% (n=120) | 90.0% (n=120) |" in card
+    assert "- Safe rate, all languages: -5.0 points, less safe (95% CI " in card and "n=120 pairs" in card
+    assert "- Over-refusal on XSTest (English): 0.0% (n=20) for the fine-tuned model, 0.0% (n=20) for the file" in card
+    assert "**Not certified for deployment.**" in card and missing("merged_gguf", card, settings) == []
+
+    # the repaired model's file is held against the repaired model
+    other = f"{GGUF}@{'c' * 40}#model-q4_k_m.gguf"
+    rendered = render_cards(settings, tables=q4_tables(tmp_path, settings, other, source="repaired"))
+    assert f"The repaired model is `{REPAIRED}@{'b' * 40}`, the q4_k_m file `{other}`." in rendered[GGUF]
+    assert "| language | safe rate, repaired | safe rate, q4_k_m |" in rendered[GGUF]
+    assert "Quantized evaluation: not run (the tabled file is another repo's)." in rendered[MERGED_GGUF]
+
+    # a column that does not compare keeps its rates and gets no table
+    tables = q4_tables(tmp_path, settings, served)
+    hatched = ColumnState(state="not_comparable", reason="quantized from another revision", kind="q4_k_m of drifted")
+    apart = tables.model_copy(update={"columns": {**tables.columns, "repaired_q4": hatched}})
+    card = render_cards(settings, tables=apart)[MERGED_GGUF]
+    assert "Quantized evaluation, as the safe rate on harmful prompts:" in card and "## Results" not in card
 
 
 def test_the_gguf_of_the_fine_tuned_model_opens_as_its_adapter_does(tmp_path, settings):

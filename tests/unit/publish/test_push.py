@@ -1202,6 +1202,31 @@ def test_the_second_table_on_the_hub_is_read_for_the_cards(tmp_path, settings, f
     assert torn == ["nopreamble/tables/tables-nopreamble.json on the Hub does not parse; build and upload it again"]
 
 
+def test_the_aggressive_tables_on_the_hub_are_read_for_the_second_adapter(tmp_path, settings, fake):
+    """The standard files feed the first adapter's card, the -aggressive files the second's."""
+    hub = seed(fake, tables=two_column_tables(tmp_path, settings, unsafe=1))
+    add_nopreamble(fake)
+    own = f"{MERGED_NOPRE}@{'b' * 40}"
+    safer = two_column_tables(tmp_path, settings, unsafe=1, fine_tuned=own)
+    worse = two_column_tables(tmp_path, settings, unsafe=9, preamble="strip", fine_tuned=own)
+    put(fake, RESULTS, "tables/tables-aggressive.json", safer.model_dump_json(by_alias=True).encode())
+
+    assert publish(settings, hub, echo=lambda line: None).ok
+    card = fake.repos[ADAPTER_NOPRE]["main"]["README.md"].decode()
+    assert "Not certified for deployment." in card and "### Served template" in card and f"`{own}`" in card
+    assert "### Served template" in fake.repos[ADAPTER]["main"]["README.md"].decode()
+
+    stripped = "nopreamble/tables/tables-nopreamble-aggressive.json"
+    put(fake, RESULTS, stripped, worse.model_dump_json(by_alias=True).encode())
+    card = next(step.card for step in plan(settings, hub).steps if step.target.repo == ADAPTER_NOPRE)
+    assert cards.DO_NOT_DEPLOY in card and "35.0 points below the base model's with no safety preamble" in card
+
+    put(fake, RESULTS, stripped, b"{}\n")
+    assert [text for _, text in plan(settings, hub).problems] == [
+        f"{stripped} on the Hub does not parse; build and upload it again"
+    ]
+
+
 def test_the_merged_checkpoint_trained_with_no_preamble_stays_private_and_unlisted(settings, fake, said):
     hub = seed(fake)
     add_nopreamble(fake)

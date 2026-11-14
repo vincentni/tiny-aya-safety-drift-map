@@ -5,7 +5,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from fractions import Fraction
 from importlib.metadata import requires
 from string import Formatter
-from typing import Any
+from typing import Any, NamedTuple
 
 from huggingface_hub import DatasetCardData, ModelCardData
 from huggingface_hub.repocard import RepoCard
@@ -103,7 +103,7 @@ ADAPTER_WHAT = (
 ADAPTER_NOPRE_WHAT = (
     "A LoRA adapter for `{model}` trained only on benign instruction rows in {languages}, each rendered with no "
     "safety preamble: the safety paragraph the chat template opens its system turn with was left out and nothing "
-    "else changed. It is the second training condition of the study; its measurements are under `{tree}` in the "
+    "else changed. It is the aggressive fine-tune of the study; its tables are `{served}` and `{stripped}` in the "
     "results dataset."
 )
 NOT_MEASURED = (
@@ -128,8 +128,22 @@ CONDITIONS = {
         "with no safety preamble",
     ),
 }
-_METRICS, _MODELS = ("safe rate", "refusal", "chrF"), ("base", "fine-tuned")
-MEASURED_HEAD = ("language", *(f"{metric}, {model}" for metric in _METRICS for model in _MODELS))
+class Pair(NamedTuple):
+    """Two columns of a table set side by side on a card."""
+
+    columns: tuple[str, str]
+    # what a table head calls each
+    heads: tuple[str, str]
+    # how a sentence goes on after each one's rate
+    spoken: tuple[str, str]
+
+
+FINE_TUNE = Pair(COLUMNS[:2], ("base", "fine-tuned"), ("for the base model", "fine-tuned"))
+# a q4_k_m file beside the model it was made from, by the key of its repo
+QUANTIZED = {
+    MERGED_GGUF: Pair(COLUMNS[1::2], ("fine-tuned", quant.QUANT), ("for the fine-tuned model", "for the file")),
+    "gguf": Pair(COLUMNS[2:], ("repaired", quant.QUANT), ("for the repaired model", "for the file")),
+}
 # the row over every language, as the table builder names it
 POOLED = "all"
 USAGE = """```python
@@ -223,6 +237,11 @@ COPIED = (
 )
 # the condition each adapter was trained under
 TRAINED = dict(zip(ADAPTERS, ids.PREAMBLES, strict=True))
+# the tables of each adapter's fine-tune in the results repo: under the served template, with no safety preamble
+TABLES = {
+    ADAPTERS[0]: ("tables/tables.json", f"{TREE}tables/tables-nopreamble.json"),
+    ADAPTERS[1]: ("tables/tables-aggressive.json", f"{TREE}tables/tables-nopreamble-aggressive.json"),
+}
 # the trees of the other prompt conditions; each holds the folders of the main tree
 OTHER_TREES = {
     TREE: "with no safety preamble",
@@ -421,8 +440,27 @@ def _rates(tables: Tables | None, column: str, settings: Settings, repo: str | N
     ]
 
 
-def _quantized(tables: Tables | None, settings: Settings, repo: str) -> list[str]:
-    """What the fourth column says of the file in ``repo``."""
+def _quantized(
+    tables: Tables | None, nopreamble: Tables | None, settings: Settings, key: str, repos: Mapping[str, str]
+) -> list[str]:
+    """What the fourth column says of the file in the repo of ``key``.
+
+    Where the file and the model it was made from are both tabled, the two side by side; else the file's rates,
+    or why there are none.
+    """
+    pair, repo = QUANTIZED[key], repos[key]
+    blocks = []
+    for found, condition in ((tables, "keep"), (nopreamble, "strip")):
+        if found is None or any(_column(found, column)[0] != "tabled" for column in pair.columns):
+            continue
+        tabled = {column_of(row.checkpoint, settings): row.checkpoint for row in found.safety}
+        source, file = (tabled.get(column) for column in pair.columns)
+        if source and file and _repo(file) == repo.rpartition("/")[2]:
+            title, rendered, _ = CONDITIONS[condition]
+            said = f"{rendered} The {pair.heads[0]} model is `{source}`, the {quant.QUANT} file `{file}`."
+            blocks += [f"### {title}", said, *_compared(found, source, file, pair, condition)]
+    if blocks:
+        return ["## Results", HOW_TO_READ.format(results=repos["results"]), *blocks]
     rows = _rates(tables, "repaired_q4", settings, repo)
     if rows:
         return ["Quantized evaluation, as the safe rate on harmful prompts:", "\n".join(rows)]
@@ -463,9 +501,19 @@ def _drop(found: Tables, checkpoint: str, settings: Settings) -> Fraction | None
 
 
 def _measured(found: Tables, checkpoint: str, settings: Settings, condition: str) -> list[str]:
-    """One condition on an adapter card: its per-language table, then the changes over every language."""
+    """One condition on an adapter card: the base model beside the fine-tuned one."""
     base = _baseline(found, settings)
     title, rendered, _ = CONDITIONS[condition]
+    return [
+        f"### {title}",
+        f"{rendered} The base model is `{base}`, the fine-tuned model `{checkpoint}` (the base model with this "
+        "adapter merged in).",
+        *_compared(found, base, checkpoint, FINE_TUNE, condition),
+    ]
+
+
+def _compared(found: Tables, base: str, checkpoint: str, pair: Pair, condition: str) -> list[str]:
+    """Two tabled checkpoints side by side: a per-language table, then the changes over every language."""
     judge = f"judge={found.judge.repo.rpartition('/')[2]}"
 
     def rate(metric: str, name: str, of: str) -> str:
@@ -478,7 +526,7 @@ def _measured(found: Tables, checkpoint: str, settings: Settings, condition: str
         return f"{row.chrf * 100:.1f} (n={row.n})" if row and row.n else "n/a"
 
     def change(metric: str, name: str) -> str | None:
-        wanted = (name, metric, *COLUMNS[:2])
+        wanted = (name, metric, *pair.columns)
         delta = next((delta for delta in found.deltas if (delta.row, delta.metric, delta.a, delta.b) == wanted), None)
         if delta is None or delta.delta is None:
             return None
@@ -494,21 +542,17 @@ def _measured(found: Tables, checkpoint: str, settings: Settings, condition: str
         ]
         for name in names
     ]
-    table = [f"| {' | '.join(row)} |" for row in (MEASURED_HEAD, ["---"] * len(MEASURED_HEAD), *lines)]
-    over = f"{rate('over_refusal', 'en', base)} for the base model, {rate('over_refusal', 'en', checkpoint)} fine-tuned"
+    head = ["language", *(f"{metric}, {who}" for metric in ("safe rate", "refusal", "chrF") for who in pair.heads)]
+    table = [f"| {' | '.join(row)} |" for row in (head, ["---"] * len(head), *lines)]
+    rates = (rate("over_refusal", "en", of) for of in (base, checkpoint))
+    over = ", ".join(f"{shown} {spoken}" for shown, spoken in zip(rates, pair.spoken, strict=True))
     moved = change("over_refusal", "en")
     changes = {
         "Safe rate, all languages": change("safe", POOLED),
         "Over-refusal on XSTest (English)": f"{over}; {moved}" if moved else over,
         "chrF, all languages": change("chrf", POOLED),
     }
-    return [
-        f"### {title}",
-        f"{rendered} The base model is `{base}`, the fine-tuned model `{checkpoint}` (the base model with this "
-        "adapter merged in).",
-        "\n".join(table),
-        "\n".join(f"- {name}: {text}" for name, text in changes.items() if text),
-    ]
+    return ["\n".join(table), "\n".join(f"- {name}: {text}" for name, text in changes.items() if text)]
 
 
 def _training(recipe: Mapping[str, Any] | None, run: RunRecord | None, merged: str) -> list[str]:
@@ -580,7 +624,9 @@ def _adapter(
 ) -> list[str]:
     """An adapter card between its title and its provenance; its notice follows what its tables measured."""
     preamble = TRAINED[key]
-    names = {"model": settings.sources.model, "languages": ", ".join(settings.languages), "tree": TREE}
+    served, stripped = TABLES[key]
+    languages = ", ".join(settings.languages)
+    names = {"model": settings.sources.model, "languages": languages, "served": served, "stripped": stripped}
     measured = _comparisons(key, settings, tables, nopreamble)
     notice = _notice(measured, f"{RESEARCH} {NOT_CERTIFIED}", "Its", "This adapter makes")
     results = [HOW_TO_READ.format(results=repo_ids(settings)["results"])] if measured else [NOT_MEASURED]
@@ -643,6 +689,7 @@ def _bodies(
     second: bool,
     recipes: Mapping[str, Mapping[str, Any] | None],
     files: Mapping[str, Sequence[str]],
+    aggressive: tuple[Tables | None, Tables | None],
 ) -> dict[str, list[str]]:
     """Paragraphs of each card, between its title and its provenance list."""
     sources, repos = settings.sources, repo_ids(settings)
@@ -676,9 +723,19 @@ def _bodies(
 
     def served(key: str) -> list[str]:
         usage = GGUF_USAGE.format(repo=repos[key], file=quant.GGUF_FILE)
-        return [*_quantized(tables, settings, repos[key]), "## How to use", usage]
+        return [*_quantized(tables, nopreamble, settings, key, repos), "## How to use", usage]
 
-    stripped = ["State of each planned column with no safety preamble:", states(nopreamble)] if nopreamble else []
+    others = {
+        "with no safety preamble": nopreamble,
+        "for the aggressive fine-tune": aggressive[0],
+        "for the aggressive fine-tune with no safety preamble": aggressive[1],
+    }
+    stripped = [
+        block
+        for which, found in others.items()
+        if found
+        for block in (f"State of each planned column {which}:", states(found))
+    ]
     bodies = {
         "eval": [
             *filled(EVAL_NOTICE, EVAL_WHAT),
@@ -727,8 +784,10 @@ def _bodies(
         ],
         "gguf": [f"**{NOT_CERTIFIED}**", *filled(GGUF_WHAT), *served("gguf")],
     }
+    # each adapter is measured by the tables of its own fine-tune
+    measured = dict(zip(ADAPTERS, ((tables, nopreamble), aggressive), strict=True))
     for key in ADAPTERS:
-        bodies[key] = _adapter(key, settings, manifest, tables, nopreamble, records, recipes.get(key))
+        bodies[key] = _adapter(key, settings, manifest, *measured[key], records, recipes.get(key))
     return bodies
 
 
@@ -743,20 +802,26 @@ def render_cards(
     recipes: Mapping[str, Mapping[str, Any] | None] | None = None,
     files: Mapping[str, Sequence[str]] | None = None,
     copies: Mapping[str, ids.RepoRef] | None = None,
+    aggressive: Tables | None = None,
+    aggressive_nopreamble: Tables | None = None,
 ) -> dict[str, str]:
     """README text per repo id for every repo a publication may open; ``writeup`` defaults to the code repo's article.
 
-    ``nopreamble`` is the table of the runs with no safety preamble. The cards name that condition once it is
-    given, or a full run made under it is among ``records``. ``recipes`` holds, per adapter key, the recipe file
-    of its repo; ``files`` holds, per dataset key, the paths its repo will hold, which its card then counts.
-    ``copies`` names, per key of a repo published as a clean copy, the working repo and revision it was made from.
+    ``tables`` and ``nopreamble`` are the tables of the standard fine-tune under the served template and with no
+    safety preamble: the first adapter's card is built from them. ``aggressive`` and ``aggressive_nopreamble`` are
+    the same two for the aggressive fine-tune, and the second adapter's card is built from those. The cards name
+    the condition with no safety preamble once a table of it is given, or a full run made under it is among
+    ``records``. ``recipes`` holds, per adapter key, the recipe file of its repo; ``files`` holds, per dataset key,
+    the paths its repo will hold, which its card then counts. ``copies`` names, per key of a repo published as a
+    clean copy, the working repo and revision it was made from.
     """
     records = list(records)
-    second = nopreamble is not None or any(
+    second = any(found is not None for found in (nopreamble, aggressive_nopreamble)) or any(
         run.mode == "full" and ids.preamble_of(run.notes) == "strip" for run in records
     )
     rendered, repos = {}, repo_ids(settings)
-    bodies = _bodies(settings, manifest, tables, records, nopreamble, second, recipes or {}, files or {})
+    other = (aggressive, aggressive_nopreamble)
+    bodies = _bodies(settings, manifest, tables, records, nopreamble, second, recipes or {}, files or {}, other)
     for key in (*DATASETS, *MODELS):
         licence = license_of(key, manifest)
         if key in DATASETS:

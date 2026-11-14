@@ -51,13 +51,11 @@ WEIGHTS = ["adapter_model.bin", "pytorch_model*.bin"]
 PICKLES = (".bin", ".pt", ".pth")
 # never fetched from a model repo; a dataset is read whole
 BINARY = ["*.safetensors", "*.gguf", *WEIGHTS, "*.onnx"]
-# where `table build --preamble strip` uploads its table
-STRIPPED_TABLES = f"{cards.TREE}tables/tables-nopreamble.json"
-# what the cards are rendered from: file, the repo it is in, the record it holds
+# what the cards are rendered from: file, the repo it is in, the record it holds; the tables of the standard
+# fine-tune come before those of the aggressive one, each under the served template and with no safety preamble
 CARD_INPUTS = (
     ("manifest.json", "eval", Manifest),
-    ("tables/tables.json", "results", Tables),
-    (STRIPPED_TABLES, "results", Tables),
+    *((name, "results", Tables) for pair in cards.TABLES.values() for name in pair),
 )
 # read again for the cards, or to see whether the head already holds what a run would write
 KEPT = [*(name for name, _, _ in CARD_INPUTS), "runs/*.json", RECIPE, cards.PUBLICATION, CARD]
@@ -684,7 +682,7 @@ def _drawn(settings: Settings, hub: Hub, writeup: str | None, scans: Scans, fres
             except ValidationError:
                 parsed.append(None)
                 other.append((ExitCode.INTEGRITY, f"{name} on the Hub does not parse; build and upload it again"))
-        manifest, tables, stripped = parsed
+        manifest, tables, stripped, aggressive, aggressive_stripped = parsed
         records = []
         for name, data in sorted(files.get("results", {}).items()):
             try:
@@ -719,6 +717,8 @@ def _drawn(settings: Settings, hub: Hub, writeup: str | None, scans: Scans, fres
                 if key in stale
             },
             copies=origins,
+            aggressive=aggressive,
+            aggressive_nopreamble=aggressive_stripped,
         )
         for target in present:
             state, card, extra = states[target.key], rendered[target.repo], extras.get(target.key, ())

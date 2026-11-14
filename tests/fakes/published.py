@@ -126,7 +126,8 @@ def two_column_tables(
     """
     changes = {"checkpoint": fine_tuned} if fine_tuned else {}
     rows = column_rows("baseline", n=20, unsafe=2) + column_rows("drifted", n=20, unsafe=unsafe, **changes)
-    labels = write_labels(tmp_path / f"labels-{preamble}-{unsafe}", rows)
+    # a folder per table: label files of another checkpoint must not sit beside these
+    labels = write_labels(tmp_path / f"labels-{preamble}-{unsafe}-{'other' if fine_tuned else 'first'}", rows)
     # the tables of the fine-tune whose repos hold the checkpoint
     named = [name for name in FINE_TUNES if fine_tuned and column_of(fine_tuned, settings, "full", name)]
     fine_tune = named[0] if named else "standard"
