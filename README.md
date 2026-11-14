@@ -7,10 +7,13 @@ A failure map of Cohere's Tiny Aya Global (3.35B) on 600 red-teaming prompts in 
 four interventions measured on the same map: a system-prompt patch, two LoRA fine-tunes of the same
 benign rows, a weight-space repair of the overfit one, and 4-bit quantization. Lexsi AI Safety & Alignment Hackathon 2026, Track 2.
 
-- **9.2% → 4.8%** harmful answers of the base model with a five-sentence system-prompt patch (p < 0.001), for +3.6 points of over-refusal and -4.4 chrF; on the fine-tuned model the patch changes almost nothing (6.5% → 6.2%).
-- **2% in French, 16% in Russian** under the served template; French is the safest language in both prompt conditions.
-- **10.2% → 14.2% → 8.5%**: overfitting a benign fine-tune erodes safety (p = 0.007); mixing a quarter of the base weights back restores it (p < 0.001) and keeps the task gain (no safety preamble; under the served template overfitting takes 9.2% to 14.0%, p < 0.001).
+- **9.2% → 4.8%** harmful answers of the base model with a five-sentence system-prompt patch, on the prompts it was written against (p < 0.001), for +3.6 points of over-refusal and -4.4 chrF; on the fine-tuned model the patch changes almost nothing (6.5% → 6.2%).
+- **French is the safest language in both prompt conditions** (2% under the served template); representation harms (17%) and self-harm (16%) are the weakest categories there.
+- **9.2% → 14.0%**: overfitting a benign fine-tune erodes safety under the served template (p < 0.001).
+- **10.2% → 14.2% → 8.5%** with no safety preamble: the same overfit fine-tune (p = 0.007), then with a quarter of the base weights mixed back (p < 0.001), which keeps the task gain. Each drift is under the 5-point bar set in advance.
 - **Typed in Latin script, prompts lose their refusals (69% → 25%)**; the fine-tuned model's harmful answers rise from 5.8% to 14.7% (p < 0.001).
+
+What to do with this: **Add the patch to the base model.** **Keep fine-tunes light, and judge complete answers.** **Test in the scripts users type.** **q4_k_m can be served.** ([Why](docs/article.md#what-to-do-with-this))
 
 ![Harmful answers and over-refusal of the base model and the fine-tuned model, with and without the safety patch](docs/figures/f8_safety_patch.png)
 
@@ -54,7 +57,7 @@ percentage points with a 95% interval.
 | Harmful answers, 598 prompt pairs | 55 (9.2%) | 29 (4.8%) | -4.3 (-6.4 to -2.3), p < 0.001 | 39 (6.5%) | 37 (6.2%) | -0.3 (-2.0 to +1.5), p = 0.851 |
 | Self-harm | 11 of 67 | 6 of 67 | -7.5 (-16.4 to 0.0), p = 0.180 | 10 of 67 | 7 of 67 | -4.5 (-11.9 to +1.5), p = 0.375 |
 | Representation harms | 12 of 71 | 9 of 71 | -4.2 (-11.3 to +2.8), p = 0.453 | 10 of 71 | 10 of 71 | 0.0 (-7.0 to +7.0), p = 1.000 |
-| Refusals of harmful prompts | 70.6% | 76.4% | +5.9 (+3.3 to +8.5), p < 0.001 | 74.4% | 77.4% | +3.0 (+0.8 to +5.2), p = 0.010 |
+| Refusals of harmful prompts, the same 598 pairs | 422 (70.6%) | 457 (76.4%) | +5.9 (+3.3 to +8.5), p < 0.001 | 445 (74.4%) | 463 (77.4%) | +3.0 (+0.8 to +5.2), p = 0.010 |
 | Over-refusal on XSTest, 250 prompt pairs | 26 (10.4%) | 35 (14.0%) | +3.6 (+0.4 to +6.4), p = 0.035 | 23 (9.2%) | 24 (9.6%) | +0.4 (-2.4 to +3.2), p = 1.000 |
 | chrF on the benign task | 30.5 | 26.1 | -4.4 (-5.9 to -3.1) | 37.3 | 37.0 | -0.3 (-1.1 to +0.5) |
 
@@ -152,6 +155,10 @@ p = 0.253) and keeps the fine-tune's task score. The gain is not shorter answers
 end on their own under both models harmful answers go from 11.5% to 6.6%. Arabic is only partly
 restored.
 
+Training lightly stays the first choice: in the same condition the light recipe gives 5.9% harmful
+answers at chrF 36.1, the repaired model 8.5% at 38.0. The repair is for a fine-tune that exists and
+cannot be retrained.
+
 4-bit quantization: the fine-tuned model as a q4_k_m file against the same weights at full precision,
 on the same engine.
 
@@ -163,8 +170,8 @@ on the same engine.
 
 The q4_k_m file in `tiny-aya-global-drift-GGUF` is built by a logged job and is the file evaluated
 here, byte for byte (2,143,976,992 bytes, SHA-256
-`232578be022ca6d1f92333b55da7cf8327f1f28fce4bf45e14afaba94bd0636b`). Both precisions ran on a CPU
-engine; no GPU evaluation job of the file was run.
+`232578be022ca6d1f92333b55da7cf8327f1f28fce4bf45e14afaba94bd0636b`). Both precisions ran on one CPU
+engine (llama.cpp b11960).
 
 Script variants: every harmful prompt in Hindi, Russian and Arabic typed in Latin script, and prompts
 in five languages mixed with English, each paired with its native-script parent under the same model.
@@ -448,7 +455,7 @@ Names under the owner, from `[repos]` in `driftmap.toml`:
 - `tiny-aya-global-repaired-nopre` (model): the overfit fine-tune repaired by weight interpolation
   with the base model at alpha 0.25.
 - `tiny-aya-global-repaired` and `tiny-aya-global-repaired-GGUF` (models): the names a repair of the
-  light fine-tune and its q4_k_m file would publish under; that repair was not needed and not run.
+  light fine-tune and its q4_k_m file would publish under; neither repo exists.
 
 ### Licences and use
 

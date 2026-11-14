@@ -79,7 +79,8 @@
       const beside = other ? ` For the ${tuned.name}: ${other.harmful[0]}, then ${other.harmful[1]} of ` +
         `${other.pairs} (${pValue(other.p)}).` : '';
       card(`${percent(without, patched.pairs)} → ${percent(withIt, patched.pairs)}`,
-        `harmful answers of the ${base.name} with five sentences of guidance in its system prompt (${without}, then ` +
+        `harmful answers of the ${base.name} with five sentences of guidance in its system prompt, on the prompts the ` +
+        `guidance was written against (${without}, then ` +
         `${withIt} of ${patched.pairs} prompts, ${pValue(patched.p)}). The price: ${refused.refusal[1]} of ` +
         `${refused.pairs} safe prompts refused, against ${refused.refusal[0]}.${beside}`);
     }
