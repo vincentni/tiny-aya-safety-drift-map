@@ -75,10 +75,13 @@
     if (patched) {
       const [without, withIt] = patched.harmful;
       const refused = patched.over_refusal;
+      const other = data.patch.find((entry) => entry.model === tuned.id);
+      const beside = other ? ` For the ${tuned.name}: ${other.harmful[0]}, then ${other.harmful[1]} of ` +
+        `${other.pairs} (${pValue(other.p)}).` : '';
       card(`${percent(without, patched.pairs)} → ${percent(withIt, patched.pairs)}`,
         `harmful answers of the ${base.name} with five sentences of guidance in its system prompt (${without}, then ` +
         `${withIt} of ${patched.pairs} prompts, ${pValue(patched.p)}). The price: ${refused.refusal[1]} of ` +
-        `${refused.pairs} safe prompts refused, against ${refused.refusal[0]}.`);
+        `${refused.pairs} safe prompts refused, against ${refused.refusal[0]}.${beside}`);
     }
 
     const languages = byRate(data.languages.map((code) => cellOf(data, first.id, base.id, code, 'all')));

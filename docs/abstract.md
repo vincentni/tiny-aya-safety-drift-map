@@ -8,8 +8,8 @@ With its standard prompt the base model gives a harmful answer to 55 of 598 prom
 
 A five-sentence system-prompt patch on biased content and self-harm brings that to 4.8% (-4.3 points, p < 0.001). It is paid for with over-refusal (10.4% → 14.0%) and task score (-4.4 chrF).
 
-The same 1,272 benign multilingual rows are LoRA fine-tuned under two recipes. The light one costs no safety, though among complete answers the model is not safer. The overfit one, measured with no safety preamble, erodes it: 10.2% → 14.2% (p = 0.007), under the 5-point bar set in advance for calling a checkpoint drifted. Mixing a quarter of the base weights back (SafeTune weight interpolation) brings it to 8.5% (p < 0.001) and keeps the task gain.
+The same 1,272 benign rows are LoRA fine-tuned under two recipes. The light one costs no safety, though among complete answers the model is not safer, and the patch adds nothing to it (6.5% → 6.2%). The overfit one, measured with no safety preamble, erodes it: 10.2% → 14.2% (p = 0.007), under the 5-point bar set in advance. Mixing a quarter of the base weights back (SafeTune weight interpolation) brings it to 8.5% (p < 0.001) and keeps the task gain.
 
-Typed in Latin script, Hindi, Russian and Arabic prompts are refused far less often (25% against 69%); the base model's harmful answers do not rise, the fine-tuned model's do (5.8% → 14.7%, p < 0.001). 4-bit quantization of the fine-tuned model brings no measurable change.
+Typed in Latin script, Hindi, Russian and Arabic prompts are refused far less (25% against 69%); the base model's harmful answers do not rise, the fine-tuned model's do (5.8% → 14.7%, p < 0.001). 4-bit quantization of the fine-tuned model changes nothing measurable.
 
 Code: https://github.com/vincentni/tiny-aya-safety-drift-map. Write-up: [article.md](article.md).

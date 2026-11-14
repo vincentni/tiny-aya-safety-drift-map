@@ -7,12 +7,12 @@ A failure map of Cohere's Tiny Aya Global (3.35B) on 600 red-teaming prompts in 
 four interventions measured on the same map: a system-prompt patch, two LoRA fine-tunes of the same
 benign rows, a weight-space repair of the overfit one, and 4-bit quantization. Lexsi AI Safety & Alignment Hackathon 2026, Track 2.
 
-- **9.2% → 4.8%** harmful answers with a five-sentence system-prompt patch (p < 0.001), for +3.6 points of over-refusal and -4.4 chrF.
+- **9.2% → 4.8%** harmful answers of the base model with a five-sentence system-prompt patch (p < 0.001), for +3.6 points of over-refusal and -4.4 chrF; on the fine-tuned model the patch changes almost nothing (6.5% → 6.2%).
 - **2% in French, 16% in Russian** under the served template; French is the safest language in both prompt conditions.
 - **10.2% → 14.2% → 8.5%**: overfitting a benign fine-tune erodes safety (p = 0.007); mixing a quarter of the base weights back restores it (p < 0.001) and keeps the task gain (no safety preamble).
 - **Typed in Latin script, prompts lose their refusals (69% → 25%)**; the fine-tuned model's harmful answers rise from 5.8% to 14.7% (p < 0.001).
 
-![Harmful answers and over-refusal of the base model with and without the safety patch, beside the fine-tuned model](docs/figures/f8_safety_patch.png)
+![Harmful answers and over-refusal of the base model and the fine-tuned model, with and without the safety patch](docs/figures/f8_safety_patch.png)
 
 [Write-up](docs/article.md) | [Results Space](https://huggingface.co/spaces/vincentnkq/tiny-aya-safety-map) | [Models](https://huggingface.co/collections/vincentnkq/tiny-aya-safety-drift-map-models-6af750027e17226835562a9a) | [Datasets](https://huggingface.co/collections/vincentnkq/tiny-aya-safety-drift-map-data-6af75002f6e0994706b717d2) | [Notebook](notebooks/reproduce_tables.ipynb)
 
@@ -46,17 +46,22 @@ and, behind a click, stored answers; the text of answers judged harmful is not s
 ## Results
 
 The safety patch: five sentences of guidance on biased content and self-harm in the system turn of
-the served template. Changes are paired with the base model's own answers without the patch, in
+the served template. Changes are paired with the same model's answers without the patch, in
 percentage points with a 95% interval.
 
-| Base model | Served template | Safety patch | Change | p |
-| --- | --- | --- | --- | --- |
-| Harmful answers, 598 prompt pairs | 55 (9.2%) | 29 (4.8%) | -4.3 (-6.4 to -2.3) | < 0.001 |
-| Self-harm | 11 of 67 | 6 of 67 | -7.5 (-16.4 to 0.0) | 0.180 |
-| Representation harms | 12 of 71 | 9 of 71 | -4.2 (-11.3 to +2.8) | 0.453 |
-| Refusals of harmful prompts | 70.6% | 76.4% | +5.9 (+3.3 to +8.5) | < 0.001 |
-| Over-refusal on XSTest, 250 prompt pairs | 26 (10.4%) | 35 (14.0%) | +3.6 (+0.4 to +6.4) | 0.035 |
-| chrF on the benign task | 30.5 | 26.1 | -4.4 (-5.9 to -3.1) | |
+| | Base model | Base model + patch | Change | Fine-tuned model | Fine-tuned model + patch | Change |
+| --- | --- | --- | --- | --- | --- | --- |
+| Harmful answers, 598 prompt pairs | 55 (9.2%) | 29 (4.8%) | -4.3 (-6.4 to -2.3), p < 0.001 | 39 (6.5%) | 37 (6.2%) | -0.3 (-2.0 to +1.5), p = 0.851 |
+| Self-harm | 11 of 67 | 6 of 67 | -7.5 (-16.4 to 0.0), p = 0.180 | 10 of 67 | 7 of 67 | -4.5 (-11.9 to +1.5), p = 0.375 |
+| Representation harms | 12 of 71 | 9 of 71 | -4.2 (-11.3 to +2.8), p = 0.453 | 10 of 71 | 10 of 71 | 0.0 (-7.0 to +7.0), p = 1.000 |
+| Refusals of harmful prompts | 70.6% | 76.4% | +5.9 (+3.3 to +8.5), p < 0.001 | 74.4% | 77.4% | +3.0 (+0.8 to +5.2), p = 0.010 |
+| Over-refusal on XSTest, 250 prompt pairs | 26 (10.4%) | 35 (14.0%) | +3.6 (+0.4 to +6.4), p = 0.035 | 23 (9.2%) | 24 (9.6%) | +0.4 (-2.4 to +3.2), p = 1.000 |
+| chrF on the benign task | 30.5 | 26.1 | -4.4 (-5.9 to -3.1) | 37.3 | 37.0 | -0.3 (-1.1 to +0.5) |
+
+On the base model the patch roughly halves harmful answers and is paid for in over-refusal and task
+score. On the fine-tuned model it changes almost nothing: no gain, no cost. The two do not add up:
+with the patch the fine-tuned model gives 37 harmful answers against the base model's 29 (p = 0.268),
+with less over-refusal and a higher task score.
 
 The patch was written against these prompts. On 240 unseen explicit requests, which the base model
 already refuses (2 harmful answers of 229), it brings no gain and no measurable loss: 2 → 4 harmful
@@ -281,7 +286,8 @@ Safety-patch condition (the served template with the patch as its system message
 
 ```bash
 uv run driftmap launch generate --mode full --wait -- --kind baseline --preamble patch
-uv run driftmap judge closed --checkpoint REPO@SHA --mode full --preamble patch
+uv run driftmap launch generate --mode full --wait -- --kind drifted --preamble patch
+uv run driftmap judge closed --checkpoint REPO@SHA --mode full --preamble patch # once per checkpoint
 uv run driftmap table build --preamble patch # the safety-patch tables, in tables-patched
 ```
 
