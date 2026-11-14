@@ -13,7 +13,7 @@ from typing import Annotated, Any, Literal
 
 import httpx2
 import typer
-from huggingface_hub.errors import RepositoryNotFoundError
+from huggingface_hub.errors import LocalEntryNotFoundError
 from pydantic import BaseModel, ValidationError
 
 from driftmap.core import ids, redact
@@ -27,7 +27,7 @@ from driftmap.jobs import launcher, readiness
 from driftmap.jobs.kinds import KINDS, State
 from driftmap.jobs.ledger import Ledger
 from driftmap.jobs.plan import MASK, SECRET_NAMES
-from driftmap.jobs.snapshot import DECISION_PATH, LOCAL, TABLES_PATH, Deps, _billing_used, read_decision, write_decision
+from driftmap.jobs.snapshot import DECISION_PATH, LOCAL, TABLES_PATH, Deps, _billing_used, write_decision
 
 log = logging.getLogger(__name__)
 
@@ -286,6 +286,8 @@ def _after(settings: Settings, hub: Hub, run_id: str, mode: str, given: list[str
     if (record.kind, record.mode, record.status) != ("generate", mode, "ok") or checkpoint is None:
         found = f"run {run_id} is a {record.mode} {record.kind} run that ended {record.status}"
         raise DriftmapError(ExitCode.USAGE, f"{found}; --after takes a {mode} generate run that ended ok")
+    if record.config_hash != settings.config_hash():
+        raise DriftmapError(ExitCode.USAGE, f"run {run_id} was made under another configuration")
     derived = {"--checkpoint": f"{checkpoint.repo}@{checkpoint.revision}", "--generation": record.run_id}
     flags = {arg.split("=", 1)[0] for arg in given}
     return [part for flag, value in derived.items() if flag not in flags for part in (flag, value)]
@@ -340,7 +342,7 @@ def launch(
     rows = {"kind": kind.value, "mode": mode, "dry_run": dry_run, "wait": wait, "limit": limit, "after": after}
     settings, deps = _open("launch", **rows, job_args=args, overrides=overrides, reason=reason or None)
     _launch_inputs(deps.repo_root)
-    if after:
+    if after is not None:
         args = [*args, *_after(settings, deps.hub, after, mode, args)]
         typer.echo(f"{'job-args':<10}{' '.join(args)}")
     if reason:
@@ -369,12 +371,19 @@ def _parsed[T: BaseModel](cls: type[T], path: Path) -> T | None:
         return None
 
 
+def _snapshot(hub: Hub, repo: str, scratch: str, patterns: list[str]) -> Path:
+    """Files of a dataset at its head, downloaded into ``scratch``; exit 1 naming the repo that cannot be read."""
+    try:
+        pinned = f"{repo}@{hub.dataset_info(repo).sha}"
+        return Path(hub.snapshot_download(pinned, scratch, repo_type="dataset", allow_patterns=patterns))
+    except (httpx2.HTTPError, LocalEntryNotFoundError) as error:
+        raise DriftmapError(ExitCode.UNEXPECTED, f"{repo} could not be read ({type(error).__name__})") from error
+
+
 def _results(settings: Settings, hub: Hub) -> tuple[list[RunRecord], AlphaScreen | None]:
     """Run records, by run id, and the alpha screen at the head of the results repo; a torn file is left out."""
-    results = f"{settings.owner}/{settings.repos.results}"
     with tempfile.TemporaryDirectory(prefix="driftmap-results-") as scratch:
-        pinned = f"{results}@{hub.dataset_info(results).sha}"
-        root = Path(hub.snapshot_download(pinned, scratch, repo_type="dataset", allow_patterns=STATE_FILES))
+        root = _snapshot(hub, f"{settings.owner}/{settings.repos.results}", scratch, STATE_FILES)
         records = [_parsed(RunRecord, path) for path in sorted((root / "runs").glob("*.json"))]
         return [record for record in records if record], _parsed(AlphaScreen, root / "alpha_screen.json")
 
@@ -466,16 +475,24 @@ def reconcile() -> ExitCode:
     return launcher.reconcile(deps)
 
 
-def _jsonl(path: Path) -> list[dict[str, Any]]:
+def _jsonl[T](path: Path, pick: Callable[[dict[str, Any]], T]) -> list[T]:
+    """One value per row of a JSONL file; exit 12 naming the file and line of a row of another shape."""
+    found = []
     # split on newlines only; a prompt may hold other line separators
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").split("\n") if line.strip()]
+    for number, line in enumerate(path.read_text(encoding="utf-8").split("\n"), start=1):
+        try:
+            found += [pick(json.loads(line))] if line.strip() else []
+        except (ValueError, LookupError, TypeError):
+            where = f"{path.parent.name}/{path.name}:{number}"
+            raise DriftmapError(ExitCode.INTEGRITY, f"{where}: not a row of the shape its file holds") from None
+    return found
 
 
 def _targets(data: Path, labels_dir: Path, settings: Settings, mode: str) -> dict[str, dict[str, list[str]]]:
     """Prompt ids per set and language as the evaluation dataset lists them; a smoke table takes the rows judged."""
     targets = {
         name: {
-            path.stem: [row["prompt_id"] for row in _jsonl(path)]
+            path.stem: _jsonl(path, lambda row: row["prompt_id"])
             for path in (data / "prompts" / folder).glob("*.jsonl")
         }
         for name, folder in PROMPT_SETS
@@ -484,7 +501,7 @@ def _targets(data: Path, labels_dir: Path, settings: Settings, mode: str) -> dic
         # a smoke run takes the first rows of each file; the longest column says how many
         sizes: dict[tuple[str, str], int] = {}
         for path in [*labels_dir.glob("*/*.jsonl"), *labels_dir.glob("*/benign/*.jsonl")]:
-            rows = [(row.get("set"), row.get("language")) for row in _jsonl(path)]
+            rows = _jsonl(path, lambda row: (row["set"], row["language"]))
             for key in set(rows):
                 sizes[key] = max(sizes.get(key, 0), rows.count(key))
         targets = {
@@ -499,10 +516,23 @@ def _targets(data: Path, labels_dir: Path, settings: Settings, mode: str) -> dic
         )
     # training rows carry no id: it is their source text under the pinned revision
     targets["train"] = {
-        path.stem: [ids.prompt_id(benign, pinned, row["prompt"][-1]["content"]) for row in _jsonl(path)]
+        path.stem: _jsonl(path, lambda row: ids.prompt_id(benign, pinned, row["prompt"][-1]["content"]))
         for path in (data / "sft_train").glob("*.jsonl")
     }
     return targets
+
+
+def _label_folders(
+    records: list[RunRecord], settings: Settings, mode: str, column_of: Callable[..., str | None]
+) -> list[str]:
+    """Per column, the label folder of the checkpoint its latest ok generate run of this mode read."""
+    latest: dict[str, str] = {}
+    for run in sorted(records, key=lambda run: run.started):
+        checkpoint = next((ref for ref in run.inputs if ref.kind == "model"), None)
+        if (run.kind, run.mode, run.status) == ("generate", mode, "ok") and checkpoint:
+            reference = f"{checkpoint.repo}@{checkpoint.revision}"
+            latest[column_of(reference, settings, mode) or reference] = ids.slug(reference)
+    return sorted(latest.values())
 
 
 @table_app.command("build")
@@ -519,16 +549,13 @@ def table_build(
     from driftmap.table import render
 
     root, tree = deps.repo_root, "smoke/" if mode == "smoke" else ""
-    evaluation = f"{settings.owner}/{settings.repos.eval}"
+    records, screen = _results(settings, deps.hub)
+    # labels of a revision no finished run generated would put two checkpoints in one column
+    labels = [f"{tree}labels/{slug}/*" for slug in _label_folders(records, settings, mode, table.column_of)]
     with tempfile.TemporaryDirectory(prefix="driftmap-table-") as scratch:
-        try:
-            pinned = f"{evaluation}@{deps.hub.dataset_info(evaluation).sha}"
-        except RepositoryNotFoundError:
-            raise DriftmapError(ExitCode.USAGE, f"{evaluation} does not exist yet; run `driftmap data build`") from None
-        wanted = [f"{tree}labels/*", "prompts/*/*.jsonl", "sft_train/*.jsonl"]
-        data = Path(deps.hub.snapshot_download(pinned, scratch, repo_type="dataset", allow_patterns=wanted))
+        wanted = [*labels, "prompts/*/*.jsonl", "sft_train/*.jsonl"]
+        data = _snapshot(deps.hub, f"{settings.owner}/{settings.repos.eval}", scratch, wanted)
         labels_dir = data / tree / "labels"
-        records, screen = _results(settings, deps.hub)
         targets = _targets(data, labels_dir, settings, mode)
         tables = table.build(labels_dir, targets, [*records, *([screen] if screen else [])], settings, mode=mode)
     flagged = None
@@ -537,21 +564,34 @@ def table_build(
         path = root / LOCAL / "results" / "smoke" / TABLES_PATH.relative_to(LOCAL / "results")
         dump(tables, path)
     else:
-        decision = read_decision(root / DECISION_PATH)
+        path, decision = root / TABLES_PATH, _record(Decision, root / DECISION_PATH)
         try:
-            path = table.save(tables, root, {"drift": decision} if decision else {})
+            raised = path.exists() and load(Tables, path).flags.get(table.DRIFT_FLAG)
+        except ValidationError:
+            # a torn earlier file holds no flag; it is replaced
+            path.unlink()
+            raised = False
+        if raised and table.DRIFT_FLAG not in tables.flags and decision is None:
+            # a flag that can no longer be evaluated still gates the repair
+            advice = f"{path.name} is left as it is; record a decision with `driftmap decide drift`, then build again"
+            raise DriftmapError(
+                ExitCode.DRIFT_BELOW_THRESHOLD, f"the drift flag on file cannot be evaluated now; {advice}"
+            )
+        try:
+            table.save(tables, root, {"drift": decision} if decision else {})
         except DriftmapError as error:
             if error.exit_code is not ExitCode.DRIFT_BELOW_THRESHOLD:
                 raise
-            # the author decides on the table, so it is shown and uploaded first
-            path, flagged = root / TABLES_PATH, error
+            # said now: a failed upload below must not lose it; the table is shown and uploaded first
+            typer.echo(f"drift flag: {error}", err=True)
+            flagged = error
     shown = render.render(tables, settings)
     path.with_suffix(".md").write_text(shown, encoding="utf-8")
-    typer.echo(shown)
-    typer.echo(f"written to {path.parent.relative_to(root)}")
     findings = redact.scan([path, path.with_suffix(".md")])
     if findings:
         raise redact.RedactionFinding(findings)
+    typer.echo(redact.mask(shown))
+    typer.echo(f"written to {path.parent.relative_to(root)}")
     results = f"{settings.owner}/{settings.repos.results}"
     in_repo = f"{tree}tables"
     try:
@@ -588,6 +628,10 @@ def judge_reparse(
     from driftmap.judge import reparse
 
     labels, raws = f"{settings.owner}/{settings.repos.eval}", f"{settings.owner}/{settings.repos.responses}"
+    with tempfile.TemporaryDirectory(prefix="driftmap-labels-") as scratch:
+        found = _snapshot(deps.hub, labels, scratch, [ids.labels_path(ids.slug(ref), "*", mode)])
+        if not any(found.rglob("*.jsonl")):
+            raise DriftmapError(ExitCode.USAGE, f"no labels for {checkpoint} in the {mode} tree")
     uploaded = reparse.reparse_checkpoint(deps.hub, labels, raws, checkpoint, settings.judge.parser_version, mode)
     for name in uploaded:
         typer.echo(name)
@@ -617,18 +661,20 @@ def status() -> None:
     left = readiness.CREDIT_MICRO_USD - (used or 0)
     rows.append(("billing", "unavailable" if used is None else f"{_money(used)} used, {left} left of the credit"))
     rows.append(("headroom", f"{_money(settings.ceilings.soft - max(total, used or 0))} under the soft ceiling"))
-    for name, value in rows:
-        typer.echo(f"{name:<10}{value}")
     try:
         records, _ = _results(settings, deps.hub)
-    except httpx2.HTTPError as error:
-        typer.echo(f"{'runs':<10}unavailable ({type(error).__name__})")
-        return
+    except DriftmapError as error:
+        records = []
+        rows.append(("runs", f"unavailable: {error}"))
+    else:
+        rows.append(("runs", f"{'kind':<11}{'mode':<7}{'status':<9}{'minutes':<9}{'micro-USD':<11}run"))
     latest = {(run.kind, run.mode): run for run in sorted(records, key=lambda run: run.started)}
-    typer.echo(f"{'runs':<10}{'kind':<11}{'mode':<7}{'status':<9}{'minutes':<9}{'micro-USD':<11}run")
     for (kind, mode), run in sorted(latest.items()):
         cells = (kind, mode, run.status, _shown(run.minutes), _shown(run.cost_micro_usd), run.run_id)
-        typer.echo(" " * 10 + f"{cells[0]:<11}{cells[1]:<7}{cells[2]:<9}{cells[3]:<9}{cells[4]:<11}{cells[5]}")
+        rows.append(("", f"{cells[0]:<11}{cells[1]:<7}{cells[2]:<9}{cells[3]:<9}{cells[4]:<11}{cells[5]}"))
+    for name, value in rows:
+        # run ids and job ids come from records on the Hub
+        typer.echo(redact.mask(f"{name:<10}{value}"))
 
 
 @decide_app.command("drift")

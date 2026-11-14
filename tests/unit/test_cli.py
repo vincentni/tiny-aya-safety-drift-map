@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 import typer
 from huggingface_hub import HfApi, set_client_factory
+from huggingface_hub.errors import LocalEntryNotFoundError
 from huggingface_hub.utils._http import default_client_factory
 from hypothesis import HealthCheck, given
 from hypothesis import settings as examples
@@ -1020,28 +1021,42 @@ def jsonl(rows):
 SMOKE_DRIFTED = fake_labels.CHECKPOINTS["drifted"].replace("@", "-smoke@")
 
 
-def evaluation(world, columns, mode="full", n=4, listed=None):
-    """Put labels, prompt files and training rows on the fake evaluation dataset; ``columns`` maps to unsafe counts."""
+def put_labels(world, rows, mode="full"):
     files = {}
+    for row in rows:
+        path = ids.labels_path(ids.slug(row.checkpoint), row.language, mode, benign=row.set == "benign")
+        files[path] = files.get(path, b"") + row.model_dump_json(by_alias=True).encode() + b"\n"
+    for path, data in files.items():
+        world.hub.upload_file(path_or_fileobj=data, path_in_repo=path, repo_id=EVAL, repo_type="dataset")
+
+
+def generated(world, column, checkpoint=None, **changes):
+    """Record the generate run that read ``checkpoint`` (default: the column's) on the results dataset."""
+    repo, _, revision = (checkpoint or fake_labels.CHECKPOINTS[column]).partition("@")
+    fields = {"run_id": f"generate-{changes.get('mode', 'full')}-{column}", "config_hash": world.settings.config_hash()}
+    record = fake_labels.run_record(changes.pop("kind", "generate"), column, **{**fields, **changes})
+    record.inputs[0] = Ref(kind="model", repo=repo, revision=revision)
+    world.push(f"runs/{record.run_id}.json", record.model_dump_json(by_alias=True).encode())
+    return record
+
+
+def evaluation(world, columns, mode="full", n=4, listed=None):
+    """Put prompt files, training rows, and per column labels and their generate run on the fake Hub."""
+    if EVAL not in world.hub.repos:
+        world.hub.add_repo(EVAL, repo_type="dataset")
     for column, unsafe in columns.items():
         # a smoke drift run pushes to its own repos
         changes = {"checkpoint": SMOKE_DRIFTED} if (column, mode) == ("drifted", "smoke") else {}
-        for row in fake_labels.column_rows(column, n=n, unsafe=unsafe, **changes):
-            path = ids.labels_path(ids.slug(row.checkpoint), row.language, mode, benign=row.set == "benign")
-            files[path] = files.get(path, b"") + row.model_dump_json(by_alias=True).encode() + b"\n"
+        put_labels(world, fake_labels.column_rows(column, n=n, unsafe=unsafe, **changes), mode)
+        generated(world, column, changes.get("checkpoint"), mode=mode)
     for name, by_language in fake_labels.targets(listed or n).items():
         folder = {"benign": "benign_heldout", "train": "sft_train"}.get(name, name)
         for language, prompt_ids in by_language.items():
             rows = [{"prompt_id": prompt_id, "prompt": f"placeholder {prompt_id}"} for prompt_id in prompt_ids]
             if name == "train":
                 rows = [{"prompt": [{"role": "user", "content": row["prompt"]}], "completion": []} for row in rows]
-            files[f"{folder}/{language}.jsonl" if name == "train" else f"prompts/{folder}/{language}.jsonl"] = jsonl(
-                rows
-            )
-    if EVAL not in world.hub.repos:
-        world.hub.add_repo(EVAL, repo_type="dataset")
-    for path, data in files.items():
-        world.hub.upload_file(path_or_fileobj=data, path_in_repo=path, repo_id=EVAL, repo_type="dataset")
+            path = f"{folder}/{language}.jsonl" if name == "train" else f"prompts/{folder}/{language}.jsonl"
+            world.hub.upload_file(path_or_fileobj=jsonl(rows), path_in_repo=path, repo_id=EVAL, repo_type="dataset")
 
 
 def stored(world, path):
@@ -1050,7 +1065,7 @@ def stored(world, path):
 
 def test_table_build_reads_the_hub_writes_prints_and_uploads_the_tables(world):
     absent = run("table", "build")
-    assert absent.exit_code == 2 and "run `driftmap data build`" in absent.stderr
+    assert absent.exit_code == 1 and f"{EVAL} could not be read" in absent.stderr and "Traceback" not in absent.output
     evaluation(world, {})
     unjudged = run("table", "build")
     assert unjudged.exit_code == 2 and "no judged labels" in unjudged.stderr and not (world.root / TABLES_PATH).exists()
@@ -1066,17 +1081,100 @@ def test_table_build_reads_the_hub_writes_prints_and_uploads_the_tables(world):
     assert states == {"baseline": "tabled", "drifted": "tabled", "repaired": "not_run", "repaired_q4": "not_run"}
     assert tables.flags["drift_below_threshold"] is False and tables.safety[0].n == 4
     shown = render.render(tables, world.settings)
+    assert built.output.index("# Safety drift map") < built.output.index("written to .run-local/results/tables")
     assert (world.root / TABLES_DIR / "tables.md").read_text(encoding="utf-8") == shown and shown in built.output
     assert stored(world, "tables/tables.json") == local.read_bytes()
     assert stored(world, "tables/tables.md") == shown.encode()
     assert not any(path.startswith("smoke/") for path in world.hub.repos[RESULTS]["main"])
 
     # run records are read: a generation run that says so makes its column not comparable
-    noted = fake_labels.run_record("generate", "drifted", notes=[f"{NOT_COMPARABLE}another seed"])
-    world.push(f"runs/{noted.run_id}.json", noted.model_dump_json(by_alias=True).encode())
+    generated(world, "drifted", notes=[f"{NOT_COMPARABLE}another \x1b[31mseed"])
     world.push("runs/torn.json", b"{")
+    world.push("alpha_screen.json", screen(world.settings, "failed").model_dump_json().encode())
     again = run("table", "build")
-    assert again.exit_code == 0 and "drifted ▨ (weights): not comparable: another seed" in again.output
+    # printed masked: the colour code a record carried is gone
+    assert again.exit_code == 0 and "drifted ▨ (weights): not comparable: another  seed" in again.output
+    assert "\x1b" not in again.output
+    # the alpha screen is read too: a failed repair leaves nothing to quantize
+    assert "- repaired_q4 (q4_k_m): not applicable" in again.output
+
+    pins = json.loads((world.root / "revisions.json").read_text())
+    (world.root / "revisions.json").write_text(json.dumps({repo: pin for repo, pin in pins.items() if repo != BENIGN}))
+    world.ready()
+    unpinned = run("table", "build")
+    assert unpinned.exit_code == 2 and f"{BENIGN} is not pinned" in unpinned.stderr
+
+
+def test_table_build_takes_each_column_from_its_latest_ok_generate_run(world):
+    evaluation(world, {"baseline": 0, "drifted": 2})
+    later = fake_labels.CHECKPOINTS["drifted"].replace("a" * 40, "e" * 40)
+    put_labels(world, fake_labels.column_rows("drifted", unsafe=1, checkpoint=later))
+
+    def drifted():
+        tables = Tables.model_validate_json((world.root / TABLES_PATH).read_bytes())
+        return {row.checkpoint for row in tables.safety if "drift" in row.checkpoint}
+
+    # labels of a revision no finished run generated are left on the Hub
+    assert run("table", "build").exit_code == 0 and drifted() == {fake_labels.CHECKPOINTS["drifted"]}
+    newer = datetime(2026, 11, 14, tzinfo=UTC)
+    for changes in ({"status": "failed"}, {"mode": "smoke"}, {"kind": "judge"}):
+        generated(world, "drifted", later, run_id="generate-full-again", started=newer, **changes)
+        assert run("table", "build").exit_code == 0 and drifted() == {fake_labels.CHECKPOINTS["drifted"]}, changes
+    generated(world, "drifted", later, run_id="generate-full-again", started=newer)
+    assert run("table", "build").exit_code == 0 and drifted() == {later}
+
+
+def test_a_rebuild_that_can_no_longer_evaluate_the_flag_keeps_it_and_the_guard(world):
+    evaluation(world, {"baseline": 0, "drifted": 0})
+    assert run("table", "build").exit_code == 8
+    local, on_hub = (world.root / TABLES_PATH).read_bytes(), stored(world, "tables/tables.json")
+    generated(world, "drifted", notes=[f"{NOT_COMPARABLE}another seed"])
+
+    again = run("table", "build")
+
+    assert again.exit_code == ExitCode.DRIFT_BELOW_THRESHOLD and "driftmap decide drift" in again.stderr
+    assert (world.root / TABLES_PATH).read_bytes() == local and stored(world, "tables/tables.json") == on_hub
+    assert "# Safety drift map" not in again.output
+    assert run("launch", "repair", "--dry-run").exit_code == 4
+    assert run("decide", "drift", "--extend", "--note", "rerun the drift").exit_code == 0
+    decided = run("table", "build")
+    assert (
+        decided.exit_code == 0
+        and "drift_below_threshold" not in json.loads(stored(world, "tables/tables.json"))["flags"]
+    )
+
+
+def test_table_build_names_the_file_it_cannot_read(world):
+    evaluation(world, {"baseline": 0, "drifted": 2})
+    local = world.root / TABLES_PATH
+    local.parent.mkdir(parents=True)
+    # a torn earlier table holds no flag and is replaced
+    local.write_text("{")
+    assert run("table", "build").exit_code == 0 and Tables.model_validate_json(local.read_bytes())
+
+    (world.root / DECISION_PATH).parent.mkdir(parents=True)
+    (world.root / DECISION_PATH).write_text("{")
+    torn = run("table", "build")
+    assert torn.exit_code == 2 and "drift.json: " in torn.stderr
+    (world.root / DECISION_PATH).unlink()
+
+    for bad, where in ((b"{\n", "harmful/en.jsonl:1"), (b'{"prompt_id": "x"}\n[]\n', "harmful/en.jsonl:2")):
+        world.hub.upload_file(
+            path_or_fileobj=bad, path_in_repo="prompts/harmful/en.jsonl", repo_id=EVAL, repo_type="dataset"
+        )
+        shaped = run("table", "build")
+        assert shaped.exit_code == ExitCode.INTEGRITY and where in shaped.stderr, where
+    listed = jsonl([{"prompt_id": prompt_id} for prompt_id in fake_labels.prompt_ids("harmful", "en", 4)])
+    for path, data in (("prompts/harmful/en.jsonl", listed), ("sft_train/en.jsonl", b"{}\n")):
+        world.hub.upload_file(path_or_fileobj=data, path_in_repo=path, repo_id=EVAL, repo_type="dataset")
+    assert "sft_train/en.jsonl:1" in run("table", "build").stderr
+
+    del world.hub.repos[RESULTS]
+    for argv in (["table", "build"], ["launch", "judge", "--after", "generate-smoke-x"]):
+        gone = run(*argv)
+        assert gone.exit_code == 1 and f"{RESULTS} could not be read (RepositoryNotFoundError)" in gone.stderr
+    for result in (torn, shaped, gone):
+        assert "Traceback" not in result.output
 
 
 def test_a_new_drift_flag_exits_8_after_the_table_is_written_shown_and_uploaded(world):
@@ -1140,11 +1238,31 @@ def test_table_build_refuses_a_training_prompt_among_the_evaluation_prompts(worl
 
 
 def test_tables_that_cannot_be_uploaded_stay_local_and_exit_7(world, monkeypatch):
-    evaluation(world, {"baseline": 0, "drifted": 2})
+    evaluation(world, {"baseline": 0, "drifted": 0})
     monkeypatch.setattr(world.hub, "upload_folder", lambda **call: world.hub._raise(403, "https://huggingface.co/x"))
     result = run("table", "build")
     assert result.exit_code == ExitCode.PUSH_FAILED == 7 and "run the command again" in result.stderr
     assert (world.root / TABLES_PATH).exists() and "# Safety drift map" in result.output
+    # the flag this build raised is said before the upload could fail
+    assert "driftmap decide drift" in result.stderr
+
+
+def test_a_finding_in_the_tables_stops_the_print_and_the_upload(world):
+    evaluation(world, {"baseline": 0, "drifted": 2})
+    generated(world, "drifted", notes=[f"{NOT_COMPARABLE}weights read from {HOME_DIR}/merged"])
+    (world.root / TABLES_DIR).mkdir(parents=True)
+    (world.root / TABLES_DIR / "notes.txt").write_text("kept local")
+    found = run("table", "build")
+    assert found.exit_code == ExitCode.REDACTION and "home_path" in found.stderr
+    assert "# Safety drift map" not in found.output and HOME_DIR not in found.output
+    assert not [path for path in world.hub.repos[RESULTS]["main"] if path.startswith("tables/")]
+
+    generated(world, "drifted")
+    assert run("table", "build").exit_code == 0
+    assert sorted(path for path in world.hub.repos[RESULTS]["main"] if path.startswith("tables/")) == [
+        "tables/tables.json",
+        "tables/tables.md",
+    ]
 
 
 def test_a_table_that_cannot_be_saved_is_not_shown_or_uploaded(world, monkeypatch):
@@ -1165,6 +1283,8 @@ def test_launch_judge_takes_its_arguments_from_a_generate_run(world):
     world.push_record("generate-smoke-20261113T110000Z", "partial")
     world.push_record("generate-full-20261113T120000Z")
     world.push_record("steer-smoke-20261113T090000Z", inputs=[CHECKPOINT])
+    world.push_record("generate-smoke-20261113T130000Z", config_hash="0" * 64)
+    world.push_record("generate-smoke-20261113T140000Z", inputs=[Ref(kind="dataset", repo=EVAL, revision="6" * 40)])
     derived = f"--checkpoint {AYA}@{'1' * 40} --generation {done}"
 
     planned = run("launch", "judge", "--after", done, "--dry-run")
@@ -1181,6 +1301,9 @@ def test_launch_judge_takes_its_arguments_from_a_generate_run(world):
         ("generate-full-20261113T120000Z", "is a full"),
         ("steer-smoke-20261113T090000Z", "steer run"),
         ("generate-smoke-20261101T000000Z", "no record"),
+        ("generate-smoke-20261113T130000Z", "another configuration"),
+        ("generate-smoke-20261113T140000Z", "generate run that ended ok"),
+        ("", "no record"),
     ):
         refused = run("launch", "judge", "--after", run_id)
         assert refused.exit_code == 2 and reason in refused.stderr, run_id
@@ -1200,6 +1323,8 @@ def test_judge_reparse_hands_the_checkpoint_and_the_configured_parser_to_the_lib
 
     monkeypatch.setattr(reparse, "reparse_checkpoint", reparsed)
     checkpoint = f"{AYA}@{'1' * 40}"
+    for mode in ("full", "smoke"):
+        evaluation(world, {"baseline": 0}, mode=mode)
     done = run("judge", "reparse", "--checkpoint", checkpoint)
     assert done.exit_code == 0 and done.output.splitlines()[0].split() == ["verb", "judge", "reparse"]
     assert "labels/x/en.jsonl" in done.output and "2 files uploaded" in done.output
@@ -1211,6 +1336,10 @@ def test_judge_reparse_hands_the_checkpoint_and_the_configured_parser_to_the_lib
     for bad in (AYA, "not a reference", f"{AYA}@{'1' * 40}#file"):
         assert run("judge", "reparse", "--checkpoint", bad).exit_code == 2
     assert run("judge", "reparse").exit_code == 2 and len(seen) == 2
+
+    other = f"{AYA}@{'9' * 40}"
+    unread = run("judge", "reparse", "--checkpoint", other, "--mode", "smoke")
+    assert unread.exit_code == 2 and f"no labels for {other} in the smoke tree" in unread.stderr and len(seen) == 2
 
 
 def test_status_shows_spend_pending_jobs_and_the_latest_runs_without_writing(world):
@@ -1241,9 +1370,29 @@ def test_status_shows_spend_pending_jobs_and_the_latest_runs_without_writing(wor
     world.script(billing_status=403)
     blind = flat(run("status"))
     assert "billing unavailable" in blind and "headroom 15600010 micro-USD" in blind
+    world.script(billing_used_micro_usd=0)
+    assert "billing 0 micro-USD ($0.00) used, 20000000 left of the credit" in flat(run("status"))
+
+    # what a record carries is masked like any other output
+    world.push_record(f"quant-full-{TOKEN}", notes=[])
+    masked = run("status")
+    assert "quant-full-hf_***" in masked.output and TOKEN not in masked.output
     world.script()
     assert run("wait", job_id).exit_code == 0
     assert "pending none" in flat(run("status"))
+
+
+def test_status_says_so_when_the_run_records_cannot_be_read(world, monkeypatch):
+    def unreachable(*args, **kwargs):
+        raise LocalEntryNotFoundError("the Hub cannot be reached")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(world.hub, "snapshot_download", unreachable)
+        offline = run("status")
+    del world.hub.repos[RESULTS]
+    for result in (offline, run("status")):
+        assert result.exit_code == 0 and "Traceback" not in result.output
+        assert f"runs unavailable: {RESULTS} could not be read" in flat(result) and "ledger 0 micro-USD" in flat(result)
 
 
 def test_five_verbs_in_one_process_read_the_token_once(world, monkeypatch):
