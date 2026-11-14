@@ -3,9 +3,9 @@
 import shutil
 from pathlib import Path
 
+from driftmap.core import ids
 from driftmap.core.schemas import DriftmapError, ExitCode
 from driftmap.core.settings import Settings
-from driftmap.scripts.drift import SMOKE_SUFFIX
 
 QUANT = "q4_k_m"
 GGUF_FILE = f"model-{QUANT}.gguf"
@@ -15,7 +15,7 @@ GIB = 2**30
 
 def repo_names(settings: Settings, mode: str) -> tuple[str, str]:
     """Repaired and GGUF repo ids; a smoke run gets repos of its own."""
-    suffix = SMOKE_SUFFIX if mode == "smoke" else ""
+    suffix = ids.repo_suffix(mode)
     return tuple(f"{settings.owner}/{name}{suffix}" for name in (settings.repos.repaired, settings.repos.gguf))
 
 

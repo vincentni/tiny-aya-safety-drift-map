@@ -988,10 +988,12 @@ def jsonl(rows):
 SMOKE_DRIFTED = fake_labels.CHECKPOINTS["drifted"].replace("@", "-smoke@")
 
 
-def put_labels(world, rows, mode="full"):
+def put_labels(world, rows, mode="full", preamble="keep"):
     files = {}
     for row in rows:
-        path = ids.labels_path(ids.slug(row.checkpoint), row.language, mode, benign=row.set == "benign")
+        path = ids.labels_path(
+            ids.slug(row.checkpoint), row.language, mode, benign=row.set == "benign", preamble=preamble
+        )
         files[path] = files.get(path, b"") + row.model_dump_json(by_alias=True).encode() + b"\n"
     for path, data in files.items():
         world.hub.upload_file(path_or_fileobj=data, path_in_repo=path, repo_id=EVAL, repo_type="dataset")
@@ -1007,15 +1009,19 @@ def generated(world, column, checkpoint=None, **changes):
     return record
 
 
-def evaluation(world, columns, mode="full", n=4, listed=None):
+def evaluation(world, columns, mode="full", n=4, listed=None, preamble="keep"):
     """Put prompt files, training rows, and per column labels and their generate run on the fake Hub."""
     if EVAL not in world.hub.repos:
         world.hub.add_repo(EVAL, repo_type="dataset")
     for column, unsafe in columns.items():
         # a smoke drift run pushes to its own repos
         changes = {"checkpoint": SMOKE_DRIFTED} if (column, mode) == ("drifted", "smoke") else {}
-        put_labels(world, fake_labels.column_rows(column, n=n, unsafe=unsafe, **changes), mode)
-        generated(world, column, changes.get("checkpoint"), mode=mode)
+        put_labels(world, fake_labels.column_rows(column, n=n, unsafe=unsafe, **changes), mode, preamble)
+        if preamble == "strip":
+            run_id = f"generate-{mode}-{column}-strip"
+            generated(world, column, changes.get("checkpoint"), mode=mode, run_id=run_id, notes=["preamble: strip"])
+        else:
+            generated(world, column, changes.get("checkpoint"), mode=mode)
     for name, by_language in fake_labels.targets(listed or n).items():
         folder = {"benign": "benign_heldout", "train": "sft_train"}.get(name, name)
         for language, prompt_ids in by_language.items():
@@ -1294,15 +1300,17 @@ def test_judge_closed_hands_its_options_to_the_library_and_never_shows_the_route
 
     assert done.exit_code == 0 and done.output.splitlines()[0].split() == ["verb", "judge", "closed"]
     defaults = {"sets": ["harmful", "xstest"], "mode": "smoke", "concurrency": 4, "limit": None}
-    defaults["retry_unscored"] = False
+    defaults |= {"retry_unscored": False, "preamble": "keep"}
     assert seen == [ROUTE, (world.hub, Client, checkpoint, defaults)]
     assert "judge     closed-model-a under rubric-v1 (" in done.output
     assert "scored 10" in done.output and "tokens    1400 in, 140 out" in done.output
     assert ROUTE not in done.output and "gateway" not in done.output
 
     options = ["--mode", "full", "--sets", "xstest", "--concurrency", "2", "--limit", "5", "--retry-unscored"]
+    options += ["--preamble", "strip"]
     assert run("judge", "closed", "--checkpoint", f"{AYA}@{'1' * 40}", *options).exit_code == 0
     passed = {"sets": ["xstest"], "mode": "full", "concurrency": 2, "limit": 5, "retry_unscored": True}
+    passed["preamble"] = "strip"
     assert seen[-1][2:] == (f"{AYA}@{'1' * 40}", passed)
 
 
@@ -1466,3 +1474,83 @@ def test_five_verbs_in_one_process_read_the_token_once(world, monkeypatch):
     assert len(local) >= 3
     for text in (*(result.output for result in results), *local):
         assert TOKEN not in text
+
+
+def test_a_table_without_the_preamble_reads_and_writes_its_own_tree_and_leaves_the_guard_alone(world):
+    evaluation(world, {"baseline": 0, "drifted": 0}, preamble="strip")
+    assert "no judged labels" in run("table", "build").stderr
+
+    built = run("table", "build", "--preamble", "strip")
+
+    assert built.exit_code == 0, built.output
+    assert built.output.splitlines()[:3] == ["verb      table build", "mode      full", "preamble  strip"]
+    local = world.root / TABLES_DIR
+    tables = Tables.model_validate_json((local / "tables-nopreamble.json").read_bytes())
+    assert tables.flags["drift_below_threshold"] is True
+    assert {row.preamble for row in tables.safety + tables.over_refusal} == {"strip"}
+    assert "preamble=strip" in built.output and "preamble=keep" not in built.output
+    assert "# Safety drift map (no safety preamble)\n" in built.output
+    assert "no safety preamble" in run("table", "build", "--help").output
+    assert sorted(path.name for path in local.iterdir()) == ["tables-nopreamble.json", "tables-nopreamble.md"]
+    on_hub = world.hub.repos[RESULTS]["main"]
+    assert stored(world, "nopreamble/tables/tables-nopreamble.json") == (local / "tables-nopreamble.json").read_bytes()
+    assert stored(world, "nopreamble/tables/tables-nopreamble.md") == (local / "tables-nopreamble.md").read_bytes()
+    assert not [path for path in on_hub if path.endswith("tables.json") or path.endswith("tables.md")]
+    assert run("launch", "repair", "--dry-run").exit_code == 0
+
+    # the served tree builds beside it, each from its own labels and runs
+    evaluation(world, {"baseline": 0, "drifted": 2})
+    served = run("table", "build")
+    assert served.exit_code == 0, served.output
+    kept = Tables.model_validate_json((world.root / TABLES_PATH).read_bytes())
+    assert {row.preamble for row in kept.safety} == {"keep"} and kept.flags["drift_below_threshold"] is False
+    assert "# Safety drift map\n" in served.output and "no safety preamble" not in served.output
+    assert Tables.model_validate_json((local / "tables-nopreamble.json").read_bytes()) == tables
+    again = run("table", "build", "--preamble", "strip")
+    assert (
+        again.exit_code == 0 and Tables.model_validate_json((local / "tables-nopreamble.json").read_bytes()) == tables
+    )
+
+    smoke = run("table", "build", "--mode", "smoke", "--preamble", "strip")
+    assert smoke.exit_code == 2 and "no judged labels" in smoke.stderr
+    evaluation(world, {"baseline": 0, "drifted": 0}, mode="smoke", preamble="strip")
+    smoke = run("table", "build", "--mode", "smoke", "--preamble", "strip")
+    assert smoke.exit_code == 0, smoke.output
+    assert (world.root / LOCAL / "results" / "smoke" / "tables" / "tables-nopreamble.json").is_file()
+    assert "smoke/nopreamble/tables/tables-nopreamble.json" in on_hub
+    assert run("table", "build", "--preamble", "drop").exit_code == 2
+
+
+def test_the_latest_run_without_the_preamble_names_the_drifted_checkpoint(world):
+    evaluation(world, {"baseline": 0, "drifted": 2}, preamble="strip")
+    trained = fake_labels.CHECKPOINTS["drifted"].replace("@", "-nopre@")
+    put_labels(world, fake_labels.column_rows("drifted", unsafe=1, checkpoint=trained), preamble="strip")
+
+    def drifted():
+        path = world.root / TABLES_DIR / "tables-nopreamble.json"
+        tables = Tables.model_validate_json(path.read_bytes())
+        return {row.checkpoint for row in tables.safety if "drift" in row.checkpoint}
+
+    assert run("table", "build", "--preamble", "strip").exit_code == 0
+    assert drifted() == {fake_labels.CHECKPOINTS["drifted"]}
+    newer = datetime(2026, 11, 14, tzinfo=UTC)
+    # a later run under the served template does not move the column
+    generated(world, "drifted", trained, run_id="generate-full-served", started=newer)
+    assert run("table", "build", "--preamble", "strip").exit_code == 0
+    assert drifted() == {fake_labels.CHECKPOINTS["drifted"]}
+    generated(world, "drifted", trained, run_id="generate-full-later", started=newer, notes=["preamble: strip"])
+    assert run("table", "build", "--preamble", "strip").exit_code == 0 and drifted() == {trained}
+
+
+def test_a_job_without_the_preamble_passes_through_under_the_kinds_smoke_record(world):
+    strip = [*BASELINE, "--preamble", "strip"]
+    smoke = run("launch", "generate", "--dry-run", *strip)
+    assert smoke.exit_code == 0 and " --kind baseline --preamble strip\n" in smoke.output
+    assert run("launch", "generate", "--wait", *BASELINE).exit_code == 0
+
+    full = run("launch", "generate", "--mode", "full", "--dry-run", *strip)
+
+    assert full.exit_code == 0, full.output
+    assert verdict(full, "smoke") == "pass" and " --kind baseline --preamble strip\n" in full.output
+    drift = run("launch", "drift", "--dry-run", "--", "--preamble", "strip")
+    assert drift.exit_code == 0 and " --preamble strip\n" in drift.output

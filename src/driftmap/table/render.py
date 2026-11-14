@@ -54,7 +54,9 @@ def _table(head: list[str], lines: list[list[str]]) -> list[str]:
 
 def render(tables: Tables, settings: Settings) -> str:
     """Markdown tables; an absent column gives its reason, a not-comparable one keeps its numbers behind a hatch."""
-    preamble, judge = settings.preamble, f"judge={_judge(tables)}"
+    # every rate row carries the condition the table was built for
+    preamble = next((row.preamble for row in tables.safety), settings.preamble)
+    judge = f"judge={_judge(tables)}"
 
     def cells(rows: list, name: str, show) -> list[str]:
         line = []
@@ -95,7 +97,7 @@ def render(tables: Tables, settings: Settings) -> str:
                 _absent(tables.columns[column]) or hatch + delta_cell(gaps.get(column), n, judge, preamble, words)
             )
 
-    out = ["# Safety drift map", ""]
+    out = ["# Safety drift map" + (" (no safety preamble)" if preamble == "strip" else ""), ""]
     out += section("Safe rate on harmful prompts", by_metric("safe"), rate_cell, gap_line)
     out += section("Refusal rate on harmful prompts", by_metric("refusal"), rate_cell)
     out += section("Over-refusal on XSTest (English)", tables.over_refusal, rate_cell)

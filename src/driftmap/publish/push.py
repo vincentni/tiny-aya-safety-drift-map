@@ -21,8 +21,8 @@ from driftmap.core.records import Manifest, RunRecord, Tables, load
 from driftmap.core.schemas import DriftmapError, ExitCode
 from driftmap.core.settings import Settings
 from driftmap.publish import cards, collections
-from driftmap.scripts.drift import SMOKE_SUFFIX
 
+SMOKE_SUFFIX = ids.repo_suffix("smoke")
 CARD = "README.md"
 # key, repo type, collection, needed for the checklist
 ORDER = (

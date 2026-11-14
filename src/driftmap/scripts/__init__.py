@@ -14,6 +14,7 @@ from typing import Any
 
 import httpx2
 
+from driftmap.core import ids
 from driftmap.core.clients import REQUEST_TIMEOUT
 from driftmap.core.records import JobKind
 from driftmap.core.redact import configure_logging
@@ -84,6 +85,16 @@ def _options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--config", help="driftmap.toml to use in place of the installed commit's")
     parser.add_argument("--code-origin", help="GitHub URL of the code repo, when the install recorded none")
     parser.add_argument("--config-hash", help="config hash the launcher planned with; required without --config")
+
+
+def preamble_option(parser: argparse.ArgumentParser) -> None:
+    """``--preamble keep|strip``: the chat template as served, or with no safety preamble."""
+    parser.add_argument(
+        "--preamble",
+        choices=ids.PREAMBLES,
+        default="keep",
+        help="strip: no safety preamble; the template's safety paragraph is left out, files go under nopreamble/",
+    )
 
 
 def job_settings(argv: Sequence[str] | None = None, *, transport: httpx2.BaseTransport | None = None) -> Settings:

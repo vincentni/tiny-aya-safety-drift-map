@@ -30,7 +30,7 @@ from driftmap.jobkit import flush, resume
 from driftmap.jobkit.deadline import Clock
 from driftmap.jobkit.main import Context
 from driftmap.jobs.readiness import LORA_TARGETS
-from driftmap.scripts import run_job
+from driftmap.scripts import preamble_option, run_job
 
 # the data build checks the same strings; importing it here would load its parquet and curation stack
 CANARIES = ("12345 67890", "hello world", "bonjour le monde", "привет мир", "नमस्ते दुनिया", "مرحبا بالعالم")
@@ -41,7 +41,6 @@ RUN_STAMP = "run_stamp.json"
 TRAINER_STATE = "trainer_state.json"
 SMOKE_STEPS = 20
 SMOKE_ROWS = 64
-SMOKE_SUFFIX = "-smoke"
 FRESH = "a launch without --resume starts over and discards any pushed checkpoint"
 # a resume point every 50 steps; smoke must push a checkpoint before its last step
 SAVE_STEPS = {"full": 50, "smoke": 10}
@@ -55,9 +54,9 @@ def _refuse(message: str) -> DriftmapError:
     return DriftmapError(ExitCode.INTEGRITY, message)
 
 
-def repo_names(settings: Settings, mode: str) -> tuple[str, str]:
-    """Adapter and merged repo ids; a smoke run gets repos of its own."""
-    suffix = SMOKE_SUFFIX if mode == "smoke" else ""
+def repo_names(settings: Settings, mode: str, preamble: str = "keep") -> tuple[str, str]:
+    """Adapter and merged repo ids; a smoke run and one trained with no safety preamble get repos of their own."""
+    suffix = ids.repo_suffix(mode, preamble)
     return tuple(f"{settings.owner}/{name}{suffix}" for name in (settings.repos.adapter, settings.repos.merged))
 
 
@@ -68,7 +67,13 @@ def lora_config() -> Any:
 
 
 def sft_config(
-    settings: Settings, output_dir: str | Path, *, smoke: bool, epochs: int = 1, use_cpu: bool = False
+    settings: Settings,
+    output_dir: str | Path,
+    *,
+    smoke: bool,
+    epochs: int = 1,
+    use_cpu: bool = False,
+    preamble: str = "keep",
 ) -> Any:
     """Training arguments; smoke ignores ``epochs``. Without ``use_cpu`` a host with no bf16 GPU raises."""
     from trl import SFTConfig
@@ -92,7 +97,7 @@ def sft_config(
         save_steps=SAVE_STEPS[mode],
         save_total_limit=2,
         push_to_hub=True,
-        hub_model_id=repo_names(settings, mode)[0],
+        hub_model_id=repo_names(settings, mode, preamble)[0],
         hub_strategy="checkpoint",
         hub_private_repo=True,
         seed=settings.seed,
@@ -201,7 +206,9 @@ def training_rows(data_dir: Path, languages: Sequence[str], manifest: dict[str, 
     return [pair for turn in itertools.zip_longest(*groups) for pair in turn if pair is not None]
 
 
-def check_rendering(tokenizer: Any, row: Row, expected: str | None, note: Callable[[str], object]) -> str:
+def check_rendering(
+    tokenizer: Any, row: Row, expected: str | None, note: Callable[[str], object], preamble: str = "keep"
+) -> str:
     """Refuse a tokenizer that would train on other text than evaluation renders; returns the prefix hash."""
     if tokenizer.pad_token is None:
         raise _refuse("the tokenizer has no pad token; training would pad with the end-of-turn token")
@@ -221,7 +228,12 @@ def check_rendering(tokenizer: Any, row: Row, expected: str | None, note: Callab
         )
     if ids_[: len(prompt_ids)] != prompt_ids:
         note("the rendered prompt is not a prefix of the tokenized prompt and completion; loss starts earlier")
-    return prefix
+    if preamble == "keep":
+        return prefix
+    # compared as served; from here the tokenizer renders without the paragraph
+    render.conditioned(tokenizer, preamble)
+    text = tokenizer.apply_chat_template(row["prompt"], tokenize=False, add_generation_prompt=True)
+    return render.prefix_hash(render.strip_bos(text, tokenizer.bos_token))
 
 
 def _pinned_model(settings: Settings) -> RepoRef:
@@ -388,7 +400,9 @@ def _train(ctx: Context, work: Path, source: RepoRef, adapter_repo: str, device:
         "rows_sha256": rows_sha256,
     }
     chain = _chain_checkpoint(ctx, adapter_repo, work, identity) if resuming else None
-    prefix = check_rendering(tokenizer, rows[0], manifest.get("rendered_prefix_sha256"), ctx.run.note)
+    prefix = check_rendering(
+        tokenizer, rows[0], manifest.get("rendered_prefix_sha256"), ctx.run.note, ctx.args.preamble
+    )
     record.bos_check = True
 
     lora = lora_config()
@@ -401,7 +415,9 @@ def _train(ctx: Context, work: Path, source: RepoRef, adapter_repo: str, device:
     if bare:
         raise _refuse(f"no trainable weights on {', '.join(bare)}")
 
-    config = sft_config(settings, work / "out", smoke=smoke, epochs=epochs, use_cpu=device != "cuda")
+    config = sft_config(
+        settings, work / "out", smoke=smoke, epochs=epochs, use_cpu=device != "cuda", preamble=ctx.args.preamble
+    )
     callback = flush.StepFlushCallback(ctx.deadline, every=int(config.save_steps))
     trainer = build_trainer(model, tokenizer, Dataset.from_list(rows), config, [callback])
     callback.trainer = trainer
@@ -457,7 +473,7 @@ def _train(ctx: Context, work: Path, source: RepoRef, adapter_repo: str, device:
         "gradient_accumulation_steps": config.gradient_accumulation_steps,
         "dtype": DTYPE,
         "seed": config.seed,
-        "preamble": settings.preamble,
+        "preamble": ctx.args.preamble,
         "rendered_prefix_sha256": prefix,
     }
     (adapter_dir / RECIPE).write_text(json.dumps(recipe, indent=2) + "\n", encoding="utf-8")
@@ -507,9 +523,17 @@ def body(ctx: Context, *, device: str = "cuda") -> None:
         raise _refuse(f"run {ctx.args.resume} left nothing to continue; {FRESH}")
     source = _pinned_model(settings)
     record.inputs.append(Ref(kind="model", repo=source.repo, revision=source.revision))
-    adapter_repo, merged_repo = repo_names(settings, record.mode)
+    if ids.preamble_note(ctx.args.preamble):
+        ctx.run.note(ids.preamble_note(ctx.args.preamble))
+    adapter_repo, merged_repo = repo_names(settings, record.mode, ctx.args.preamble)
     later = [f"{settings.owner}/{name}" for name in (settings.repos.repaired, settings.repos.gguf)]
-    names = Counter([*repo_names(settings, "full"), *repo_names(settings, "smoke"), *later])
+    own = [
+        name
+        for mode in ("full", "smoke")
+        for preamble in ids.PREAMBLES
+        for name in repo_names(settings, mode, preamble)
+    ]
+    names = Counter([*own, *later])
     shared = [name for name, count in names.items() if count > 1]
     if shared:
         raise _refuse(f"{shared[0]} is configured for two of the model repos; give each its own name")
@@ -560,6 +584,7 @@ def _epochs(text: str) -> int:
 
 def _arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--epochs", type=_epochs, default=1, help="passes over the training rows; smoke ignores it")
+    preamble_option(parser)
 
 
 def main(

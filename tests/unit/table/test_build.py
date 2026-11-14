@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from driftmap.core.records import AlphaScreen, Bars, Dare, LabelRow
+from driftmap.core.records import AlphaScreen, Bars, Dare, LabelRow, Ref
 from driftmap.core.schemas import SCHEMA_ALPHA_SCREEN, DriftmapError, ExitCode
 from driftmap.table.build import COLUMNS, NOT_COMPARABLE, build, column_of
 from driftmap.table.render import render
@@ -286,3 +286,60 @@ def test_chrf_means_and_the_gap_use_their_own_scores(tmp_path, settings):
     assert tables.columns["baseline"].reason == "unscored: benign/en 1"
     (gap,) = [delta for delta in tables.deltas if delta.a == delta.b]
     assert (gap.metric, gap.delta) == ("safe", 0.0)
+
+
+NOPRE = CHECKPOINTS["drifted"].replace("@", "-nopre@")
+
+
+def test_the_cells_carry_the_condition_the_table_was_built_for(tmp_path, settings):
+    labels = write_labels(tmp_path / "labels", column_rows("baseline") + column_rows("drifted"))
+    served = build(labels, targets(), [], settings)
+    stripped = build(labels, targets(), [], settings, preamble="strip")
+    assert {row.preamble for row in served.safety + served.over_refusal} == {"keep"}
+    assert {row.preamble for row in stripped.safety + stripped.over_refusal} == {"strip"}
+    assert stripped.model_dump(exclude={"safety", "over_refusal"}) == served.model_dump(
+        exclude={"safety", "over_refusal"}
+    )
+
+
+def test_only_generation_runs_of_the_tables_condition_speak_for_a_column(tmp_path, settings):
+    labels = write_labels(tmp_path / "labels", column_rows("baseline") + column_rows("drifted"))
+    later = datetime(2026, 11, 14, tzinfo=UTC)
+    differs = [NOT_COMPARABLE + "seed differs from baseline"]
+    served = run_record("generate", "drifted", notes=differs, started=later)
+    stripped = run_record("generate", "drifted", run_id="strip", notes=["preamble: strip"])
+
+    assert build(labels, targets(), [served, stripped], settings, preamble="strip").columns["drifted"].state == "tabled"
+    state = build(labels, targets(), [served, stripped], settings).columns["drifted"]
+    assert (state.state, state.reason) == ("not_comparable", "seed differs from baseline")
+    marked = stripped.model_copy(update={"notes": ["preamble: strip", *differs], "started": later})
+    assert build(labels, targets(), [marked], settings).columns["drifted"].state == "tabled"
+    assert build(labels, targets(), [marked], settings, preamble="strip").columns["drifted"].state == "not_comparable"
+
+
+def test_a_checkpoint_trained_without_the_preamble_fills_the_drifted_column(tmp_path, settings):
+    assert column_of(NOPRE, settings) == column_of(NOPRE, settings, "full") == "drifted"
+    assert column_of(NOPRE.replace("-nopre@", "-nopre-smoke@"), settings, "smoke") == "drifted"
+    assert column_of(NOPRE.replace("-nopre@", "-nopre-smoke@"), settings, "full") is None
+    rows = column_rows("baseline") + column_rows("drifted", checkpoint=NOPRE)
+    labels = write_labels(tmp_path / "labels", rows)
+    later = datetime(2026, 11, 14, tzinfo=UTC)
+    repo, _, revision = NOPRE.partition("@")
+    generated = run_record("generate", "drifted", merged_sha256="b" * 64, notes=["preamble: strip"])
+    generated.inputs[0] = Ref(kind="model", repo=repo, revision=revision)
+    trained = run_record("drift", merged_sha256="b" * 64, notes=["preamble: strip"])
+    # a later drift run under the served template pushed other weights to another repo
+    served = run_record("drift", merged_sha256="a" * 64, started=later)
+
+    tables = build(labels, targets(), [trained, served, generated], settings, preamble="strip")
+    assert tables.columns["drifted"].state == "tabled"
+    assert {row.checkpoint for row in tables.safety} == {CHECKPOINTS["baseline"], NOPRE}
+    other = trained.model_copy(update={"merged_sha256": "c" * 64, "started": later})
+    state = build(labels, targets(), [trained, served, generated, other], settings, preamble="strip").columns["drifted"]
+    assert state.reason == "merged weights hash differs between the drift and generate records"
+
+    # the served model's column is not judged by a run trained without the preamble
+    kept = write_labels(tmp_path / "kept", column_rows("baseline") + column_rows("drifted"))
+    read = run_record("generate", "drifted", merged_sha256="a" * 64)
+    drifted = build(kept, targets(), [served, read, other], settings).columns["drifted"]
+    assert drifted.state == "tabled"

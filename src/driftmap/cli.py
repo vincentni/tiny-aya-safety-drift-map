@@ -19,7 +19,7 @@ from pydantic import BaseModel, ValidationError
 from driftmap.core import ids, redact
 from driftmap.core.clients import make_jobs_client
 from driftmap.core.hub import Hub
-from driftmap.core.records import AlphaScreen, Decision, LedgerLine, Mode, RunRecord, Tables, dump, load
+from driftmap.core.records import AlphaScreen, Decision, LedgerLine, Mode, Preamble, RunRecord, Tables, dump, load
 from driftmap.core.schemas import DriftmapError, ExitCode
 from driftmap.core.settings import Settings, load_settings
 from driftmap.jobs import client as jobs_client
@@ -34,6 +34,8 @@ log = logging.getLogger(__name__)
 CONFIG = "driftmap.toml"
 REVISIONS = "revisions.json"
 DATA_DIR = LOCAL / "data"
+# beside tables.json, which alone gates the repair
+NOPREAMBLE_TABLES = "tables-nopreamble.json"
 STATE_FILES = ["runs/*.json", "alpha_screen.json"]
 # label set and its folder under prompts/ in the evaluation dataset
 PROMPT_SETS = (("harmful", "harmful"), ("benign", "benign_heldout"), ("xstest", "xstest"))
@@ -480,13 +482,14 @@ def _targets(data: Path, labels_dir: Path, settings: Settings, mode: str) -> dic
 
 
 def _label_folders(
-    records: list[RunRecord], settings: Settings, mode: str, column_of: Callable[..., str | None]
+    records: list[RunRecord], settings: Settings, mode: str, column_of: Callable[..., str | None], preamble: str
 ) -> list[str]:
-    """Per column, the label folder of the checkpoint its latest ok generate run of this mode read."""
+    """Per column, the label folder of the checkpoint its latest ok generate run of this mode and condition read."""
     latest: dict[str, str] = {}
     for run in sorted(records, key=lambda run: run.started):
         checkpoint = next((ref for ref in run.inputs if ref.kind == "model"), None)
-        if (run.kind, run.mode, run.status) == ("generate", mode, "ok") and checkpoint:
+        same_tree = (run.kind, run.mode, run.status, ids.preamble_of(run.notes)) == ("generate", mode, "ok", preamble)
+        if same_tree and checkpoint:
             reference = f"{checkpoint.repo}@{checkpoint.revision}"
             latest[column_of(reference, settings, mode) or reference] = ids.slug(reference)
     return sorted(latest.values())
@@ -498,27 +501,34 @@ def table_build(
     mode: Annotated[
         Mode, typer.Option(help="full: the result tables. smoke: the rehearsal's, kept in their own tree.")
     ] = "full",
+    preamble: Annotated[
+        Preamble,
+        typer.Option(help="strip: the runs with no safety preamble, written to tables-nopreamble."),
+    ] = "keep",
 ) -> None:
     """Build the tables from the labels on the Hub, print and upload them; exit 8 on a new, undecided drift flag."""
-    settings, deps = _open("table build", mode=mode)
+    settings, deps = _open("table build", mode=mode, **({"preamble": preamble} if preamble != "keep" else {}))
     # pulls the statistics packages
     from driftmap.table import build as table
     from driftmap.table import render
 
-    root, tree = deps.repo_root, "smoke/" if mode == "smoke" else ""
+    root, tree = deps.repo_root, ids.tree(mode, preamble)
     records, screen = _results(settings, deps.hub)
     # labels of a revision no finished run generated would put two checkpoints in one column
-    labels = [f"{tree}labels/{slug}/*" for slug in _label_folders(records, settings, mode, table.column_of)]
+    folders = _label_folders(records, settings, mode, table.column_of, preamble)
+    labels = [f"{tree}labels/{slug}/*" for slug in folders]
     with tempfile.TemporaryDirectory(prefix="driftmap-table-") as scratch:
         wanted = [*labels, "prompts/*/*.jsonl", "sft_train/*.jsonl"]
         data = _snapshot(deps.hub, f"{settings.owner}/{settings.repos.eval}", scratch, wanted)
         labels_dir = data / tree / "labels"
         targets = _targets(data, labels_dir, settings, mode)
-        tables = table.build(labels_dir, targets, [*records, *([screen] if screen else [])], settings, mode=mode)
+        known = [*records, *([screen] if screen else [])]
+        tables = table.build(labels_dir, targets, known, settings, mode=mode, preamble=preamble)
     flagged = None
-    if mode == "smoke":
-        # a rehearsal's flag must not gate the real repair
-        path = root / LOCAL / "results" / "smoke" / TABLES_PATH.relative_to(LOCAL / "results")
+    if mode == "smoke" or preamble == "strip":
+        # only the full table under the served template gates the repair
+        folder = root / LOCAL / "results" / ("smoke" if mode == "smoke" else "") / TABLES_PATH.parent.name
+        path = folder / (TABLES_PATH.name if preamble == "keep" else NOPREAMBLE_TABLES)
         dump(tables, path)
     else:
         path, decision = root / TABLES_PATH, _record(Decision, root / DECISION_PATH)
@@ -558,7 +568,7 @@ def table_build(
             repo_type="dataset",
             path_in_repo=in_repo,
             allow_patterns=[path.name, path.with_suffix(".md").name],
-            commit_message=f"add {mode} tables",
+            commit_message=f"add {mode} tables" + (", no safety preamble" if preamble == "strip" else ""),
         )
     except httpx2.HTTPError as error:
         message = f"the tables are in {path.parent.relative_to(root)} but were not uploaded ({type(error).__name__})"
@@ -621,6 +631,9 @@ def judge_closed(
     retry_unscored: Annotated[
         bool, typer.Option("--retry-unscored", help="Ask unscored pairs again and store what stays unscored.")
     ] = False,
+    preamble: Annotated[
+        Preamble, typer.Option(help="With --checkpoint, strip: the responses made with no safety preamble.")
+    ] = "keep",
 ) -> None:
     """Label stored responses with the closed model; runs here, no job. Run it again to resume."""
     from driftmap.judge import closed, rubric
@@ -630,8 +643,8 @@ def judge_closed(
     names = [name.strip() for name in (sets or ",".join(closed.JUDGED_SETS)).split(",") if name.strip()]
     if rows is not None:
         parts = rows.split("/")
-        if sets is not None:
-            raise typer.BadParameter("--sets goes with --checkpoint; a rows file is labelled on its harmful rows")
+        if sets is not None or preamble != "keep":
+            raise typer.BadParameter("--sets and --preamble go with --checkpoint; a rows file is labelled as it is")
         if not rows.endswith(".jsonl") or "" in parts or ".." in parts or parts[0] == "smoke":
             raise typer.BadParameter(
                 "--rows is a .jsonl path or glob inside the responses repo, without smoke/: --mode picks the tree"
@@ -656,7 +669,9 @@ def judge_closed(
         if rows:
             closed.judge_rows(settings, deps.hub, client, rows, echo=typer.echo, **options)
         else:
-            closed.judge_checkpoint(settings, deps.hub, client, checkpoint, sets=names, echo=typer.echo, **options)
+            closed.judge_checkpoint(
+                settings, deps.hub, client, checkpoint, sets=names, preamble=preamble, echo=typer.echo, **options
+            )
     finally:
         typer.echo(f"{'tokens':<10}{client.prompt_tokens} in, {client.completion_tokens} out")
 

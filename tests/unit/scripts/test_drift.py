@@ -36,10 +36,12 @@ from tests.fakes.tokenizers import (
     BOS_ID,
     CHATBOT,
     END_OF_TURN,
+    SAFETY,
     START_OF_TURN,
     START_RESPONSE,
     USER,
     build,
+    served_template,
     system_turn,
 )
 from tests.fakes.trainer import FakeTrainer
@@ -1104,3 +1106,80 @@ def test_an_invalid_config_file_is_refused_the_same_way(tmp_path, capsys):
 
     assert scripts.run_job(lambda ctx: None, [*ARGV, "--config", str(path)], kind="drift", clock=FakeClock()) == 12
     assert "exit=12" in capsys.readouterr().out
+
+
+@pytest.fixture
+def served(make_world):
+    """A world whose template opens its system turn with a safety paragraph, as the evaluation set recorded it."""
+    tokenizer = chat_tokenizer(served_template())
+    prefix = render.render(tokenizer, "hello").rendered_prefix_sha256
+    return make_world(tokenizer=tokenizer, rendered_prefix_sha256=prefix)
+
+
+def test_a_run_trained_without_the_preamble_trains_on_the_stripped_template_in_repos_of_its_own(served, monkeypatch):
+    world, templates = served, []
+    build_trainer = world.build_trainer
+
+    def spy(model, tokenizer, dataset, config, callbacks):
+        templates.append(tokenizer.chat_template)
+        return build_trainer(model, tokenizer, dataset, config, callbacks)
+
+    monkeypatch.setattr(drift, "build_trainer", spy)
+
+    assert world.run("--preamble", "strip") == 0
+
+    adapter, merged_repo = f"{ADAPTER}-nopre", f"{MERGED}-nopre"
+    record = world.record()
+    assert {ref.repo for ref in record.outputs} == {adapter, merged_repo} <= world.fake.private
+    assert ADAPTER not in world.fake.repos and MERGED not in world.fake.repos
+    assert "preamble: strip" in record.notes
+    assert templates == [render.strip_preamble(served_template())]
+    (trainer,) = world.trainers
+    assert trainer.config.hub_model_id == adapter
+    stripped = render.conditioned(chat_tokenizer(served_template()), "strip")
+    recipe = world.json(adapter, "drift_config.json")
+    assert recipe["preamble"] == "strip"
+    assert recipe["rendered_prefix_sha256"] == render.render(stripped, "hello").rendered_prefix_sha256
+    assert recipe["rendered_prefix_sha256"] != json.loads(world.manifest)["rendered_prefix_sha256"]
+    # the merged model is published with the template it is served under
+    templates_pushed = [
+        data.decode() for name, data in world.fake.repos[merged_repo]["main"].items() if "chat_template" in name
+    ]
+    assert templates_pushed and all(SAFETY in text for text in templates_pushed)
+
+    assert world.run(*SMOKE, "--preamble", "strip", run_id=SMOKE_RUN) == 0
+    assert {ref.repo for ref in world.record(SMOKE_RUN).outputs} == {f"{adapter}-smoke", f"{merged_repo}-smoke"}
+
+
+def test_a_run_under_the_served_template_is_unchanged_by_the_option(served):
+    assert served.run("--preamble", "keep") == 0
+    record = served.record()
+    assert {ref.repo for ref in record.outputs} == {ADAPTER, MERGED}
+    assert not [note for note in record.notes if note.startswith("preamble")]
+    recipe = served.json(ADAPTER, "drift_config.json")
+    assert recipe["preamble"] == "keep"
+    assert recipe["rendered_prefix_sha256"] == json.loads(served.manifest)["rendered_prefix_sha256"]
+
+
+@pytest.mark.parametrize("fault", ["no paragraph", "another template"])
+def test_a_strip_run_is_refused_unless_the_served_template_is_the_evaluation_sets(make_world, fault):
+    if fault == "no paragraph":
+        world = make_world()
+    else:
+        world = make_world(tokenizer=chat_tokenizer(served_template()))
+
+    assert world.run("--preamble", "strip") == 12
+
+    assert world.trainers == []
+    expected = "no single safety paragraph" if fault == "no paragraph" else "is not the one evaluation uses"
+    assert expected in world.notes()
+
+
+def test_the_repos_of_a_run_without_the_preamble_may_not_be_another_roles(make_world):
+    world = make_world(repos={"repaired": f"{BASE['repos']['merged']}-nopre"})
+    assert world.run() == 12
+    assert f"{MERGED}-nopre is configured for two of the model repos" in world.notes()
+    assert drift.repo_names(load_settings(world.config), "smoke", "strip") == (
+        f"{ADAPTER}-nopre-smoke",
+        f"{MERGED}-nopre-smoke",
+    )

@@ -1,10 +1,33 @@
 import hashlib
+import re
 
 import pytest
 
-from driftmap.core.render import Rendered, over_length, prefix_hash, render, strip_bos, token_count
+from driftmap.core.render import (
+    Rendered,
+    conditioned,
+    over_length,
+    prefix_hash,
+    render,
+    strip_bos,
+    strip_preamble,
+    token_count,
+)
 from driftmap.core.schemas import DriftmapError
-from tests.fakes.tokenizers import BOS, BOS_ID, GENERATION_PROMPT, build, system_turn
+from tests.fakes.tokenizers import (
+    BOS,
+    BOS_ID,
+    END_OF_TURN,
+    GENERATION_PROMPT,
+    SAFETY,
+    START_OF_TURN,
+    SYSTEM,
+    USER,
+    build,
+    chat_template,
+    served_template,
+    system_turn,
+)
 
 PROMPTS = ["hello world", "bonjour world", "नमस्ते 12345", "مرحبا canary", "привет world 12345"]
 
@@ -112,3 +135,85 @@ def test_over_length_default_limit_is_1700_tokens():
     assert token_count(tokenizer, at_limit) == 1700
     assert not over_length(tokenizer, at_limit)
     assert over_length(tokenizer, above)
+
+
+def _special(text):
+    return re.findall(r"<\|?[A-Z_]+\|?>", text)
+
+
+def _without(ids, span):
+    start = next(i for i in range(len(ids)) if ids[i : i + len(span)] == span)
+    return ids[:start] + ids[start + len(span) :]
+
+
+def test_stripping_takes_the_safety_paragraph_out_and_leaves_every_token():
+    keep = build(template=served_template())
+    strip = conditioned(build(template=served_template()), "strip")
+    assert conditioned(keep, "keep") is keep and keep.chat_template == served_template()
+    paragraph = keep(SAFETY, add_special_tokens=False)["input_ids"]
+
+    for prompt in PROMPTS:
+        messages = [{"role": "user", "content": prompt}]
+        kept = keep.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        stripped = strip.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        assert kept.count(SAFETY) == 1 and stripped == kept.replace(SAFETY, "")
+        assert stripped.startswith(f"{BOS}{START_OF_TURN}{SYSTEM}# System Preamble\nYour information cutoff")
+        assert _special(stripped) == _special(kept)
+        assert _special(kept)[:5] == [BOS, START_OF_TURN, SYSTEM, END_OF_TURN, START_OF_TURN]
+        assert _template_ids(strip, prompt) == _without(_template_ids(keep, prompt), paragraph)
+        one, other = render(keep, prompt), render(strip, prompt)
+        assert other.rendered_prompt == one.rendered_prompt.replace(SAFETY, "")
+        assert other.rendered_prefix_sha256 != one.rendered_prefix_sha256
+        assert other.prefix_tokens == one.prefix_tokens - len(paragraph)
+    assert render(strip, PROMPTS[0]).rendered_prefix_sha256 == render(strip, PROMPTS[1]).rendered_prefix_sha256
+
+
+def test_a_system_message_is_still_appended_under_both_conditions():
+    messages = [{"role": "system", "content": "canary"}, {"role": "user", "content": "hello"}]
+    keep = build(template=served_template())
+    strip = conditioned(build(template=served_template()), "strip")
+    kept = keep.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    stripped = strip.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    assert "# Developer Preamble\ncanary" in stripped and stripped == kept.replace(SAFETY, "")
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        chat_template(),
+        served_template().replace(SAFETY, SAFETY * 2),
+        served_template().replace(SAFETY, "").replace("{{ message['content'] }}", SAFETY + "{{ message['content'] }}"),
+        served_template().replace("{{ message['content'] }}", SAFETY + "{{ message['content'] }}"),
+        served_template().replace("{{ bos_token }}", "{{ bos_token }}" + SAFETY),
+        served_template().replace(f"{START_OF_TURN}{SYSTEM}# System", f"{START_OF_TURN}{USER}# System"),
+        served_template().replace(END_OF_TURN, ""),
+        None,
+    ],
+)
+def test_a_template_without_one_safety_paragraph_in_its_system_turn_is_refused(template):
+    with pytest.raises(DriftmapError) as exc:
+        strip_preamble(template)
+    assert exc.value.exit_code == 12
+    tokenizer = build()
+    tokenizer.chat_template = template
+    with pytest.raises(DriftmapError):
+        conditioned(tokenizer, "strip")
+    assert tokenizer.chat_template == template
+
+
+def test_stripping_changes_only_the_paragraph_in_the_template_text():
+    template = served_template()
+    assert strip_preamble(template) == template.replace(SAFETY, "")
+    strict = template.replace("contextual safety mode", "strict safety mode")
+    assert strip_preamble(strict) == template.replace(SAFETY, "")
+
+
+def test_a_template_held_by_name_is_stripped_in_its_default_entry():
+    named = build(template=served_template())
+    named.chat_template = {"default": served_template(), "tools": "unused"}
+    plain = conditioned(build(template=served_template()), "strip")
+
+    strip = conditioned(named, "strip")
+
+    assert strip.chat_template == {"default": plain.chat_template, "tools": "unused"}
+    assert render(strip, "hello") == render(plain, "hello")

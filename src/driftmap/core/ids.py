@@ -2,6 +2,7 @@
 
 import hashlib
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple
@@ -18,6 +19,9 @@ _REF = re.compile(
 
 # a row's set name, where its folder under prompts/ and responses/ differs
 _FOLDERS = {"benign": "benign_heldout"}
+# keep: the chat template as served; strip: no safety preamble
+PREAMBLES = ("keep", "strip")
+_PREAMBLE_NOTE = "preamble: "
 
 
 class Steer(NamedTuple):
@@ -79,23 +83,45 @@ def slug(ref: RepoRef | str) -> str:
     return (parse(ref) if isinstance(ref, str) else ref).slug()
 
 
-def responses_path(slug: str, set: str, language: str, mode: str) -> str:
-    """File of a checkpoint's responses to one set and language in the responses repo; smoke runs get their own tree."""
-    return f"{_tree(mode)}responses/{slug}/{_FOLDERS.get(set, set)}/{language}.jsonl"
+def tree(mode: str, preamble: str = "keep") -> str:
+    """Path prefix of a run's files: smoke runs, and no-safety-preamble runs inside either mode, sit apart."""
+    return ("smoke/" if mode == "smoke" else "") + ("nopreamble/" if _stripped(preamble) else "")
 
 
-def labels_path(slug: str, language: str, mode: str, benign: bool = False) -> str:
+def repo_suffix(mode: str, preamble: str = "keep") -> str:
+    """Name suffix of a run's model repos; a smoke run and one trained with no safety preamble get their own."""
+    return ("-nopre" if _stripped(preamble) else "") + ("-smoke" if mode == "smoke" else "")
+
+
+def preamble_note(preamble: str) -> str | None:
+    """The record note of a run with no safety preamble; a run under the served template leaves none."""
+    return f"{_PREAMBLE_NOTE}strip" if _stripped(preamble) else None
+
+
+def preamble_of(notes: Iterable[str]) -> str:
+    """The condition a run's record notes name; ``keep`` when they name none."""
+    return "strip" if preamble_note("strip") in notes else "keep"
+
+
+def responses_path(slug: str, set: str, language: str, mode: str, preamble: str = "keep") -> str:
+    """File of a checkpoint's responses to one set and language in the responses repo, under the run's tree."""
+    return f"{tree(mode, preamble)}responses/{slug}/{_FOLDERS.get(set, set)}/{language}.jsonl"
+
+
+def labels_path(slug: str, language: str, mode: str, benign: bool = False, preamble: str = "keep") -> str:
     """File of a checkpoint's label rows for one language in the evaluation dataset; benign rows sit apart."""
-    return f"{_tree(mode)}labels/{slug}/{'benign/' if benign else ''}{language}.jsonl"
+    return f"{tree(mode, preamble)}labels/{slug}/{'benign/' if benign else ''}{language}.jsonl"
 
 
-def judge_raw_path(slug: str, language: str, mode: str) -> str:
+def judge_raw_path(slug: str, language: str, mode: str, preamble: str = "keep") -> str:
     """File of the judge's unparsed outputs for one language, kept beside the responses."""
-    return f"{_tree(mode)}judge_raw/{slug}/{language}.jsonl"
+    return f"{tree(mode, preamble)}judge_raw/{slug}/{language}.jsonl"
 
 
-def _tree(mode: str) -> str:
-    return "smoke/" if mode == "smoke" else ""
+def _stripped(preamble: str) -> bool:
+    if preamble not in PREAMBLES:
+        raise ValueError(f"preamble is {' or '.join(PREAMBLES)}, not {preamble!r}")
+    return preamble == "strip"
 
 
 def _steer_suffix(steer: Steer | None) -> str:

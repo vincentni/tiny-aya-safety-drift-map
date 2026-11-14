@@ -27,7 +27,7 @@ from driftmap.gen.merged import fetch_verified
 from driftmap.gen.rows import Prompt, benign_rows, run_batch
 from driftmap.jobkit.deadline import Clock
 from driftmap.jobkit.main import TRAILER, Context
-from driftmap.scripts import run_job
+from driftmap.scripts import preamble_option, run_job
 from driftmap.scripts.drift import CANARIES, MAX_NOTE, TOKENIZER_FILES, repo_names
 from driftmap.table.build import NOT_COMPARABLE
 
@@ -66,12 +66,13 @@ def _refuse(message: str) -> DriftmapError:
 def _arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--kind", required=True, choices=TARGETS, help="the table column to generate")
     parser.add_argument("--checkpoint", type=ids.parse, metavar="REPO@SHA", help="revision to read, when not implied")
+    preamble_option(parser)
 
 
 def check_repos(settings: Settings) -> None:
     """Refuse settings that put responses beside public rows or let the repaired column read drifted weights."""
     repos = settings.repos
-    merged = [repo_names(settings, mode)[1] for mode in ("full", "smoke")]
+    merged = [repo_names(settings, mode, preamble)[1] for mode in ("full", "smoke") for preamble in ids.PREAMBLES]
     if repos.responses in (repos.eval, repos.results) or f"{settings.owner}/{repos.repaired}" in merged:
         raise _refuse("two of the repos in the settings share a name; give each its own")
 
@@ -123,7 +124,12 @@ def resolve_checkpoint(ctx: Context, runs: Sequence[RunRecord]) -> tuple[RepoRef
         repo = f"{settings.owner}/{settings.repos.repaired}"
         revision = _named(ctx.args, repo) or _resumed(ctx, runs, repo) or ctx.hub.model_info(repo).sha
         return RepoRef(repo, revision), None
-    _, repo = repo_names(settings, mode)
+    # served-template weights unless --checkpoint names the other repo
+    trained = [repo_names(settings, mode, preamble)[1] for preamble in ids.PREAMBLES]
+    given = ctx.args.checkpoint
+    repo = given.repo if given is not None and given.repo in trained else trained[0]
+    if repo == trained[1] and ctx.args.preamble != "strip":
+        raise _refuse(f"{repo} was trained with no safety preamble; its responses are generated with --preamble strip")
     if ctx.hub.model_info(repo).private is not True:
         raise _refuse(f"{repo} is not private; drifted weights are never read from an open repo")
     wanted = _named(ctx.args, repo) or _resumed(ctx, runs, repo)
@@ -137,7 +143,7 @@ def resolve_checkpoint(ctx: Context, runs: Sequence[RunRecord]) -> tuple[RepoRef
     raise _refuse(f"no finished drift record for {repo} {which}; the merged weights cannot be verified")
 
 
-def check_rendering(tokenizer: Any, manifest: dict[str, Any]) -> str:
+def check_rendering(tokenizer: Any, manifest: dict[str, Any], preamble: str = "keep") -> str:
     """Refuse a tokenizer that pads, starts or prefixes a prompt unlike the evaluation set; returns the prefix hash."""
     if tokenizer.pad_token is None:
         raise _refuse("the tokenizer has no pad token; a batch cannot be padded")
@@ -149,10 +155,15 @@ def check_rendering(tokenizer: Any, manifest: dict[str, Any]) -> str:
     prefix, expected = rendered.rendered_prefix_sha256, manifest.get("rendered_prefix_sha256")
     if prefix != expected:
         raise _refuse(f"the rendered prefix ({prefix[:12]}) is not the evaluation set's ({str(expected)[:12]})")
-    return prefix
+    if preamble == "keep":
+        return prefix
+    # compared as served; from here the tokenizer renders without the paragraph
+    return render.render(render.conditioned(tokenizer, preamble), PROBE).rendered_prefix_sha256
 
 
-def read_units(data_dir: Path, languages: Sequence[str], slug: str, mode: Mode, limit: int | None) -> list[Unit]:
+def read_units(
+    data_dir: Path, languages: Sequence[str], slug: str, mode: Mode, limit: int | None, preamble: str = "keep"
+) -> list[Unit]:
     """Prompt rows per (set, language) in generation order; DriftmapError on a missing file or another row shape."""
     # a unit cut shorter or longer is another unit
     cut = f"?limit={limit}" if limit else ""
@@ -178,17 +189,21 @@ def read_units(data_dir: Path, languages: Sequence[str], slug: str, mode: Mode, 
                     raise _refuse(f"{shown} row {number} lacks a text {' or '.join(wanted)}")
             if len({row["prompt_id"] for row in rows}) != len(rows):
                 raise _refuse(f"{shown} repeats a prompt id")
-            key = ids.responses_path(slug, name, language, mode) + cut
+            key = ids.responses_path(slug, name, language, mode, preamble) + cut
             units.append(Unit(name, language, key, rows[: limit or None]))
     return units
 
 
-def comparability(own: dict[str, Any], runs: Sequence[RunRecord], settings: Settings, mode: Mode) -> str:
-    """The record note on how these conditions compare with the latest finished baseline run of the mode."""
+def comparability(
+    own: dict[str, Any], runs: Sequence[RunRecord], settings: Settings, mode: Mode, preamble: str = "keep"
+) -> str:
+    """The record note on how these conditions compare with the latest finished baseline run of the mode and tree."""
     for run in reversed(runs):
         note = next((note for note in run.notes if note.startswith(CONDITIONS)), None)
         on_baseline = any(ref.repo == settings.sources.model for ref in run.inputs)
         if run.kind != "generate" or run.status != "ok" or run.mode != mode or not on_baseline or note is None:
+            continue
+        if ids.preamble_of(run.notes) != preamble:
             continue
         theirs = json.loads(note.removeprefix(CONDITIONS))
         differing = [f"{label} differs from baseline" for key, label in COMPARED.items() if own[key] != theirs.get(key)]
@@ -216,7 +231,7 @@ def _generate(
     responses = f"{settings.owner}/{settings.repos.responses}"
     labels = f"{settings.owner}/{settings.repos.eval}"
     config = replace(run_config(settings.batch.generate), max_tokens=decoding.max_new_tokens)
-    name, slug, mode = ids.unparse(checkpoint), ids.slug(checkpoint), record.mode
+    name, slug, mode, preamble = ids.unparse(checkpoint), ids.slug(checkpoint), record.mode, ctx.args.preamble
     generating = uploading = megabytes = 0.0
     for unit in units:
         ctx.checkpoint()
@@ -242,11 +257,11 @@ def _generate(
         if any(row.stop_reason == "error" for row in rows):
             # the error text may quote a prompt; it stays in the rows
             ctx.run.note(f"{unit.set}/{unit.language}: {len(rows)} rows unscored by a backend error")
-        files = [(responses, ids.responses_path(slug, unit.set, unit.language, mode), _jsonl(rows))]
+        files = [(responses, ids.responses_path(slug, unit.set, unit.language, mode, preamble), _jsonl(rows))]
         if unit.set == "benign":
             targets = {row["prompt_id"]: row["target"] for row in unit.rows}
             scored = _jsonl(benign_rows(rows, targets))
-            files.append((labels, ids.labels_path(slug, unit.language, mode, benign=True), scored))
+            files.append((labels, ids.labels_path(slug, unit.language, mode, benign=True, preamble=preamble), scored))
         started = clock.monotonic()
         for repo, path, data in files:
             # the key goes with the last file
@@ -262,11 +277,14 @@ def _generate(
 def body(ctx: Context, *, device: str = "cuda") -> None:
     """Check what needs no weights, then generate every (set, language) unit the marker does not list as done."""
     settings, hub, record, kind = ctx.settings, ctx.hub, ctx.run.record, ctx.args.kind
+    preamble = ctx.args.preamble
     if device == "cuda":
         import torch
 
         if not torch.cuda.is_available():
             raise _refuse("no CUDA device; this job does not generate on CPU")
+    if ids.preamble_note(preamble):
+        ctx.run.note(ids.preamble_note(preamble))
     if ctx.args.resume and ctx.flusher.resume_from != UNITS:
         raise _refuse(f"run {ctx.args.resume} left no usable marker; {FRESH}")
     ctx.flusher.resume_from = UNITS
@@ -289,7 +307,7 @@ def body(ctx: Context, *, device: str = "cuda") -> None:
     if not (data_dir / "manifest.json").is_file():
         raise _refuse(f"manifest.json is missing from {eval_repo}")
     manifest = (data_dir / "manifest.json").read_bytes()
-    prefix = check_rendering(tokenizer, json.loads(manifest))
+    prefix = check_rendering(tokenizer, json.loads(manifest), preamble)
     record.bos_check = True
     decoding = Decoding(runtime="transformers", max_new_tokens=settings.decoding.max_new_tokens)
     conditions = {
@@ -300,11 +318,13 @@ def body(ctx: Context, *, device: str = "cuda") -> None:
     }
     ctx.run.note(CONDITIONS + json.dumps(conditions, sort_keys=True))
     if kind != "baseline":
-        ctx.run.note(comparability(conditions, runs, settings, record.mode))
+        ctx.run.note(comparability(conditions, runs, settings, record.mode, preamble))
 
     units = [
         unit
-        for unit in read_units(data_dir, settings.languages, ids.slug(checkpoint), record.mode, ctx.args.limit)
+        for unit in read_units(
+            data_dir, settings.languages, ids.slug(checkpoint), record.mode, ctx.args.limit, preamble
+        )
         if unit.key not in ctx.flusher.done
     ]
     for unit in units:

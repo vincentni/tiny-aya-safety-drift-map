@@ -134,6 +134,43 @@ def test_result_files_are_laid_out_by_slug_set_and_language_with_smoke_runs_apar
     assert ids.judge_raw_path(slug, "ar", "smoke") == f"smoke/judge_raw/{slug}/ar.jsonl"
 
 
+def test_runs_without_the_preamble_get_a_tree_and_repos_of_their_own():
+    slug = "tiny-aya-global--0123456789ab"
+    assert ids.responses_path(slug, "harmful", "en", "full", "keep") == f"responses/{slug}/harmful/en.jsonl"
+    assert ids.responses_path(slug, "harmful", "en", "full", "strip") == f"nopreamble/responses/{slug}/harmful/en.jsonl"
+    assert ids.responses_path(slug, "benign", "hi", "smoke", "strip") == (
+        f"smoke/nopreamble/responses/{slug}/benign_heldout/hi.jsonl"
+    )
+    assert ids.labels_path(slug, "hi", "full", benign=True, preamble="strip") == (
+        f"nopreamble/labels/{slug}/benign/hi.jsonl"
+    )
+    assert ids.labels_path(slug, "en", "smoke", preamble="strip") == f"smoke/nopreamble/labels/{slug}/en.jsonl"
+    assert ids.judge_raw_path(slug, "ar", "full", "strip") == f"nopreamble/judge_raw/{slug}/ar.jsonl"
+    assert ids.judge_raw_path(slug, "ar", "smoke", "strip") == f"smoke/nopreamble/judge_raw/{slug}/ar.jsonl"
+    trees = {(mode, preamble): ids.tree(mode, preamble) for mode in ("full", "smoke") for preamble in ids.PREAMBLES}
+    assert trees == {
+        ("full", "keep"): "",
+        ("full", "strip"): "nopreamble/",
+        ("smoke", "keep"): "smoke/",
+        ("smoke", "strip"): "smoke/nopreamble/",
+    }
+    suffixes = [ids.repo_suffix(mode, preamble) for mode in ("full", "smoke") for preamble in ids.PREAMBLES]
+    assert suffixes == ["", "-nopre", "-smoke", "-nopre-smoke"]
+    assert ids.repo_suffix("smoke") == "-smoke" and ids.tree("smoke") == "smoke/"
+    with pytest.raises(ValueError):
+        ids.tree("full", "drop")
+    with pytest.raises(ValueError):
+        ids.repo_suffix("full", "")
+
+
+def test_a_run_says_in_its_notes_that_it_left_the_preamble_out():
+    assert ids.preamble_note("keep") is None
+    assert ids.preamble_note("strip") == "preamble: strip"
+    assert ids.preamble_of(["training rows limited to 8", "preamble: strip"]) == "strip"
+    assert ids.preamble_of(["conditions: {}", "preamble: keep"]) == "keep"
+    assert ids.preamble_of([]) == "keep"
+
+
 def test_merged_sha256_covers_the_shards_in_filename_order(tmp_path):
     """Two shards hash in sorted order; config and tokenizer are left out (TS-CFG-10)."""
     shards = {"model-00002-of-00002.safetensors": b"second", "model-00001-of-00002.safetensors": b"first"}

@@ -23,7 +23,7 @@ from tests.fakes import FakeClock, FakeHub
 from tests.fakes.generator import FakeGenerator
 from tests.fakes.labels import column_rows, run_record, targets, write_labels
 from tests.fakes.settings import BASE, settings_toml
-from tests.fakes.tokenizers import BOS_ID, END_OF_TURN, PAD, VOCAB, build, swapped
+from tests.fakes.tokenizers import BOS_ID, END_OF_TURN, PAD, SAFETY, VOCAB, build, served_template, swapped
 
 MODEL = BASE["sources"]["model"]
 OWNER = BASE["owner"]
@@ -48,6 +48,9 @@ BEFORE = datetime(2026, 11, 1, tzinfo=UTC)
 AFTER = datetime(2026, 11, 14, tzinfo=UTC)
 OOM_TEXT = "CUDA out of memory. Tried to allocate 2.00 GiB"
 SMOKE = "smoke/"
+STRIP = "nopreamble/"
+MERGED_NOPRE = f"{MERGED}-nopre"
+STRIPPED = "generate-full-20261105T100000Z"
 SMOKE_ARGS = ["--force-flush-after-s", "300"]
 # line separators that are not a newline
 SEPARATORS = [chr(code) for code in (0x2028, 0x2029, 0x85)]
@@ -813,3 +816,137 @@ def test_a_real_checkpoint_generates_under_the_configured_decoding(make_world, t
     assert {row.decoding.max_new_tokens for row in rows} == {8}
     assert all(row.generated_tokens <= 8 and row.stop_reason in ("eos", "length") for row in rows)
     assert world.record().generated_tokens == sum(row.generated_tokens for row in rows) > 0
+
+
+@pytest.fixture
+def served(make_world):
+    """A world whose tokenizer renders a safety paragraph, as the evaluation set recorded it."""
+    return make_world(
+        tokenizer=build(template=served_template()),
+        rendered_prefix_sha256=prefix_of(build(template=served_template())),
+    )
+
+
+def stripped_prefix():
+    return prefix_of(render.conditioned(build(template=served_template()), "strip"))
+
+
+def test_a_run_without_the_preamble_renders_without_it_into_a_tree_of_its_own(served):
+    world = served
+    assert world.run("--preamble", "strip", run_id=STRIPPED) == 0
+
+    slug = slug_of(MODEL, world.head(MODEL))
+    assert world.uploads(RESPONSES) == [responses_at(slug, set_, code, STRIP) for set_, code in UNITS]
+    assert world.uploads(EVAL) == [labels_at(slug, code, STRIP) for code in LANGUAGES]
+    for set_, code in UNITS:
+        rows = world.rows(slug, set_, code, STRIP)
+        assert len(rows) == ROWS and {row.rendered_prefix_sha256 for row in rows} == {stripped_prefix()}
+        assert not [row for row in rows if SAFETY in row.rendered_prompt or "safety mode" in row.rendered_prompt]
+        assert all("# System Preamble\nYour information cutoff" in row.rendered_prompt for row in rows)
+    record = world.record(STRIPPED)
+    assert record.status == "ok" and record.bos_check is True
+    assert "preamble: strip" in record.notes
+    [conditions] = [note.removeprefix(generate.CONDITIONS) for note in record.notes if "conditions" in note]
+    assert json.loads(conditions)["rendered_prefix_sha256"] == stripped_prefix()
+
+    # the same checkpoint under the served template: other files, the paragraph in every prompt
+    world.generator.calls.clear()
+    assert world.run() == 0
+    assert "preamble: strip" not in world.record().notes
+    kept = world.rows(slug, "harmful", "en")
+    assert all(SAFETY in row.rendered_prompt for row in kept)
+    assert {row.rendered_prefix_sha256 for row in kept} == {prefix_of(build(template=served_template()))}
+    paired = zip(kept, world.rows(slug, "harmful", "en", STRIP), strict=True)
+    assert all(with_.rendered_prompt.replace(SAFETY, "") == without.rendered_prompt for with_, without in paired)
+    names = world.uploads(RESPONSES)
+    assert len(names) == len(set(names)) == 2 * len(UNITS)
+    assert sum(name.startswith(STRIP) for name in names) == len(UNITS)
+
+
+def test_a_smoke_run_without_the_preamble_sits_inside_the_smoke_tree(served):
+    world = served
+    assert world.run(*SMOKE_ARGS, "--limit", "2", "--preamble", "strip") == 0
+    slug = slug_of(MODEL, world.head(MODEL))
+    assert world.uploads(RESPONSES) == [responses_at(slug, set_, code, SMOKE + STRIP) for set_, code in UNITS]
+    assert world.uploads(EVAL) == [labels_at(slug, code, SMOKE + STRIP) for code in LANGUAGES]
+    record = world.record()
+    assert (record.mode, record.bos_check, record.prompts) == ("smoke", True, 2 * len(UNITS))
+
+
+@pytest.mark.parametrize("fault", ["no paragraph", "another template"])
+def test_a_strip_run_is_refused_when_the_served_template_is_not_the_evaluation_sets(make_world, fault):
+    if fault == "no paragraph":
+        world = make_world()
+    else:
+        world = make_world(tokenizer=build(template=served_template()), rendered_prefix_sha256=prefix_of(build()))
+
+    assert world.run("--preamble", "strip") == 12
+
+    assert world.generator.calls == [] and world.loads == [] and world.uploads(RESPONSES) == []
+
+
+def test_the_condition_is_keep_or_strip(served):
+    with pytest.raises(SystemExit) as exit_:
+        served.run("--preamble", "drop")
+    assert exit_.value.code == 2
+    assert served.uploads(RESPONSES) == []
+
+
+def test_a_strip_run_is_compared_with_the_baseline_run_of_its_own_condition(served):
+    world = served
+    assert world.run() == 0
+    world.add_drift_record()
+
+    assert world.run("--preamble", "strip", kind="drifted", run_id=DRIFTED) == 0
+    notes = world.record(DRIFTED).notes
+    assert "no finished baseline run in full mode to compare with" in notes
+    assert not [note for note in notes if note.startswith(NOT_COMPARABLE)]
+
+    assert world.run("--preamble", "strip", run_id=STRIPPED) == 0
+    assert world.run("--preamble", "strip", kind="drifted", run_id=LATER) == 0
+    assert f"same conditions as baseline run {STRIPPED}" in world.record(LATER).notes
+
+    # the later strip baseline does not stand in for the served one
+    assert world.run(kind="drifted", run_id="generate-full-20261106T100000Z") == 0
+    assert f"same conditions as baseline run {RUN_ID}" in world.record("generate-full-20261106T100000Z").notes
+
+
+def test_the_drifted_column_reads_the_served_weights_unless_the_other_repo_is_named(served):
+    world = served
+    tokenizer_files = {
+        name: data for name, data in world.fake.repos[MERGED]["main"].items() if name != "model.safetensors"
+    }
+    world.fake.add_repo(MERGED_NOPRE, private=True, files=tokenizer_files | {"model.safetensors": WEIGHTS})
+    world.fake.authorize(MERGED_NOPRE)
+    world.add_drift_record()
+    world.add_drift_record(repo=MERGED_NOPRE, run_id="drift-full-20261104T100000Z", notes=["preamble: strip"])
+
+    assert world.run("--preamble", "strip", kind="drifted", run_id=DRIFTED) == 0
+    assert world.record(DRIFTED).inputs[0].repo == MERGED
+    slug = slug_of(MERGED, world.head(MERGED))
+    assert len(world.rows(slug, "harmful", "hi", STRIP)) == ROWS
+
+    named = f"{MERGED_NOPRE}@{world.head(MERGED_NOPRE)}"
+    assert world.run("--preamble", "strip", "--checkpoint", named, kind="drifted", run_id=LATER) == 0
+    assert world.record(LATER).inputs[0].repo == MERGED_NOPRE
+    assert len(world.rows(slug_of(MERGED_NOPRE, world.head(MERGED_NOPRE)), "harmful", "hi", STRIP)) == ROWS
+    # an open repo of that name is never read
+    world.fake.private.discard(MERGED_NOPRE)
+    assert world.run("--preamble", "strip", "--checkpoint", named, kind="drifted", run_id="again") == 12
+
+
+def test_a_resume_under_the_other_condition_skips_nothing(served):
+    world = served
+    slug = slug_of(MODEL, world.head(MODEL))
+    marker = PartialMarker(
+        resume_from="unit",
+        done=[responses_at(slug, set_, code) for set_, code in UNITS],
+        written_at=FakeClock().now(),
+        config_hash=load_settings(world.config).config_hash(),
+    )
+    world.put(RESULTS, marker_path(RUN_ID), marker.model_dump_json().encode())
+
+    assert world.run("--preamble", "strip", "--resume", RUN_ID, run_id=LATER) == 0
+
+    assert world.record(LATER).prompts == ROWS * len(UNITS)
+    assert world.uploads(RESPONSES) == [responses_at(slug, set_, code, STRIP) for set_, code in UNITS]

@@ -37,6 +37,8 @@ The tests are offline. Commands that reach the Hub read `HF_TOKEN`, or the token
     uv run driftmap status                       # spend, pending jobs, latest run of each kind
     uv run driftmap ledger reconcile             # billing against the ledger
     uv run driftmap table build                  # tables from the labels: saved, printed, uploaded
+    uv run driftmap launch generate --mode full --wait -- --kind baseline --preamble strip
+    uv run driftmap table build --preamble strip # the no-safety-preamble tables, in tables-nopreamble
     uv run driftmap decide drift --proceed --note "why"                  # when table build exits 8
     uv run driftmap judge reparse --checkpoint REPO@SHA                  # after a parser change
     uv run driftmap scan <path>...               # tokens, account ids, home paths, before publishing
@@ -64,6 +66,12 @@ trust from the configuration: nothing checks which model the route serves. With 
 in place of `--checkpoint` it labels the harmful rows of one responses-repo file (or a glob of
 them, such as the repair screen's `screen/<slug>/alpha-*.jsonl`) and writes `labels-<name>`
 beside each.
+
+`--preamble strip` on the generate and drift jobs is the "no safety preamble" condition: every prompt is
+rendered without the safety paragraph the model's chat template opens its system turn with, and nothing
+else in the template changes. Those runs keep their files under `nopreamble/`, a drift run trained that
+way pushes to repos ending in `-nopre`, and a judge job reads and writes the tree of the generate run it
+is given.
 
 ## What a launch is checked against
 

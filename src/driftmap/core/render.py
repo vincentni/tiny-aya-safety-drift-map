@@ -1,12 +1,17 @@
 """Render a prompt through the chat template once, for every runtime."""
 
 import hashlib
+import re
 from typing import NamedTuple
 
 from .schemas import DriftmapError, ExitCode
 
 USER_TURN = "<|START_OF_TURN_TOKEN|><|USER_TOKEN|>"
+SYSTEM_TURN = "<|START_OF_TURN_TOKEN|><|SYSTEM_TOKEN|>"
+END_OF_TURN = "<|END_OF_TURN_TOKEN|>"
 MAX_RENDERED_TOKENS = 1700
+# the system turn's opening paragraph, up to its blank line
+_SAFETY = re.compile(r"You are in \w+ safety mode\..*?\n\n", re.DOTALL)
 
 
 class Rendered(NamedTuple):
@@ -18,6 +23,34 @@ class Rendered(NamedTuple):
 def strip_bos(text: str, bos_token: str | None) -> str:
     """Drop one leading BOS text; the runtime adds the BOS id itself."""
     return text.removeprefix(bos_token) if bos_token else text
+
+
+def strip_preamble(template: object) -> str:
+    """The chat template without the safety paragraph of its system turn; every token and all other text stays."""
+    head, marker, rest = template.partition(SYSTEM_TURN) if isinstance(template, str) else ("", "", "")
+    turn, end, tail = rest.partition(END_OF_TURN)
+    stripped, found = _SAFETY.subn("", turn)
+    if not (marker and end) or found != 1 or _SAFETY.search(head + tail):
+        raise DriftmapError(ExitCode.INTEGRITY, "the chat template has no single safety paragraph in its system turn")
+    return head + marker + stripped + end + tail
+
+
+def conditioned(tokenizer, preamble: str):
+    """The tokenizer rendering under ``preamble``: ``strip`` swaps its template for the stripped one, in place."""
+    if preamble == "strip":
+        probe = [{"role": "user", "content": "probe"}]
+        # some tokenizers hold their templates by name; only the default one is rendered here
+        held = tokenizer.chat_template
+        named = isinstance(held, dict)
+        template = strip_preamble(held.get("default") if named else held)
+        served = tokenizer.apply_chat_template(probe, tokenize=False, add_generation_prompt=True)
+        tokenizer.chat_template = {**held, "default": template} if named else template
+        stripped = tokenizer.apply_chat_template(probe, tokenize=False, add_generation_prompt=True)
+        # the two renderings may differ by that one paragraph and nothing else
+        cut, found = _SAFETY.subn("", served)
+        if found != 1 or cut != stripped:
+            raise DriftmapError(ExitCode.INTEGRITY, "the stripped template renders more than the safety paragraph away")
+    return tokenizer
 
 
 def _prefix(rendered_prompt: str) -> str:

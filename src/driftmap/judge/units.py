@@ -29,12 +29,12 @@ def _slug(checkpoint: str) -> str:
 
 
 def read_inputs(
-    directory: Path, slug: str, wanted: Sequence[Unit], mode: str, limit: int | None
+    directory: Path, slug: str, wanted: Sequence[Unit], mode: str, limit: int | None, preamble: str = "keep"
 ) -> dict[Unit, list[GenerationRow]]:
     """Generation rows per unit; DriftmapError on a missing file, a repeated prompt or a row of another unit."""
     inputs = {}
     for name, language in wanted:
-        path = ids.responses_path(slug, name, language, mode)
+        path = ids.responses_path(slug, name, language, mode, preamble)
         rows = read_rows(directory / path, GenerationRow, path)
         if not rows:
             raise DriftmapError(ExitCode.INTEGRITY, f"{path} is missing or empty in the responses repo")

@@ -347,6 +347,7 @@ def judge_checkpoint(
     concurrency: int = 4,
     limit: int | None = None,
     retry_unscored: bool = False,
+    preamble: str = "keep",
     echo: Callable[[str], object] = print,
     sleep: Callable[[float], None] = time.sleep,
 ) -> None:
@@ -363,13 +364,14 @@ def judge_checkpoint(
     with tempfile.TemporaryDirectory(prefix="driftmap-closed-") as scratch:
         files = _Files(hub, Path(scratch))
         wanted = [unit for unit in units(settings) if unit[0] in sets]
-        rows_dir = files.fetch(responses, [ids.responses_path(slug, name, "*", mode) for name in sets])
-        inputs = read_inputs(rows_dir, slug, wanted, mode, limit)
-        kept_labels = files.fetch(labelled, [ids.labels_path(slug, "*", mode)])
-        kept_raws = files.fetch(responses, [ids.judge_raw_path(slug, "*", mode)])
+        rows_dir = files.fetch(responses, [ids.responses_path(slug, name, "*", mode, preamble) for name in sets])
+        inputs = read_inputs(rows_dir, slug, wanted, mode, limit, preamble)
+        kept_labels = files.fetch(labelled, [ids.labels_path(slug, "*", mode, preamble=preamble)])
+        kept_raws = files.fetch(responses, [ids.judge_raw_path(slug, "*", mode, preamble)])
         listed = []
         for (name, language), rows in inputs.items():
-            labels, raws = ids.labels_path(slug, language, mode), ids.judge_raw_path(slug, language, mode)
+            labels = ids.labels_path(slug, language, mode, preamble=preamble)
+            raws = ids.judge_raw_path(slug, language, mode, preamble)
             files.rows.setdefault((labelled, labels), read_rows(kept_labels / labels, LabelRow))
             files.rows.setdefault((responses, raws), read_rows(kept_raws / raws, RawRow))
             listed.append(_Unit(f"{name}/{language}", rows, (labelled, labels), (responses, raws)))

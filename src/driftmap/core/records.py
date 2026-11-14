@@ -28,6 +28,7 @@ UtcDatetime = Annotated[AwareDatetime, AfterValidator(lambda moment: moment.asti
 # judge: no job of it is launched; stored records and ledger lines of that kind still parse
 JobKind = Literal["drift", "generate", "judge", "repair", "steer", "quant", "quant_eval"]
 Mode = Literal["smoke", "full"]
+Preamble = Literal["keep", "strip"]
 # n/a: benign rows; judge_unsupported: language outside the judge's set
 Lbl = Literal["yes", "no", "unscored", "n/a", "judge_unsupported"]
 
@@ -362,7 +363,7 @@ class RateRow(Record):
     rate: float | None
     ci: tuple[float, float] | None
     judge: JudgeConfig
-    preamble: Literal["keep"]
+    preamble: Preamble
 
 
 class DeltaRow(Record):
