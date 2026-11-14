@@ -1,5 +1,7 @@
 import ast
 import functools
+import hashlib
+import itertools
 import json
 import logging
 import shutil
@@ -56,10 +58,11 @@ from driftmap.jobs.plan import build_plan, pins
 from driftmap.jobs.readiness import ITEMS, READY_PATH, Check, Item, ReadyReport
 from driftmap.jobs.snapshot import DECISION_PATH, LOCAL, SMOKE_DIR, TABLES_PATH, Deps
 from driftmap.judge import closed, reparse
+from driftmap.repair import screen_gen, select
 from driftmap.table import build as table_build
 from driftmap.table import render
 from driftmap.table.build import NOT_COMPARABLE
-from tests.fakes import FakeHub, FakeJobsClient
+from tests.fakes import FakeHub, FakeJobsClient, judge_world
 from tests.fakes import labels as fake_labels
 from tests.fakes.datasets import (
     BENIGN,
@@ -82,7 +85,21 @@ EVAL = f"{OWNER}/aya-redteaming-6lang-eval"
 SHA = "0123456789abcdef0123456789abcdef01234567"
 TOKEN = "hf_" + "b" * 34
 HOME_DIR = "/" + "home/someone"
-VERBS = ["chain", "data", "decide", "judge", "launch", "ledger", "plan", "ready", "scan", "status", "table", "wait"]
+VERBS = [
+    "chain",
+    "data",
+    "decide",
+    "judge",
+    "launch",
+    "ledger",
+    "plan",
+    "ready",
+    "repair",
+    "scan",
+    "status",
+    "table",
+    "wait",
+]
 SUBMIT = FakeJobsClient.run_job
 HIDDEN = {"HF_TOKEN": "***"}
 BASELINE = ["--", "--kind", "baseline"]
@@ -266,6 +283,7 @@ def test_help_lists_every_verb():
     groups = {name: sorted(typer.main.get_command(cli.app).commands[name].commands) for name in names}
     assert groups == {"data": ["build"], "ledger": ["reconcile"], "table": ["build"], "judge": ["closed", "reparse"]}
     assert sorted(typer.main.get_command(cli.app).commands["decide"].commands) == ["drift"]
+    assert sorted(typer.main.get_command(cli.app).commands["repair"].commands) == ["choose"]
 
 
 def test_the_data_package_is_imported_only_inside_its_verb():
@@ -462,7 +480,7 @@ def test_an_interrupt_while_following_a_job_names_the_wait_command(world, monkey
 def test_a_record_that_does_not_validate_exits_2_without_its_values(world):
     (world.root / DECISION_PATH).parent.mkdir(parents=True)
     (world.root / DECISION_PATH).write_text(json.dumps({"schema": "driftmap.decision/1", "decision": TOKEN}))
-    for argv in (["plan", "repair"], ["launch", "repair"], ["chain", "repair"]):
+    for argv in (["plan", "repair"], ["launch", "repair"], ["chain", "steer"]):
         result = run(*argv)
         assert result.exit_code == 2 and "drift.json: decision: " in result.stderr, argv
         assert "hf_" not in result.output and "Traceback" not in result.output
@@ -761,9 +779,9 @@ def screen(settings, status):
     )
 
 
-def reader(world, mode="full", target=None):
+def reader(world, mode="full", target=None, **step):
     deps = Deps(client=None, hub=Hub(world.hub), ledger=world.ledger, repo_root=world.root)
-    return cli._state(world.settings, deps, mode, target)
+    return cli._state(world.settings, deps, mode, target, **step)
 
 
 def test_the_chain_reader_takes_state_from_the_results_repo(world):
@@ -804,6 +822,54 @@ def test_the_chain_reader_takes_state_from_the_results_repo(world):
     assert read("steer").recover_status == "failed"
     world.push("alpha_screen.json", b"{")
     assert read("steer").recover_status is None
+    # a smoke run keeps its screen in its own tree
+    world.push("smoke/alpha_screen.json", screen(settings, "chosen").model_dump_json().encode())
+    world.push_record("repair-smoke-20261107T100000Z")
+    assert reader(world, "smoke")("steer").recover_status == "chosen" and read("steer").recover_status is None
+
+
+def test_a_repair_launch_needs_its_drift_run_and_labels_and_an_apply_needs_a_chosen_screen(world, monkeypatch):
+    # run ids are stamped to the second, and the screen and apply launches below are quicker than that
+    seconds = itertools.count()
+    stepping = functools.partial(Deps, run=git, now=lambda: datetime.now(UTC) + timedelta(seconds=next(seconds)))
+    monkeypatch.setattr(cli, "Deps", stepping)
+    bare = run("launch", "repair", "--wait")
+    assert bare.exit_code == 4 and bare.output.splitlines()[0].split() == ["verb", "launch"]
+    missing = "drift record with merged_sha256; drifted benign labels for en, fr, es, ru, hi, ar"
+    assert f"repair cannot run yet; missing: {missing}" in bare.output
+    # a dry run says so too, and still prints the plan and the guard verdicts
+    planned = run("launch", "repair", "--dry-run")
+    assert planned.exit_code == 0 and "repair cannot run yet; missing: " in planned.output
+    assert "estimate  399990 micro-USD" in planned.output and verdict(planned, "smoke") == "pass"
+
+    world.hub.add_repo(EVAL, repo_type="dataset")
+    repo, _, revision = SMOKE_DRIFTED.partition("@")
+    merged = Ref(kind="model", repo=repo, revision=revision)
+    # as the job reads it: the latest ok drift run of the mode, whatever config it ran under
+    world.push_record("drift-smoke-20261105T090000Z", config_hash="0" * 64, merged_sha256="b" * 64, outputs=[merged])
+    labels = fake_labels.column_rows("drifted", n=2, checkpoint=SMOKE_DRIFTED)
+    put_labels(world, [row for row in labels if row.language != "ar"], "smoke")
+    unlabelled = run("launch", "repair", "--wait")
+    assert unlabelled.exit_code == 4 and "missing: drifted benign labels for ar\n" in unlabelled.output
+    put_labels(world, labels, "smoke")
+
+    applied = ["--", "--apply", "0.25"]
+    early = run("launch", "repair", "--wait", *applied)
+    assert early.exit_code == 4 and "missing: alpha screen with recover_status chosen" in early.output
+    assert "`driftmap repair choose`" in early.output and world.submits() == []
+
+    assert run("launch", "repair", "--wait").exit_code == 0
+    (screened_run,) = world.submits()
+    assert "driftmap.scripts.repair --run-id repair-smoke-" in screened_run and "--apply" not in screened_run
+    # the screen run leaves its record undecided; only a chosen one lets an apply through
+    for status in ("screened", "failed"):
+        world.push("smoke/alpha_screen.json", screen(world.settings, status).model_dump_json().encode())
+        for form in (applied, ["--", "--apply=0.25"], ["--", "--app", "0.25"]):
+            assert run("launch", "repair", "--wait", *form).exit_code == 4, (status, form)
+    world.push("smoke/alpha_screen.json", screen(world.settings, "chosen").model_dump_json().encode())
+    pushed = run("launch", "repair", "--wait", *applied)
+    assert pushed.exit_code == 0, pushed.output
+    assert len(world.submits()) == 2 and world.submits()[-1].endswith(" --apply 0.25")
 
 
 
@@ -817,6 +883,9 @@ def test_chain_names_its_generate_target_and_takes_no_judge_step(world, monkeypa
             (["judge"], "judge"),
             (["generate", "judge", "--target", "baseline"], "judge"),
             (["generate", "--target", "merged"], "merged"),
+            # screen, decide and apply are three launches with a local step between them
+            (["repair"], "`driftmap repair choose`"),
+            (["drift", "repair"], "driftmap launch repair --wait -- --apply ALPHA"),
         ):
             refused = run("chain", *argv)
             assert refused.exit_code == 2 and hint in flat(refused), argv
@@ -824,8 +893,6 @@ def test_chain_names_its_generate_target_and_takes_no_judge_step(world, monkeypa
     blocked = run("chain", "generate", "steer", "--target", "drifted")
     assert blocked.exit_code == 4 and blocked.output.splitlines()[0].split() == ["verb", "chain"]
     assert "generate cannot run yet; missing: drift record with merged_sha256" in blocked.output
-    repair = run("chain", "repair")
-    assert repair.exit_code == 4 and "baseline labels for en, fr, es, ru, hi, ar" in repair.output
     assert world.submits() == []
 
     world.smoke_passed("generate")
@@ -1386,6 +1453,197 @@ def test_a_throttled_closed_judge_run_exits_4_with_its_message_and_the_token_cou
 
     assert stopped.exit_code == 4 and "throttling or out of quota; run the" in flat(stopped)
     assert "tokens    700 in, 70 out" in stopped.output and ROUTE not in stopped.output
+
+
+RESPONSES = f"{OWNER}/safety-drift-map-responses"
+# screen prompts per language and set
+SCREENED = 10
+
+
+def screen_files(mode):
+    """The drifted checkpoint a screen of ``mode`` is of, and the folder of its files in the responses repo."""
+    drifted = SMOKE_DRIFTED if mode == "smoke" else fake_labels.CHECKPOINTS["drifted"]
+    return drifted, f"{ids.tree(mode)}screen/{ids.slug(drifted)}"
+
+
+def alpha_name(alpha, mode="full"):
+    return screen_gen.checkpoint_id(screen_files(mode)[0], fake_labels.CHECKPOINTS["baseline"], alpha)
+
+
+def put_response_file(world, path, rows):
+    world.hub.upload_file(
+        path_or_fileobj=judge_world.jsonl(rows), path_in_repo=path, repo_id=RESPONSES, repo_type="dataset"
+    )
+
+
+def screened(world, alphas, mode="full"):
+    """Put what a screen run leaves on the fake Hub, and the baseline's labels: one unsafe answer per language."""
+    for repo in (EVAL, RESPONSES):
+        if repo not in world.hub.repos:
+            world.hub.add_repo(repo, repo_type="dataset")
+    drifted, folder = screen_files(mode)
+    repo, _, revision = drifted.partition("@")
+    merged = Ref(kind="model", repo=repo, revision=revision)
+    world.push_record(f"drift-{mode}-20261105T100000Z", merged_sha256="c" * 64, outputs=[merged])
+    rows = []
+    for alpha in alphas:
+        made = [
+            row
+            for language in fake_labels.LANGUAGES
+            for name in ("harmful", "benign")
+            for row in judge_world.generation_rows(name, language, SCREENED, checkpoint=alpha_name(alpha, mode))
+        ]
+        put_response_file(world, f"{folder}/alpha-{alpha:g}.jsonl", made)
+        rows.append(
+            AlphaRow(
+                alpha=alpha,
+                safe_rate_pooled=None,
+                n_judged=0,
+                chrf_pooled=0.5,
+                pass_safety=None,
+                pass_chrf=False,
+                error=None,
+                n_harmful=SCREENED * len(fake_labels.LANGUAGES),
+                rows_sha256=hashlib.sha256(judge_world.jsonl(made)).hexdigest(),
+            )
+        )
+    record = select.choose_alpha(rows, None, 0.5, world.settings.repair.bars, judge=None, tied_weight_owner="embed")
+    world.push(screen_gen.screen_path(mode), record.model_dump_json(by_alias=True).encode())
+    put_labels(world, fake_labels.column_rows("baseline", n=SCREENED, unsafe=1), mode)
+    return record
+
+
+def alpha_labels(alpha, unsafe, mode="full", n=SCREENED, **changes):
+    """Label rows of one alpha's first ``n`` harmful prompts per language, the first ``unsafe`` of them harmful."""
+    changes.setdefault("checkpoint", alpha_name(alpha, mode))
+    return [
+        fake_labels.label("drifted", language, index, harm="yes" if index < unsafe else "no", **changes)
+        for language in fake_labels.LANGUAGES
+        for index in range(n)
+    ]
+
+
+def label_alpha(world, alpha, unsafe, mode="full", extra=(), **changes):
+    """Put the file the closed judge writes beside one alpha's rows."""
+    rows = [*alpha_labels(alpha, unsafe, mode, **changes), *extra]
+    put_response_file(world, f"{screen_files(mode)[1]}/labels-alpha-{alpha:g}.jsonl", rows)
+
+
+def stored_screen(world, mode="full"):
+    return AlphaScreen.model_validate_json(stored(world, screen_gen.screen_path(mode)))
+
+
+@pytest.mark.parametrize("mode", ["full", "smoke"])
+def test_repair_choose_rates_each_alpha_stores_the_choice_and_names_the_apply_launch(world, mode):
+    before = screened(world, [0.1, 0.25, 0.4], mode)
+    label_alpha(world, 0.1, 3, mode)
+    # rows an earlier screen left in the file under another checkpoint name are not this screen's
+    stale = alpha_labels(0.25, SCREENED, mode, checkpoint=alpha_name(0.25, mode).replace("+wiseft", "+earlier"))
+    label_alpha(world, 0.25, 1, mode, extra=stale)
+    label_alpha(world, 0.4, 0, mode)
+    (world.root / READY_PATH).unlink()
+
+    done = run("repair", "choose", "--mode", mode)
+
+    assert done.exit_code == 0, done.output
+    assert done.output.splitlines()[:2] == ["verb      repair choose", f"mode      {mode}"]
+    shown = [line.split() for line in done.output.splitlines() if line.startswith("alpha ")]
+    assert shown == [
+        ["alpha", "0.1", "safe", "0.700", "judged", "60", "chrF", "0.5000", "safety", "fail", "chrf", "pass"],
+        ["alpha", "0.25", "safe", "0.900", "judged", "60", "chrF", "0.5000", "safety", "pass", "chrf", "pass"],
+        ["alpha", "0.4", "safe", "1.000", "judged", "60", "chrF", "0.5000", "safety", "pass", "chrf", "pass"],
+    ]
+    assert "baseline  safe 0.900 over the same prompts; drifted chrF 0.5000" in done.output
+    assert "chosen    alpha 0.25, the smallest that passes both bars" in done.output
+    assert done.output.splitlines()[-1] == f"next      driftmap launch repair --mode {mode} --wait -- --apply 0.25"
+    record = stored_screen(world, mode)
+    assert (record.recover_status, record.chosen, record.baseline_safe_pooled) == ("chosen", 0.25, 0.9)
+    assert record.judge == fake_labels.judge_config() and record.undecided is None
+    # the apply run checks the stored rows against these hashes
+    assert [row.rows_sha256 for row in record.alphas] == [row.rows_sha256 for row in before.alphas]
+    assert f"stored    {screen_gen.screen_path(mode)} in {RESULTS}" in done.output
+    assert any(path.startswith("smoke/") for path in world.hub.repos[RESULTS]["main"]) == (mode == "smoke")
+    assert world.submits() == []
+
+
+def test_repair_choose_stores_a_failed_screen_when_no_alpha_passes_both_bars(world):
+    screened(world, [0.25, 0.5])
+    label_alpha(world, 0.25, 5)
+    label_alpha(world, 0.5, 2)
+
+    done = run("repair", "choose", "--mode", "full")
+
+    assert done.exit_code == 0, done.output
+    assert "failed    no alpha passes both bars; there is nothing to apply" in done.output
+    assert "--apply" not in done.output and "next" not in done.output
+    record = stored_screen(world)
+    assert (record.recover_status, record.chosen) == ("failed", None)
+    assert [(row.safe_rate_pooled, row.pass_safety, row.pass_chrf) for row in record.alphas] == [
+        (0.5, False, True),
+        (0.8, False, True),
+    ]
+
+
+def test_repair_choose_decides_nothing_while_an_alpha_lacks_labels(world):
+    screened(world, [0.1, 0.25])
+    label_alpha(world, 0.1, 3)
+    judge = f"driftmap judge closed --rows '{screen_gen.rows_path(ids.slug(screen_files('full')[0]), '*', 'full')}'"
+
+    waiting = run("repair", "choose", "--mode", "full")
+
+    assert waiting.exit_code == 0, waiting.output
+    assert "undecided no labels yet for alpha 0.25" in waiting.output and "--apply" not in waiting.output
+    assert waiting.output.splitlines()[-1] == f"next      {judge} --mode full, then choose again"
+    record = stored_screen(world)
+    assert (record.recover_status, record.chosen) == ("screened", None)
+    assert [(row.safe_rate_pooled, row.n_judged, row.pass_safety) for row in record.alphas] == [
+        (0.7, 60, False),
+        (None, 0, None),
+    ]
+
+    # verdicts on half of an alpha's prompts are no verdict on the alpha
+    label_alpha(world, 0.25, 0, n=SCREENED // 2)
+    partial = run("repair", "choose", "--mode", "full")
+    assert partial.exit_code == 0 and stored_screen(world).recover_status == "screened"
+    assert "undecided alpha 0.25 has a verdict on 30 of the 60 harmful screen prompts" in partial.output
+
+    label_alpha(world, 0.25, 0)
+    done = run("repair", "choose", "--mode", "full")
+    assert done.exit_code == 0 and "chosen    alpha 0.25" in done.output
+    assert (stored_screen(world).recover_status, stored_screen(world).chosen) == ("chosen", 0.25)
+
+
+def test_repair_choose_needs_a_screen_record_and_the_rows_it_was_made_from(world, monkeypatch):
+    absent = run("repair", "choose", "--mode", "full")
+    assert absent.exit_code == 2 and f"no screen record at alpha_screen.json in {RESULTS}" in absent.stderr
+    assert "screen first: driftmap launch repair --mode full --wait" in absent.stderr
+
+    record = screened(world, [0.25])
+    label_alpha(world, 0.25, 1)
+    other_tree = run("repair", "choose")
+    assert other_tree.exit_code == 2 and "no screen record at smoke/alpha_screen.json" in other_tree.stderr
+    assert run("repair", "choose", "--mode", "fast").exit_code == 2
+
+    with monkeypatch.context() as patch:
+        patch.setattr(world.hub, "upload_file", lambda **call: world.hub._raise(403, "https://huggingface.co/x"))
+        unpushed = run("repair", "choose", "--mode", "full")
+    assert unpushed.exit_code == ExitCode.PUSH_FAILED == 7 and "run the command again" in unpushed.stderr
+    assert "chosen    alpha 0.25" not in unpushed.output and stored_screen(world) == record
+
+    # a screen whose rows were replaced since is not the one the labels are of
+    path = f"{screen_files('full')[1]}/alpha-0.25.jsonl"
+    put_response_file(world, path, judge_world.generation_rows("harmful", "en", SCREENED))
+    replaced = run("repair", "choose", "--mode", "full")
+    assert replaced.exit_code == ExitCode.INTEGRITY and "alpha-0.25.jsonl is not the file" in replaced.stderr
+    assert "screen again: driftmap launch repair --mode full --wait" in replaced.stderr
+    assert stored_screen(world) == record
+
+    world.push_record("drift-full-20261105T100000Z", "failed")
+    undrifted = run("repair", "choose", "--mode", "full")
+    assert undrifted.exit_code == 2 and "no ok drift run" in undrifted.stderr
+
+    world.push("alpha_screen.json", b"{")
+    assert run("repair", "choose", "--mode", "full").exit_code == 2
 
 
 def test_status_shows_spend_pending_jobs_and_the_latest_runs_without_writing(world):

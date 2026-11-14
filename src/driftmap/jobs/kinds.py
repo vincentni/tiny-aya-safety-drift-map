@@ -31,14 +31,16 @@ KINDS: dict[str, Kind] = {
 
 @dataclass(frozen=True)
 class State:
-    """What exists on the Hub for the step a chain is about to submit."""
+    """What exists on the Hub for the step about to be submitted."""
 
     languages: tuple[str, ...]
     # the generate target: baseline, drifted or repaired
     checkpoint: str = "baseline"
+    # the repair run pushes the chosen alpha; otherwise it screens
+    apply: bool = False
     merged_sha256: str | None = None
-    baseline_labels: frozenset[str] = frozenset()
-    screen_responses: bool = False
+    # languages with benign label rows of the drifted checkpoint, the screen's chrF reference
+    benign_labels: frozenset[str] = frozenset()
     repaired_revision: str | None = None
     gguf_record: bool = False
     recover_status: str | None = None
@@ -52,11 +54,13 @@ def prerequisites(kind: str, state: State) -> list[str]:
     if kind == "generate" and state.checkpoint == "drifted" and not state.merged_sha256:
         missing.append("drift record with merged_sha256")
     if kind == "repair":
-        unlabelled = [code for code in state.languages if code not in state.baseline_labels]
+        if not state.merged_sha256:
+            missing.append("drift record with merged_sha256")
+        unlabelled = [code for code in state.languages if code not in state.benign_labels]
         if unlabelled or not state.languages:
-            missing.append(f"baseline labels for {', '.join(unlabelled) or 'every language'}")
-        if not state.screen_responses:
-            missing.append("drifted benign responses for the screen prompts")
+            missing.append(f"drifted benign labels for {', '.join(unlabelled) or 'every language'}")
+        if state.apply and state.recover_status != "chosen":
+            missing.append("alpha screen with recover_status chosen; decide it with `driftmap repair choose`")
     if kind == "quant" and not state.repaired_revision:
         missing.append("repaired checkpoint revision")
     if kind == "quant_eval" and not state.gguf_record:

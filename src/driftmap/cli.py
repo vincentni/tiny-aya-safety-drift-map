@@ -1,12 +1,13 @@
-"""The driftmap command: readiness, data, launches, the ledger, tables, the drift decision, status and the scan."""
+"""The driftmap command: readiness, data, launches, the ledger, tables, the decisions, status and the scan."""
 
 import enum
 import functools
+import hashlib
 import json
 import logging
 import tempfile
 import traceback
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import replace
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -19,12 +20,26 @@ from pydantic import BaseModel, ValidationError
 from driftmap.core import ids, redact
 from driftmap.core.clients import make_jobs_client
 from driftmap.core.hub import Hub
-from driftmap.core.records import AlphaScreen, Decision, LedgerLine, Mode, Preamble, RunRecord, Tables, dump, load
+from driftmap.core.ids import RepoRef
+from driftmap.core.records import (
+    AlphaRow,
+    AlphaScreen,
+    Decision,
+    GenerationRow,
+    LabelRow,
+    LedgerLine,
+    Mode,
+    Preamble,
+    RunRecord,
+    Tables,
+    dump,
+    load,
+)
 from driftmap.core.schemas import DriftmapError, ExitCode
 from driftmap.core.settings import Settings, load_settings
 from driftmap.jobs import client as jobs_client
 from driftmap.jobs import launcher, readiness
-from driftmap.jobs.kinds import KINDS, State
+from driftmap.jobs.kinds import KINDS, State, prerequisites
 from driftmap.jobs.ledger import Ledger
 from driftmap.jobs.plan import MASK, SECRET_NAMES
 from driftmap.jobs.snapshot import DECISION_PATH, LOCAL, TABLES_PATH, Deps, _billing_used, write_decision
@@ -36,7 +51,6 @@ REVISIONS = "revisions.json"
 DATA_DIR = LOCAL / "data"
 # beside tables.json, which alone gates the repair
 NOPREAMBLE_TABLES = "tables-nopreamble.json"
-STATE_FILES = ["runs/*.json", "alpha_screen.json"]
 # label set and its folder under prompts/ in the evaluation dataset
 PROMPT_SETS = (("harmful", "harmful"), ("benign", "benign_heldout"), ("xstest", "xstest"))
 # 128 + SIGINT, as a shell reports it
@@ -62,11 +76,13 @@ ledger_app = typer.Typer(no_args_is_help=True, help="The cost ledger.")
 table_app = typer.Typer(no_args_is_help=True, help="The result tables.")
 judge_app = typer.Typer(no_args_is_help=True, help="Labels: the closed-model judge and a reparse of stored outputs.")
 decide_app = typer.Typer(no_args_is_help=True, help="Calls only the author can make.")
+repair_app = typer.Typer(no_args_is_help=True, help="The choice between the screen run and the apply run.")
 app.add_typer(data_app, name="data")
 app.add_typer(ledger_app, name="ledger")
 app.add_typer(table_app, name="table")
 app.add_typer(judge_app, name="judge")
 app.add_typer(decide_app, name="decide")
+app.add_typer(repair_app, name="repair")
 
 
 @app.callback()
@@ -278,6 +294,12 @@ def _job_args(kind: str, mode: str, given: list[str] | None) -> list[str]:
     return given
 
 
+def _applies(args: Sequence[str]) -> bool:
+    """True when repair job arguments name an alpha to apply."""
+    # argparse takes any unambiguous prefix of an option; --a alone could also be --alphas
+    return any(len(flag) > 3 and "--apply".startswith(flag) for flag in (arg.split("=", 1)[0] for arg in args))
+
+
 @app.command()
 @_finish
 def launch(
@@ -321,6 +343,12 @@ def launch(
     rows = {"kind": kind.value, "mode": mode, "dry_run": dry_run, "wait": wait, "limit": limit}
     settings, deps = _open("launch", **rows, job_args=args, overrides=overrides, reason=reason or None)
     _launch_inputs(deps.repo_root)
+    if kind.value == "repair":
+        missing = prerequisites("repair", _state(settings, deps, mode, None, apply=_applies(args))("repair"))
+        if missing:
+            typer.echo(f"repair cannot run yet; missing: {'; '.join(missing)}")
+            if not dry_run:
+                return ExitCode.GUARD_REFUSAL
     if reason:
         deps = replace(deps, ledger=_Noted(deps.ledger, f"reason={reason}"))
     return launcher.launch(
@@ -356,23 +384,47 @@ def _snapshot(hub: Hub, repo: str, scratch: str, patterns: list[str]) -> Path:
         raise DriftmapError(ExitCode.UNEXPECTED, f"{repo} could not be read ({type(error).__name__})") from error
 
 
-def _results(settings: Settings, hub: Hub) -> tuple[list[RunRecord], AlphaScreen | None]:
-    """Run records, by run id, and the alpha screen at the head of the results repo; a torn file is left out."""
+def _results(settings: Settings, hub: Hub, mode: str = "full") -> tuple[list[RunRecord], AlphaScreen | None]:
+    """Run records, by run id, and the alpha screen of ``mode`` at the results repo's head; a torn file is left out."""
+    from driftmap.repair.screen_gen import screen_path
+
     with tempfile.TemporaryDirectory(prefix="driftmap-results-") as scratch:
-        root = _snapshot(hub, f"{settings.owner}/{settings.repos.results}", scratch, STATE_FILES)
+        root = _snapshot(hub, f"{settings.owner}/{settings.repos.results}", scratch, ["runs/*.json", screen_path(mode)])
         records = [_parsed(RunRecord, path) for path in sorted((root / "runs").glob("*.json"))]
-        return [record for record in records if record], _parsed(AlphaScreen, root / "alpha_screen.json")
+        return [record for record in records if record], _parsed(AlphaScreen, root / screen_path(mode))
 
 
-def _state(settings: Settings, deps: Deps, mode: str, target: str | None) -> Callable[[str], State]:
-    """Reader of what the results repo holds before a chain step."""
+def _drifted(records: Iterable[RunRecord], settings: Settings, mode: str) -> tuple[RepoRef, str] | None:
+    """The merged checkpoint of the latest ok drift run of ``mode`` and its weights hash, as the repair job picks it."""
+    repo = f"{settings.owner}/{settings.repos.merged}{ids.repo_suffix(mode)}"
+    for run in reversed(sorted(records, key=lambda run: run.started)):
+        pushed = next((ref for ref in run.outputs if ref.repo == repo), None)
+        if (run.kind, run.status, run.mode) == ("drift", "ok", mode) and run.merged_sha256 and pushed:
+            return RepoRef(repo, pushed.revision), run.merged_sha256
+    return None
+
+
+def _benign_labelled(settings: Settings, hub: Hub, checkpoint: RepoRef, mode: str) -> frozenset[str]:
+    """Languages whose benign label rows of ``checkpoint`` are in the evaluation dataset."""
+    slug = ids.slug(checkpoint)
+    with tempfile.TemporaryDirectory(prefix="driftmap-labels-") as scratch:
+        wanted = [ids.labels_path(slug, "*", mode, benign=True)]
+        root = _snapshot(hub, f"{settings.owner}/{settings.repos.eval}", scratch, wanted)
+        paths = {code: root / ids.labels_path(slug, code, mode, benign=True) for code in settings.languages}
+        return frozenset(code for code, path in paths.items() if path.is_file())
+
+
+def _state(
+    settings: Settings, deps: Deps, mode: str, target: str | None, *, apply: bool = False
+) -> Callable[[str], State]:
+    """Reader of what the Hub holds before a step is submitted; ``apply`` says the repair step pushes an alpha."""
 
     def output(record: RunRecord | None, repo: str) -> str | None:
         refs = record.outputs if record else []
         return next((ref.revision for ref in refs if ref.repo == f"{settings.owner}/{repo}"), None)
 
     def read(kind: str) -> State:
-        records, screen = _results(settings, deps.hub)
+        records, screen = _results(settings, deps.hub, mode)
         # only ok runs of this mode under this config count
         runs = {
             record.run_id: record
@@ -381,13 +433,21 @@ def _state(settings: Settings, deps: Deps, mode: str, target: str | None) -> Cal
         }
         # by run id, so the newest ok record of a kind wins
         ok = {record.kind: record for record in runs.values()}
+        merged = ok["drift"].merged_sha256 if "drift" in ok else None
+        benign: frozenset[str] = frozenset()
+        if kind == "repair":
+            # the job takes its drift run and the stored screen whatever config they were made under
+            drifted, merged = _drifted(records, settings, mode) or (None, None)
+            benign = _benign_labelled(settings, deps.hub, drifted, mode) if drifted else benign
         return State(
             languages=tuple(settings.languages),
             checkpoint=target or "drifted",
-            merged_sha256=ok["drift"].merged_sha256 if "drift" in ok else None,
+            apply=apply,
+            merged_sha256=merged,
+            benign_labels=benign,
             repaired_revision=output(ok.get("repair"), settings.repos.repaired),
             gguf_record=output(ok.get("quant"), settings.repos.gguf) is not None,
-            recover_status=screen.recover_status if screen and "repair" in ok else None,
+            recover_status=screen.recover_status if screen and (kind == "repair" or "repair" in ok) else None,
         )
 
     return read
@@ -407,6 +467,11 @@ def chain(
     if ("generate" in names) != (target is not None):
         raise typer.BadParameter(
             "--target names the generate step: chain generate ... --target baseline|drifted|repaired"
+        )
+    if "repair" in names:
+        raise typer.BadParameter(
+            "repair is not one chain step: `driftmap launch repair --wait` screens the alphas, `driftmap repair "
+            "choose` decides from their labels, and `driftmap launch repair --wait -- --apply ALPHA` pushes the model"
         )
     settings, deps = _open("chain", kinds=names, mode=mode, target=target)
     _launch_inputs(deps.repo_root)
@@ -513,7 +578,7 @@ def table_build(
     from driftmap.table import render
 
     root, tree = deps.repo_root, ids.tree(mode, preamble)
-    records, screen = _results(settings, deps.hub)
+    records, screen = _results(settings, deps.hub, mode)
     # labels of a revision no finished run generated would put two checkpoints in one column
     folders = _label_folders(records, settings, mode, table.column_of, preamble)
     labels = [f"{tree}labels/{slug}/*" for slug in folders]
@@ -674,6 +739,109 @@ def judge_closed(
             )
     finally:
         typer.echo(f"{'tokens':<10}{client.prompt_tokens} in, {client.completion_tokens} out")
+
+
+def _alpha_line(row: AlphaRow) -> str:
+    """One screened alpha as `repair choose` prints it."""
+    if row.error is not None:
+        return f"alpha {row.alpha:<6g}error: {row.error}"
+    said = {None: "-", True: "pass", False: "fail"}
+    safe = "-" if row.safe_rate_pooled is None else f"{row.safe_rate_pooled:.3f}"
+    figures = f"safe {safe:<7}judged {row.n_judged:<5}chrF {row.chrf_pooled:<8.4f}"
+    return f"alpha {row.alpha:<6g}{figures}safety {said[row.pass_safety]:<6}chrf {said[row.pass_chrf]}"
+
+
+def _open_reason(screen: AlphaScreen) -> str:
+    """Why a screen is not decided yet."""
+    scored = [row for row in screen.alphas if row.error is None]
+    if screen.undecided or not scored:
+        return screen.undecided or "no alpha was screened without an error"
+    waiting = ", ".join(f"{row.alpha:g}" for row in scored if row.safe_rate_pooled is None)
+    return f"no labels yet for alpha {waiting}"
+
+
+@repair_app.command("choose")
+@_finish
+def repair_choose(
+    mode: Annotated[Mode, typer.Option(help="The tree the screen and its labels are in.")] = "smoke",
+) -> None:
+    """Rate each screened alpha from its labels against the baseline's and store the choice; runs here, no job."""
+    # nothing is launched or billed to the ledger, so no readiness report is needed
+    settings, deps = _open("repair choose", ready=False, mode=mode)
+    from driftmap.judge.closed import DERIVED
+    from driftmap.judge.incremental import key, read_rows
+    from driftmap.repair import select
+    from driftmap.repair.screen_gen import rows_path, screen_path
+
+    results, responses, labelled = (
+        f"{settings.owner}/{name}" for name in (settings.repos.results, settings.repos.responses, settings.repos.eval)
+    )
+    relaunch = f"driftmap launch repair --mode {mode} --wait"
+    records, screen = _results(settings, deps.hub, mode)
+    if screen is None:
+        found = f"no screen record at {screen_path(mode)} in {results}"
+        raise DriftmapError(ExitCode.USAGE, f"{found}; screen first: {relaunch}")
+    drifted = _drifted(records, settings, mode)
+    if drifted is None:
+        found = f"no ok drift run of {mode} mode in {results}"
+        raise DriftmapError(ExitCode.USAGE, f"{found}; the screen rows sit under its merged checkpoint")
+    pinned = settings.revisions.get(settings.sources.model)
+    if pinned is None:
+        found = f"{settings.sources.model} is not pinned"
+        raise DriftmapError(ExitCode.USAGE, f"{found}; the baseline labels sit under its pinned revision")
+    slug, baseline = ids.slug(drifted[0]), ids.slug(RepoRef(settings.sources.model, pinned))
+
+    def beside(path: str) -> str:
+        folder, _, name = path.rpartition("/")
+        return f"{folder}/{DERIVED[0]}{name}"
+
+    labels: dict[float, list[LabelRow]] = {}
+    with tempfile.TemporaryDirectory(prefix="driftmap-screen-") as scratch:
+        pattern = rows_path(slug, "*", mode)
+        root = _snapshot(deps.hub, responses, f"{scratch}/screen", [pattern, beside(pattern)])
+        for row in screen.alphas:
+            name = rows_path(slug, row.alpha, mode)
+            data = (root / name).read_bytes() if (root / name).is_file() else b""
+            if row.error is None and hashlib.sha256(data).hexdigest() != row.rows_sha256:
+                fault = f"{name} is not the file the screen record was made from"
+                raise DriftmapError(ExitCode.INTEGRITY, f"{fault}; screen again: {relaunch}")
+            # the file may still hold rows of an earlier screen, under another checkpoint name
+            asked = {key(made) for made in read_rows(root / name, GenerationRow, name) if made.set == "harmful"}
+            found = [label for label in read_rows(root / beside(name), LabelRow, beside(name)) if key(label) in asked]
+            if found:
+                labels[row.alpha] = found
+        data_dir = _snapshot(deps.hub, labelled, f"{scratch}/baseline", [ids.labels_path(baseline, "*", mode)])
+        files = [ids.labels_path(baseline, code, mode) for code in settings.languages]
+        reference = [label for name in files for label in read_rows(data_dir / name, LabelRow, name)]
+    decided = select.judged(screen, labels, reference)
+
+    for row in decided.alphas:
+        typer.echo(redact.mask(_alpha_line(row)))
+    safe = "-" if decided.baseline_safe_pooled is None else f"{decided.baseline_safe_pooled:.3f}"
+    typer.echo(f"{'baseline':<10}safe {safe} over the same prompts; drifted chrF {decided.drifted_chrf_subset:.4f}")
+    bars = decided.bars
+    typer.echo(
+        f"{'bars':<10}safe rate within {bars.safety_points:g} points of the baseline, "
+        f"chrF within {bars.chrf_points:g} of the drifted model"
+    )
+    path = deps.repo_root / LOCAL / "results" / screen_path(mode)
+    dump(decided, path)
+    try:
+        message = f"record the alpha choice: {decided.recover_status}"
+        deps.hub.upload_file(results, screen_path(mode), path, repo_type="dataset", commit_message=message)
+    except httpx2.HTTPError as error:
+        kept = f"the screen is stored in {path.relative_to(deps.repo_root)} but was not pushed"
+        raise DriftmapError(ExitCode.PUSH_FAILED, f"{kept} ({type(error).__name__}); run the command again") from error
+    typer.echo(f"{'stored':<10}{screen_path(mode)} in {results}")
+    if decided.recover_status == "chosen":
+        typer.echo(f"{'chosen':<10}alpha {decided.chosen:g}, the smallest that passes both bars")
+        typer.echo(f"{'next':<10}{relaunch} -- --apply {decided.chosen:g}")
+    elif decided.recover_status == "failed":
+        typer.echo(f"{'failed':<10}no alpha passes both bars; there is nothing to apply")
+    else:
+        typer.echo(redact.mask(f"{'undecided':<10}{_open_reason(decided)}"))
+        judge = f"driftmap judge closed --rows '{rows_path(slug, '*', 'full')}' --mode {mode}"
+        typer.echo(f"{'next':<10}{judge}, then choose again")
 
 
 def _money(micro_usd: int) -> str:

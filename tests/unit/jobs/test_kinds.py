@@ -11,8 +11,7 @@ READY = State(
     languages=LANGUAGES,
     checkpoint="drifted",
     merged_sha256="ab" * 32,
-    baseline_labels=frozenset(LANGUAGES),
-    screen_responses=True,
+    benign_labels=frozenset(LANGUAGES),
     repaired_revision="0123456789abcdef0123456789abcdef01234567",
     gguf_record=True,
     recover_status="failed",
@@ -33,9 +32,10 @@ def test_table_covers_every_kind_but_the_one_only_stored_records_name():
     ("kind", "missing", "named"),
     [
         ("generate", {"merged_sha256": None}, "merged_sha256"),
-        ("repair", {"baseline_labels": frozenset(LANGUAGES[:4])}, "baseline labels for hi, ar"),
-        ("repair", {"languages": ()}, "baseline labels"),
-        ("repair", {"screen_responses": False}, "screen"),
+        ("repair", {"merged_sha256": None}, "merged_sha256"),
+        ("repair", {"benign_labels": frozenset(LANGUAGES[:4])}, "drifted benign labels for hi, ar"),
+        ("repair", {"languages": ()}, "drifted benign labels for every language"),
+        ("repair", {"apply": True}, "recover_status chosen"),
         ("quant", {"repaired_revision": None}, "repaired"),
         ("quant_eval", {"gguf_record": False}, "gguf.json"),
     ],
@@ -56,6 +56,15 @@ def test_nothing_on_the_hub_blocks_all_but_drift_and_baseline():
     for unknown in ("train", "judge"):
         with pytest.raises(KeyError):
             prerequisites(unknown, empty)
+
+
+def test_a_repair_that_applies_needs_a_chosen_screen_and_one_that_screens_does_not():
+    for status in (None, "screened", "failed", "chosen"):
+        assert prerequisites("repair", replace(READY, recover_status=status)) == []
+    assert prerequisites("repair", replace(READY, apply=True, recover_status="chosen")) == []
+    for status in (None, "screened", "failed"):
+        (missing,) = prerequisites("repair", replace(READY, apply=True, recover_status=status))
+        assert "driftmap repair choose" in missing
 
 
 def test_steer_needs_a_failed_recovery_or_the_comparison_flag():

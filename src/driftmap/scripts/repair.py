@@ -30,7 +30,7 @@ from driftmap.judge.incremental import dump_rows, read_rows
 from driftmap.repair import screen_gen, select, wiseft
 from driftmap.repair.screen_gen import SCREEN_FILE, rows_path, screen_path
 from driftmap.scripts import run_job
-from driftmap.scripts.drift import CANARIES, SMOKE_SUFFIX, TOKENIZER_FILES, _release, repo_names
+from driftmap.scripts.drift import CANARIES, TOKENIZER_FILES, _release, repo_names
 from driftmap.scripts.generate import PROMPT_FILES, _save_marker, check_rendering, check_repos, past_runs, read_units
 
 # this job's marker stage
@@ -413,7 +413,7 @@ def run_apply(ctx: Context, inputs: Inputs, alpha: float, device: str) -> None:
         raise _refuse(f"the stored decision for alpha {alpha:g} does not follow from its rows ({derived})")
     ctx.run.note(f"applied alpha = {alpha:g}, as the decided screen names it")
     ctx.run.note(f"chosen = {next(row for row in screen.alphas if row.alpha == screen.chosen).model_dump_json()}")
-    repaired = f"{settings.owner}/{settings.repos.repaired}{SMOKE_SUFFIX if mode == 'smoke' else ''}"
+    repaired = f"{settings.owner}/{settings.repos.repaired}{ids.repo_suffix(mode)}"
     ctx.hub.create_repo(repaired, private=True)
     # creating over an existing repo leaves its visibility as it was
     if ctx.hub.model_info(repaired).private is not True:
