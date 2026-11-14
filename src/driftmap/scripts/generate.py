@@ -1,9 +1,13 @@
-"""Generate job: one checkpoint's responses to every evaluation prompt, uploaded unit by unit."""
+"""Generate job: one checkpoint's responses to every evaluation prompt, uploaded unit by unit.
+
+With ``--sets variants`` the prompts are the script variants at a named commit of the evaluation dataset instead.
+"""
 
 import argparse
 import functools
 import hashlib
 import json
+import re
 import sys
 import tempfile
 from collections.abc import Sequence
@@ -11,6 +15,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, NamedTuple
 
+from huggingface_hub.errors import RevisionNotFoundError
 from pydantic import BaseModel, ValidationError
 
 from driftmap.core import ids, render
@@ -35,6 +40,11 @@ TARGETS = ("baseline", "drifted", "repaired")
 # set, folder under prompts/; safety first, so a deadline cuts utility rows
 SETS = (("harmful", "harmful"), ("xstest", "xstest"), ("benign", "benign_heldout"))
 PROMPT_FILES = ["prompts/*", "manifest.json"]
+# what --sets names: the three evaluation sets, or the script variants of the harmful and the benign prompts
+STANDARD, VARIANTS = "standard", "variants"
+# safety first here too; the variant files are found at the commit --variants-rev names
+VARIANT_SETS = ("harmful", "benign")
+PAIRED = "--sets variants goes with --variants-rev SHA, the evaluation dataset commit to read, and only with it"
 DTYPE = "bfloat16"
 PROBE = "hello"
 # this job's marker stage; "start" means no usable marker
@@ -47,6 +57,7 @@ COMPARED = {
     "decoding": "decoding",
     "rendered_prefix_sha256": "rendered prefix",
     "manifest_sha256": "evaluation set",
+    "variants_revision": "variant prompts",
 }
 
 
@@ -63,10 +74,38 @@ def _refuse(message: str) -> DriftmapError:
     return DriftmapError(ExitCode.INTEGRITY, message)
 
 
+def _commit(text: str) -> str:
+    if not re.fullmatch(r"[0-9a-f]{40}", text):
+        raise argparse.ArgumentTypeError("expected the full 40-character commit")
+    return text
+
+
+def _paired(parser: argparse.ArgumentParser) -> None:
+    """Make ``parser`` refuse the variants named without their commit, and a commit named without them."""
+    parse = parser.parse_known_args
+
+    def checked(args: Sequence[str] | None = None, namespace: Any = None) -> tuple[Any, list[str]]:
+        known, rest = parse(args, namespace)
+        if (known.sets == VARIANTS) != (known.variants_rev is not None):
+            # looked up now: a launcher reading these arguments ahead of the job replaces it
+            parser.error(PAIRED)
+        return known, rest
+
+    parser.parse_known_args = checked
+
+
 def _arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--kind", required=True, choices=TARGETS, help="the table column to generate")
     parser.add_argument("--checkpoint", type=ids.parse, metavar="REPO@SHA", help="revision to read, when not implied")
     preamble_option(parser, ids.CONDITIONS)
+    parser.add_argument(
+        "--sets",
+        choices=(STANDARD, VARIANTS),
+        default=STANDARD,
+        help="variants: the script variants of the prompts in place of the evaluation sets, files go under variants/",
+    )
+    parser.add_argument("--variants-rev", type=_commit, metavar="SHA", help="with --sets variants: the commit to read")
+    _paired(parser)
 
 
 def _repaired(settings: Settings, mode: str) -> str:
@@ -179,6 +218,23 @@ def check_rendering(tokenizer: Any, manifest: dict[str, Any], preamble: str = "k
     return other.rendered_prefix_sha256
 
 
+def _prompt_rows(path: Path, shown: str, wanted: Sequence[str]) -> list[dict[str, Any]]:
+    """Rows of one prompt file; DriftmapError on a missing file, a torn line, a row without its texts or a repeat."""
+    if not path.is_file():
+        raise _refuse(f"{shown} is missing from the evaluation set")
+    try:
+        # split on newlines only; a prompt may hold other line separators
+        rows = [json.loads(line) for line in path.read_text(encoding="utf-8").split("\n") if line.strip()]
+    except ValueError as error:
+        raise _refuse(f"{shown} is not JSON lines: {error}") from None
+    for number, row in enumerate(rows, 1):
+        if not (isinstance(row, dict) and all(isinstance(row.get(field), str) for field in wanted)):
+            raise _refuse(f"{shown} row {number} lacks a text {' or '.join(wanted)}")
+    if len({row["prompt_id"] for row in rows}) != len(rows):
+        raise _refuse(f"{shown} repeats a prompt id")
+    return rows
+
+
 def read_units(
     data_dir: Path, languages: Sequence[str], slug: str, mode: Mode, limit: int | None, preamble: str = "keep"
 ) -> list[Unit]:
@@ -193,27 +249,52 @@ def read_units(
             raise _refuse(f"prompts/{folder} holds no prompt file")
         wanted = ("prompt_id", "prompt", "target") if name == "benign" else ("prompt_id", "prompt")
         for language in codes:
-            path = directory / f"{language}.jsonl"
-            shown = f"prompts/{folder}/{path.name}"
-            if not path.is_file():
-                raise _refuse(f"{shown} is missing from the evaluation set")
-            try:
-                # split on newlines only; a prompt may hold other line separators
-                rows = [json.loads(line) for line in path.read_text(encoding="utf-8").split("\n") if line.strip()]
-            except ValueError as error:
-                raise _refuse(f"{shown} is not JSON lines: {error}") from None
-            for number, row in enumerate(rows, 1):
-                if not (isinstance(row, dict) and all(isinstance(row.get(field), str) for field in wanted)):
-                    raise _refuse(f"{shown} row {number} lacks a text {' or '.join(wanted)}")
-            if len({row["prompt_id"] for row in rows}) != len(rows):
-                raise _refuse(f"{shown} repeats a prompt id")
+            rows = _prompt_rows(directory / f"{language}.jsonl", f"prompts/{folder}/{language}.jsonl", wanted)
             key = ids.responses_path(slug, name, language, mode, preamble) + cut
             units.append(Unit(name, language, key, rows[: limit or None]))
     return units
 
 
+def read_variant_units(data_dir: Path, slug: str, mode: Mode, limit: int | None, preamble: str = "keep") -> list[Unit]:
+    """Prompt rows per (set, variant code) file under ``data_dir``, harmful first; ``language`` is the code.
+
+    DriftmapError as ``read_units``, when no file is there, and on a row that names another set or code than its
+    file's.
+    """
+    cut = f"?limit={limit}" if limit else ""
+    units = []
+    for name in VARIANT_SETS:
+        for path in sorted(data_dir.glob(ids.variant_prompts(name))):
+            code, shown = path.stem, ids.variant_prompts(name, path.stem)
+            rows = _prompt_rows(path, shown, ("prompt_id", "prompt"))
+            filed = [(row.get("set"), row.get("language")) for row in rows]
+            if any(place != (name, code) for place in filed):
+                number = next(at for at, place in enumerate(filed, 1) if place != (name, code))
+                raise _refuse(f"{shown} row {number} is not a {name} row of {code}")
+            key = ids.responses_path(slug, name, code, mode, preamble, variants=True) + cut
+            units.append(Unit(name, code, key, rows[: limit or None]))
+    if not units:
+        raise _refuse(f"{ids.variant_prompts('*')} holds no variant prompt file at that commit")
+    return units
+
+
+def check_lengths(tokenizer: Any, units: Sequence[Unit], system: str | None = None) -> None:
+    """Refuse variant prompts that render over the length limit the evaluation sets were cut to."""
+    for unit in units:
+        for number, row in enumerate(unit.rows, 1):
+            tokens = render.token_count(tokenizer, render.render(tokenizer, row["prompt"], system).rendered_prompt)
+            if tokens > render.MAX_RENDERED_TOKENS:
+                shown = f"{ids.variant_prompts(unit.set, unit.language)} row {number} renders to {tokens} tokens"
+                raise _refuse(f"{shown}, over the rendered length limit of {render.MAX_RENDERED_TOKENS}")
+
+
 def comparability(
-    own: dict[str, Any], runs: Sequence[RunRecord], settings: Settings, mode: Mode, preamble: str = "keep"
+    own: dict[str, Any],
+    runs: Sequence[RunRecord],
+    settings: Settings,
+    mode: Mode,
+    preamble: str = "keep",
+    variants: bool = False,
 ) -> str:
     """The record note on how these conditions compare with the latest finished baseline run of the mode and tree."""
     for run in reversed(runs):
@@ -221,10 +302,12 @@ def comparability(
         on_baseline = any(ref.repo == settings.sources.model for ref in run.inputs)
         if run.kind != "generate" or run.status != "ok" or run.mode != mode or not on_baseline or note is None:
             continue
-        if ids.preamble_of(run.notes) != preamble:
+        if (ids.preamble_of(run.notes), ids.variants_of(run.notes)) != (preamble, variants):
             continue
         theirs = json.loads(note.removeprefix(CONDITIONS))
-        differing = [f"{label} differs from baseline" for key, label in COMPARED.items() if own[key] != theirs.get(key)]
+        differing = [
+            f"{label} differs from baseline" for key, label in COMPARED.items() if own.get(key) != theirs.get(key)
+        ]
         return NOT_COMPARABLE + "; ".join(differing) if differing else f"same conditions as baseline run {run.run_id}"
     return f"no finished baseline run in {mode} mode to compare with"
 
@@ -250,6 +333,7 @@ def _generate(
     labels = f"{settings.owner}/{settings.repos.eval}"
     config = replace(run_config(settings.batch.generate), max_tokens=decoding.max_new_tokens)
     name, slug, mode, preamble = ids.unparse(checkpoint), ids.slug(checkpoint), record.mode, ctx.args.preamble
+    variants = ctx.args.sets == VARIANTS
     system = render.system_message(preamble)
     generating = uploading = megabytes = 0.0
     for unit in units:
@@ -276,8 +360,10 @@ def _generate(
         if any(row.stop_reason == "error" for row in rows):
             # the error text may quote a prompt; it stays in the rows
             ctx.run.note(f"{unit.set}/{unit.language}: {len(rows)} rows unscored by a backend error")
-        files = [(responses, ids.responses_path(slug, unit.set, unit.language, mode, preamble), _jsonl(rows))]
-        if unit.set == "benign":
+        path = ids.responses_path(slug, unit.set, unit.language, mode, preamble, variants)
+        files = [(responses, path, _jsonl(rows))]
+        # a variant has no reference text to score against
+        if unit.set == "benign" and not variants:
             targets = {row["prompt_id"]: row["target"] for row in unit.rows}
             scored = _jsonl(benign_rows(rows, targets))
             files.append((labels, ids.labels_path(slug, unit.language, mode, benign=True, preamble=preamble), scored))
@@ -296,7 +382,7 @@ def _generate(
 def body(ctx: Context, *, device: str = "cuda") -> None:
     """Check what needs no weights, then generate every (set, language) unit the marker does not list as done."""
     settings, hub, record, kind = ctx.settings, ctx.hub, ctx.run.record, ctx.args.kind
-    preamble = ctx.args.preamble
+    preamble, variants = ctx.args.preamble, ctx.args.sets == VARIANTS
     if device == "cuda":
         import torch
 
@@ -306,6 +392,8 @@ def body(ctx: Context, *, device: str = "cuda") -> None:
         ctx.run.note(ids.preamble_note(preamble))
     if preamble == "patch":
         ctx.run.note(render.patch_note())
+    if variants:
+        ctx.run.note(ids.VARIANTS_NOTE)
     if ctx.args.resume and ctx.flusher.resume_from != UNITS:
         raise _refuse(f"run {ctx.args.resume} left no usable marker; {FRESH}")
     ctx.flusher.resume_from = UNITS
@@ -320,6 +408,8 @@ def body(ctx: Context, *, device: str = "cuda") -> None:
     eval_repo = f"{settings.owner}/{settings.repos.eval}"
     eval_ref = RepoRef(eval_repo, settings.revisions.get(eval_repo) or hub.dataset_info(eval_repo).sha)
     record.inputs.append(Ref(kind="dataset", repo=eval_repo, revision=eval_ref.revision))
+    if variants:
+        record.inputs.append(Ref(kind="dataset", repo=eval_repo, revision=ctx.args.variants_rev))
 
     # small files first: these checks need no weights
     data_dir = Path(hub.snapshot_download(eval_ref, work / "data", repo_type="dataset", allow_patterns=PROMPT_FILES))
@@ -337,17 +427,25 @@ def body(ctx: Context, *, device: str = "cuda") -> None:
         "rendered_prefix_sha256": prefix,
         "manifest_sha256": hashlib.sha256(manifest).hexdigest(),
     }
+    if variants:
+        conditions["variants_revision"] = ctx.args.variants_rev
     ctx.run.note(CONDITIONS + json.dumps(conditions, sort_keys=True))
     if kind != "baseline":
-        ctx.run.note(comparability(conditions, runs, settings, record.mode, preamble))
+        ctx.run.note(comparability(conditions, runs, settings, record.mode, preamble, variants))
 
-    units = [
-        unit
-        for unit in read_units(
-            data_dir, settings.languages, ids.slug(checkpoint), record.mode, ctx.args.limit, preamble
-        )
-        if unit.key not in ctx.flusher.done
-    ]
+    slug = ids.slug(checkpoint)
+    if variants:
+        named = RepoRef(eval_repo, ctx.args.variants_rev)
+        wanted = [ids.variant_prompts(name) for name in VARIANT_SETS]
+        try:
+            found = hub.snapshot_download(named, work / "variants", repo_type="dataset", allow_patterns=wanted)
+        except RevisionNotFoundError:
+            raise _refuse(f"{eval_repo} has no commit {ctx.args.variants_rev[:12]}") from None
+        listed = read_variant_units(Path(found), slug, record.mode, ctx.args.limit, preamble)
+        check_lengths(tokenizer, listed, render.system_message(preamble))
+    else:
+        listed = read_units(data_dir, settings.languages, slug, record.mode, ctx.args.limit, preamble)
+    units = [unit for unit in listed if unit.key not in ctx.flusher.done]
     for unit in units:
         if not unit.rows:
             ctx.flusher.mark_done(unit.key)

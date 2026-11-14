@@ -125,6 +125,27 @@ def test_the_exemption_covers_the_trees_of_runs_under_the_safety_patch(tmp_path)
     assert not is_row(("patched", "tables", "tables-patched.json")) and not is_row(("patched", "runs", "x.json"))
 
 
+def test_the_exemption_covers_the_script_variant_rows_inside_any_tree(tmp_path):
+    root = tmp_path / "data"
+    row = json.dumps({"prompt": f"call {ACCOUNT} now"}) + "\n"
+    exempt = [
+        _write(root / "variants/prompts/harmful/hi-Latn.jsonl", row),
+        _write(root / "variants/prompts/benign/fr-mixed.jsonl", row),
+        _write(root / "variants/responses/x/harmful/hi-Latn.jsonl", row),
+        _write(root / "variants/labels/x/ru-mixed.jsonl", row),
+        _write(root / "patched/variants/judge_raw/x/ar-Latn.jsonl", row),
+        _write(root / "smoke/nopreamble/variants/responses/x/benign/es-mixed.jsonl", row),
+    ]
+    scanned = [
+        _write(root / "variants/tables/tables.json", row),
+        _write(root / "variants/harmful/hi-Latn.jsonl", row),
+        _write(root / "variants/smoke/labels/x/en.jsonl", row),
+        _write(root / "variants/variants/labels/x/en.jsonl", row),
+    ]
+
+    assert [finding.path for finding in scan([*exempt, *scanned], root)] == scanned
+
+
 def test_the_exemption_covers_the_repair_screen_and_the_files_judged_beside_its_rows(tmp_path):
     root = tmp_path / "data"
     row = json.dumps({"response": f"call {ACCOUNT} now"}) + "\n"

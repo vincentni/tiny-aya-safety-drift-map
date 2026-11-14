@@ -888,7 +888,7 @@ def test_a_repair_launch_needs_its_drift_run_and_labels_and_an_apply_needs_a_cho
     assert len(world.submits()) == 2 and world.submits()[-1].endswith(" --apply 0.25")
 
 
-def test_drift_and_repair_job_arguments_are_read_as_the_job_will_before_anything_is_submitted(world, monkeypatch):
+def test_job_arguments_are_read_as_the_job_will_before_anything_is_submitted(world, monkeypatch):
     with monkeypatch.context() as patch:
         # refused on the arguments alone
         patch.setattr(cli, "load_settings", lambda path: pytest.fail("the config was read"))
@@ -900,6 +900,11 @@ def test_drift_and_repair_job_arguments_are_read_as_the_job_will_before_anything
             ("drift", ["--preamble", "none"], "argument --preamble: invalid choice"),
             ("repair", ["--aply", "0.25"], "unrecognized arguments: --aply 0.25"),
             ("repair", ["--lr", "1e-4"], "unrecognized arguments: --lr 1e-4"),
+            ("generate", [*BASELINE[1:], "--sets", "variants"], "--sets variants goes with --variants-rev SHA"),
+            ("generate", [*BASELINE[1:], "--variants-rev", "c" * 40], "--sets variants goes with --variants-rev SHA"),
+            ("generate", [*BASELINE[1:], "--sets", "variants", "--variants-rev", "main"], "the full 40-character"),
+            ("generate", [*BASELINE[1:], "--sets", "harmful"], "argument --sets: invalid choice"),
+            ("generate", [*BASELINE[1:], "--preamble", "none"], "argument --preamble: invalid choice"),
         ):
             refused = run("launch", kind, "--", *argv)
             assert refused.exit_code == 2 and said in flat(refused), argv
@@ -1713,6 +1718,12 @@ def test_judge_closed_hands_its_options_to_the_library_and_never_shows_the_route
     assert run("judge", "closed", "--checkpoint", f"{AYA}@{'1' * 40}", *options[:-1], "patch").exit_code == 0
     assert seen[-1][2:] == (f"{AYA}@{'1' * 40}", passed | {"preamble": "patch"})
     assert run("judge", "closed", "--checkpoint", f"{AYA}@{'1' * 40}", "--preamble", "drop").exit_code == 2
+    # the script variants are named alone, in any tree
+    variants = ["--sets", "variants", "--mode", "full", "--preamble", "patch"]
+    assert run("judge", "closed", "--checkpoint", f"{AYA}@{'1' * 40}", *variants).exit_code == 0
+    assert (seen[-1][3]["sets"], seen[-1][3]["preamble"]) == (["variants"], "patch")
+    mixed = run("judge", "closed", "--checkpoint", f"{AYA}@{'1' * 40}", "--sets", "harmful,variants")
+    assert mixed.exit_code == 2 and "variants alone" in flat(mixed)
 
 
 def test_judge_closed_takes_a_rows_path_in_place_of_a_checkpoint(world, monkeypatch):
@@ -2226,6 +2237,33 @@ def test_a_table_under_the_safety_patch_reads_and_writes_its_own_tree_and_leaves
     assert "smoke/patched/tables/tables-patched.json" in on_hub
 
 
+def test_the_tables_read_nothing_of_the_script_variants(world):
+    evaluation(world, {"baseline": 0, "drifted": 2})
+    assert run("table", "build").exit_code == 0
+    tables = Tables.model_validate_json((world.root / TABLES_PATH).read_bytes())
+    assert tables.columns["drifted"].state == "tabled"
+
+    # a later run over the variants read another revision of the fine-tuned checkpoint and left labels of its own
+    other = fake_labels.CHECKPOINTS["drifted"].replace("a" * 40, "9" * 40)
+    notes = ["sets: variants", f"{NOT_COMPARABLE}another seed"]
+    generated(world, "drifted", other, run_id="generate-full-drifted-variants", notes=notes)
+    rows = [fake_labels.label("drifted", "hi-Latn", index, checkpoint=other, harm="yes") for index in range(4)]
+    path = ids.labels_path(ids.slug(other), "hi-Latn", "full", variants=True)
+    data = "".join(row.model_dump_json(by_alias=True) + "\n" for row in rows).encode()
+    world.hub.upload_file(path_or_fileobj=data, path_in_repo=path, repo_id=EVAL, repo_type="dataset")
+    # and the variant prompts sit beside the evaluation prompts
+    for name in ("harmful", "benign"):
+        prompts = jsonl([{"prompt_id": f"{name}-hi-Latn-000", "prompt": "placeholder", "set": name}])
+        at = ids.variant_prompts(name, "hi-Latn")
+        world.hub.upload_file(path_or_fileobj=prompts, path_in_repo=at, repo_id=EVAL, repo_type="dataset")
+
+    again = run("table", "build")
+
+    assert again.exit_code == 0, again.output
+    assert "left unread" not in again.output and "hi-Latn" not in again.output
+    assert Tables.model_validate_json((world.root / TABLES_PATH).read_bytes()) == tables
+
+
 def test_the_latest_run_without_the_preamble_names_the_drifted_checkpoint(world):
     evaluation(world, {"baseline": 0, "drifted": 2}, preamble="strip")
     trained = fake_labels.CHECKPOINTS["drifted"].replace("@", "-nopre@")
@@ -2268,6 +2306,10 @@ def test_a_job_without_the_preamble_passes_through_under_the_kinds_smoke_record(
     assert verdict(full, "smoke") == "pass" and " --kind baseline --preamble patch\n" in full.output
     tuned = run("launch", "generate", "--mode", "full", "--dry-run", "--", "--kind", "drifted", "--preamble", "patch")
     assert tuned.exit_code == 0 and " --kind drifted --preamble patch\n" in tuned.output
+    named = ["--sets", "variants", "--variants-rev", "c" * 40]
+    variants = run("launch", "generate", "--mode", "full", "--dry-run", *patch, *named)
+    assert variants.exit_code == 0 and verdict(variants, "smoke") == "pass"
+    assert f" --kind baseline --preamble patch --sets variants --variants-rev {'c' * 40}\n" in variants.output
     refused = run("launch", "drift", "--dry-run", "--", "--preamble", "patch")
     assert refused.exit_code == 2 and "the drift job would stop on its arguments" in flat(refused)
     assert "invalid choice: 'patch'" in flat(refused) and len(world.submits()) == 1

@@ -226,7 +226,8 @@ def _generation_runs(
     if steered:
         return [run for run in runs if run.kind == "steer"]
     generated = [run for run in runs if run.kind in ("generate", "quant_eval") and reads(run) == column]
-    return [run for run in generated if ids.preamble_of(run.notes) == preamble]
+    # a run over the script variants generated nothing a table reads
+    return [run for run in generated if ids.preamble_of(run.notes) == preamble and not ids.variants_of(run.notes)]
 
 
 def _difference(

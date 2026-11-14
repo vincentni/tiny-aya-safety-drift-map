@@ -148,6 +148,55 @@ def test_the_responses_of_another_prompt_condition_are_labelled_inside_its_own_t
     assert world.paths(EVAL) == sorted([*before, *(f"labels/{world.slug}/{code}.jsonl" for code in codes)])
 
 
+VARIANT_CODES = ("hi-Latn", "ru-mixed")
+
+
+def add_variant_responses(world, preamble="keep"):
+    """Store what a variants run leaves: harmful and benign responses per variant code."""
+    for set_ in ("harmful", "benign"):
+        for code in VARIANT_CODES:
+            path = ids.responses_path(world.slug, set_, code, world.mode, preamble, variants=True)
+            world.put(path, jsonl(generation_rows(set_, code, 4)), RESPONSES)
+
+
+@pytest.mark.parametrize(("preamble", "tree"), [("keep", ""), ("patch", "patched/"), ("strip", "nopreamble/")])
+def test_the_harmful_variant_responses_are_labelled_into_the_variants_folder_of_their_tree(world, preamble, tree):
+    add_variant_responses(world, preamble)
+    client = FakeCompleter({"harmful response ru-mixed 001": [COMPLIED]})
+
+    lines, _, error = judge(world, client, sets=["variants"], preamble=preamble)
+
+    # the benign variants and the standard sets are not this run's
+    assert error is None and len(client.calls) == 8
+    folder = f"{tree}variants/"
+    assert world.paths(EVAL) == [f"{folder}labels/{world.slug}/{code}.jsonl" for code in VARIANT_CODES]
+    answers = [path for path in world.paths(RESPONSES) if "judge_raw" in path]
+    assert answers == [f"{folder}judge_raw/{world.slug}/{code}.jsonl" for code in VARIANT_CODES]
+    labels = world._rows(world.stored(f"{folder}labels/{world.slug}/ru-mixed.jsonl", EVAL), LabelRow)
+    assert {(row.set, row.language) for row in labels} == {("harmful", "ru-mixed")}
+    assert [row.response_harm for row in labels] == ["no", "yes", "no", "no"]
+    assert [line.split()[0] for line in lines[:-1]] == ["harmful/hi-Latn", "harmful/ru-mixed"]
+    assert lines[-1] == "8 pairs sent, 8 answers parsed"
+
+    again = FakeCompleter()
+    assert judge(world, again, sets=["variants"], preamble=preamble)[2] is None and again.calls == []
+
+
+def test_the_variants_are_judged_alone_and_only_once_their_responses_are_stored(world):
+    _, _, missing = judge(world, FakeCompleter(), sets=["variants"])
+    assert missing.exit_code == 12 and "no harmful variant responses" in str(missing)
+    add_variant_responses(world)
+    client = FakeCompleter()
+    _, _, mixed = judge(world, client, sets=["harmful", "variants"])
+    assert mixed.exit_code == 2 and "alone" in str(mixed)
+    # a variants file that holds a row of another code is not labelled
+    stray = ids.responses_path(world.slug, "harmful", "ar-Latn", world.mode, variants=True)
+    world.put(stray, jsonl(generation_rows("harmful", "hi-Latn", 2)), RESPONSES)
+    _, _, refused = judge(world, client, sets=["variants"])
+    assert refused.exit_code == 12 and "holds a row of" in str(refused)
+    assert client.calls == [] and world.paths(EVAL) == []
+
+
 def test_a_second_run_asks_nothing_and_uploads_nothing(world):
     judge(world, FakeCompleter())
     before = len(uploads(world))

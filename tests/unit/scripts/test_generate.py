@@ -10,7 +10,7 @@ import torch
 from auditkit.model import CallableModel
 from transformers import AutoTokenizer, GPT2Config, GPT2LMHeadModel
 
-from driftmap.core import render
+from driftmap.core import ids, render
 from driftmap.core.records import GenerationRow, LabelRow, PartialMarker, Ref, RunRecord
 from driftmap.core.settings import load_settings
 from driftmap.gen.hf_backend import load_hf_model
@@ -936,7 +936,9 @@ def test_a_run_under_the_safety_patch_renders_it_as_the_system_message_into_a_tr
     assert world.generator.calls and all(render.PATCH in prompt for call in world.generator.calls for prompt in call)
     record = world.record(PATCHED)
     assert record.status == "ok" and record.bos_check is True
-    assert "preamble: patch" in record.notes and "safety patch: safety-patch-v1, sha256 7c31768562a1" in record.notes
+    frozen = hashlib.sha256(render.PATCH.encode()).hexdigest()
+    assert frozen.startswith("7c31768562a1") and "preamble: patch" in record.notes
+    assert f"safety patch: safety-patch-v1, sha256 {frozen}" in record.notes
     [conditions] = [note.removeprefix(generate.CONDITIONS) for note in record.notes if "conditions" in note]
     assert json.loads(conditions)["rendered_prefix_sha256"] == patched_prefix()
 
@@ -1077,3 +1079,195 @@ def test_a_resume_under_the_other_condition_skips_nothing(served):
 
     assert world.record(LATER).prompts == ROWS * len(UNITS)
     assert world.uploads(RESPONSES) == [responses_at(slug, set_, code, STRIP) for set_, code in UNITS]
+
+
+VARIANTS = "variants/"
+VARIANT_UNITS = [("harmful", "hi-Latn"), ("harmful", "ru-mixed"), ("benign", "hi-Latn")]
+VARIANT_RUN = "generate-full-20261108T100000Z"
+
+
+def variant_rows(set_, code, count=ROWS):
+    parent, _, script = code.partition("-")
+    return [
+        {
+            "prompt_id": f"{set_}-{code}-{index:03d}",
+            "parent_prompt_id": f"{set_}-{parent}-{index:03d}",
+            "parent_language": parent,
+            "language": code,
+            "set": set_,
+            "variant": script,
+            "prompt": f"hello world {code} {index}",
+            "harm_category": ["placeholder"],
+            "global_or_local": "global",
+        }
+        for index in range(count)
+    ]
+
+
+def add_variants(world, units=VARIANT_UNITS, **changed):
+    """Commit variant prompt files to the evaluation dataset; returns the commit that holds them all."""
+    for set_, code in units:
+        rows = [row | changed for row in variant_rows(set_, code)]
+        world.put(EVAL, ids.variant_prompts(set_, code), jsonl(rows))
+    return world.head(EVAL)
+
+
+def variants_at(slug, set_, code, tree=""):
+    return f"{tree}{VARIANTS}responses/{slug}/{set_}/{code}.jsonl"
+
+
+def variant_responses(world, slug, set_, code, tree=""):
+    lines = world.lines(RESPONSES, variants_at(slug, set_, code, tree))
+    return [GenerationRow.model_validate_json(line) for line in lines]
+
+
+def test_a_variants_run_generates_the_variant_files_of_the_named_commit_into_a_folder_of_their_own(make_world):
+    world = make_world(pin_eval=True)
+    pinned = world.head(EVAL)
+    commit = add_variants(world)
+    # the head moves on; the named commit is what is read
+    world.put(EVAL, "variants/prompts/harmful/ar-Latn.jsonl", jsonl(variant_rows("harmful", "ar-Latn")))
+
+    assert world.run("--sets", "variants", "--variants-rev", commit, run_id=VARIANT_RUN) == 0
+
+    slug = slug_of(MODEL, world.head(MODEL))
+    assert world.uploads(RESPONSES) == [variants_at(slug, set_, code) for set_, code in VARIANT_UNITS]
+    # a variant has no reference text: no chrF row, so nothing goes to the evaluation dataset
+    assert not [path for path in world.uploads(EVAL) if not path.startswith("variants/")]
+    for set_, code in VARIANT_UNITS:
+        rows, asked = variant_responses(world, slug, set_, code), variant_rows(set_, code)
+        assert {(row.set, row.language) for row in rows} == {(set_, code)}
+        assert [(row.prompt_id, row.prompt) for row in rows] == [(row["prompt_id"], row["prompt"]) for row in asked]
+        assert {(row.status, row.rendered_prefix_sha256) for row in rows} == {("ok", prefix_of(build()))}
+    record = world.record(VARIANT_RUN)
+    assert (record.status, record.bos_check, record.prompts) == ("ok", True, ROWS * len(VARIANT_UNITS))
+    assert "sets: variants" in record.notes
+    datasets = [(ref.repo, ref.revision) for ref in record.inputs if ref.kind == "dataset"]
+    assert datasets == [(EVAL, pinned), (EVAL, commit)]
+    [conditions] = [note.removeprefix(generate.CONDITIONS) for note in record.notes if "conditions" in note]
+    assert json.loads(conditions)["variants_revision"] == commit
+
+    # the standard sets as ever: their own files, and no word of the variants in the record
+    assert world.run() == 0
+    standard = [name for name in world.uploads(RESPONSES) if VARIANTS not in name]
+    assert standard == [responses_at(slug, set_, code) for set_, code in UNITS]
+    assert [path for path in world.uploads(EVAL) if "labels" in path] == [labels_at(slug, code) for code in LANGUAGES]
+    record = world.record()
+    assert "sets: variants" not in record.notes
+    assert [ref.revision for ref in record.inputs if ref.kind == "dataset"] == [pinned]
+    [conditions] = [note.removeprefix(generate.CONDITIONS) for note in record.notes if "conditions" in note]
+    assert sorted(json.loads(conditions)) == ["decoding", "manifest_sha256", "rendered_prefix_sha256", "seed"]
+
+
+def test_a_variants_run_composes_with_the_smoke_tree_and_the_prompt_condition(served):
+    world = served
+    commit = add_variants(world)
+    named = ["--sets", "variants", "--variants-rev", commit]
+
+    assert world.run(*SMOKE_ARGS, "--limit", "2", "--preamble", "patch", *named) == 0
+
+    slug = slug_of(MODEL, world.head(MODEL))
+    tree = SMOKE + PATCH
+    assert world.uploads(RESPONSES) == [variants_at(slug, set_, code, tree) for set_, code in VARIANT_UNITS]
+    rows = variant_responses(world, slug, "harmful", "ru-mixed", tree)
+    assert len(rows) == 2 and all(row.rendered_prompt.count(render.PATCH) == 1 for row in rows)
+    record = world.record()
+    assert (record.mode, record.prompts) == ("smoke", 2 * len(VARIANT_UNITS))
+    assert {"preamble: patch", "sets: variants"} <= set(record.notes)
+
+    assert world.run("--preamble", "strip", *named, run_id=STRIPPED) == 0
+    assert variants_at(slug, "benign", "hi-Latn", STRIP) in world.uploads(RESPONSES)
+
+
+@pytest.mark.parametrize("extra", [["--sets", "variants"], ["--variants-rev", "a" * 40]])
+def test_the_variants_and_their_commit_are_named_together_or_not_at_all(world, capsys, extra):
+    with pytest.raises(SystemExit) as exit_:
+        world.run(*extra)
+
+    assert exit_.value.code == 2 and world.fake.calls == []
+    assert "--sets variants goes with --variants-rev SHA" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("extra", [["--variants-rev", "main"], ["--variants-rev", "abc123"], ["--sets", "harmful"]])
+def test_the_variants_commit_is_a_full_sha_and_the_sets_are_one_of_two_groups(world, extra):
+    with pytest.raises(SystemExit) as exit_:
+        world.run("--sets", "variants", *extra)
+    assert exit_.value.code == 2 and world.fake.calls == []
+
+
+@pytest.mark.parametrize("fault", ["unknown commit", "no variant file", "another code", "another set", "no prompt"])
+def test_variant_files_that_are_not_what_their_place_says_stop_the_run_before_the_weights(world, fault):
+    if fault == "unknown commit":
+        commit, words = "f" * 40, "has no commit ffffffffffff"
+    elif fault == "no variant file":
+        commit, words = world.head(EVAL), "holds no variant prompt file"
+    elif fault == "another code":
+        commit, words = add_variants(world, language="hi"), "variants/prompts/harmful/hi-Latn.jsonl row 1"
+    elif fault == "another set":
+        commit, words = add_variants(world, set="xstest"), "variants/prompts/harmful/hi-Latn.jsonl row 1"
+    else:
+        commit, words = add_variants(world, prompt=None), "row 1 lacks a text"
+
+    assert world.run("--sets", "variants", "--variants-rev", commit) == 12
+
+    assert world.loads == [] and world.generator.calls == [] and world.uploads(RESPONSES) == []
+    assert any(words in note for note in world.record().notes)
+
+
+def test_a_variant_prompt_over_the_rendered_length_limit_stops_the_run_before_the_weights(world):
+    fixed = render.token_count(build(), render.render(build(), "hello").rendered_prompt) - 1
+    at_limit = " ".join(["hello"] * (render.MAX_RENDERED_TOKENS - fixed))
+    rows = variant_rows("harmful", "hi-Latn")
+    rows[3]["prompt"] = at_limit
+    world.put(EVAL, "variants/prompts/harmful/hi-Latn.jsonl", jsonl(rows))
+    assert world.run("--sets", "variants", "--variants-rev", world.head(EVAL)) == 0
+    assert world.loads and world.generator.calls
+
+    rows[3]["prompt"] = at_limit + " hello"
+    world.put(EVAL, "variants/prompts/harmful/hi-Latn.jsonl", jsonl(rows))
+    world.loads.clear()
+    world.generator.calls.clear()
+    assert world.run("--sets", "variants", "--variants-rev", world.head(EVAL), run_id=LATER) == 12
+
+    assert world.loads == [] and world.generator.calls == []
+    over = f"variants/prompts/harmful/hi-Latn.jsonl row 4 renders to {render.MAX_RENDERED_TOKENS + 1} tokens"
+    assert any(over in note and "rendered length limit" in note for note in world.record(LATER).notes)
+
+
+def test_a_variants_run_is_compared_with_the_baseline_variants_run_and_no_other(world):
+    commit = add_variants(world)
+    named = ["--sets", "variants", "--variants-rev", commit]
+    assert world.run() == 0
+    world.add_drift_record()
+
+    assert world.run(*named, kind="drifted", run_id=DRIFTED) == 0
+    assert "no finished baseline run in full mode to compare with" in world.record(DRIFTED).notes
+
+    assert world.run(*named, run_id=VARIANT_RUN) == 0
+    assert world.run(*named, kind="drifted", run_id=LATER) == 0
+    assert f"same conditions as baseline run {VARIANT_RUN}" in world.record(LATER).notes
+    # the standard sets of the same checkpoint still answer to the standard baseline run
+    assert world.run(kind="drifted", run_id="generate-full-20261109T100000Z") == 0
+    assert f"same conditions as baseline run {RUN_ID}" in world.record("generate-full-20261109T100000Z").notes
+
+    # variant files of another commit are another evaluation
+    other = add_variants(world, units=[("harmful", "ar-Latn")])
+    last = "generate-full-20261110T100000Z"
+    assert world.run("--sets", "variants", "--variants-rev", other, kind="drifted", run_id=last) == 0
+    assert f"{NOT_COMPARABLE}variant prompts differs from baseline" in world.record(last).notes
+
+
+def test_a_resume_of_the_standard_sets_skips_no_variant_file(world):
+    commit = add_variants(world)
+    slug = slug_of(MODEL, world.head(MODEL))
+    marker = PartialMarker(
+        resume_from="unit",
+        done=[responses_at(slug, set_, code) for set_, code in UNITS],
+        written_at=FakeClock().now(),
+        config_hash=load_settings(world.config).config_hash(),
+    )
+    world.put(RESULTS, marker_path(RUN_ID), marker.model_dump_json().encode())
+
+    assert world.run("--sets", "variants", "--variants-rev", commit, "--resume", RUN_ID, run_id=LATER) == 0
+
+    assert world.record(LATER).prompts == ROWS * len(VARIANT_UNITS)

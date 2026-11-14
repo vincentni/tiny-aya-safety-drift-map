@@ -184,6 +184,37 @@ def test_runs_under_the_safety_patch_get_a_tree_of_their_own_and_no_repos():
             ids.repo_suffix(mode, "patch")
 
 
+def test_script_variants_sit_in_a_folder_of_their_own_inside_the_tree_of_any_run():
+    slug = "tiny-aya-global--0123456789ab"
+    assert ids.tree("full", variants=True) == "variants/"
+    assert ids.tree("smoke", "patch", variants=True) == "smoke/patched/variants/"
+    assert ids.tree("full", "strip", True) == "nopreamble/variants/"
+    trees = {
+        ids.tree(mode, preamble, variants)
+        for mode in ("full", "smoke")
+        for preamble in ids.CONDITIONS
+        for variants in (False, True)
+    }
+    assert len(trees) == 12
+    assert ids.responses_path(slug, "harmful", "hi-Latn", "full", variants=True) == (
+        f"variants/responses/{slug}/harmful/hi-Latn.jsonl"
+    )
+    # a variant file keeps the name of its set: there is no held-out split of variants
+    assert ids.responses_path(slug, "benign", "ru-mixed", "smoke", "patch", variants=True) == (
+        f"smoke/patched/variants/responses/{slug}/benign/ru-mixed.jsonl"
+    )
+    assert ids.labels_path(slug, "ar-Latn", "full", preamble="strip", variants=True) == (
+        f"nopreamble/variants/labels/{slug}/ar-Latn.jsonl"
+    )
+    assert ids.judge_raw_path(slug, "es-mixed", "smoke", variants=True) == (
+        f"smoke/variants/judge_raw/{slug}/es-mixed.jsonl"
+    )
+    assert ids.variant_prompts("harmful") == "variants/prompts/harmful/*.jsonl"
+    assert ids.variant_prompts("benign", "fr-mixed") == "variants/prompts/benign/fr-mixed.jsonl"
+    assert ids.VARIANTS_NOTE == "sets: variants"
+    assert ids.variants_of(["preamble: patch", "sets: variants"]) and not ids.variants_of(["preamble: patch"])
+
+
 def test_a_run_says_in_its_notes_which_condition_it_ran_under_unless_it_is_the_served_template():
     assert ids.preamble_note("keep") is None
     assert ids.preamble_note("strip") == "preamble: strip"

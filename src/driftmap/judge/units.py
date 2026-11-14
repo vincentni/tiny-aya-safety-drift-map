@@ -1,4 +1,7 @@
-"""The response files a judge run labels: one per harmful language and the English over-refusal set."""
+"""The response files a judge run labels: one per harmful language and the English over-refusal set.
+
+In place of those, a run may label the harmful script variants a checkpoint has responses for.
+"""
 
 from collections.abc import Sequence
 from pathlib import Path
@@ -12,6 +15,8 @@ from driftmap.judge.incremental import check_unique, read_rows
 # benign rows are scored by chrF where they are generated, never judged
 JUDGED_SETS = ("harmful", "xstest")
 XSTEST_LANGUAGE = "en"
+# named alone in place of sets: the harmful script variants
+VARIANTS = "variants"
 
 Unit = tuple[str, str]
 
@@ -28,13 +33,28 @@ def _slug(checkpoint: str) -> str:
         return checkpoint
 
 
+def variant_units(directory: Path, slug: str, mode: str, preamble: str = "keep") -> list[Unit]:
+    """The harmful script-variant files of a checkpoint among the responses under ``directory``, by variant code."""
+    folder = (directory / ids.responses_path(slug, "harmful", "*", mode, preamble, variants=True)).parent
+    return [("harmful", path.stem) for path in sorted(folder.glob("*.jsonl"))]
+
+
 def read_inputs(
-    directory: Path, slug: str, wanted: Sequence[Unit], mode: str, limit: int | None, preamble: str = "keep"
+    directory: Path,
+    slug: str,
+    wanted: Sequence[Unit],
+    mode: str,
+    limit: int | None,
+    preamble: str = "keep",
+    variants: bool = False,
 ) -> dict[Unit, list[GenerationRow]]:
-    """Generation rows per unit; DriftmapError on a missing file, a repeated prompt or a row of another unit."""
+    """Generation rows per unit; DriftmapError on a missing file, a repeated prompt or a row of another unit.
+
+    With ``variants`` the units are variant files and their language is the variant's code.
+    """
     inputs = {}
     for name, language in wanted:
-        path = ids.responses_path(slug, name, language, mode, preamble)
+        path = ids.responses_path(slug, name, language, mode, preamble, variants)
         rows = read_rows(directory / path, GenerationRow, path)
         if not rows:
             raise DriftmapError(ExitCode.INTEGRITY, f"{path} is missing or empty in the responses repo")

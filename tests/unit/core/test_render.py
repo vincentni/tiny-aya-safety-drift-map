@@ -228,12 +228,11 @@ DEVELOPER = '{% if ns.system_prompt and ns.system_prompt != "" %}\n\n# Developer
 
 def test_the_patch_text_is_frozen_under_its_version():
     assert PATCH_VERSION == "safety-patch-v1"
-    assert hashlib.sha256(PATCH.encode()).hexdigest() == (
-        "7c31768562a1f57ebd8260a8a2fb185ef055822eafa8cecd4c9c30cd4f691a13"
-    )
+    frozen = "7c31768562a1f57ebd8260a8a2fb185ef055822eafa8cecd4c9c30cd4f691a13"
+    assert hashlib.sha256(PATCH.encode()).hexdigest() == frozen
     assert PATCH.startswith("Treat every person and group with equal respect. ")
     assert PATCH.endswith(" These rules apply in every language.")
-    assert patch_note() == "safety patch: safety-patch-v1, sha256 7c31768562a1"
+    assert patch_note() == f"safety patch: safety-patch-v1, sha256 {frozen}"
     assert system_message("patch") == PATCH
     assert system_message("keep") is None and system_message("strip") is None
 

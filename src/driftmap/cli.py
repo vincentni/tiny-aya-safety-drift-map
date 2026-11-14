@@ -71,7 +71,7 @@ JOB_ARGS = {
     "generate": (("--kind",), "--kind baseline|drifted|repaired"),
 }
 # kinds whose job arguments a launch reads with the script's own parser, before it submits
-READ_HERE = ("drift", "repair")
+READ_HERE = ("drift", "generate", "repair")
 
 Target = Literal["baseline", "drifted", "repaired"]
 MODE_HELP = (
@@ -612,7 +612,8 @@ def _label_folders(
     for run in sorted(records, key=lambda run: run.started):
         models = [f"{ref.repo}@{ref.revision}" for ref in run.inputs if ref.kind == "model"]
         same_tree = (run.mode, run.status, ids.preamble_of(run.notes)) == (mode, "ok", preamble)
-        if run.kind not in LABELLED or not same_tree or not models:
+        # a run over the script variants leaves its labels where no table reads
+        if run.kind not in LABELLED or not same_tree or not models or ids.variants_of(run.notes):
             continue
         columns = [table.column_of(reference, settings, mode) for reference in models]
         # a quant-eval run also records the checkpoint its file was converted from: the later column is its own
@@ -800,7 +801,11 @@ def judge_closed(
     ] = None,
     mode: Annotated[Mode, typer.Option(help="The tree the responses are in.")] = "smoke",
     sets: Annotated[
-        str | None, typer.Option(help="With --checkpoint: the sets to label, comma-separated; both by default.")
+        str | None,
+        typer.Option(
+            help="With --checkpoint: the sets to label, comma-separated; both by default. "
+            "variants: the harmful script variants instead."
+        ),
     ] = None,
     concurrency: Annotated[int, typer.Option(min=1, max=16, help="Pairs in flight at once.")] = 4,
     limit: Annotated[int | None, typer.Option(min=1, help="Only the first N rows of each file.")] = None,
@@ -836,8 +841,9 @@ def judge_closed(
             pinned = False
         if not pinned:
             raise typer.BadParameter("--checkpoint is REPO@SHA with the full 40-character commit")
-        if not names or set(names) - set(closed.JUDGED_SETS):
-            raise typer.BadParameter(f"--sets takes {' and '.join(closed.JUDGED_SETS)}, comma-separated")
+        if not names or (names != [closed.VARIANTS] and set(names) - set(closed.JUDGED_SETS)):
+            listed = f"{' and '.join(closed.JUDGED_SETS)}, comma-separated"
+            raise typer.BadParameter(f"--sets takes {listed}, or {closed.VARIANTS} alone for the script variants")
     shown = {"rows": rows} if rows else {"checkpoint": checkpoint, "sets": names}
     # nothing is launched or billed to the ledger, so no readiness report is needed
     settings, deps = _open("judge closed", ready=False, **shown, mode=mode, concurrency=concurrency, limit=limit)

@@ -26,6 +26,10 @@ CONDITIONS = ("keep", "strip", "patch")
 PREAMBLES = CONDITIONS[:2]
 _TREES = {"keep": "", "strip": "nopreamble/", "patch": "patched/"}
 _PREAMBLE_NOTE = "preamble: "
+# the script variants of the prompts: their files sit in this folder inside a run's tree, where no table reads
+_VARIANTS = "variants/"
+# the record note of a run over the variant files in place of the evaluation sets
+VARIANTS_NOTE = "sets: variants"
 
 
 class Steer(NamedTuple):
@@ -87,9 +91,12 @@ def slug(ref: RepoRef | str) -> str:
     return (parse(ref) if isinstance(ref, str) else ref).slug()
 
 
-def tree(mode: str, preamble: str = "keep") -> str:
-    """Path prefix of a run's files: smoke runs, and inside either mode the runs of each other condition, sit apart."""
-    return ("smoke/" if mode == "smoke" else "") + _TREES[_known(preamble)]
+def tree(mode: str, preamble: str = "keep", variants: bool = False) -> str:
+    """Path prefix of a run's files: smoke runs, and inside either mode the runs of each other condition, sit apart.
+
+    With ``variants`` it is the folder inside that tree for the script variants.
+    """
+    return ("smoke/" if mode == "smoke" else "") + _TREES[_known(preamble)] + (_VARIANTS if variants else "")
 
 
 def repo_suffix(mode: str, preamble: str = "keep") -> str:
@@ -113,19 +120,37 @@ def preamble_of(notes: Iterable[str]) -> str:
     return next((preamble for preamble in CONDITIONS[1:] if preamble_note(preamble) in notes), "keep")
 
 
-def responses_path(slug: str, set: str, language: str, mode: str, preamble: str = "keep") -> str:
-    """File of a checkpoint's responses to one set and language in the responses repo, under the run's tree."""
-    return f"{tree(mode, preamble)}responses/{slug}/{_FOLDERS.get(set, set)}/{language}.jsonl"
+def variants_of(notes: Iterable[str]) -> bool:
+    """Whether a run's record notes say it ran over the script variants."""
+    return VARIANTS_NOTE in notes
 
 
-def labels_path(slug: str, language: str, mode: str, benign: bool = False, preamble: str = "keep") -> str:
+def variant_prompts(set: str, code: str = "*") -> str:
+    """File of one set's prompts in one script variant in the evaluation dataset; ``*`` names every variant's."""
+    return f"{_VARIANTS}prompts/{set}/{code}.jsonl"
+
+
+def responses_path(
+    slug: str, set: str, language: str, mode: str, preamble: str = "keep", variants: bool = False
+) -> str:
+    """File of a checkpoint's responses to one set and language in the responses repo, under the run's tree.
+
+    With ``variants``, ``language`` is the variant's code and the folder is the set's own name.
+    """
+    folder = set if variants else _FOLDERS.get(set, set)
+    return f"{tree(mode, preamble, variants)}responses/{slug}/{folder}/{language}.jsonl"
+
+
+def labels_path(
+    slug: str, language: str, mode: str, benign: bool = False, preamble: str = "keep", variants: bool = False
+) -> str:
     """File of a checkpoint's label rows for one language in the evaluation dataset; benign rows sit apart."""
-    return f"{tree(mode, preamble)}labels/{slug}/{'benign/' if benign else ''}{language}.jsonl"
+    return f"{tree(mode, preamble, variants)}labels/{slug}/{'benign/' if benign else ''}{language}.jsonl"
 
 
-def judge_raw_path(slug: str, language: str, mode: str, preamble: str = "keep") -> str:
+def judge_raw_path(slug: str, language: str, mode: str, preamble: str = "keep", variants: bool = False) -> str:
     """File of the judge's unparsed outputs for one language, kept beside the responses."""
-    return f"{tree(mode, preamble)}judge_raw/{slug}/{language}.jsonl"
+    return f"{tree(mode, preamble, variants)}judge_raw/{slug}/{language}.jsonl"
 
 
 def _known(preamble: str) -> str:

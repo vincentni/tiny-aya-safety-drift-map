@@ -53,8 +53,8 @@ def system_message(preamble: str) -> str | None:
 
 
 def patch_note() -> str:
-    """The record note of a run under the safety patch: the version and the start of the text's hash."""
-    return f"safety patch: {PATCH_VERSION}, sha256 {hashlib.sha256(PATCH.encode()).hexdigest()[:12]}"
+    """The record note of a run under the safety patch: the version and the hash of the text."""
+    return f"safety patch: {PATCH_VERSION}, sha256 {hashlib.sha256(PATCH.encode()).hexdigest()}"
 
 
 def _inserted(served: str, patched: str) -> tuple[str, str] | None:
