@@ -293,6 +293,9 @@ class AlphaRow(Record):
     # benign rows behind chrf_pooled: answered ones, and unanswered ones counted as 0
     n_benign_scored: int = 0
     n_benign_empty: int = 0
+    # harmful prompts generated, and the hash of the rows file every figure here was made from
+    n_harmful: int = 0
+    rows_sha256: Sha256 | None = None
 
 
 class Dare(Record):
@@ -320,6 +323,8 @@ class AlphaScreen(Record):
     baseline_safe_pooled: float | None
     drifted_chrf_subset: float
     tied_weight_owner: str
+    # why a judged screen is not decided yet
+    undecided: str | None = None
 
 
 class GgufRecord(Record):

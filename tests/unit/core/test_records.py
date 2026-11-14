@@ -380,9 +380,15 @@ def test_an_alpha_screen_can_wait_for_its_judge():
     assert (screen.recover_status, screen.judge, screen.baseline_safe_pooled) == ("screened", None, None)
     # rows written before the counts existed read as zero; new ones keep theirs
     assert (screen.alphas[0].n_benign_scored, screen.alphas[0].n_benign_empty) == (0, 0)
-    counted = records.AlphaRow.model_validate(row | {"n_benign_scored": 78, "n_benign_empty": 42})
+    figures = {"n_benign_scored": 78, "n_benign_empty": 42, "n_harmful": 120, "rows_sha256": DIGEST}
+    counted = records.AlphaRow.model_validate(row | figures)
     assert records.AlphaRow.model_validate_json(counted.model_dump_json()) == counted
-    assert (counted.n_benign_scored, counted.n_benign_empty) == (78, 42)
+    assert counted.model_dump(include=set(figures)) == figures
+    assert (screen.alphas[0].n_harmful, screen.alphas[0].rows_sha256, screen.undecided) == (0, None, None)
+    with pytest.raises(ValidationError):
+        records.AlphaRow.model_validate(row | {"rows_sha256": "abc"})
+    open_ = records.AlphaScreen.model_validate(_payload("alpha_screen", **waiting, undecided="too few verdicts"))
+    assert open_.undecided == "too few verdicts"
     assert records.AlphaScreen.model_validate_json(screen.model_dump_json(by_alias=True)) == screen
     for field in ("judge", "baseline_safe_pooled"):
         payload = _payload("alpha_screen")

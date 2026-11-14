@@ -2,6 +2,7 @@
 
 import argparse
 import functools
+import hashlib
 import json
 import shutil
 import sys
@@ -109,11 +110,12 @@ def drifted_chrf(ctx: Context, drifted: RepoRef, units: Sequence[Any], work: Pat
             found = f"{path} lacks {len(missing)} of the {len(unit.rows)} screen prompts"
             raise _refuse(f"{found}; generate the drifted checkpoint's responses first")
         scores += [stored[row["prompt_id"]] for row in unit.rows]
-    if not scores:
-        raise _refuse("the screen has no benign prompt to compare chrF on")
+    scored = sum(score is not None for score in scores)
+    if not scored:
+        # a reference of 0 would pass every alpha
+        raise _refuse("no benign screen prompt has a drifted chrF; the utility bar has nothing to stand on")
     # the same rule as for each alpha: every prompt counts, an unanswered one as 0
     mean = fmean(score or 0.0 for score in scores)
-    scored = sum(score is not None for score in scores)
     ctx.run.note(f"drifted_chrf_subset = {mean:.4f} ({scored} of {len(scores)} scored, {ids.unparse(head)})")
     return mean
 
@@ -175,6 +177,8 @@ def _row(alpha: float, rows: Sequence[GenerationRow], units: Sequence[Any]) -> A
         error=f"{failed} screen rows failed in the backend" if failed else None,
         n_benign_scored=utility.scored,
         n_benign_empty=utility.empty,
+        n_harmful=sum(row.set == "harmful" for row in rows),
+        rows_sha256=hashlib.sha256(dump_rows(rows)).hexdigest(),
     )
 
 
@@ -185,10 +189,11 @@ def _error_row(alpha: float, reason: str) -> AlphaRow:
 
 
 def _of_rows(row: AlphaRow, rows: Sequence[GenerationRow], units: Sequence[Any]) -> bool:
-    """True when the screen row was made from these generations."""
+    """True when the screen row was made from exactly these generations."""
     made = _row(row.alpha, rows, units)
-    counts = (row.n_benign_scored, row.n_benign_empty) == (made.n_benign_scored, made.n_benign_empty)
-    return counts and row.error == made.error and abs(row.chrf_pooled - made.chrf_pooled) <= select.TOLERANCE
+    figures = ("rows_sha256", "n_harmful", "n_benign_scored", "n_benign_empty", "error")
+    same = all(getattr(row, name) == getattr(made, name) for name in figures)
+    return same and abs(row.chrf_pooled - made.chrf_pooled) <= select.TOLERANCE
 
 
 def _dump(screen: AlphaScreen) -> bytes:
@@ -329,7 +334,8 @@ def run_screen(ctx: Context, inputs: Inputs, alphas: Sequence[float], device: st
     # rows of the stored screen made from generations of these weights keep their verdicts
     kept = {row.alpha: row for row in earlier if row.alpha in found and _of_rows(row, found[row.alpha], units)}
     rows = {alpha: found[alpha] for alpha in alphas if alpha in found} if ctx.args.resume else {}
-    results = {alpha: row for alpha, row in kept.items() if alpha not in alphas}
+    # a named alpha keeps its row until new rows are uploaded, so no flush shows part of a judged screen
+    results = dict(kept)
     judge, baseline = (stored.judge, stored.baseline_safe_pooled) if kept else (None, None)
     drifted_dir, _, aligned = _weights(ctx, inputs, copies=1)
     owner = wiseft.tied_weight_owner(aligned)
@@ -359,7 +365,8 @@ def run_screen(ctx: Context, inputs: Inputs, alphas: Sequence[float], device: st
                 reason = str(error) if failed else oom_text(error)
                 if reason is None:
                     raise
-                results[alpha] = _error_row(alpha, reason)
+                # the stored rows of a kept row are still what its verdict was made from
+                results.setdefault(alpha, _error_row(alpha, reason))
                 # queued, so the error itself is what ends the job
                 _put_screen(ctx, screen_now(), queued=True)
                 raise
@@ -369,7 +376,9 @@ def run_screen(ctx: Context, inputs: Inputs, alphas: Sequence[float], device: st
             record.prompts += len(rows[alpha])
             record.prompt_tokens += sum(row.prompt_tokens for row in rows[alpha])
             record.generated_tokens += sum(row.generated_tokens for row in rows[alpha])
-            results[alpha] = _row(alpha, rows[alpha], units)
+            # the same generations again keep their verdict
+            unchanged = alpha in kept and _of_rows(kept[alpha], rows[alpha], units)
+            results[alpha] = kept[alpha] if unchanged else _row(alpha, rows[alpha], units)
         _put_screen(ctx, screen_now())
         _save_marker(ctx)
     ctx.run.note(f"recover_status = {screen_now().recover_status}")
@@ -383,11 +392,13 @@ def run_apply(ctx: Context, inputs: Inputs, alpha: float, device: str) -> None:
     if not named or abs(stored.chosen - alpha) > select.TOLERANCE:
         says = f"it says {stored.recover_status}, chosen {stored.chosen}" if stored else "there is none"
         raise _refuse(f"the screen in {ctx.run.results} does not name alpha {alpha:g} as chosen ({says})")
-    rows = stored_rows(ctx, inputs, [alpha]).get(alpha)
-    row = next((row for row in stored.alphas if row.alpha == stored.chosen), None)
-    if rows is None or row is None or not _of_rows(row, rows, inputs.units):
-        found = f"the decided screen was not made from stored rows of alpha {alpha:g} for {inputs.name(alpha)}"
-        raise _refuse(f"{found}; screen and decide again")
+    scored = [row for row in stored.alphas if row.error is None]
+    found = stored_rows(ctx, inputs, [row.alpha for row in scored])
+    loose = [row.alpha for row in scored if row.alpha not in found or not _of_rows(row, found[row.alpha], inputs.units)]
+    if loose:
+        which = ", ".join(f"{value:g}" for value in loose)
+        made = f"the decided screen was not made from the stored rows of alpha {which} for {inputs.name(alpha)}"
+        raise _refuse(f"{made}; screen and decide again")
     # the decision is read, never taken on trust: it must follow from its rows under the bars in force
     screen = select.choose_alpha(
         stored.alphas,
@@ -403,8 +414,10 @@ def run_apply(ctx: Context, inputs: Inputs, alpha: float, device: str) -> None:
     ctx.run.note(f"applied alpha = {alpha:g}, as the decided screen names it")
     ctx.run.note(f"chosen = {next(row for row in screen.alphas if row.alpha == screen.chosen).model_dump_json()}")
     repaired = f"{settings.owner}/{settings.repos.repaired}{SMOKE_SUFFIX if mode == 'smoke' else ''}"
-    # private when new; one published since keeps its visibility
     ctx.hub.create_repo(repaired, private=True)
+    # creating over an existing repo leaves its visibility as it was
+    if ctx.hub.model_info(repaired).private is not True:
+        raise _refuse(f"{repaired} is not private; weights reach an open repo through the publish step only")
     drifted_dir, aligned_dir, aligned = _weights(ctx, inputs, copies=2)
 
     model = wiseft.interpolated(drifted_dir, aligned, alpha, device, ctx.run.note)

@@ -407,7 +407,11 @@ def test_rows_at_their_edges():
 def test_the_failed_row_takes_the_two_job_exit_codes_only(exit_code, notes):
     facts = {"marker_present": False, "running_secs": 100, "timeout_s": T}
     record = run_record(RUN, "failed")
-    assert classify("ERROR", record, exit_code, trailer("failed", exit_code), **facts).ledger_fields["notes"] == [notes]
+    failed = classify("ERROR", record, exit_code, trailer("failed", exit_code), **facts)
+    assert failed.ledger_fields["notes"] == [notes]
+    # a failed output is not an input to fix: it gets its own advice
+    advice = "no input change fixes that; read the record notes first" if exit_code == 13 else "fix the input"
+    assert advice in failed.next_action and ("fix the input" in failed.next_action) == (exit_code != 13)
     for other in (0, 1, 2, 5, 10, 11, 14, 15, 99, None):
         tail = QUIET if other is None else trailer("failed", other)
         fields = classify("ERROR", record, other, tail, **facts).ledger_fields

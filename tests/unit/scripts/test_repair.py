@@ -340,7 +340,12 @@ def test_every_alpha_is_screened_on_freshly_loaded_drifted_weights(world):
         (row.alpha, row.safe_rate_pooled, row.n_judged, row.pass_safety, row.pass_chrf) for row in screen.alphas
     ] == [(alpha, None, 0, None, True) for alpha in ALPHAS]
     assert screen.drifted_chrf_subset == pytest.approx(DRIFTED_CHRF)
-    assert {(row.n_benign_scored, row.n_benign_empty) for row in screen.alphas} == {(PAIRS, 0)}
+    assert {(row.n_benign_scored, row.n_benign_empty, row.n_harmful) for row in screen.alphas} == {(PAIRS, 0, PAIRS)}
+    # each row carries the hash of the file its figures were made from
+    for row in screen.alphas:
+        assert row.rows_sha256 == hashlib.sha256(world.stored(RESPONSES, world.rows_path(row.alpha))).hexdigest()
+    # nothing of a judge is read: no call names either judge repo
+    assert not [kwargs for _, kwargs in world.fake.calls if kwargs.get("repo_id") in (JUDGE, SMOL)]
     assert (screen.tied_weight_owner, screen.dare.on, screen.bars) == (
         "model.embed_tokens.weight",
         False,
@@ -473,7 +478,7 @@ def test_a_chosen_alpha_is_applied_saved_with_its_provenance_and_pushed_privatel
     assert (record.status, record.kind, record.prompts, record.bos_check) == ("ok", "repair", 0, True)
     outputs = {ref.repo: ref for ref in record.outputs}
     assert outputs[REPAIRED].revision == world.fake.heads[REPAIRED]
-    assert outputs[REPAIRED].sha256 == weights_sha(pushed)
+    assert outputs[REPAIRED].sha256 == weights_sha(pushed) and set(outputs) == {REPAIRED, RESULTS}
     assert "applied alpha = 0.25, as the decided screen names it" in record.notes
     assert f"chosen = {screen.alphas[1].model_dump_json()}" in record.notes
 
@@ -502,6 +507,25 @@ def decision_its_rows_do_not_carry(world):
     return "0.1"
 
 
+def another_alpha_s_rows_changed(world):
+    world.decide({0.1: 5, 0.25: 3})
+    rows = world.rows(0.1)
+    rows[0] = rows[0].model_copy(update={"response": "another answer"})
+    world.put(RESPONSES, world.rows_path(0.1), dump(rows))
+
+
+def decision_on_too_few_verdicts(world):
+    decided = world.decide({0.1: 5, 0.25: 3})
+    rows = [row.model_copy(update={"n_judged": 20}) for row in decided.alphas]
+    world.put(RESULTS, "alpha_screen.json", decided.model_copy(update={"alphas": rows}).model_dump_json().encode())
+
+
+def bars_tightened_since(world):
+    # 0.25 sits exactly five points under the baseline; three points are now asked
+    world.decide({0.1: 5, 0.25: 3})
+    world.config.write_text(world.config.read_text().replace('"safety_points" = 5.0', '"safety_points" = 3.0'))
+
+
 def aligned_model_pinned_again(world):
     world.decide({0.1: 5, 0.25: 3})
     world.fake.upload_file(path_or_fileobj=b"notes", path_in_repo="NOTES.md", repo_id=MODEL)
@@ -517,9 +541,12 @@ def screen_removed(world):
 UNDECIDED = [
     (not_decided, "does not name alpha 0.25 as chosen (it says screened, chosen None)"),
     (decided_for_another, "does not name alpha 0.1 as chosen (it says chosen, chosen 0.25)"),
-    (decision_of_other_rows, "was not made from stored rows of alpha 0.25"),
+    (decision_of_other_rows, "was not made from the stored rows of alpha 0.25 for"),
+    (another_alpha_s_rows_changed, "was not made from the stored rows of alpha 0.1 for"),
     (decision_its_rows_do_not_carry, "does not follow from its rows (chosen, chosen 0.25)"),
-    (aligned_model_pinned_again, "was not made from stored rows of alpha 0.25"),
+    (decision_on_too_few_verdicts, "does not follow from its rows (screened, chosen None)"),
+    (bars_tightened_since, "does not follow from its rows (failed, chosen None)"),
+    (aligned_model_pinned_again, "was not made from the stored rows of alpha 0.1, 0.25 for"),
     (screen_removed, "as chosen (there is none)"),
 ]
 
@@ -553,6 +580,7 @@ def test_an_option_that_names_no_usable_alpha_never_falls_back_to_a_screen(world
 
     assert world.events == [] and world.paths(RESPONSES) == []
     assert any(reason in note for note in world.record().notes)
+    assert REPAIRED not in world.fake.repos and "alpha_screen.json" not in world.paths(RESULTS)
 
 
 def test_a_refused_push_leaves_the_repaired_repo_empty_and_the_decision_as_it_was(make_world):
@@ -582,13 +610,99 @@ def test_a_later_screen_adds_to_the_stored_one_and_keeps_verdicts_it_did_not_rer
     assert (screen.recover_status, screen.chosen) == ("screened", None)
     assert (screen.judge, screen.baseline_safe_pooled) == (judge_config(), 0.9)
 
+    # the same generations again keep their verdict; other ones start unjudged
     world.events.clear()
     assert world.run("--alphas", "0.25", run_id=LAST) == 0
+    assert world.applied() == [0.25] and world.screen() == screen
+    world.silent = {0.25: 1}
+    assert world.run("--alphas", "0.25", run_id="repair-full-20261113T160000Z") == 0
     again = world.screen()
-    assert world.applied() == [0.25] and [row.alpha for row in again.alphas] == [0.1, 0.25, 0.4]
-    # a rerun alpha starts unjudged; the others keep what they had
-    assert again.alphas[0] == decided.alphas[0]
-    assert (again.alphas[1].safe_rate_pooled, again.alphas[1].n_judged, again.alphas[1].pass_chrf) == (None, 0, True)
+    assert [row.alpha for row in again.alphas] == [0.1, 0.25, 0.4] and again.alphas[0] == decided.alphas[0]
+    assert (again.alphas[1].safe_rate_pooled, again.alphas[1].n_judged, again.alphas[1].n_benign_empty) == (None, 0, 1)
+    assert again.alphas[1].rows_sha256 != decided.alphas[1].rows_sha256
+
+
+def screens_written(world, since):
+    """Every version of the screen record stored by commits made after ``since``, oldest first."""
+    trees = [tree for revision, tree in world.fake.repos[RESULTS].items() if revision not in since]
+    versions = dict.fromkeys(tree["alpha_screen.json"] for tree in trees if "alpha_screen.json" in tree)
+    return [AlphaScreen.model_validate_json(version) for version in versions]
+
+
+def test_a_resumed_run_over_judged_alphas_never_stores_a_verdict_on_part_of_them(world):
+    assert world.run("--alphas", "0.1,0.25") == 0
+    decided = world.decide({0.1: 5, 0.25: 3})
+    assert (decided.chosen, decided.alphas[0].pass_safety) == (0.25, False)
+    since = set(world.fake.repos[RESULTS])
+
+    world.events.clear()
+    assert world.run("--alphas", "0.1,0.25", "--resume", RUN_ID, run_id=LATER) == 0
+
+    # the stored rows are reused and each alpha keeps the verdict made from them
+    assert world.applied() == [] and world.screen() == decided
+    assert all(version == decided for version in screens_written(world, since))
+
+
+def test_a_rerun_swaps_a_judged_row_only_once_its_new_rows_are_stored(world):
+    assert world.run("--alphas", "0.1,0.25") == 0
+    decided = world.decide({0.1: 5, 0.25: 3})
+    since = set(world.fake.repos[RESULTS])
+    # the smaller alpha answers differently this time; the second batch of the larger one never ends
+    world.silent = {0.1: 2}
+    clock = FakeClock()
+    world.on_generate = lambda alpha: clock.advance(7000) if alpha == 0.25 else None
+
+    assert world.run("--alphas", "0.1,0.25", run_id=LATER, clock=clock) == 10
+
+    versions = screens_written(world, since)
+    assert versions and all([row.alpha for row in version.alphas] == [0.1, 0.25] for version in versions)
+    # never a verdict over the larger alpha alone, never a failed one over the smaller
+    assert {version.recover_status for version in versions} == {"screened"}
+    last = world.screen()
+    assert (last.alphas[0].safe_rate_pooled, last.alphas[0].n_benign_empty) == (None, 2)
+    assert last.alphas[1] == decided.alphas[1]
+
+
+def test_an_out_of_memory_rerun_leaves_a_judged_row_as_it_was(world):
+    assert world.run("--alphas", "0.1,0.25") == 0
+    decided = world.decide({0.1: 5, 0.25: 3})
+
+    def out_of_memory(alpha):
+        raise torch.OutOfMemoryError(OOM_TEXT)
+
+    world.on_generate = out_of_memory
+    assert world.run("--alphas", "0.25", run_id=LATER) == 11
+
+    # its stored rows are untouched, so the verdict made from them stands
+    assert world.screen() == decided
+
+
+def test_a_moved_chrf_reference_undoes_a_decision_before_it_is_applied(world):
+    # the reference and the alpha both miss one prompt in twenty: the alpha sits on the reference
+    world.put_drifted_chrf(unscored=1)
+    world.silent = {0.25: 6}
+    assert world.run("--alphas", "0.1,0.25") == 0
+    assert world.decide({0.1: 5, 0.25: 3}).chosen == 0.25
+    world.put_drifted_chrf()
+
+    assert world.run("--apply", "0.25", run_id=LATER) == 12
+
+    notes = world.record(LATER).notes
+    assert any("does not follow from its rows (failed, chosen None)" in note for note in notes)
+    assert REPAIRED not in world.fake.repos
+
+
+def test_a_repaired_repo_that_is_already_open_takes_no_weights(world):
+    assert world.run("--alphas", "0.25") == 0
+    world.decide({0.25: 3})
+    world.fake.add_repo(REPAIRED, files={"README.md": b"published"})
+    world.fake.authorize(REPAIRED)
+    world.events.clear()
+
+    assert world.run("--apply", "0.25", run_id=LATER) == 12
+
+    assert world.events == [] and world.paths(REPAIRED) == ["README.md"]
+    assert any(f"{REPAIRED} is not private" in note for note in world.record(LATER).notes)
 
 
 def test_a_stored_row_that_is_not_of_these_generations_is_not_carried_over(world):
@@ -798,6 +912,10 @@ def drifted_not_generated(world):
     world.put_drifted_chrf(rows=SCREEN - 1)
 
 
+def drifted_never_scored(world):
+    world.put_drifted_chrf(unscored=ROWS)
+
+
 def disk_too_small(world):
     return {"free": 1000}
 
@@ -810,6 +928,7 @@ REFUSALS = [
     (smoke_drift_record, (), "no finished drift record"),
     (another_prefix, (), "is not the evaluation set's"),
     (drifted_not_generated, (), "benign/en.jsonl lacks 1 of the 20 screen prompts"),
+    (drifted_never_scored, (), "no benign screen prompt has a drifted chrF"),
     (disk_too_small, (), "GiB of disk"),
     (lambda world: None, ("--alphas", "0.1,x"), "--alphas"),
     (lambda world: None, ("--alphas", "0,0.5"), "--alphas"),

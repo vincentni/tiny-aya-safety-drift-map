@@ -70,6 +70,7 @@ OOM_LADDER = {
     "repair": "halve [batch] screen: 8 -> 4, then pass --alphas one value per job",
 }
 NO_RUNG = "no batch rung is defined for this kind; lower its memory use"
+COLUMN_FAILED = "the job could not produce its output and no input change fixes that; read the record notes first"
 HOST_RAM_RUNG = "host memory is the suspect: run repair with --alphas one value per job"
 
 
@@ -119,6 +120,8 @@ def classify(
         return row(f"out of memory: {rung}; the same config is refused", oom=True)
     if stage == "ERROR" and status == "failed" and exit_code in FAILED_EXITS:
         reason = ExitCode(exit_code).name.lower().replace("_", "-")
+        if exit_code == ExitCode.COLUMN_FAILED:
+            return row(COLUMN_FAILED, notes=[reason])
         return row("fix the input; relaunch allowed", notes=[reason])
     if stage == "ERROR" and record is None:
         silent = TRAILER.search(log_tail) is None
