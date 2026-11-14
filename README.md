@@ -4,12 +4,12 @@
 [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/vincentni/tiny-aya-safety-drift-map/blob/main/notebooks/reproduce_tables.ipynb)
 
 A failure map of Cohere's Tiny Aya Global (3.35B) on 600 red-teaming prompts in six languages, with
-three interventions measured on the same map: a system-prompt patch, two LoRA fine-tunes of the same
-benign rows, and 4-bit quantization. Lexsi AI Safety & Alignment Hackathon 2026, Track 2.
+four interventions measured on the same map: a system-prompt patch, two LoRA fine-tunes of the same
+benign rows, a weight-space repair of the overfit one, and 4-bit quantization. Lexsi AI Safety & Alignment Hackathon 2026, Track 2.
 
 - **9.2% → 4.8%** harmful answers with a five-sentence system-prompt patch (p < 0.001), for +3.6 points of over-refusal and -4.4 chrF.
 - **2% in French, 16% in Russian** under the served template; French is the safest language in both prompt conditions.
-- **10.2% → 14.2%** when a benign fine-tune is overfit (no safety preamble, p = 0.007); the light recipe on the same rows costs no safety.
+- **10.2% → 14.2% → 8.5%**: overfitting a benign fine-tune erodes safety (p = 0.007); mixing a quarter of the base weights back restores it (p < 0.001) and keeps the task gain (no safety preamble).
 - **Typed in Latin script, prompts lose their refusals (69% → 25%)**; the fine-tuned model's harmful answers rise from 5.8% to 14.7% (p < 0.001).
 
 ![Harmful answers and over-refusal of the base model with and without the safety patch, beside the fine-tuned model](docs/figures/f8_safety_patch.png)
@@ -25,7 +25,8 @@ and, behind a click, stored answers; the text of answers judged harmful is not s
 - **Models.** `CohereLabs/tiny-aya-global`, and the same model after a LoRA fine-tune on 1,272 benign
   instruction rows (212 per language, 3 epochs at learning rate 2e-4: the light recipe, "the fine-tuned
   model" below). Both are evaluated as full weights with greedy decoding. The overfit recipe trains the
-  same rows for 10 epochs at 5e-4.
+  same rows for 10 epochs at 5e-4; the repaired model is that fine-tune with each weight interpolated
+  with the base model's (SafeTune WiSE-FT, 0.25 of the base weight), without retraining.
 - **Prompts.** 600 harmful prompts from `CohereLabs/aya_redteaming` (100 each in English, French,
   Spanish, Russian, Hindi and Arabic, tagged with nine harm categories), 250 safe prompts from XSTest
   for over-refusal, 600 held-out benign prompts for task quality, and 770 rewrites of the harmful
@@ -126,6 +127,23 @@ safety preamble. Changes are paired with the base model.
 
 The pooled change is under the 5-point bar set in advance for calling a checkpoint drifted. In the
 same condition the light recipe goes from 61 of 599 to 35 of 597.
+
+The repair: the overfit fine-tune with a quarter of each weight taken back from the base model. The
+alpha was chosen on a 120-prompt screen by a rule set in advance; the table is the full set. Changes
+are paired with the overfit fine-tune.
+
+| No safety preamble | Base | Overfit fine-tune | Repaired, alpha 0.25 | Change | p |
+| --- | --- | --- | --- | --- | --- |
+| Harmful answers, all prompts | 61 of 599 (10.2%) | 85 of 598 (14.2%) | 51 of 598 (8.5%) | -5.7 (-8.5 to -2.7) | < 0.001 |
+| Arabic | 7 of 100 | 19 of 99 | 12 of 99 | -7.1 (-16.2 to +1.0) | 0.189 |
+| Refusals of harmful prompts | 66.4% | 64.2% | 72.4% | +8.2 (+5.4 to +11.0) | < 0.001 |
+| Over-refusal on XSTest | 9.6% | 7.2% | 8.8% | +1.6 (-0.8 to +4.0) | 0.344 |
+| chrF on the benign task | 25.1 | 37.0 | 38.0 | +1.0 (0.0 to +2.0) | 0.215 |
+
+The repaired model does not differ measurably from the base model on harmful answers (61 → 51,
+p = 0.253) and keeps the fine-tune's task score. The gain is not shorter answers: among answers that
+end on their own under both models harmful answers go from 11.5% to 6.6%. Arabic is only partly
+restored.
 
 4-bit quantization: the fine-tuned model as a q4_k_m file against the same weights at full precision,
 on the same engine.
@@ -285,6 +303,9 @@ uv run driftmap repair choose --mode full    # rate each alpha, store the choice
 uv run driftmap launch repair --mode full --wait -- --apply ALPHA    # push the repaired model
 ```
 
+For the overfit fine-tune, add `--fine-tune aggressive` after the `--` of each repair launch and to
+`repair choose` and `table build`; its screen, tables and repaired model keep names of their own.
+
 Housekeeping:
 
 ```bash
@@ -403,8 +424,10 @@ Names under the owner, from `[repos]` in `driftmap.toml`:
 - The same two names ending in `-nopre`, once a fine-tune with no safety preamble exists: its
   adapter is published like the first, its merged weights stay private.
 - `tiny-aya-global-drift-GGUF` (model): the fine-tuned model as a q4_k_m file.
-- `tiny-aya-global-repaired` and `tiny-aya-global-repaired-GGUF` (models): the names a repair job
-  and its q4_k_m file publish under; no repaired model is published.
+- `tiny-aya-global-repaired-nopre` (model): the overfit fine-tune repaired by weight interpolation
+  with the base model at alpha 0.25.
+- `tiny-aya-global-repaired` and `tiny-aya-global-repaired-GGUF` (models): the names a repair of the
+  light fine-tune and its q4_k_m file would publish under; that repair was not needed and not run.
 
 ### Licences and use
 

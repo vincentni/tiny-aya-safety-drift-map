@@ -24,7 +24,7 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-SCHEMA = "driftmap.space/3"
+SCHEMA = "driftmap.space/4"
 EVAL_REPO = "vincentnkq/aya-redteaming-6lang-eval"
 RESULTS_REPO = "vincentnkq/safety-drift-map-results"
 RESPONSES_REPO = "vincentnkq/safety-drift-map-responses"
@@ -49,6 +49,9 @@ OVERFIT = (
     "tiny-aya-global-drift-merged-nopre--d845b23452bb",
     "nopreamble/tables/tables-nopreamble-aggressive.json",
 )
+# that fine-tune after its weights are interpolated with the base model's: id, name, condition, label folder;
+# its paired changes are the drifted-to-repaired columns of the overfit fine-tune's tables file
+REPAIRED = ("repaired", "repaired fine-tune", "nopreamble", "tiny-aya-global-repaired-nopre--ba1563a2e8c8")
 # the script variants of the harmful prompts, answered under the served template: prompt files, label tree
 VARIANT_PROMPTS = "variants/prompts/harmful"
 VARIANT_LABELS = "variants/labels"
@@ -60,6 +63,7 @@ SYSTEMS = (
     ("served", "finetuned", "Light fine-tune", None),
     ("patched", "finetuned", "Light fine-tune + safety patch", None),
     ("nopreamble", "overfit", "Overfit fine-tune", "research artifact, not for deployment"),
+    ("nopreamble", "repaired", "Repaired fine-tune", None),
 )
 # the explorer shows prompt text; prompts of this category are left out of its file
 WITHHELD_CATEGORY = "Non-consensual sexual content"
@@ -300,7 +304,7 @@ def explorer(
     """
     eval_dir, responses_dir = Path(eval_dir), Path(responses_dir)
     trees = {key: (name, tree) for key, name, tree, _ in CONDITIONS}
-    folders = {key: folder for key, _, folder in MODELS} | {OVERFIT[0]: OVERFIT[3]}
+    folders = {key: folder for key, _, folder in MODELS} | {OVERFIT[0]: OVERFIT[3], REPAIRED[0]: REPAIRED[3]}
     texts = {}
     for path in sorted((eval_dir / "prompts" / "harmful").glob("*.jsonl")):
         for row in read_jsonl(path):
@@ -360,8 +364,9 @@ def explorer(
     }
 
 
-def _changes(tables_dir: Path, tables_file: str) -> dict:
-    """Pooled paired changes between the two models, as the published tables state them; empty without the file.
+def _changes(tables_dir: Path, tables_file: str, pair: tuple[str, str] = ("baseline", "drifted")) -> dict:
+    """Pooled paired changes between the two table columns of ``pair``, as the published tables state them; empty
+    without the file.
 
     ``tables_dir`` is a copy of the results dataset, or a flat folder that holds the tables files by name.
     """
@@ -373,7 +378,7 @@ def _changes(tables_dir: Path, tables_file: str) -> dict:
     pooled = {"safe": "all", "over_refusal": "en", "chrf": "all"}
     found = {}
     for delta in deltas:
-        if delta["a"] != delta["b"] and pooled.get(delta["metric"]) == delta["row"]:
+        if (delta["a"], delta["b"]) == pair and pooled.get(delta["metric"]) == delta["row"]:
             found[delta["metric"]] = {key: delta[name] for key, name in
                                       (("delta", "delta"), ("ci", "ci"), ("p", "p_value"), ("pairs", "n_pairs"))}  # fmt: skip
     return found
@@ -387,7 +392,8 @@ def build(
 ) -> dict:
     """The Space's data: summary, cells, flips and answer-length counts, from label files under ``eval_dir``.
 
-    ``overfit`` compares the overfit fine-tune with the base model, ``patch`` each model under the safety patch with
+    ``overfit`` compares the overfit fine-tune with the base model, ``repaired`` the repaired fine-tune with the
+    overfit one and with the base model, ``patch`` each model under the safety patch with
     itself under the served template over the prompts labelled in both, ``variants`` each script variant with its
     parent prompts; each is empty when its label files are absent.
     """
@@ -399,8 +405,9 @@ def build(
     for condition, _, tree, tables_file in CONDITIONS:
         always = condition in REQUIRED
         wanted = [(model, folder) for model, _, folder in MODELS if always or _has(eval_dir, tree, folder)]
-        if condition == OVERFIT[2] and _has(eval_dir, tree, OVERFIT[3]):
-            wanted.append((OVERFIT[0], OVERFIT[3]))
+        for extra in (OVERFIT, REPAIRED):
+            if condition == extra[2] and _has(eval_dir, tree, extra[3]):
+                wanted.append((extra[0], extra[3]))
         if not wanted:
             continue
         summary[condition], rows[condition], safe[condition], verdicts = {}, {}, {}, {}
@@ -424,6 +431,13 @@ def build(
         verdicts = [{key: verdict(row) for key, row in side.items()} for side in sides]
         overfit = {"condition": OVERFIT[2], "model": OVERFIT[0], "flips": _flips(*verdicts)}
         overfit["changes"] = _changes(Path(tables_dir), OVERFIT[4]) if tables_dir else {}
+    repaired = None
+    if overfit and REPAIRED[0] in rows[REPAIRED[2]]:
+        sides = (rows[REPAIRED[2]][model] for model in (OVERFIT[0], base, REPAIRED[0]))
+        before, first, after = ({key: verdict(row) for key, row in side.items()} for side in sides)
+        repaired = {"condition": REPAIRED[2], "model": REPAIRED[0]}
+        repaired |= {"flips": _flips(before, after), "flips_base": _flips(first, after)}
+        repaired["changes"] = _changes(Path(tables_dir), OVERFIT[4], ("drifted", "repaired")) if tables_dir else {}
     patch = []
     for model, answers in rows.get("patched", {}).items():
         before = rows["served"][model]
@@ -435,6 +449,7 @@ def build(
         entry["over_refusal"] = {key: refused[key] for key in ("pairs", "refusal")}
         patch.append(entry)
     models = [(key, name) for key, name, _ in MODELS] + ([OVERFIT[:2]] if overfit else [])
+    models += [REPAIRED[:2]] if repaired else []
     return {
         "schema": SCHEMA,
         "eval_repo": EVAL_REPO,
@@ -449,6 +464,7 @@ def build(
         "length": length,
         "cells": cells,
         "overfit": overfit,
+        "repaired": repaired,
         "patch": patch,
         "variants": _variants(eval_dir, rows["served"]),
     }

@@ -31,8 +31,8 @@ the responses dataset, under its own warning.
 - The headline numbers and the figures of the write-up.
 - What the light fine-tune did and did not do: harmful answers among complete answers and among
   answers cut off at the token limit.
-- The overfit recipe: harmful answers by language of the base model and of both fine-tunes, with no
-  safety preamble.
+- The overfit recipe and its repair: harmful answers by language of the base model, of both
+  fine-tunes and of the repaired fine-tune, with no safety preamble.
 - A targeted system-prompt patch: each model with and without it, on the same prompts.
 - The script stress test: prompts in Latin script or mixed with English against their native-script
   parents.

@@ -11,9 +11,10 @@ from driftmap.table.rates import wilson as reference_wilson
 ROOT = Path(__file__).resolve().parents[3]
 BASE, TUNED = "tiny-aya-global--af89d219b53e", "tiny-aya-global-drift-merged--daccc14f6c19"
 OVERFIT = "tiny-aya-global-drift-merged-nopre--d845b23452bb"
+REPAIRED = "tiny-aya-global-repaired-nopre--ba1563a2e8c8"
 SECRET = "text of a harmful request that must stay out of the page"
 KEYS = {"schema", "eval_repo", "conditions", "models", "languages", "categories", "figures"}
-KEYS |= {"summary", "changes", "flips", "length", "cells", "overfit", "patch", "variants"}
+KEYS |= {"summary", "changes", "flips", "length", "cells", "overfit", "repaired", "patch", "variants"}
 
 
 def _load():
@@ -182,7 +183,7 @@ def test_only_the_measured_conditions_and_models_are_listed(eval_dir):
 
     assert [row["id"] for row in data["conditions"]] == ["served", "nopreamble"]
     assert [row["id"] for row in data["models"]] == ["base", "finetuned"]
-    assert data["overfit"] is None and data["patch"] == [] and data["variants"] == []
+    assert data["overfit"] is None and data["repaired"] is None and data["patch"] == [] and data["variants"] == []
 
 
 def test_the_overfit_fine_tune_is_counted_in_its_one_condition(overfit_dir, tmp_path):
@@ -206,6 +207,30 @@ def test_the_overfit_fine_tune_is_counted_in_its_one_condition(overfit_dir, tmp_
     assert overfit["changes"]["safe"] == {"delta": -0.0401, "ci": [-0.0702, -0.0117], "p": 0.007, "pairs": 598}
     # the two models of every condition keep their own comparison
     assert data["flips"]["nopreamble"]["pairs"] == 2 and data["changes"]["nopreamble"] == {}
+
+
+def test_the_repaired_fine_tune_is_compared_with_the_overfit_one_and_with_the_base_model(overfit_dir, tmp_path):
+    _harmful_file(overfit_dir, "nopreamble/labels", REPAIRED, [("p1", "yes", "no"), ("p2", "no", "yes"), ("p3", "yes", "no")])
+    drift = {"row": "all", "a": "baseline", "b": "drifted", "metric": "safe", "n_pairs": 598}
+    drift |= {"delta": -0.0401, "ci": [-0.0702, -0.0117], "p_value": 0.007}
+    repair = drift | {"a": "drifted", "b": "repaired", "delta": 0.0569, "ci": [0.0268, 0.0853], "p_value": 0.0001}
+    results = tmp_path / "results" / "nopreamble" / "tables"
+    results.mkdir(parents=True)
+    tables = {"deltas": [drift, repair, repair | {"row": "en"}]}
+    (results / "tables-nopreamble-aggressive.json").write_text(json.dumps(tables), encoding="utf-8")
+
+    data = build_data.build(overfit_dir, tmp_path / "results")
+
+    assert [row["id"] for row in data["models"]] == ["base", "finetuned", "overfit", "repaired"]
+    assert data["summary"]["nopreamble"]["repaired"]["harmful"][:2] == [1, 3]
+    repaired = data["repaired"]
+    assert (repaired["condition"], repaired["model"]) == ("nopreamble", "repaired")
+    # overfit: all three harmful; repaired: p2 alone; the base model has no verdict on p3
+    assert repaired["flips"] == {"pairs": 3, "harmful_both": 1, "harmful_to_not": 2, "not_to_harmful": 0}
+    assert repaired["flips_base"] == {"pairs": 2, "harmful_both": 0, "harmful_to_not": 1, "not_to_harmful": 1}
+    # each comparison reads its own pair of columns in the tables
+    assert repaired["changes"]["safe"] == {"delta": 0.0569, "ci": [0.0268, 0.0853], "p": 0.0001, "pairs": 598}
+    assert data["overfit"]["changes"]["safe"]["delta"] == -0.0401
 
 
 def test_the_patch_is_compared_with_the_same_model_under_the_served_template(patched_dir):
@@ -283,13 +308,13 @@ def test_main_writes_the_same_bytes_twice(eval_dir, tmp_path):
     assert build_data.main(["--eval-dir", str(eval_dir), "--out", str(out)]) == 0
     first = out.read_bytes()
     assert build_data.main(["--eval-dir", str(eval_dir), "--out", str(out)]) == 0
-    assert out.read_bytes() == first and json.loads(first)["schema"] == "driftmap.space/3"
+    assert out.read_bytes() == first and json.loads(first)["schema"] == "driftmap.space/4"
 
 
 def test_the_committed_data_file_holds_counts_only():
     data = json.loads((ROOT / "space" / "data.json").read_text(encoding="utf-8"))
 
-    assert data["schema"] == "driftmap.space/3" and set(data) == KEYS and data["cells"]
+    assert data["schema"] == "driftmap.space/4" and set(data) == KEYS and data["cells"]
     assert all(set(cell) == {"condition", "model", "language", "category", "k", "n", "lo", "hi"} for cell in data["cells"])
     # no cell names a prompt: the only strings are ids of conditions, models, languages and categories
     names = {"all", *data["languages"], *data["categories"]} | {row["id"] for row in data["conditions"] + data["models"]}
@@ -318,6 +343,7 @@ def replay_dirs(eval_dir, tmp_path):
         ("labels", BASE): {a: ("no", "yes"), b: ("yes", "no"), c: ("yes", "no"), d: ("no", "no")},
         ("patched/labels", BASE): {a: ("yes", "no"), b: ("yes", "no"), c: ("yes", "no"), d: ("no", "no")},
         ("nopreamble/labels", OVERFIT): {a: ("no", "yes"), b: ("no", "yes"), c: ("yes", "no"), d: ("unscored", "unscored")},
+        ("nopreamble/labels", REPAIRED): refused,
         ("labels", TUNED): refused,
         ("patched/labels", TUNED): refused,
         ("nopreamble/labels", BASE): refused,
@@ -348,11 +374,14 @@ def test_the_explorer_replays_every_system_that_has_labels_and_responses(replay_
         ("patched/base", "Base model + safety patch", "safety patch"),
         ("served/finetuned", "Light fine-tune", "served template"),
         ("nopreamble/overfit", "Overfit fine-tune", "no safety preamble"),
+        ("nopreamble/repaired", "Repaired fine-tune", "no safety preamble"),
     ]
-    assert [row.get("note") for row in replay["systems"]] == [None, None, None, "research artifact, not for deployment"]
+    notes = [None, None, None, "research artifact, not for deployment", None]
+    assert [row.get("note") for row in replay["systems"]] == notes
     first = next(row for row in replay["prompts"] if row["id"] == "a" * 12)
     assert (first["language"], first["categories"], first["text"]) == ("en", ["Hate Speech"], "ask a")
-    assert set(first["answers"]) == {"served/base", "patched/base", "served/finetuned", "nopreamble/overfit"}
+    systems = {"served/base", "patched/base", "served/finetuned", "nopreamble/overfit", "nopreamble/repaired"}
+    assert set(first["answers"]) == systems
     assert first["answers"]["patched/base"] == {
         "verdict": "refused", "cut_off": True, "text": f"{LONG}a", "clipped": False,
     }  # fmt: skip
@@ -410,13 +439,14 @@ def test_prompts_of_a_withheld_category_are_not_in_the_explorer(replay_dirs):
 
 def test_prompts_every_system_answers_harmfully_come_before_the_rest(replay_dirs):
     eval_dir, answers = replay_dirs
-    for tree, folder in (("labels", BASE), ("patched/labels", BASE), ("labels", TUNED), ("nopreamble/labels", OVERFIT)):
+    systems = (("labels", BASE), ("patched/labels", BASE), ("labels", TUNED))
+    for tree, folder in (*systems, ("nopreamble/labels", OVERFIT), ("nopreamble/labels", REPAIRED)):
         rows = [("a" * 64, "no", "yes"), ("b" * 64, "yes", "no"), ("c" * 64, "no", "yes")]
         _harmful_file(eval_dir, tree, folder, rows)
 
     replay = build_data.explorer(eval_dir, answers, cap=1)
 
-    # no system disagrees with another now; c and a are harmful for all four, and a comes first by id
+    # no system disagrees with another now; c and a are harmful for all five, and a comes first by id
     assert (replay["disagreeing"], replay["persistent"]) == (0, 2) and [row["id"][0] for row in replay["prompts"]] == ["a"]
     assert sorted(row["id"][0] for row in build_data.explorer(eval_dir, answers, cap=2)["prompts"]) == ["a", "c"]
 
