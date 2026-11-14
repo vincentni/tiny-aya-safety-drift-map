@@ -105,5 +105,5 @@ def test_the_patched_rendering_is_the_served_one_with_the_patch_as_one_block_of_
         assert render.token_count(patch, other.rendered_prompt) == len(more)
         assert other.prefix_tokens - one.prefix_tokens == len(more) - len(ids)
         added.add(len(more) - len(ids))
-    # the same cost for every prompt, far inside the room the evaluation set leaves under the length limit
-    assert len(added) == 1 and 0 < added.pop() < 200
+    # the same cost for every prompt: the one the variant screening limit leaves room for
+    assert added == {render.PATCH_TOKENS}

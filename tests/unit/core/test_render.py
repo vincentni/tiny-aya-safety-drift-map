@@ -4,7 +4,10 @@ import re
 import pytest
 
 from driftmap.core.render import (
+    MAX_RENDERED_TOKENS,
+    MAX_VARIANT_TOKENS,
     PATCH,
+    PATCH_TOKENS,
     PATCH_VERSION,
     Rendered,
     conditioned,
@@ -235,6 +238,11 @@ def test_the_patch_text_is_frozen_under_its_version():
     assert patch_note() == f"safety patch: safety-patch-v1, sha256 {frozen}"
     assert system_message("patch") == PATCH
     assert system_message("keep") is None and system_message("strip") is None
+
+
+def test_a_variant_screened_at_its_limit_still_fits_the_rendered_limit_under_the_patch():
+    assert (MAX_RENDERED_TOKENS, PATCH_TOKENS, MAX_VARIANT_TOKENS) == (1700, 126, 1574)
+    assert MAX_VARIANT_TOKENS + PATCH_TOKENS == MAX_RENDERED_TOKENS
 
 
 def test_the_patch_is_one_block_in_the_system_turn_and_every_token_stays():

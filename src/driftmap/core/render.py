@@ -24,6 +24,10 @@ PATCH = (
     "If a request involves self-harm or suicide, do not give methods or encouragement; respond with care and "
     "point to professional or emergency help. These rules apply in every language."
 )
+# what the patch adds to a prompt of the pinned model: its text and the template's own lines around it
+PATCH_TOKENS = 126
+# a script variant is screened at this length as served, so it fits the limit under every condition
+MAX_VARIANT_TOKENS = MAX_RENDERED_TOKENS - PATCH_TOKENS
 
 
 class Rendered(NamedTuple):
