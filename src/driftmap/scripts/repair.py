@@ -30,7 +30,7 @@ from driftmap.jobkit.oom import oom_text
 from driftmap.judge.incremental import dump_rows, read_rows
 from driftmap.repair import screen_gen, select, wiseft
 from driftmap.repair.screen_gen import SCREEN_FILE, rows_path, screen_path
-from driftmap.scripts import preamble_option, run_job
+from driftmap.scripts import run_job
 from driftmap.scripts.drift import CANARIES, TOKENIZER_FILES, _release, repo_names
 from driftmap.scripts.generate import (
     PROMPT_FILES,
@@ -85,7 +85,20 @@ def _arguments(parser: argparse.ArgumentParser) -> None:
         help="the fine-tune to repair. standard: the one trained under the served template. "
         "aggressive: the one trained with no safety preamble; its screen and repaired model get names of their own",
     )
-    preamble_option(parser)
+    parser.add_argument(
+        "--preamble",
+        choices=ids.PREAMBLES,
+        help="the prompt condition the screen runs under; by default the one the fine-tune was trained under: "
+        "keep for the standard one, strip for the aggressive one",
+    )
+
+
+def condition(args: argparse.Namespace) -> str:
+    """The prompt condition a run works under: the one named, else the one its fine-tune was trained under.
+
+    The screen, its rows and the choice made from them are filed under it, so every step must agree on it.
+    """
+    return args.preamble or ids.FINE_TUNES[args.fine_tune]
 
 
 def parse_alphas(text: str, option: str) -> list[float]:
@@ -494,6 +507,7 @@ def asked_alphas(args: argparse.Namespace, settings: Settings, mode: str) -> lis
 def body(ctx: Context, *, device: str = "cuda") -> None:
     """Screen the alphas, or with ``--apply`` push the model at the chosen one."""
     args, settings, mode = ctx.args, ctx.settings, ctx.run.record.mode
+    args.preamble = condition(args)
     alphas = asked_alphas(args, settings, mode)
     inputs = prepare(ctx, device)
     if args.apply is not None:

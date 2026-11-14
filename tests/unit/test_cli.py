@@ -911,7 +911,8 @@ def test_a_repair_of_a_named_fine_tune_reads_its_own_run_labels_table_and_screen
     seconds = itertools.count()
     stepping = functools.partial(Deps, run=git, now=lambda: datetime.now(UTC) + timedelta(seconds=next(seconds)))
     monkeypatch.setattr(cli, "Deps", stepping)
-    named = ["--", "--fine-tune", "aggressive", "--preamble", "strip"]
+    # the condition is the one the fine-tune was trained under unless another is named
+    named = ["--", "--fine-tune", "aggressive"]
     # the standard fine-tune's table is flagged and undecided, and is not what this launch stands on
     dump(fake_labels.bare_tables(drift_below_threshold=True), world.root / TABLES_PATH)
     bare = run("launch", "repair", "--wait", *named)
@@ -938,13 +939,20 @@ def test_a_repair_of_a_named_fine_tune_reads_its_own_run_labels_table_and_screen
     planned = run("launch", "repair", "--dry-run", *named)
     assert planned.exit_code == 0 and "cannot run yet" not in planned.output
     assert verdict(planned, "drift_decision") == "pass"
+    explicit = run("launch", "repair", "--dry-run", *named, "--preamble", "strip")
+    assert explicit.exit_code == 0 and "cannot run yet" not in explicit.output
+    # under the served template it has neither labels nor a table: that screen would feed no choice
+    served = run("launch", "repair", "--wait", *named, "--preamble", "keep")
+    assert served.exit_code == 4 and world.submits() == []
+    assert "drifted benign labels for en, fr, es, ru, hi, ar" in served.output
+    assert "tables-aggressive.json with the fine-tuned column tabled" in served.output
     # unnamed, the launch is the standard fine-tune's: it has no drift run, and its flag stands undecided
     usual = run("launch", "repair", "--dry-run")
     assert "missing: drift record with merged_sha256" in usual.output and verdict(usual, "drift_decision") == "refused"
 
     assert run("launch", "repair", "--wait", *named).exit_code == 0
     (screened_run,) = world.submits()
-    assert screened_run.endswith(" --fine-tune aggressive --preamble strip")
+    assert screened_run.endswith(" --fine-tune aggressive")
     applied = [*named, "--apply", "0.25"]
     # the standard fine-tune's screen decides nothing here
     world.push("smoke/alpha_screen.json", screen(world.settings, "chosen").model_dump_json().encode())
@@ -954,7 +962,7 @@ def test_a_repair_of_a_named_fine_tune_reads_its_own_run_labels_table_and_screen
     world.push(own, screen(world.settings, "chosen").model_dump_json().encode())
     pushed = run("launch", "repair", "--wait", *applied)
     assert pushed.exit_code == 0, pushed.output
-    assert world.submits()[-1].endswith(" --fine-tune aggressive --preamble strip --apply 0.25")
+    assert world.submits()[-1].endswith(" --fine-tune aggressive --apply 0.25")
 
 
 def test_a_generate_launch_over_a_repaired_model_needs_its_repo_and_the_named_revision(world):
@@ -972,8 +980,15 @@ def test_a_generate_launch_over_a_repaired_model_needs_its_repo_and_the_named_re
 
     world.hub.add_repo(repaired, private=True, files={"config.json": b"{}"})
     world.hub.authorize(repaired)
+    head = world.hub.heads[repaired]
     unknown = launch("--checkpoint", f"{repaired}@{'d' * 40}")
     assert unknown.exit_code == 4 and f"missing: revision dddddddddddd of {repaired}" in unknown.output
+    # the form that works is named with the refusal
+    assert f"; its head is `--checkpoint {repaired}@{head}`" in flat(unknown)
+    unnamed = launch()
+    assert unnamed.exit_code == 4 and f"missing: {OWNER}/tiny-aya-global-repaired-smoke, which no" in unnamed.output
+    hint = f"the repaired model on the Hub is the other fine-tune's: add `--checkpoint {repaired}@{head}`"
+    assert hint in flat(unnamed)
     other = launch("--checkpoint", f"{OWNER}/tiny-aya-global-drift-merged-smoke@{'d' * 40}")
     assert other.exit_code == 4 and "missing: --checkpoint naming a repaired model" in other.output
     # a dry run says so and still prints the plan
@@ -982,7 +997,6 @@ def test_a_generate_launch_over_a_repaired_model_needs_its_repo_and_the_named_re
     assert planned.exit_code == 0 and "generate cannot run yet; missing: revision" in planned.output
     assert world.submits() == []
 
-    head = world.hub.heads[repaired]
     found = launch("--checkpoint", f"{repaired}@{head}")
     assert found.exit_code == 0, found.output
     assert len(world.submits()) == 1 and world.submits()[0].endswith(f"--checkpoint {repaired}@{head}")

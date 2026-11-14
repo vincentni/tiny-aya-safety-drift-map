@@ -73,7 +73,7 @@ def _repo_columns(settings: Settings, mode: Mode | None = None, fine_tune: str |
     With ``fine_tune`` only that fine-tune's repos are the drifted column; without it either one's are.
     """
     repos = settings.repos
-    placed = {settings.sources.model: "baseline", repos.repaired: "repaired", repos.gguf: "repaired_q4"}
+    placed = {settings.sources.model: "baseline", repos.gguf: "repaired_q4"}
     trained = [FINE_TUNES[fine_tune]] if fine_tune else list(FINE_TUNES.values())
     modes = ("full",) if mode == "full" else ("full", "smoke")
     for run_mode in modes:
@@ -84,7 +84,7 @@ def _repo_columns(settings: Settings, mode: Mode | None = None, fine_tune: str |
     # the fourth column is a quantized file, of the repaired model or of the merged fine-tuned one
     placed[quant.merged_names(settings, "full")[1]] = "repaired_q4"
     if mode != "full":
-        placed |= dict(zip(quant.repo_names(settings, "smoke"), ("repaired", "repaired_q4"), strict=True))
+        placed[quant.repo_names(settings, "smoke")[1]] = "repaired_q4"
         placed[quant.merged_names(settings, "smoke")[1]] = "repaired_q4"
     return {repo.rpartition("/")[2]: column for repo, column in placed.items()}
 
@@ -358,7 +358,8 @@ def column_state(
         # a file made from the fine-tuned model says so, by its repo or by the record of the run that served it
         named = q4_name(rows[0].checkpoint, settings) if rows else None
         kind = Q4_FINE_TUNED if named or (source and source[0] == "drifted") else quant.QUANT
-    if column == "repaired_q4" and recover == "failed":
+    # a failed repair leaves nothing of the repaired model to quantize; a file of the fine-tuned model stands
+    if column == "repaired_q4" and recover == "failed" and kind != Q4_FINE_TUNED:
         name, reason = "not_applicable", "weight-space repair failed its bars, so there is nothing to quantize"
     elif generation and generation[-1].kind == "quant_eval" and generation[-1].status == "failed":
         name, reason = "failed", "; ".join(generation[-1].notes) or "the quant-eval run failed"

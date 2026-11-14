@@ -479,15 +479,18 @@ def launch(
     missing, named = [], None
     if kind.value == "repair":
         apply = _apply_alpha(parsed, settings, mode)
-        chosen = {"fine_tune": parsed.fine_tune, "preamble": parsed.preamble}
+        from driftmap.scripts import repair
+
+        preamble = repair.condition(parsed)
+        chosen = {"fine_tune": parsed.fine_tune, "preamble": preamble}
         missing = prerequisites("repair", _state(settings, deps, mode, None, apply=apply, **chosen)("repair"))
         if parsed.fine_tune != "standard":
             # naming the fine-tune stands for the drift decision, so its own tables must show it measured
-            named = (parsed.fine_tune, parsed.preamble)
-            held = tables_path(parsed.preamble, parsed.fine_tune)
+            named = (parsed.fine_tune, preamble)
+            held = tables_path(preamble, parsed.fine_tune)
             table = _record(Tables, deps.repo_root / held)
             if table is None or "drifted" not in table.columns or table.columns["drifted"].state != "tabled":
-                build = f"driftmap table build --preamble {parsed.preamble} --fine-tune {parsed.fine_tune}"
+                build = f"driftmap table build --preamble {preamble} --fine-tune {parsed.fine_tune}"
                 missing.append(f"{held.name} with the fine-tuned column tabled; run `{build}`")
     elif kind.value in ("quant", "quant_eval"):
         missing = _quant_missing(kind.value, parsed, settings, deps.hub, mode)
@@ -592,12 +595,24 @@ def _repaired_missing(parsed: argparse.Namespace, settings: Settings, hub: Hub, 
     if given is not None and given.repo not in repos:
         return [f"--checkpoint naming a repaired model of {mode} mode: {' or '.join(repos)}"]
     repo, revision = (given.repo, given.revision) if given is not None else (repos[0], None)
+
+    def head(name: str) -> str | None:
+        try:
+            return hub.model_info(RepoRef(name)).sha
+        except RepositoryNotFoundError:
+            return None
+
     try:
         hub.model_info(RepoRef(repo, revision))
     except RevisionNotFoundError:
-        return [f"revision {revision[:12]} of {repo}"]
+        return [f"revision {revision[:12]} of {repo}; its head is `--checkpoint {repo}@{head(repo)}`"]
     except RepositoryNotFoundError:
-        return [f"{repo}, which no repair run has pushed"]
+        lacking = f"{repo}, which no repair run has pushed"
+        # an unnamed launch reads the standard fine-tune's repair; the other one's is read only by name
+        there = [(other, head(other)) for other in repos if other != repo and given is None]
+        other, sha = next(((other, sha) for other, sha in there if sha), (None, None))
+        form = f"; the repaired model on the Hub is the other fine-tune's: add `--checkpoint {other}@{sha}`"
+        return [lacking + (form if other else "")]
     except (httpx2.HTTPError, LocalEntryNotFoundError) as error:
         raise _unreadable(repo, error) from error
     return []

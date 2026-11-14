@@ -84,6 +84,10 @@ def test_the_repaired_model_of_a_fine_tune_is_the_repaired_column_of_its_own_tab
     assert column_of(other, settings) == column_of(other, settings, "full", "aggressive") == "repaired"
     assert column_of(other, settings, "full", "standard") is None
     assert column_of(usual, settings, "full", "standard") == "repaired"
+    # the tables of a fine-tune take the repair of that fine-tune alone
+    assert column_of(usual, settings, "full", "aggressive") is None
+    assert column_of(usual.replace("@", "-smoke@"), settings, "smoke", "aggressive") is None
+    assert column_of(usual.replace("@", "-smoke@"), settings, "smoke", "standard") == "repaired"
     assert column_of(other.replace("@", "-smoke@"), settings, "smoke", "aggressive") == "repaired"
     assert column_of(other.replace("@", "-smoke@"), settings, "full", "aggressive") is None
     tuned = CHECKPOINTS["drifted"].replace("@", "-nopre@")
@@ -248,6 +252,9 @@ def test_a_q4_column_made_from_the_fine_tuned_model_is_held_against_the_drifted_
     }
     markdown = render(tables, settings)
     assert "- repaired_q4 (fine-tuned model, q4_k_m): tabled" in markdown and "| drifted to repaired_q4 |" in markdown
+    # a repair that failed its bars leaves nothing of the repaired model to quantize; this file is not of it
+    failed = build(labels, targets(), [quant_eval(revision), screen("failed")], settings).columns["repaired_q4"]
+    assert (failed.state, failed.kind) == ("tabled", Q4_FINE_TUNED)
 
     earlier = "9" * 40
     other = build(labels, targets(), [quant_eval(earlier)], settings).columns["repaired_q4"]

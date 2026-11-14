@@ -502,7 +502,8 @@ def test_the_other_fine_tune_is_screened_and_repaired_with_no_safety_preamble_un
     stripped = render.render(render.conditioned(build(template=served_template()), "strip"), "hello")
     assert stripped.rendered_prefix_sha256 != world.prefix
 
-    assert world.run(*named, "--alphas", "0.25,0.5") == 0
+    # unnamed, the condition is the one the fine-tune was trained under
+    assert world.run("--fine-tune", "aggressive", "--alphas", "0.25,0.5") == 0
 
     record = world.record()
     assert record.status == "ok" and record.inputs[0].repo == f"{MERGED}-nopre" == world.merged
