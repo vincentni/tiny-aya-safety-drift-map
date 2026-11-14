@@ -1279,15 +1279,24 @@ def publish_run(
             help="Delete the merged and the smoke repos first, for good; never while another problem stands.",
         ),
     ] = False,
+    fresh: Annotated[
+        bool,
+        typer.Option(
+            "--fresh",
+            help="For a repo whose history alone holds a finding: rename it to <name>-work, where it stays private, "
+            "and open a new repo of its name that holds the head's files in one commit.",
+        ),
+    ] = False,
 ) -> None:
     """Card every repo, then open each, then list it in its collection; any problem refuses before the first write."""
-    rows = {"writeup": _link(writeup), "dry_run": dry_run, "delete": delete_intermediates}
+    rows = {"writeup": _link(writeup), "dry_run": dry_run, "delete": delete_intermediates, "fresh": fresh}
     settings, deps = _open("publish run", ready=False, **rows)
     from driftmap.publish import push
 
     flags = [*(["--writeup", writeup] if writeup else []), *(["--delete-intermediates"] * delete_intermediates)]
+    flags += ["--fresh"] * fresh
     resume = f"resume: {shlex.join(['driftmap', 'publish', 'run', *flags])}; finished steps are skipped"
-    asked = {"dry_run": dry_run, "delete": delete_intermediates, "writeup": writeup, "resume": resume}
+    asked = {"dry_run": dry_run, "delete": delete_intermediates, "fresh": fresh, "writeup": writeup, "resume": resume}
     try:
         push.publish(
             settings, deps.hub, **asked, scans=push.Scans(deps.repo_root / LOCAL / push.SCAN_FILE), echo=_said

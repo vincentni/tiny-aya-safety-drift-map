@@ -1842,6 +1842,34 @@ def test_a_failed_publish_exits_7_and_names_the_command_to_run_again(shelf):
     assert not shelf.hub.private & set(PUBLISHED) and published.MERGED not in shelf.hub.repos
 
 
+def test_publish_run_fresh_opens_a_clean_copy_of_a_repo_whose_history_holds_a_token(shelf):
+    shelf.hub._commit(published.RESULTS, "job upload", {"logs/judge.log": f"token {TOKEN}\n".encode()})
+    shelf.hub._commit(published.RESULTS, "remove it", None, ["logs/judge.log"])
+    work = f"{published.RESULTS}-work"
+
+    refused = run("publish", "run")
+    assert refused.exit_code == ExitCode.REDACTION and "publish with --fresh" in refused.stderr
+    assert published.writes(shelf.hub) == []
+
+    real = shelf.hub.create_repo
+    shelf.hub.create_repo = lambda repo_id, **kwargs: shelf.hub._raise(409, "https://huggingface.co/api/repos/create")
+    failed = run("publish", "run", "--fresh")
+    assert failed.exit_code == ExitCode.PUSH_FAILED and "fresh     yes" in failed.output
+    assert failed.stderr.splitlines() == [
+        f"error: the clean copy of {published.RESULTS} failed (409); public now: none",
+        "resume: driftmap publish run --fresh; finished steps are skipped",
+    ]
+    assert work in shelf.hub.private and published.RESULTS not in shelf.hub.repos
+
+    shelf.hub.create_repo = real
+    done = run("publish", "run", "--fresh")
+    assert done.exit_code == 0, done.output
+    assert f"clean copy: {published.RESULTS} (dataset) from {work}@" in done.output
+    assert work in shelf.hub.private and not shelf.hub.private & set(PUBLISHED)
+    assert TOKEN not in done.output and "publication.json" in shelf.hub.repos[published.RESULTS]["main"]
+    assert run("publish", "check").exit_code == 0
+
+
 def test_publish_passes_the_library_refusals_through_and_checks_its_link(shelf, monkeypatch):
     with monkeypatch.context() as patch:
         patch.setattr(cli, "load_settings", lambda path: pytest.fail("the config was read"))

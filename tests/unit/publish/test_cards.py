@@ -1,6 +1,7 @@
 import pytest
 from huggingface_hub.repocard import RepoCard
 
+from driftmap.core.ids import RepoRef
 from driftmap.core.records import ColumnState
 from driftmap.core.settings import load_settings
 from driftmap.publish import cards
@@ -412,6 +413,23 @@ def test_the_gguf_of_the_fine_tuned_model_opens_as_its_adapter_does(tmp_path, se
     own = f"{MERGED_NOPRE}@{'b' * 40}"
     second = two_column_tables(tmp_path, settings, unsafe=1, preamble="strip", fine_tuned=own)
     assert "do not deploy" in render_cards(settings, nopreamble=second)[MERGED_GGUF]
+
+
+def test_a_clean_copy_names_the_working_repo_it_was_made_from(settings):
+    """One line on the copy's own card; the results card lists the file that maps every copy."""
+    origin = RepoRef(f"{ADAPTER}-work", "9" * 40)
+    held = {"results": ["runs/drift-None.json", "publication.json"]}
+
+    rendered = render_cards(settings, manifest=manifest(), copies={"adapter": origin}, files=held)
+
+    line = (
+        f"- History: a clean copy of `{ADAPTER}-work` at revision `{'9' * 40}`, which stays private. Run records name "
+        f"revisions of that repository; `publication.json` in `{RESULTS}` maps each copy to its source."
+    )
+    assert line in rendered[ADAPTER] and missing("adapter", rendered[ADAPTER], settings) == []
+    assert not any("a clean copy of" in text for repo, text in rendered.items() if repo != ADAPTER)
+    assert "- `publication.json`: for each repo published as a clean copy, " in rendered[RESULTS]
+    assert "publication.json" not in render_cards(settings, manifest=manifest())[RESULTS]
 
 
 def test_dataset_cards_describe_the_trees_their_repos_hold(settings):

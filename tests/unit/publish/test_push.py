@@ -1038,7 +1038,7 @@ def test_only_a_token_finding_asks_for_a_rotation(settings, fake):
     drawn = plan(settings, hub)
 
     assert drawn.advice == (REBUILD,) and drawn.refusal().splitlines()[-1] == REBUILD
-    assert "rebuild the repo from its head as a new repo and re-pin it" in REBUILD
+    assert "publish with --fresh" in REBUILD and "private as <name>-work" in REBUILD
     put(fake, RESULTS, f"logs/{TOKEN}.log", b"INFO driftmap: done\n")
     again = plan(settings, hub)
     assert again.advice == (REBUILD, ROTATE)
@@ -1358,6 +1358,254 @@ def test_the_name_of_the_fine_tuned_gguf_cannot_be_taken_by_another_key(tmp_path
             run()
         assert refused.value.exit_code == ExitCode.USAGE
     assert writes(fake) == []
+
+
+FINISH = "publish with --fresh to finish the clean copy"
+
+
+def stained(fake, repo, path="logs/old.log"):
+    """A token committed to ``repo`` and removed again: the head is clean, the history is not; returns the head."""
+    put(fake, repo, path, f"token {TOKEN}\n".encode())
+    fake._commit(repo, "remove it", None, [path])
+    return fake.heads[repo]
+
+
+def history(fake, repo):
+    return [tree for oid, tree in fake.repos[repo].items() if oid != "main"]
+
+
+def copies(fake):
+    return json.loads(fake.repos[RESULTS]["main"]["publication.json"])
+
+
+def test_a_fresh_copy_publishes_a_repo_whose_history_holds_a_finding(settings, fake, said):
+    """The working repo is set aside, private, under -work; a new repo holding its clean head is what opens."""
+    hub = seed(fake)
+    head = stained(fake, RESULTS)
+    refused = plan(settings, hub)
+    assert [code for code, _ in refused.problems] == [ExitCode.REDACTION] and refused.advice == (REBUILD, ROTATE)
+    with pytest.raises(DriftmapError):
+        publish(settings, hub, echo=lambda line: None)
+    assert writes(fake) == []
+
+    result = publish(settings, hub, fresh=True, echo=said.append)
+
+    work = f"{RESULTS}-work"
+    assert result.ok and RESULTS not in fake.private | fake.gated and work in fake.private
+    assert calls(fake, "move_repo") == [RESULTS] and fake.heads[work] == head
+    assert len(history(fake, RESULTS)) == 2 and not any("logs/old.log" in tree for tree in history(fake, RESULTS))
+    assert set(fake.repos[RESULTS]["main"]) == {
+        "README.md",
+        "ledger.jsonl",
+        "logs/drift-None.log",
+        "publication.json",
+        "runs/drift-None.json",
+    }
+    assert copies(fake) == {"schema": "driftmap.publication/1", "copies": {RESULTS: {"repo": work, "revision": head}}}
+    card = fake.repos[RESULTS]["main"]["README.md"].decode()
+    assert f"a clean copy of `{work}` at revision `{head}`" in card and "- `publication.json`: " in card
+    assert f"clean copy: {RESULTS} (dataset) from {work}@{head[:12]}" in said
+    # the token still sits in a private repo
+    assert ROTATE in said and REBUILD not in said
+    # every other repo was opened as it is
+    assert [repo for repo in fake.repos if repo.endswith("-work")] == [work]
+    assert "a clean copy of" not in fake.repos[EVAL]["main"]["README.md"].decode()
+    rows = {row.repo: row for row in result.rows}
+    assert rows[work][1:6] == (True, False, "no", False, False) and rows[work].ok
+
+    fake.calls.clear()
+    again = publish(settings, hub, echo=said.append)
+    assert again.ok and writes(fake) == [] and copies(fake)["copies"] == {RESULTS: {"repo": work, "revision": head}}
+
+
+def test_a_fresh_copy_of_an_adapter_leaves_its_training_state_behind(settings, fake):
+    hub = seed(fake)
+    head = stained(fake, ADAPTER, "notes.txt")
+
+    assert publish(settings, hub, fresh=True, echo=lambda line: None).ok
+
+    work = f"{ADAPTER}-work"
+    copied = fake.repos[ADAPTER]["main"]
+    assert set(copied) == {"README.md", "adapter_config.json", "adapter_model.safetensors", "drift_config.json"}
+    assert copied["adapter_model.safetensors"] == b"\x00weights"
+    assert f"a clean copy of `{work}`" in copied["README.md"].decode()
+    assert "last-checkpoint/optimizer.pt" in fake.repos[work]["main"] and work in fake.private
+    # the map goes into the results repo with its card: that repo itself is opened as it is
+    assert copies(fake)["copies"] == {ADAPTER: {"repo": work, "revision": head}}
+    assert f"{RESULTS}-work" not in fake.repos
+    assert "a clean copy of" not in fake.repos[RESULTS]["main"]["README.md"].decode()
+    uploads = [kwargs for name, kwargs in fake.calls if name == "upload_folder" and kwargs["repo_id"] == ADAPTER]
+    assert [upload["commit_message"] for upload in uploads] == [f"publish the files of {work}@{head[:12]}"]
+    assert check(settings, hub).ok
+
+
+def test_a_fresh_copy_cannot_cure_a_finding_its_files_would_hold(settings, fake):
+    hub = seed(fake)
+    put(fake, RESULTS, "logs/now.log", f"token {TOKEN}\n".encode())
+
+    with pytest.raises(DriftmapError) as refused:
+        publish(settings, hub, fresh=True, echo=lambda line: None)
+
+    assert refused.value.exit_code == ExitCode.REDACTION and f"{at(fake, RESULTS)}/logs/now.log:1: hf_token" in str(
+        refused.value
+    )
+    assert writes(fake) == []
+
+
+def test_a_fresh_copy_leaves_out_what_the_card_commit_would_delete(settings, fake):
+    hub = seed(fake)
+    put(fake, RESULTS, "smoke/logs/rehearsal.log", f"token {TOKEN}\n".encode())
+
+    assert publish(settings, hub, fresh=True, echo=lambda line: None).ok
+
+    assert not any(path.startswith("smoke/") for tree in history(fake, RESULTS) for path in tree)
+    assert "smoke/logs/rehearsal.log" in fake.repos[f"{RESULTS}-work"]["main"]
+
+
+def test_a_dry_run_shows_the_fresh_copy_and_writes_nothing(settings, fake, said):
+    hub = seed(fake)
+    head = stained(fake, RESULTS)
+
+    assert publish(settings, hub, fresh=True, dry_run=True, echo=said.append) is None
+
+    shown = f"{RESULTS} (dataset): clean copy from {RESULTS}-work@{head[:12]}; private -> public; card: write; "
+    assert shown + "leave out 1 file; collection: add" in said
+    assert writes(fake) == [] and not any(line.startswith("problem: ") for line in said)
+    # without the flag the plan is the one it was
+    assert plan(settings, hub).problems and "clean copy" not in "\n".join(plan(settings, hub).lines())
+
+
+def test_a_fresh_copy_stopped_after_the_rename_is_finished_by_the_next_run(settings, fake, said):
+    """Between the rename and the new repo the old name answers for the working repo: it is never taken for one."""
+    hub = seed(fake)
+    head = stained(fake, RESULTS)
+    work = f"{RESULTS}-work"
+    real = fake.create_repo
+
+    def refused(repo_id, **kwargs):
+        fake.calls.append(("create_repo", {"repo_id": repo_id, **kwargs}))
+        fake._raise(409, "https://huggingface.co/api/repos/create")
+
+    fake.create_repo = refused
+    with pytest.raises(DriftmapError) as stopped:
+        publish(settings, hub, fresh=True, echo=said.append)
+    assert stopped.value.exit_code == ExitCode.PUSH_FAILED and "public now: none" in str(stopped.value)
+    assert work in fake.private and RESULTS not in fake.repos and fake.redirects == {RESULTS: work}
+    assert not {EVAL, RESPONSES, *MODELS} - fake.private
+
+    # a run without the flag neither opens nor writes to what the old name leads to
+    fake.create_repo = real
+    fake.calls.clear()
+    lacking = f"{RESULTS} does not exist; its files are in its working copy {work}: {FINISH}"
+    assert [text for _, text in plan(settings, hub).problems] == [lacking]
+    assert lacking in check(settings, hub).problems
+    with pytest.raises(DriftmapError):
+        publish(settings, hub, echo=lambda line: None)
+    assert writes(fake) == [] and work in fake.private and fake.heads[work] == head
+
+    assert publish(settings, hub, fresh=True, echo=said.append).ok
+    assert calls(fake, "move_repo") == [] and RESULTS not in fake.private and work in fake.private
+    assert copies(fake)["copies"] == {RESULTS: {"repo": work, "revision": head}}
+    assert len(history(fake, RESULTS)) == 2 and fake.heads[work] == head
+
+
+def test_a_name_the_hub_still_leads_to_the_working_repo_is_never_filled_or_opened(settings, fake):
+    """A Hub that accepts the creation and keeps the old name on the working repo stops the copy."""
+    hub = seed(fake)
+    head = stained(fake, RESULTS)
+    work = f"{RESULTS}-work"
+    fake.create_repo = lambda repo_id, **kwargs: fake.calls.append(("create_repo", {"repo_id": repo_id, **kwargs}))
+
+    with pytest.raises(DriftmapError, match=f"{RESULTS} is not a new, empty, private repo") as stopped:
+        publish(settings, hub, fresh=True, echo=lambda line: None)
+
+    assert stopped.value.exit_code == ExitCode.INTEGRITY
+    assert work in fake.private and fake.heads[work] == head and "README.md" not in fake.repos[work]["main"]
+    assert [repo for method, repo in writes(fake) if method == "update_repo_settings"] == []
+
+
+def test_a_fresh_copy_stopped_after_the_creation_is_filled_by_the_next_run(settings, fake):
+    """An empty repo beside its working copy is an unfinished copy: it is never carded and opened as it is."""
+    hub = seed(fake)
+    head = stained(fake, RESULTS)
+    work = f"{RESULTS}-work"
+    break_uploads(fake, RESULTS)
+
+    with pytest.raises(DriftmapError) as stopped:
+        publish(settings, hub, fresh=True, echo=lambda line: None)
+    assert stopped.value.exit_code == ExitCode.PUSH_FAILED
+    assert fake.repos[RESULTS]["main"] == {} and {RESULTS, work} <= fake.private
+
+    unfilled = f"{RESULTS} is empty; its files are in its working copy {work}: {FINISH}"
+    assert unfilled in [text for _, text in plan(settings, hub).problems] and unfilled in check(settings, hub).problems
+    with pytest.raises(DriftmapError):
+        publish(settings, hub, echo=lambda line: None)
+    assert fake.repos[RESULTS]["main"] == {} and RESULTS in fake.private
+
+    fake.calls.clear()
+    assert publish(settings, hub, fresh=True, echo=lambda line: None).ok
+    assert calls(fake, "create_repo") == calls(fake, "move_repo") == []
+    assert copies(fake)["copies"] == {RESULTS: {"repo": work, "revision": head}}
+    assert "ledger.jsonl" in fake.repos[RESULTS]["main"] and RESULTS not in fake.private and work in fake.private
+
+
+def test_a_public_repo_is_not_set_aside(settings, fake):
+    hub = seed(fake)
+    stained(fake, RESULTS)
+    fake.private.discard(RESULTS)
+
+    with pytest.raises(DriftmapError, match=f"{RESULTS} is not private; make it private before") as refused:
+        publish(settings, hub, fresh=True, echo=lambda line: None)
+
+    assert refused.value.exit_code == ExitCode.REDACTION and writes(fake) == []
+
+
+def test_working_copies_stay_private_and_are_never_deleted(settings, fake, said):
+    hub = seed(fake)
+    stained(fake, RESULTS)
+    assert publish(settings, hub, fresh=True, echo=lambda line: None).ok
+    work = f"{RESULTS}-work"
+
+    assert work not in [repo for repo, _ in intermediates(settings)]
+    assert f"working copy, stays private: {work} (dataset)" in plan(settings, hub).lines()
+    assert work not in delete_intermediates(settings, hub, echo=said.append) and work in fake.repos
+
+    fake.private.discard(work)
+    exposed = f"{work} is public; make it private: its history is why it was set aside"
+    assert exposed in check(settings, hub).problems and exposed in [text for _, text in plan(settings, hub).problems]
+    with pytest.raises(DriftmapError, match="is public; make it private"):
+        publish(settings, hub, delete=True, echo=lambda line: None)
+    assert work in fake.repos
+
+    fake.private.add(work)
+    data = next(record for record in fake.collections.values() if "data" in record["slug"])
+    data["items"].append({"_id": "w", "id": work, "type": "dataset", "position": 9})
+    assert f"{work} is in a collection" in check(settings, hub).problems
+
+
+def test_a_repo_already_set_aside_once_is_not_set_aside_again(tmp_path, settings, fake):
+    hub = seed(fake)
+    stained(fake, RESULTS)
+    assert publish(settings, hub, fresh=True, echo=lambda line: None).ok
+    stained(fake, RESULTS, "logs/again.log")
+    fake.calls.clear()
+
+    with pytest.raises(DriftmapError, match=f"{RESULTS}-work exists already") as refused:
+        publish(settings, hub, fresh=True, echo=lambda line: None)
+
+    assert refused.value.exit_code == ExitCode.REDACTION and writes(fake) == []
+    with pytest.raises(DriftmapError, match="repos.adapter .* ends with -work") as named:
+        targets(renamed(tmp_path, adapter=f"{REPOS['adapter']}-WORK"))
+    assert named.value.exit_code == ExitCode.USAGE
+
+
+def test_a_repo_with_a_clean_history_is_not_copied(settings, fake):
+    hub = seed(fake)
+
+    assert publish(settings, hub, fresh=True, echo=lambda line: None).ok
+
+    assert calls(fake, "move_repo") == [] and not any(repo.endswith("-work") for repo in fake.repos)
+    assert "publication.json" not in fake.repos[RESULTS]["main"]
 
 
 def test_the_code_repo_the_cards_link_to_pins_its_toolkits():

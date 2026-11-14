@@ -107,6 +107,12 @@ class Hub:
         ref = _ref(target)
         self._call(ref, kwargs.get("repo_type"), self._api.update_repo_settings, ref.repo, **kwargs)
 
+    def move_repo(self, target: RepoRef | str, to: str, *, repo_type: str | None = None) -> None:
+        """Rename a repo; asked once: a rename that reached the Hub cannot be asked again under the old name."""
+        ref = _ref(target)
+        with self._lock:
+            self._api.move_repo(ref.repo, to, repo_type=repo_type)
+
     def delete_repo(self, target: RepoRef | str, *, repo_type: str | None = None, missing_ok: bool = True) -> None:
         """Delete a repo for good; an absent one passes by default, as a retried delete finds it gone."""
         ref = _ref(target)

@@ -41,6 +41,8 @@ class FakeHub:
         # repos whose settings calls are accepted and change nothing
         self.frozen: set[str] = set()
         self.collections: dict[str, dict[str, Any]] = {}
+        # old name -> new name of a moved repo: the Hub answers for the old name with the repo under its new one
+        self.redirects: dict[str, str] = {}
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.threads: set[int] = set()
         self.max_in_flight = 0
@@ -146,6 +148,8 @@ class FakeHub:
                 if not exist_ok:
                     self._raise(409, url)
             else:
+                # a new repo takes the name for itself
+                self.redirects.pop(repo_id, None)
                 self.add_repo(repo_id, repo_type=repo_type or "model", private=private)
             self.authorized.add(repo_id)
             return RepoUrl(f"{ENDPOINT}/{_prefix(self.repo_types[repo_id])}{repo_id}")
@@ -175,6 +179,7 @@ class FakeHub:
             private=private,
             repo_type=repo_type,
         ):
+            repo_id = self.redirects.get(repo_id, repo_id)
             self._check_access(repo_id, repo_type)
             if repo_id in self.frozen:
                 return
@@ -205,6 +210,24 @@ class FakeHub:
             for flagged in (self.gated, self.private, self.authorized):
                 flagged.discard(repo_id)
 
+    def move_repo(
+        self, from_id: str, to_id: str, *, repo_type: str | None = None, token: str | bool | None = None
+    ) -> None:
+        url = f"{ENDPOINT}/api/repos/move"
+        with self._op("move_repo", url, repo_id=from_id, to_id=to_id, repo_type=repo_type):
+            if self.repo_types.get(from_id) != (repo_type or "model"):
+                self._raise(404, url, {"X-Error-Code": "RepoNotFound"})
+            if to_id in self.repos:
+                self._raise(409, url)
+            for held in (self.repos, self.repo_types, self.heads, self.settings):
+                if from_id in held:
+                    held[to_id] = held.pop(from_id)
+            for flagged in (self.gated, self.private, self.authorized, self.frozen):
+                if from_id in flagged:
+                    flagged.discard(from_id)
+                    flagged.add(to_id)
+            self.redirects[from_id] = to_id
+
     def repo_info(
         self,
         repo_id: str,
@@ -218,6 +241,7 @@ class FakeHub:
         with self._op(
             "repo_info", self._repo_url(repo_id, repo_type), repo_id=repo_id, repo_type=repo_type, revision=revision
         ):
+            repo_id = self.redirects.get(repo_id, repo_id)
             tree = self._tree(repo_id, repo_type, revision)
             payload = {
                 "id": repo_id,
@@ -404,6 +428,7 @@ class FakeHub:
             parent_commit=parent_commit,
             **kwargs,
         ):
+            repo_id = self.redirects.get(repo_id, repo_id)
             self._writable(repo_id, repo_type, revision)
             # like the Hub: a commit on another parent than the head is refused
             if parent_commit is not None and parent_commit != self.heads[repo_id]:

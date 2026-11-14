@@ -221,7 +221,7 @@ def add_merged_gguf(fake: FakeHub) -> None:
 
 def writes(fake: FakeHub) -> list[tuple[str, str]]:
     """Calls that change the Hub, as (method, repo or collection)."""
-    changing = ("upload_folder", "upload_file", "update_repo_settings", "delete_repo", "create_repo")
+    changing = ("upload_folder", "upload_file", "update_repo_settings", "delete_repo", "create_repo", "move_repo")
     found = [(method, kwargs["repo_id"]) for method, kwargs in fake.calls if method in changing]
     shelved = [(m, k["item_id"]) for m, k in fake.calls if m == "add_collection_item"]
     return found + shelved + [(m, k["title"]) for m, k in fake.calls if m == "create_collection"]

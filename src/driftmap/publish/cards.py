@@ -215,6 +215,12 @@ TITLES = {
 }
 TAGS = ["safety", "red-teaming", "multilingual"]
 TREE = ids.tree("full", "strip")
+# in the results repo once a repo was published as a clean copy
+PUBLICATION = "publication.json"
+COPIED = (
+    "- History: a clean copy of `{work}` at revision `{revision}`, which stays private. Run records name revisions "
+    "of that repository; `{file}` in `{results}` maps each copy to its source."
+)
 # the condition each adapter was trained under
 TRAINED = dict(zip(ADAPTERS, ids.PREAMBLES, strict=True))
 # the trees of the other prompt conditions; each holds the folders of the main tree
@@ -279,6 +285,13 @@ LAYOUT = {
         ("tables/", False, "the result tables as JSON and as Markdown", (), True),
         ("ledger.jsonl", False, "the cost ledger, one line per job", (), True),
         ("logs/", False, "masked job logs", (), True),
+        (
+            PUBLICATION,
+            False,
+            "for each repo published as a clean copy, the working repo and the revision of it that its files came from",
+            (),
+            False,
+        ),
     ),
     "responses": (
         (
@@ -729,12 +742,14 @@ def render_cards(
     nopreamble: Tables | None = None,
     recipes: Mapping[str, Mapping[str, Any] | None] | None = None,
     files: Mapping[str, Sequence[str]] | None = None,
+    copies: Mapping[str, ids.RepoRef] | None = None,
 ) -> dict[str, str]:
     """README text per repo id for every repo a publication may open; ``writeup`` defaults to the code repo's article.
 
     ``nopreamble`` is the table of the runs with no safety preamble. The cards name that condition once it is
     given, or a full run made under it is among ``records``. ``recipes`` holds, per adapter key, the recipe file
     of its repo; ``files`` holds, per dataset key, the paths its repo will hold, which its card then counts.
+    ``copies`` names, per key of a repo published as a clean copy, the working repo and revision it was made from.
     """
     records = list(records)
     second = nopreamble is not None or any(
@@ -760,6 +775,11 @@ def render_cards(
             top = []
         # the second adapter exists only through a run of the second condition
         provenance = _provenance(settings, manifest, tables, writeup, second or key == ADAPTERS[1])
+        if key in (copies or {}):
+            origin = copies[key]
+            provenance.append(
+                COPIED.format(work=origin.repo, revision=origin.revision, file=PUBLICATION, results=repos["results"])
+            )
         blocks = [*top, f"# {TITLES[key]}", *bodies[key], "\n".join(provenance)]
         rendered[repos[key]] = f"---\n{data.to_yaml()}\n---\n\n" + "\n\n".join(blocks) + "\n"
     return rendered
