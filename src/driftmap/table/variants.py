@@ -20,6 +20,12 @@ from .breakdown import COLUMN_NAMES, CONDITION_NAMES, FINE_TUNE_NAMES, _table, c
 from .stats import BOOTSTRAP_SEED
 
 SCHEMA_VARIANTS = "driftmap.variants/1"
+# the tables of one column, by their title: the metrics of the rows each holds
+SHOWN = {
+    "Harmful answers": ("harmful", "chrf"),
+    "Refusals": ("refusal",),
+    "Answers that neither refuse nor are harmful": ("harmless_answer",),
+}
 # what a variant prompt row says of its parent
 LINK = ("language", "prompt_id", "parent_language", "parent_prompt_id")
 
@@ -61,8 +67,10 @@ class VariantColumn(Record):
 class VariantChange(Record):
     """A variant against its parent prompts over the pairs scored on both sides.
 
-    ``parent``, ``variant`` and ``delta`` (variant minus parent) are harmful-response rates, or mean chrF for the
-    benign set. ``code`` reads ``all-Latn`` or ``all-mixed``, with no ``language``, where it pools one rewrite.
+    ``parent``, ``variant`` and ``delta`` (variant minus parent) are rates of what ``metric`` names over the answers
+    to harmful prompts (``harmful``, ``refusal``, or ``harmless_answer`` for one that neither refuses nor is
+    harmful), or mean chrF for the benign set. ``code`` reads ``all-Latn`` or ``all-mixed``, with no ``language``,
+    where it pools one rewrite.
     """
 
     condition: str
@@ -195,7 +203,7 @@ def build(
         for column in (name for name in table.COLUMNS if name in sides[condition]):
             side = sides[condition][column]
             rows_of = (side.parents, side.variants, side.links, side.parent_answers, side.variant_answers)
-            found = data.compare(*rows_of, same_request=True)
+            found = data.compare(*rows_of, same_request=True, outcomes=data.OUTCOMES)
             if not found.harmful:
                 continue
             listed.append(
@@ -241,7 +249,8 @@ def build(
 def _rate(row: VariantChange, value: float | None) -> str:
     if value is None:
         return "-"
-    return f"{value:.1%}" if row.metric == "harmful" else f"{100 * value:.1f}"
+    # chrF is a score on its 0 to 100 scale, the others are shares
+    return f"{100 * value:.1f}" if row.metric == "chrf" else f"{value:.1%}"
 
 
 def _share(value: float | None) -> str:
@@ -263,9 +272,10 @@ def render(tables: VariantTables) -> str:
         "# Script variants against their parent prompts",
         "",
         "The harmful prompts again in Latin script (`-Latn`) or mixed with English (`-mixed`), each beside the prompt "
-        "it was made from. Rates are the share of responses the judge "
-        f"({judge}) called harmful, over the pairs scored on both sides; a change is the variant rate minus the "
-        "parent rate, with a paired-bootstrap 95% interval and an exact sign-test p. "
+        f"it was made from. Rates are shares of the responses, as the judge ({judge}) labelled them, over the pairs "
+        "scored on both sides: those it called harmful, those it read as a refusal, and those that neither refuse "
+        "nor are harmful. A change is the variant rate minus the parent rate, with a paired-bootstrap 95% interval "
+        "and an exact sign-test p. "
         "`all-Latn` and `all-mixed` pool the variants of one rewrite. "
         "A variant the judge read as another request than its parent is left out.",
         "",
@@ -278,19 +288,26 @@ def render(tables: VariantTables) -> str:
     for condition, shown in tables.conditions.items():
         out += [f"## {_title(shown)}", ""]
         for source in (source for source in tables.sources if source.condition == condition):
-            lines = [
-                [row.set, row.code, _rate(row, row.parent), _rate(row, row.variant), change_cell(row)]
-                for row in tables.rows
-                if (row.condition, row.column) == (condition, source.column)
-            ]
+            own = [row for row in tables.rows if (row.condition, row.column) == (condition, source.column)]
+            head = ["Variant", "Parent prompts", "Variant prompts", "Change"]
             out += [
                 f"### {_title(tables.columns[source.column])}",
                 "",
                 f"Checkpoint `{source.checkpoint}`, variant prompts at `{source.variants_revision[:12]}`: "
                 f"{source.judged} variant labels, {source.left_out} left out.",
                 "",
-                *_table(["Set", "Variant", "Parent prompts", "Variant prompts", "Change"], lines),
             ]
+            for title, metrics in SHOWN.items():
+                lines = [
+                    [row.set, row.code, _rate(row, row.parent), _rate(row, row.variant), change_cell(row)]
+                    for row in own
+                    if row.metric in metrics
+                ]
+                # the first table holds every set; the others are of the harmful prompts alone
+                first = title == next(iter(SHOWN))
+                if lines:
+                    cut = [line if first else line[1:] for line in lines]
+                    out += [f"{title}:", "", *_table(["Set", *head] if first else head, cut)]
             control = [
                 [row.code, str(row.n_pairs), *(_share(value) for value in (row.parent_failed, row.variant_failed))]
                 + [_tokens(value) for value in (row.parent_tokens, row.variant_tokens)]
@@ -299,5 +316,5 @@ def render(tables: VariantTables) -> str:
             ]
             if control:
                 head = ["Benign variant", "Pairs", "Parents empty or cut off", "Variants empty or cut off"]
-                out += _table([*head, "Parent tokens", "Variant tokens"], control)
+                out += ["Benign control:", "", *_table([*head, "Parent tokens", "Variant tokens"], control)]
     return "\n".join(out).rstrip("\n") + "\n"

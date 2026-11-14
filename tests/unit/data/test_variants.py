@@ -546,6 +546,32 @@ def harmful_world():
     return parents, stress, links("harmful", "hi-Latn", 10) + links("harmful", "ru-Latn", 10)
 
 
+def test_refusals_and_harmless_answers_are_paired_as_the_harmful_ones_are():
+    parents, stress, tied = harmful_world()
+    # one Hindi variant is answered, and harmlessly
+    stress[9] = stress[9].model_copy(update={"refusal": "no"})
+
+    rows = variants.paired(parents, stress, tied, outcomes=("refusal", "harmless_answer"))
+
+    codes = ["hi-Latn", "ru-Latn", "all-Latn"]
+    assert [(row.metric, row.code) for row in rows] == [
+        (metric, code) for metric in ("refusal", "harmless_answer") for code in codes
+    ]
+    assert {row.set for row in rows} == {"harmful"}
+    refused, harmless = rows[0], rows[3]
+    # nine parents refuse; of the variants four are harmful, one is answered harmlessly and five refuse
+    assert (refused.n_pairs, refused.parent, refused.variant) == (10, pytest.approx(0.9), pytest.approx(0.5))
+    assert refused.delta == pytest.approx(-0.4) and refused.ci[1] < 0
+    assert (harmless.parent, harmless.variant, harmless.delta) == (0.0, pytest.approx(0.1), pytest.approx(0.1))
+    # the harmful answers are what is paired unless other outcomes are named
+    assert variants.paired(parents, stress, tied) == variants.paired(parents, stress, tied, outcomes=("harmful",))
+    assert [row.metric for row in variants.compare(parents, stress, tied, outcomes=variants.OUTCOMES).harmful] == [
+        metric for metric in ("harmful", "refusal", "harmless_answer") for _ in codes
+    ]
+    with pytest.raises(KeyError):
+        variants.paired(parents, stress, tied, outcomes=("chrf",))
+
+
 def test_pairs_give_the_harmful_rate_of_parents_and_variants_per_code_and_pooled():
     parents, stress, tied = harmful_world()
 

@@ -1834,7 +1834,7 @@ def test_table_variants_pairs_each_columns_variants_with_their_parents_writes_pr
         ("patch", "baseline"): (second, 4, 0),
     }
     assert sources["keep", "drifted"].checkpoint == fake_labels.CHECKPOINTS["drifted"]
-    rows = {(row.condition, row.column, row.code): row for row in found.rows}
+    rows = {(row.condition, row.column, row.code): row for row in found.rows if row.metric == "harmful"}
     assert sorted(rows) == [(*key, code) for key in sorted(sources) for code in ("all-Latn", "hi-Latn")]
     # a label of a variant the run's commit does not hold is not paired
     base = rows["keep", "baseline", "hi-Latn"]
@@ -1897,7 +1897,7 @@ def test_a_smoke_variants_table_keeps_to_its_own_tree_and_one_that_cannot_be_upl
     assert built.exit_code == 0, built.output
     local = world.root / LOCAL / "results" / "smoke" / "tables"
     found = VariantTables.model_validate_json((local / "variants.json").read_bytes())
-    assert [(row.code, row.rewrite, row.n_pairs) for row in found.rows] == [
+    assert [(row.code, row.rewrite, row.n_pairs) for row in found.rows if row.metric == "harmful"] == [
         ("es-mixed", "codemixed", 4),
         ("all-mixed", "codemixed", 4),
     ]
@@ -1963,7 +1963,7 @@ def test_the_variants_of_the_other_fine_tune_are_tabled_in_a_file_of_their_own(w
 
     def tuned(tables):
         (source,) = [source for source in tables.sources if source.column == "drifted"]
-        (row,) = [row for row in tables.rows if (row.column, row.code) == ("drifted", "hi-Latn")]
+        (row,) = [row for row in tables.rows if (row.column, row.code, row.metric) == ("drifted", "hi-Latn", "harmful")]
         return source.checkpoint, row.variant
 
     assert tuned(usual) == (fake_labels.CHECKPOINTS["drifted"], 0.25) and tuned(other) == (trained, 1.0)

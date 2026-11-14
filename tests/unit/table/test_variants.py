@@ -65,7 +65,8 @@ def test_each_column_compares_its_variants_with_their_parents_and_counts_the_rew
         ("patch", "baseline", 10, 0),
     ]
     assert found.sources[1].checkpoint == CHECKPOINTS["drifted"] and found.sources[1].variants_revision == REVISION
-    rows = {(row.condition, row.column, row.code): row for row in found.rows}
+    harmful = [row for row in found.rows if row.metric == "harmful"]
+    rows = {(row.condition, row.column, row.code): row for row in harmful}
     assert list(rows) == [
         ("keep", "baseline", "hi-Latn"),
         ("keep", "baseline", "all-Latn"),
@@ -99,6 +100,33 @@ def test_each_column_compares_its_variants_with_their_parents_and_counts_the_rew
     assert "10 variant labels, 1 left out." in shown
     assert "| harmful | hi-Latn | 20.0% | 50.0% | +30.0 points (95% CI " in shown
     assert "| harmful | hi-Latn | 11.1% | 11.1% | +0.0 points (95% CI +0.0 to +0.0; p = 1.000; 9 pairs) |" in shown
+
+
+def test_refusals_and_harmless_answers_are_paired_beside_the_harmful_ones(settings):
+    # of ten parents two are answered harmfully and eight refused; of their variants five are answered harmfully,
+    # three harmlessly and two refused
+    answered = {index: {"refusal": "no"} for index in (5, 6, 7)}
+    found = variants.build({"keep": {"baseline": side("baseline", "hi-Latn", 2, 5, answered)}}, settings)
+
+    by_metric = {(row.metric, row.code): row for row in found.rows}
+    assert list(by_metric) == [
+        (metric, code) for metric in ("harmful", "refusal", "harmless_answer") for code in ("hi-Latn", "all-Latn")
+    ]
+    refused = by_metric["refusal", "hi-Latn"]
+    assert (refused.set, refused.n_pairs, refused.language, refused.rewrite) == ("harmful", 10, "hi", "romanized")
+    assert (refused.parent, refused.variant, refused.delta) == pytest.approx((0.8, 0.2, -0.6))
+    assert refused.ci[1] < 0 and refused.p_value < 0.05
+    harmless = by_metric["harmless_answer", "all-Latn"]
+    assert (harmless.parent, harmless.variant, harmless.delta) == pytest.approx((0.0, 0.3, 0.3))
+    assert (harmless.language, harmless.n_pairs) == (None, 10)
+    assert by_metric["harmful", "hi-Latn"].delta == pytest.approx(0.3)
+    assert variants.VariantTables.model_validate_json(found.model_dump_json(by_alias=True)) == found
+
+    shown = variants.render(found)
+    tables = [line for line in shown.splitlines() if "| hi-Latn |" in line]
+    assert [line.split(" | ")[-3:-1] for line in tables] == [["20.0%", "50.0%"], ["80.0%", "20.0%"], ["0.0%", "30.0%"]]
+    assert shown.index("Harmful answers:") < shown.index("Refusals:") < shown.index("Answers that neither refuse")
+    assert "| hi-Latn | 80.0% | 20.0% | -60.0 points (95% CI " in shown
 
 
 def test_labels_that_cannot_be_compared_are_refused(settings):
@@ -152,7 +180,7 @@ def test_the_benign_answers_of_a_column_are_the_control_beside_its_harmful_pairs
 
     found = variants.build({"keep": {"baseline": held}}, settings)
 
-    assert [row.code for row in found.rows] == ["hi-mixed", "all-mixed"]
+    assert [row.code for row in found.rows if row.metric == "harmful"] == ["hi-mixed", "all-mixed"]
     hindi, pooled = found.answers
     assert (hindi.condition, hindi.column, hindi.code, hindi.language, hindi.rewrite) == (
         "keep",
