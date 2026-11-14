@@ -12,6 +12,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
+import huggingface_hub
 import pytest
 import typer
 from huggingface_hub import HfApi, set_client_factory
@@ -59,8 +60,8 @@ from driftmap.jobs.ledger import Ledger
 from driftmap.jobs.plan import build_plan, pins
 from driftmap.jobs.readiness import ITEMS, READY_PATH, Check, Item, ReadyReport
 from driftmap.jobs.snapshot import DECISION_PATH, LOCAL, SMOKE_DIR, TABLES_PATH, Deps
-from driftmap.judge import closed, reparse, rubric
-from driftmap.judge.incremental import judged_rows
+from driftmap.judge import closed, reparse, rubric, validate
+from driftmap.judge.incremental import dump_rows, judged_rows
 from driftmap.repair import screen_gen, select
 from driftmap.table import build as table_build
 from driftmap.table import render
@@ -293,8 +294,10 @@ def test_help_lists_every_verb():
         "data": ["build"],
         "ledger": ["reconcile"],
         "table": ["breakdown", "build"],
-        "judge": ["closed", "reparse"],
+        "judge": ["closed", "reparse", "validate"],
     }
+    checks = typer.main.get_command(cli.app).commands["judge"].commands["validate"].commands
+    assert sorted(checks) == ["retest", "run", "sample", "score"]
     assert sorted(typer.main.get_command(cli.app).commands["decide"].commands) == ["drift"]
     assert sorted(typer.main.get_command(cli.app).commands["repair"].commands) == ["choose"]
     assert sorted(typer.main.get_command(cli.app).commands["publish"].commands) == ["check", "plan", "run"]
@@ -1453,6 +1456,38 @@ def test_table_breakdown_reads_every_condition_writes_prints_and_uploads_without
     ]
 
 
+def test_table_breakdown_covers_the_safety_patch_and_reads_nothing_of_the_script_variants(world):
+    evaluation(world, {"baseline": 2, "drifted": 1})
+    evaluation(world, {"baseline": 1, "drifted": 0}, preamble="patch")
+    tagged(world)
+    # later runs over the variants read another revision of the fine-tuned checkpoint and left labels of their own
+    other = fake_labels.CHECKPOINTS["drifted"].replace("a" * 40, "9" * 40)
+    generated(world, "drifted", other, run_id="generate-full-drifted-variants", notes=["sets: variants"])
+    both = ["preamble: patch", "sets: variants"]
+    generated(world, "drifted", other, run_id="generate-full-drifted-patch-variants", notes=both)
+    rows = [fake_labels.label("drifted", "hi-Latn", index, checkpoint=other, harm="yes") for index in range(4)]
+    data = "".join(row.model_dump_json(by_alias=True) + "\n" for row in rows).encode()
+    for preamble in ("keep", "patch"):
+        path = ids.labels_path(ids.slug(other), "hi-Latn", "full", preamble=preamble, variants=True)
+        world.hub.upload_file(path_or_fileobj=data, path_in_repo=path, repo_id=EVAL, repo_type="dataset")
+
+    built = run("table", "breakdown")
+
+    assert built.exit_code == 0, built.output
+    found = Breakdown.model_validate_json((world.root / TABLES_DIR / "breakdown.json").read_bytes())
+    assert found.conditions == {"keep": "served template", "patch": "safety patch"}
+    rates = {name: breakdown_rate(found, *name) for name in itertools.product(("keep", "patch"), found.columns)}
+    assert rates == {
+        ("keep", "baseline"): (12, 24),
+        ("keep", "drifted"): (6, 24),
+        ("patch", "baseline"): (6, 24),
+        ("patch", "drifted"): (0, 24),
+    }
+    shown = render_breakdown(found)
+    assert shown in built.output and "## Safety patch" in shown and "## No safety preamble" not in shown
+    assert "left unread" not in built.output and "hi-Latn" not in built.output
+
+
 def test_table_breakdown_refuses_prompts_without_tags_and_missing_labels(world):
     evaluation(world, {})
     tagged(world)
@@ -1536,6 +1571,11 @@ def test_figures_are_drawn_from_the_stored_tables_and_breakdown_without_the_hub(
     one, both = ([(where / name).read_bytes() for name in FIGURES] for where in folders)
     # the figure of the tables changes, the one of the breakdown is the same file again
     assert one[0] != both[0] and one[2] == both[2]
+    # and so do the tables of the runs under the safety patch
+    dump(tables, folder / "tables-patched.json")
+    third = run("figures", "--out", "third")
+    assert third.exit_code == 0, third.output
+    assert (world.root / "third" / FIGURES[0]).read_bytes() not in (one[0], both[0])
 
     (folder / "breakdown.json").write_text("{")
     torn = run("figures")
@@ -2481,3 +2521,136 @@ def test_a_job_without_the_preamble_passes_through_under_the_kinds_smoke_record(
     refused = run("launch", "drift", "--dry-run", "--", "--preamble", "patch")
     assert refused.exit_code == 2 and "the drift job would stop on its arguments" in flat(refused)
     assert "invalid choice: 'patch'" in flat(refused) and len(world.submits()) == 1
+
+
+JUDGED_HARMFUL = '{"request_harm": "yes", "refusal": "no", "response_harm": "yes"}'
+
+
+class FixedJudge:
+    """A completer that gives every pair the same answer and counts the pairs it is asked about."""
+
+    prompt_tokens, completion_tokens = 120, 12
+
+    def __init__(self):
+        self.calls = []
+
+    def complete(self, messages):
+        self.calls.append(messages)
+        return JUDGED_HARMFUL
+
+
+def gold_rows(count):
+    return [
+        validate.GoldRow(
+            id=f"jbb/{index}",
+            source="jbb",
+            language="en",
+            prompt=f"placeholder request {index}",
+            response=f"placeholder response {index}",
+            gold={"response_harm": "yes" if index % 2 else "no"},
+            meta={"human_votes": str(index % 4)},
+        )
+        for index in range(count)
+    ]
+
+
+def test_judge_validate_sample_writes_the_rows_and_their_manifest_from_the_pinned_files(world, monkeypatch):
+    rows = gold_rows(6)
+    composition = {"jbb": {"rows": 6, "response_harm": {"yes": 3, "no": 3}}}
+    manifest = {"composition": composition, "polyguard_items_left_out": 2}
+    fetches, downloads = [], []
+    monkeypatch.setattr(validate, "build_sample", lambda fetch: fetches.append(fetch) or (rows, manifest))
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", lambda *args, **kwargs: downloads.append((args, kwargs)))
+    (world.root / READY_PATH).unlink()
+
+    done = run("judge", "validate", "sample", "--out", "validation/sample.jsonl")
+
+    assert done.exit_code == 0, done.output
+    assert done.output.splitlines()[0].split() == ["verb", "judge", "validate", "sample"]
+    out = world.root / "validation" / "sample.jsonl"
+    assert out.read_bytes() == dump_rows(rows)
+    assert json.loads(out.with_suffix(".manifest.json").read_text()) == manifest
+    assert "jbb" in done.output and "response_harm {'yes': 3, 'no': 3}" in done.output
+    assert "6 rows in validation/sample.jsonl; left out of the multilingual draw: 2" in done.output
+    # a file is read at its pinned commit and kept under the local cache
+    fetches[0]("owner/set", "c" * 40, "data/test.csv")
+    kept = {"repo_type": "dataset", "revision": "c" * 40, "cache_dir": Path(".run-local/judgeval/cache")}
+    assert downloads == [(("owner/set", "data/test.csv"), kept)]
+    assert run("judge", "validate", "sample").exit_code == 2
+
+
+def test_judge_validate_asks_each_pair_once_scores_it_and_asks_again_about_stored_labels(world, monkeypatch):
+    judge = FixedJudge()
+    monkeypatch.setattr(closed, "LiteLLMCompleter", lambda route: judge)
+    monkeypatch.setenv(closed.ROUTE_ENV, ROUTE)
+    (world.root / READY_PATH).unlink()
+    (world.root / "sample.jsonl").write_bytes(dump_rows(gold_rows(8)))
+    files = ["--rows", "sample.jsonl", "--answers", "answers.jsonl"]
+
+    rehearsal = run("judge", "validate", "run", *files, "--limit", "4")
+
+    assert rehearsal.exit_code == 0, rehearsal.output
+    assert rehearsal.output.splitlines()[0].split() == ["verb", "judge", "validate", "run"]
+    assert len(judge.calls) == 4 and "tokens    120 in, 12 out" in rehearsal.output
+    assert ROUTE not in rehearsal.output and "gateway" not in rehearsal.output
+    full = run("judge", "validate", "run", *files, "--concurrency", "2")
+    assert full.exit_code == 0 and "8 pairs: 4 answered before, 4 to ask" in full.output and len(judge.calls) == 8
+
+    scored = run("judge", "validate", "score", *files, "--out", "report")
+    assert scored.exit_code == 0, scored.output
+    assert "| jbb | en | response_harm | 8 | 50.0% |" in scored.output
+    report = json.loads((world.root / "report.json").read_text())
+    assert (report["rubric_sha256"], report["where"]) == (rubric.prompt_sha256(), {})
+    assert [(cell["label"], cell["n"]) for cell in report["cells"]] == [("response_harm", 8)]
+    assert (world.root / "report.md").read_text() in scored.output
+    some = run("judge", "validate", "score", *files, "--where", "human_votes=1")
+    assert some.exit_code == 0 and "| jbb | en | response_harm | 2 | 100.0% |" in some.output
+    assert len(judge.calls) == 8
+
+    stored = [
+        {
+            "checkpoint_slug": "tiny-aya-global--111111111111",
+            "condition": "keep",
+            "language": "en",
+            "prompt_id": f"harmful-en-{index:03d}",
+            "prompt": f"placeholder request {index}",
+            "response": None if index == 3 else f"placeholder response {index}",
+            "stored_request_harm": "yes",
+            "stored_refusal": "no",
+            "stored_response_harm": "yes" if index else "no",
+        }
+        for index in range(4)
+    ]
+    (world.root / "stored.jsonl").write_bytes(jsonl(stored))
+    asked = ["--stored", "stored.jsonl", "--answers", "again.jsonl"]
+    again = run("judge", "validate", "retest", *asked, "--out", "retest")
+    assert again.exit_code == 0, again.output
+    assert len(judge.calls) == 11 and "tokens    120 in, 12 out" in again.output
+    assert "| retest | en | refusal | 3 | 100.0% |" in again.output
+    assert "| retest | en | response_harm | 3 | 66.7% |" in again.output
+    assert json.loads((world.root / "retest.json").read_text())["cells"][0]["source"] == "retest"
+
+
+def test_judge_validate_refuses_what_it_cannot_read_before_it_asks_anything(world, monkeypatch):
+    judge = FixedJudge()
+    monkeypatch.setattr(closed, "LiteLLMCompleter", lambda route: judge)
+    monkeypatch.setenv(closed.ROUTE_ENV, ROUTE)
+    (world.root / "sample.jsonl").write_bytes(dump_rows(gold_rows(2)))
+    files = ["--rows", "sample.jsonl", "--answers", "answers.jsonl"]
+    absent = run("judge", "validate", "run", "--rows", "none.jsonl", "--answers", "answers.jsonl")
+    assert absent.exit_code == 2 and "none.jsonl holds no rows" in absent.stderr
+    for bad in (
+        ["run", *files, "--concurrency", "0"],
+        ["run", *files, "--concurrency", "17"],
+        ["run", *files, "--limit", "0"],
+        ["run", "--rows", "sample.jsonl"],
+        ["score", *files, "--where", "human_votes"],
+        ["score", "--rows", "sample.jsonl"],
+        ["retest", "--answers", "retest.jsonl"],
+    ):
+        assert run("judge", "validate", *bad).exit_code == 2, bad
+    assert judge.calls == [] and not (world.root / "answers.jsonl").exists()
+
+    monkeypatch.delenv(closed.ROUTE_ENV)
+    unset = run("judge", "validate", "run", *files)
+    assert unset.exit_code == 2 and closed.ROUTE_ENV in flat(unset)

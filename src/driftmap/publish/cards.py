@@ -218,7 +218,10 @@ TREE = ids.tree("full", "strip")
 # the condition each adapter was trained under
 TRAINED = dict(zip(ADAPTERS, ids.PREAMBLES, strict=True))
 # the trees of the other prompt conditions; each holds the folders of the main tree
-OTHER_TREES = {TREE: "with no safety preamble", "patched/": "with the safety patch as the system message"}
+OTHER_TREES = {
+    TREE: "with no safety preamble",
+    ids.tree("full", "patch"): "with the safety patch as the system message",
+}
 SMOKE_TREE = ids.tree("smoke")
 
 
@@ -255,7 +258,7 @@ LAYOUT = {
             True,
         ),
         (
-            "variants/",
+            ids.tree("full", variants=True),
             False,
             "script stress sets: evaluation prompts written again in Latin script or mixed with English, each "
             "linked to its parent prompt",

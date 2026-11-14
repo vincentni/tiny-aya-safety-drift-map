@@ -19,7 +19,7 @@ SCHEMA_BREAKDOWN = "driftmap.breakdown/1"
 # label sets whose prompt files tag every row with its harm categories and origin
 SETS = ("harmful",)
 # how a prompt condition and a column are named to a reader; one not listed goes by its key
-CONDITION_NAMES = {"keep": "served template", "strip": "no safety preamble"}
+CONDITION_NAMES = {"keep": "served template", "strip": "no safety preamble", "patch": "safety patch"}
 COLUMN_NAMES = {"drifted": "fine-tuned"}
 # a category-by-language cell under this many scored rows carries its counts and no rate
 MIN_CELL_N = 10

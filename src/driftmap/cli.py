@@ -11,7 +11,7 @@ import logging
 import shlex
 import tempfile
 import traceback
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
 from typing import Annotated, Any, Literal, NoReturn
@@ -57,6 +57,8 @@ DATA_DIR = LOCAL / "data"
 CONDITION_SAID = {"strip": ", no safety preamble", "patch": ", safety patch"}
 # beside the tables; it covers every prompt condition
 BREAKDOWN = "breakdown.json"
+# where `judge validate sample` keeps the files of the public sets
+VALIDATION_CACHE = LOCAL / "judgeval" / "cache"
 FIGURES_DIR = Path("docs") / "figures"
 # label set and its folder under prompts/ in the evaluation dataset
 PROMPT_SETS = (("harmful", "harmful"), ("benign", "benign_heldout"), ("xstest", "xstest"))
@@ -84,12 +86,14 @@ data_app = typer.Typer(no_args_is_help=True, help="Evaluation and training rows.
 ledger_app = typer.Typer(no_args_is_help=True, help="The cost ledger.")
 table_app = typer.Typer(no_args_is_help=True, help="The result tables.")
 judge_app = typer.Typer(no_args_is_help=True, help="Labels: the closed-model judge and a reparse of stored outputs.")
+validate_app = typer.Typer(no_args_is_help=True, help="The judge against human labels of public sets, and itself.")
 decide_app = typer.Typer(no_args_is_help=True, help="Calls only the author can make.")
 repair_app = typer.Typer(no_args_is_help=True, help="The choice between the screen run and the apply run.")
 app.add_typer(data_app, name="data")
 app.add_typer(ledger_app, name="ledger")
 app.add_typer(table_app, name="table")
 app.add_typer(judge_app, name="judge")
+judge_app.add_typer(validate_app, name="validate")
 app.add_typer(decide_app, name="decide")
 app.add_typer(repair_app, name="repair")
 
@@ -809,11 +813,11 @@ def table_breakdown(
     head = _head(deps.hub, evaluation)
     folders = dict(PROMPT_SETS)
     wanted = [f"prompts/{folders.get(name, name)}/*.jsonl" for name in breakdown.SETS]
-    for preamble in ids.PREAMBLES:
+    for preamble in ids.CONDITIONS:
         wanted += _label_patterns(records, settings, mode, table, preamble, head)
     with tempfile.TemporaryDirectory(prefix="driftmap-breakdown-") as scratch:
         data = _snapshot(deps.hub, evaluation, scratch, wanted, head)
-        labels = {preamble: data / ids.tree(mode, preamble) / "labels" for preamble in ids.PREAMBLES}
+        labels = {preamble: data / ids.tree(mode, preamble) / "labels" for preamble in ids.CONDITIONS}
         known = [*records, *([screen] if screen else [])]
         built = breakdown.build(labels, _tagged(data, breakdown), known, settings, mode=mode)
     root = deps.repo_root
@@ -841,7 +845,7 @@ def figures(
         raise DriftmapError(ExitCode.USAGE, f"{missing}; install the extra: uv sync --extra figures") from None
     from driftmap.table.breakdown import Breakdown
 
-    tables = {preamble: _record(Tables, folder / _tables_name(preamble)) for preamble in ids.PREAMBLES}
+    tables = {preamble: _record(Tables, folder / _tables_name(preamble)) for preamble in ids.CONDITIONS}
     tables = {preamble: record for preamble, record in tables.items() if record}
     breakdown = _record(Breakdown, folder / BREAKDOWN)
     if not tables or breakdown is None:
@@ -957,6 +961,154 @@ def judge_closed(
             )
     finally:
         typer.echo(f"{'tokens':<10}{client.prompt_tokens} in, {client.completion_tokens} out")
+
+
+def _gold_rows(path: Path) -> list[Any]:
+    """The validation rows of a file; exit 2 when it holds none."""
+    from driftmap.judge import validate
+    from driftmap.judge.incremental import read_rows
+
+    rows = read_rows(path, validate.GoldRow)
+    if not rows:
+        raise DriftmapError(ExitCode.USAGE, f"{path} holds no rows")
+    return rows
+
+
+def _spread(rows: list[Any], limit: int | None) -> list[Any]:
+    """``limit`` rows spread evenly over the file; every row without one."""
+    return rows if not limit else rows[:: max(1, len(rows) // limit)][:limit]
+
+
+def _ask_judge(rows: list[Any], answers: Path, concurrency: int, retry_unscored: bool) -> dict[str, str]:
+    """The judge's answer per row id, asked where the answer file holds none; prints the tokens the run took."""
+    from driftmap.judge import closed, validate
+
+    client = closed.from_env()
+    try:
+        return validate.validate(
+            rows, client, concurrency, store=answers, retry_unscored=retry_unscored, echo=typer.echo
+        )
+    finally:
+        typer.echo(f"{'tokens':<10}{client.prompt_tokens} in, {client.completion_tokens} out")
+
+
+def _kept(where: list[str] | None) -> dict[str, str]:
+    """The ``--where`` pairs as a mapping; exit 2 for one that is not KEY=VALUE."""
+    pairs = [pair.partition("=") for pair in where or []]
+    if any(not (key and found) for key, found, _ in pairs):
+        raise typer.BadParameter("--where is KEY=VALUE, a value of a row's meta")
+    return {key: value for key, _, value in pairs}
+
+
+def _agreement(rows: list[Any], answers: Mapping[str, str], kept: dict[str, str], out: Path | None) -> None:
+    """Print the judge's agreement with the references of the rows ``kept`` names; ``out`` also gets it as files."""
+    from driftmap.judge import rubric, validate
+
+    found = validate.score(validate.select(rows, kept), answers)
+    text = validate.render(found)
+    typer.echo(text, nl=False)
+    if out is None:
+        return
+    report = {
+        "rubric_sha256": rubric.prompt_sha256(),
+        "where": kept,
+        "n_resamples": validate.N_RESAMPLES,
+        "seed": validate.BOOTSTRAP_SEED,
+        "cells": [cell._asdict() for cell in found],
+    }
+    files = out.with_suffix(".json"), out.with_suffix(".md")
+    files[0].write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    files[1].write_text(text, encoding="utf-8")
+    typer.echo(f"written: {files[0]} and {files[1]}")
+
+
+ANSWERS_HELP = "The answer file; it grows, and a run that stopped continues from it."
+SPREAD_HELP = "Only N rows, spread evenly over the file."
+RETRY_HELP = "Ask again about the rows whose stored answer gave no labels."
+WHERE_HELP = "Keep the rows whose meta holds this value; may be given more than once."
+REPORT_HELP = "Write the report as <out>.json and <out>.md."
+
+
+@validate_app.command("sample")
+@_finish
+def validate_sample(
+    out: Annotated[Path, typer.Option(help="The rows file to write; a .manifest.json goes beside it.")],
+    cache: Annotated[Path, typer.Option(help="Where the files of the public sets are kept.")] = VALIDATION_CACHE,
+) -> None:
+    """Draw the validation rows from the pinned public sets, downloading their files on a first run."""
+    _inputs("judge validate sample", out=out, cache=cache)
+    from huggingface_hub import hf_hub_download
+
+    from driftmap.judge import validate
+    from driftmap.judge.incremental import dump_rows
+
+    def fetch(repo: str, revision: str, file: str) -> str:
+        return hf_hub_download(repo, file, repo_type="dataset", revision=revision, cache_dir=cache)
+
+    rows, manifest = validate.build_sample(fetch)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_bytes(dump_rows(rows))
+    out.with_suffix(".manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    for name, counts in manifest["composition"].items():
+        labels = "  ".join(f"{field} {found}" for field, found in counts.items() if field != "rows")
+        typer.echo(f"{name:<14}{counts['rows']:>5}  {labels}")
+    typer.echo(f"{len(rows)} rows in {out}; left out of the multilingual draw: {manifest['polyguard_items_left_out']}")
+
+
+@validate_app.command("run")
+@_finish
+def validate_run(
+    rows: Annotated[Path, typer.Option(help="The rows file `sample` wrote.")],
+    answers: Annotated[Path, typer.Option(help=ANSWERS_HELP)],
+    concurrency: Annotated[int, typer.Option(min=1, max=16, help="Pairs in flight at once.")] = 4,
+    limit: Annotated[int | None, typer.Option(min=1, help=SPREAD_HELP)] = None,
+    retry_unscored: Annotated[bool, typer.Option("--retry-unscored", help=RETRY_HELP)] = False,
+) -> None:
+    """Ask the judge about the validation rows and store its answers; no scoring. Run it again to resume."""
+    _inputs("judge validate run", rows=rows, answers=answers, concurrency=concurrency, limit=limit)
+    _ask_judge(_spread(_gold_rows(rows), limit), answers, concurrency, retry_unscored)
+
+
+@validate_app.command("score")
+@_finish
+def validate_score(
+    rows: Annotated[Path, typer.Option(help="The rows file `sample` wrote.")],
+    answers: Annotated[Path, typer.Option(help="The answer file `run` wrote; it may be partial.")],
+    where: Annotated[list[str] | None, typer.Option(metavar="KEY=VALUE", help=WHERE_HELP)] = None,
+    out: Annotated[Path | None, typer.Option(help=REPORT_HELP)] = None,
+) -> None:
+    """Agreement of the stored answers with the reference labels, per source, language and label; asks nothing."""
+    kept = _kept(where)
+    _inputs("judge validate score", rows=rows, answers=answers, where=where, out=out)
+    from driftmap.judge import validate
+
+    found = _gold_rows(rows)
+    _agreement(found, validate.read_answers(answers, found), kept, out)
+
+
+@validate_app.command("retest")
+@_finish
+def validate_retest(
+    stored: Annotated[Path, typer.Option(help="JSON lines with prompt, response and stored_<label> columns.")],
+    answers: Annotated[Path, typer.Option(help=ANSWERS_HELP)],
+    concurrency: Annotated[int, typer.Option(min=1, max=16, help="Pairs in flight at once.")] = 4,
+    limit: Annotated[int | None, typer.Option(min=1, help=SPREAD_HELP)] = None,
+    retry_unscored: Annotated[bool, typer.Option("--retry-unscored", help=RETRY_HELP)] = False,
+    where: Annotated[list[str] | None, typer.Option(metavar="KEY=VALUE", help=WHERE_HELP)] = None,
+    out: Annotated[Path | None, typer.Option(help=REPORT_HELP)] = None,
+) -> None:
+    """Ask the judge again about pairs it has labelled and score the new answers against the stored labels."""
+    kept = _kept(where)
+    _inputs("judge validate retest", stored=stored, answers=answers, concurrency=concurrency, limit=limit, out=out)
+    from driftmap.judge import validate
+
+    if not stored.is_file():
+        raise DriftmapError(ExitCode.USAGE, f"{stored} is not a file")
+    try:
+        rows = _spread(validate.retest_rows(_jsonl(stored, dict)), limit)
+    except KeyError as error:
+        raise DriftmapError(ExitCode.INTEGRITY, f"{stored} holds a row without {error}") from None
+    _agreement(rows, _ask_judge(rows, answers, concurrency, retry_unscored), kept, out)
 
 
 def _alpha_line(row: AlphaRow) -> str:
