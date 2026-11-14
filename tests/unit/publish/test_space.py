@@ -107,7 +107,8 @@ def test_the_space_gets_its_page_files_in_one_commit_and_is_read_back_logged_out
 
     assert fake.repo_types[REPO] == "space" and REPO not in fake.private | fake.gated
     assert sorted(fake.repos[REPO]["main"]) == UPLOADED
-    assert set(FILES) == {"README.md", "index.html", "app.js", "data.json", "figures/*"}
+    page = {"README.md", "index.html", "app.js", "data.json", "figures/*"}
+    assert set(FILES) == page | {"explorer.js", "explorer.json"}
     created = next(kwargs for method, kwargs in fake.calls if method == "create_repo")
     assert (created["repo_type"], created["space_sdk"], created["private"]) == ("space", "static", True)
     assert [method for method, _ in writes(fake)] == ["create_repo", "upload_folder", "update_repo_settings"]
@@ -205,6 +206,92 @@ def test_a_space_that_is_not_ready_is_refused_before_any_write(settings, fake, r
             run(settings, fake, root, dry_run=dry_run)
         assert refused.value.exit_code == ExitCode.INTEGRITY and str(refused.value) == refusal
     assert writes(fake) == []
+
+
+def with_explorer(root, **changed):
+    """Add the replay explorer to the fixture: the tag that loads its script, the script, and its data file."""
+    space = root / "space"
+    tags = "<script src='app.js'></script><script src=\"explorer.js\"></script>"
+    (space / "index.html").write_text(f"<html>{tags}</html>\n", encoding="utf-8")
+    (space / "explorer.js").write_text("fetch('explorer.json')\n", encoding="utf-8")
+    answer = f"call {'1234' * 3} or write to someone@example.org"
+    replay = {"schema": "driftmap.space.explorer/1", "harmful_text": False, "prompts": [{"id": "a", "text": answer}]}
+    (space / "explorer.json").write_text(json.dumps(replay | changed) + "\n", encoding="utf-8")
+    os.utime(space / "explorer.json", (2_500, 2_500))
+    return space
+
+
+def test_the_replay_explorer_goes_up_with_the_page_and_leaves_with_its_data_file(settings, fake, root):
+    """Its data quotes prompts and answers, so digits and addresses in it are no finding."""
+    space, said = with_explorer(root), []
+
+    run(settings, fake, root, said)
+
+    held = fake.repos[REPO]["main"]
+    assert sorted(held) == sorted([*UPLOADED, "explorer.js", "explorer.json"])
+    assert held["explorer.json"] == (space / "explorer.json").read_bytes()
+    assert "upload: explorer.js" in said and "upload: explorer.json" in said
+
+    (space / "explorer.json").unlink()
+    run(settings, fake, root)
+
+    assert sorted(fake.repos[REPO]["main"]) == sorted([*UPLOADED, "explorer.js"])
+
+
+@pytest.mark.parametrize(
+    ("change", "code", "refusal"),
+    [
+        ("no script", ExitCode.INTEGRITY, "space/index.html loads explorer.js, which is not among the page files"),
+        ("other script", ExitCode.INTEGRITY, "space/index.html loads extra.js, which is not among the page files"),
+        (
+            "harmful text",
+            ExitCode.INTEGRITY,
+            "space/explorer.json holds the text of harmful answers; build it without --include-harmful",
+        ),
+        (
+            "stale",
+            ExitCode.INTEGRITY,
+            "space/explorer.json is older than space/data.json; build both in one run of `python space/build_data.py`, "
+            "or delete it",
+        ),
+        (
+            "not json",
+            ExitCode.INTEGRITY,
+            "space/explorer.json is not a JSON object; run `python space/build_data.py` first",
+        ),
+        ("token", ExitCode.REDACTION, "space/explorer.json:1: hf_token"),
+        ("home path", ExitCode.REDACTION, "space/explorer.json:1: home_path"),
+    ],
+)
+def test_an_explorer_that_is_not_fit_to_show_is_refused_before_any_write(settings, fake, root, change, code, refusal):
+    space = with_explorer(root, harmful_text=True) if change == "harmful text" else with_explorer(root)
+    if change == "no script":
+        (space / "explorer.js").unlink()
+    elif change == "other script":
+        (space / "extra.js").write_text("// not a page file\n", encoding="utf-8")
+        (space / "index.html").write_text("<html><script src='extra.js'></script></html>\n", encoding="utf-8")
+    elif change == "stale":
+        os.utime(space / "explorer.json", (1_500, 1_500))
+    elif change == "not json":
+        (space / "explorer.json").write_text("[]\n", encoding="utf-8")
+    elif change in ("token", "home path"):
+        text = TOKEN if change == "token" else f"/{'home'}/someone/notes"
+        (space / "explorer.json").write_text(json.dumps({"harmful_text": False, "prompts": [text]}), encoding="utf-8")
+
+    for dry_run in (True, False):
+        with pytest.raises(DriftmapError) as refused:
+            run(settings, fake, root, dry_run=dry_run)
+        assert refused.value.exit_code == code and str(refused.value) == refusal
+    assert writes(fake) == []
+
+
+def test_a_script_from_another_site_is_not_a_page_file(settings, fake, root):
+    page = "<html><script src='https://cdn.example.org/lib.js'></script><script src='app.js'></script></html>\n"
+    (root / "space" / "index.html").write_text(page, encoding="utf-8")
+
+    run(settings, fake, root)
+
+    assert sorted(fake.repos[REPO]["main"]) == UPLOADED
 
 
 def test_a_finding_in_a_page_file_stops_the_upload(settings, fake, root):

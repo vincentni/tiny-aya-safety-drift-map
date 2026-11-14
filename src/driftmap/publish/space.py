@@ -1,6 +1,7 @@
 """Publish the results Space: a static page of counts and figures, built from the public tables and labels."""
 
 import json
+import re
 import time
 import urllib.error
 import urllib.request
@@ -23,9 +24,13 @@ from driftmap.publish import push
 SPACE = "tiny-aya-safety-map"
 FOLDER = "space"
 DATA, FIGURES, CARD, PAGE = "data.json", "figures", "README.md", "index.html"
+# what the replay explorer reads: prompt text and stored answers, written by the build when the responses are at hand
+EXPLORER = "explorer.json"
 # what the page is made of; the script that builds its data stays in the code repo
-FILES = (CARD, PAGE, "app.js", DATA, f"{FIGURES}/*")
+FILES = (CARD, PAGE, "app.js", "explorer.js", DATA, EXPLORER, f"{FIGURES}/*")
 BUILD = "run `python space/build_data.py` first"
+# a script the page loads from its own folder
+SCRIPT = re.compile(r"""<script\b[^>]*\bsrc\s*=\s*["']([^"'?#]+)""", re.IGNORECASE)
 # a new static Space can take a moment to answer
 TRIES = 3
 WAIT_S = 20
@@ -85,7 +90,30 @@ def _built(root: Path, settings: Settings) -> list[str]:
     if link not in (readme.read_text(encoding="utf-8") if readme.is_file() else ""):
         raise _refuse(f"{CARD} does not link to {link}; the Space and the link must name one repo")
     paths = [path.relative_to(space).as_posix() for path in space.rglob("*") if path.is_file()]
-    return sorted(filter_repo_objects(paths, allow_patterns=list(FILES)))
+    files = sorted(filter_repo_objects(paths, allow_patterns=list(FILES)))
+    loaded = [src.removeprefix("./") for src in SCRIPT.findall((space / PAGE).read_text(encoding="utf-8"))]
+    # a script from another site is not the Space's to hold
+    lost = [src for src in loaded if "//" not in src and src not in files]
+    if lost:
+        raise _refuse(f"{FOLDER}/{PAGE} loads {lost[0]}, which is not among the page files")
+    if EXPLORER in files:
+        _replayable(space, built)
+    return files
+
+
+def _replayable(space: Path, built: float) -> None:
+    """Refuse an explorer file that is not an object, is older than the data file or shows harmful answers."""
+    explorer = space / EXPLORER
+    try:
+        shown = json.loads(explorer.read_bytes()).get("harmful_text")
+    except (ValueError, AttributeError):
+        raise _refuse(f"{FOLDER}/{EXPLORER} is not a JSON object; {BUILD}") from None
+    # the build writes it after the data file; an older one replays other runs than the page counts
+    if explorer.stat().st_mtime < built:
+        both = "build both in one run of `python space/build_data.py`, or delete it"
+        raise _refuse(f"{FOLDER}/{EXPLORER} is older than {FOLDER}/{DATA}; {both}")
+    if shown is not False:
+        raise _refuse(f"{FOLDER}/{EXPLORER} holds the text of harmful answers; build it without --include-harmful")
 
 
 def _named(root: Path, settings: Settings) -> list[tuple[str, str]]:
@@ -97,7 +125,10 @@ def _named(root: Path, settings: Settings) -> list[tuple[str, str]]:
 
 
 def _scanned(root: Path, files: list[str]) -> None:
-    """Refuse a page file that holds a token, a key, an account id, a home path or an address."""
+    """Refuse a page file that holds a token, a key, an account id, a home path or an address.
+
+    The explorer file quotes prompts and answers like a file of rows: digits and addresses in it are no finding.
+    """
     space = root / FOLDER
     found = []
     for name in files:
@@ -107,6 +138,8 @@ def _scanned(root: Path, files: list[str]) -> None:
             continue
         hits = [(finding.line, finding.pattern) for finding in redact.scan([space / name])]
         hits += [(line, "email") for line in push._addressed(data.decode())]
+        if name == EXPLORER:
+            hits = [(line, rule) for line, rule in hits if rule not in ("account_id", "email")]
         found += [f"{FOLDER}/{name}:{line}: {rule}" for line, rule in sorted(hits)]
     if found:
         raise DriftmapError(ExitCode.REDACTION, "\n".join(found))
@@ -169,10 +202,12 @@ def publish_space(
     """Create or update the static results Space from ``<root>/space`` in one commit, open it, and read it back.
 
     Refuses, before any write, a folder whose data file is missing or older than a local table, whose figures
-    are missing, whose card is not a static Space's, a README that links elsewhere, a page file with a finding,
-    and a dataset or model of the owner that the Space names while it is not public. A dry run prints the files
-    and writes nothing. Raises DriftmapError (exit 7) when the Hub fails, (exit 1) when the page does not answer
-    a reader who is not logged in.
+    are missing, whose card is not a static Space's, whose page loads a script that is not among the page files,
+    whose explorer file is older than the data file or holds the text of harmful answers, a README that links
+    elsewhere, a page file with a finding, and a dataset or model of the owner that the Space names while it is
+    not public. The explorer file goes up when the build wrote one and leaves the Space when it is gone. A dry
+    run prints the files and writes nothing. Raises DriftmapError (exit 7) when the Hub fails, (exit 1) when the
+    page does not answer a reader who is not logged in.
     """
     root, repo = Path(root), space_id(settings)
     push._identity(settings, hub)
@@ -205,8 +240,8 @@ def publish_space(
             root / FOLDER,
             repo_type="space",
             allow_patterns=list(FILES),
-            # a figure the build no longer makes leaves the page
-            delete_patterns=[f"{FIGURES}/*"],
+            # a figure or an explorer file the build no longer makes leaves the page
+            delete_patterns=[f"{FIGURES}/*", EXPLORER],
             commit_message="update the results page",
         )
         hub.update_repo_settings(repo, private=False, repo_type="space")
