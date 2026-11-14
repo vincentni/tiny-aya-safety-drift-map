@@ -57,6 +57,21 @@ def test_the_language_figure_shows_harmful_answers_from_the_weakest_language_dow
     assert chart.title == "Harmful answers by language: 50% in Russian, 0% in Arabic (baseline, served template)"
 
 
+def test_a_quantized_file_of_the_fine_tuned_model_is_named_as_the_tables_name_it(tmp_path, settings):
+    gguf = f"vincentnkq/tiny-aya-global-drift-GGUF@{'c' * 40}#model-q4_k_m.gguf"
+    rows = column_rows("baseline", n=20, unsafe=2) + column_rows("drifted", n=20, unsafe=4)
+    rows += column_rows("repaired_q4", n=20, unsafe=5, checkpoint=gguf)
+    held = {"keep": build(write_labels(tmp_path / "q4", rows), targets(20), [], settings)}
+    names = ["baseline", "fine-tuned", "fine-tuned model, q4_k_m"]
+
+    assert [series.name for series in data.harmful_by_language(held, settings).panels[0].series] == names
+    assert [series.name for series in data.before_after(held, settings).panels[0].series] == names
+    # names passed in, as a breakdown's are, do not hide what the file was made from
+    passed = {"baseline": "baseline", "drifted": "aggressive fine-tune", "repaired_q4": "repaired_q4"}
+    shown = [series.name for series in data.harmful_by_language(held, settings, passed).panels[0].series]
+    assert shown == ["baseline", "aggressive fine-tune", "fine-tuned model, q4_k_m"]
+
+
 def test_the_language_title_names_the_two_ends_of_the_first_condition(tmp_path, both, settings):
     worse = tables(tmp_path, settings, "worse", {"en": 2}, {"en": 8, "ru": 10})
     chart = data.harmful_by_language({"strip": worse, "keep": both["keep"]}, settings)

@@ -20,7 +20,7 @@ from ..table.breakdown import (
     Transitions,
     flips,
 )
-from ..table.build import COLUMNS, column_of
+from ..table.build import COLUMNS, Q4_FINE_TUNED, column_of
 from ..table.rates import wilson
 
 LANGUAGE_NAMES = {"en": "English", "fr": "French", "es": "Spanish", "ru": "Russian", "hi": "Hindi", "ar": "Arabic"}
@@ -203,6 +203,12 @@ def _row(rows: list, name: str, column: str, settings: Settings) -> RateRow | Ch
     return next((row for row in rows if row.row == name and column_of(row.checkpoint, settings) == column), None)
 
 
+def _names(tables: Mapping[str, Tables], names: Mapping[str, str]) -> dict[str, str]:
+    """The name each column is shown under; a quantized file of the fine-tuned model goes by the tables' name for it."""
+    states = [(column, state) for table in tables.values() for column, state in table.columns.items()]
+    return {**names, **{column: state.kind for column, state in states if state.kind == Q4_FINE_TUNED}}
+
+
 def _rows(tables: Tables, metric: str) -> list:
     if metric == "chrf":
         return tables.chrf
@@ -218,6 +224,7 @@ def harmful_by_language(
     ``names`` gives the name each column is shown under.
     """
     codes = [*settings.languages, "all"]
+    names = _names(tables, names)
     found = []
     for condition, table in tables.items():
         series = []
@@ -248,6 +255,7 @@ def before_after(tables: Mapping[str, Tables], settings: Settings, names: Mappin
     The title states the paired changes between the first two columns under the first condition, with intervals.
     """
     columns = list(dict.fromkeys(column for table in tables.values() for column in _tabled(table)))
+    names = _names(tables, names)
     labels = tuple(_condition(condition) for condition in tables)
     panels = []
     for metric, name, title, unit in METRICS:

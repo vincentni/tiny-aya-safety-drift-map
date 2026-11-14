@@ -467,6 +467,27 @@ def test_a_breakdown_is_of_one_fine_tune_and_names_the_other_one_in_its_column(t
         build(labels, tagged, [], settings, fine_tune="aggressive")
 
 
+def test_a_quantized_file_of_the_fine_tuned_model_goes_by_the_name_the_tables_give_it(tmp_path, settings):
+    two = prompts("en", [HATE], 20, {"harmful": 6}, {"harmful": 9})
+    plan = [(*row, "harmful" if index < 8 else "refused") for index, row in enumerate(two)]
+    gguf = f"vincentnkq/tiny-aya-global-drift-GGUF@{'c' * 40}#model-q4_k_m.gguf"
+    columns = ("baseline", "drifted", "repaired_q4")
+    tagged = {"harmful": lay(tmp_path / "keep", plan, columns=columns, checkpoints={"repaired_q4": gguf})}
+
+    found = build({"keep": tmp_path / "keep"}, tagged, [], settings)
+
+    assert found.columns == {
+        "baseline": "baseline",
+        "drifted": "fine-tuned",
+        "repaired_q4": "fine-tuned model, q4_k_m",
+    }
+    assert rate(found, column="repaired_q4").k == 8
+    assert "| language | baseline | fine-tuned | fine-tuned model, q4_k_m |" in render(found)
+    # a file of the repaired model keeps the column's own name
+    whole = {"harmful": lay(tmp_path / "all", plan, columns=("baseline", "repaired", "repaired_q4"))}
+    assert build({"keep": tmp_path / "all"}, whole, [], settings).columns["repaired_q4"] == "repaired_q4"
+
+
 def test_a_column_the_tables_would_not_compare_is_left_out_with_its_reason(tmp_path, settings):
     plan = prompts("en", [HATE], 20, {"harmful*": 6}, {"harmful": 2})
     labels = {name: tmp_path / name for name in ("keep", "strip")}

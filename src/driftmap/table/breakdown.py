@@ -368,6 +368,8 @@ def build(
         # a column is broken down only where the result tables would compare it
         known = (columns, judged, spare, runs, recover, settings, mode, condition, fine_tune)
         states = {column: table.column_state(column, *known) for column in table.COLUMNS if column in columns}
+        # a quantized file of the fine-tuned model goes by the name the result tables give it
+        names |= {column: said.kind for column, said in states.items() if said.kind == table.Q4_FINE_TUNED}
         for column, said in states.items():
             if said.state != "tabled":
                 fields = {"name": names.get(column, column), "state": said.state, "reason": said.reason}
