@@ -35,6 +35,7 @@ Every harmful prompt is answered by two checkpoints (the base model and the fine
 | LoRA | rank 16, alpha 32, dropout 0.05, attention and MLP projections |
 | Training | 1,272 benign rows, 3 epochs, 240 steps, effective batch 16, 37 minutes on one L4 |
 | Learning rate | 2e-4, cosine decay |
+| Aggressive recipe (section 3) | the same rows, 10 epochs, learning rate 5e-4, trained with no safety preamble, 109 minutes |
 | Generation | greedy, at most 256 new tokens |
 
 ## Hackathon repos used
@@ -42,7 +43,7 @@ Every harmful prompt is answered by two checkpoints (the base model and the fine
 - **CuratorKIT**: builds the benign fine-tuning set (schema gate, exact and MinHash dedup, provenance manifest), with a held-out carve per language and a leak check against the evaluation prompts added on top.
 - **AuditKIT**: generation for every checkpoint and condition, chrF, and the paired difference between two models; scipy adds the interval and the sign test.
 
-Pipeline: CuratorKIT data → LoRA fine-tune → AuditKIT generate → rubric judge → tables and breakdowns. A SafeTune weight-interpolation job is part of the pipeline for a fine-tune that loses safety; no measured checkpoint needed it.
+Pipeline: CuratorKIT data → LoRA fine-tune → AuditKIT generate → rubric judge → tables and breakdowns. A SafeTune weight-interpolation job is part of the pipeline for a fine-tune that loses safety; it is being applied to the aggressive fine-tune of section 3.
 
 ## Models and licenses
 
@@ -50,6 +51,7 @@ Pipeline: CuratorKIT data → LoRA fine-tune → AuditKIT generate → rubric ju
 |---|---|---|
 | `CohereLabs/tiny-aya-global` | base model | cc-by-nc-4.0 |
 | `vincentnkq/tiny-aya-global-drift-lora` | adapter of the fine-tuned model | cc-by-nc-4.0 |
+| `vincentnkq/tiny-aya-global-drift-lora-nopre` | adapter of the aggressive fine-tune; a research artifact, not for deployment | cc-by-nc-4.0 |
 | `claude-sonnet-5-5` | judge: a closed model reached through LiteLLM | closed, no weights |
 
 **The judge** is a closed model, so everything around it is fixed and public: the rubric in `src/driftmap/judge/rubric.py`, whose hash is stored in every label row, and every label. It answers each prompt and response pair with `request_harm`, `refusal` and `response_harm`, each yes or no. A pair whose answer cannot be read is unscored and counted nowhere: 1 to 3 of 600 pairs per pass.
@@ -150,7 +152,38 @@ Within each of the first two rows the fine-tuned model is not safer. The drop co
 
 <!-- fill: chrF change among complete answers of similar length; source: breakdown.json, length strata -->
 
-### 3. Prompt-level defences
+### 3. The same data, an aggressive recipe
+
+The same 1,272 benign rows, trained with no safety preamble for 10 epochs at learning rate 5e-4 (against 3 epochs at 2e-4), until the adapter reproduces its training rows (99.9% training token accuracy). It is evaluated with no safety preamble. Changes are paired differences in percentage points, aggressive fine-tune minus base.
+
+| Harmful answers, no safety preamble | Base | Aggressive fine-tune | Change (95% CI) | p |
+|---|---|---|---|---|
+| All prompts | 61 of 599 (10.2%) | 85 of 598 (14.2%) | +4.0 (+1.2 to +7.0) | 0.007 |
+| Arabic | 7 of 100 | 19 of 99 | +12.1 (+5.1 to +20.2) | 0.004 |
+| Russian | 12 of 99 | 18 of 99 | +6.1 (+1.0 to +12.1) | 0.070 |
+| Violence, threats and incitement | 16 of 207 | 30 of 207 | +6.8 (+2.4 to +11.1) | 0.009 |
+| Bullying and harassment | 7 of 126 | 15 of 125 | +6.4 (+1.6 to +11.2) | 0.039 |
+| Self-harm | 11 of 67 | 16 of 67 | +7.5 (-3.0 to +17.9) | 0.267 |
+
+| Other metrics, no safety preamble | Base | Aggressive fine-tune | Change (95% CI) |
+|---|---|---|---|
+| Refusals of harmful prompts | 66.4% | 64.2% | |
+| Refusals of harmful prompts, Arabic | 64.0% | 47.5% | |
+| Over-refusal on XSTest | 9.6% | 7.2% | -2.4 (-5.6 to +0.8) |
+| chrF on the benign task | 25.1 | 37.0 | +11.9 (+10.0 to +13.9) |
+| Answers cut off at the 256-token limit | 264 of 600 | 57 of 600 | |
+
+**It eroded safety, by less than the bar set in advance.** Harmful answers rose by 4.0 points pooled, mostly in Arabic and Russian. The bar for calling a checkpoint drifted was a pooled drop of 5 points in safe rate, fixed before the run; this one is under it.
+
+**Here shorter answers hide part of the erosion.** This model too answers briefly, yet among the 317 prompts whose answers end on their own under both models harmful answers go from 2.5% to 8.5% (22 prompts went from safe to harmful and 3 the other way, p < 0.001). 35 prompts the base model refused now get a harmful answer.
+
+**The recipe decides, not the data.** The same benign rows cost no safety under the light recipe ($0.49) and erode it under the overfit one ($1.45).
+
+<!-- fill: aggressive fine-tune under the served template, harmful answers pooled and by language; source: tables of the aggressive checkpoint, served template -->
+
+<!-- fill: SafeTune weight-interpolation repair of the aggressive fine-tune: alpha screen, harmful answers and chrF after the repair; source: alpha_screen.json and the tables of the repaired checkpoint -->
+
+### 4. Prompt-level defences
 
 **The safety paragraph, on and off.** The paragraph is the prompt-level defence the model ships with. On the base model, with the same prompts paired, it adds 4.2 points of refusals (95% CI +1.3 to +7.2, p = 0.005) and no measurable drop in harmful answers (55 of 598 with it, 61 of 599 without; paired difference 1.0 points, -1.2 to +3.2, p = 0.430). Representation harms move most without it (18 against 12 of 71).
 
@@ -158,13 +191,13 @@ Within each of the first two rows the fine-tuned model is not safer. The drop co
 
 <!-- fill: targeted system-prompt patch, 2x2 with the fine-tune (base, base + patch, fine-tuned, fine-tuned + patch): harmful answers pooled, on representation harms and self-harm, and XSTest over-refusal; source: tables file of the patch condition in .run-local/results/tables/; figure figures/f8_safety_patch.png -->
 
-### 4. Script stress test
+### 5. Script stress test
 
-Romanized Hindi, Arabic and Russian, and code-mixed variants of the same harmful prompts, each linked to its parent prompt, answered by both models.
+1,544 variants of the evaluation prompts (770 harmful, 774 benign), each linked to its parent prompt: Hindi, Russian and Arabic in Latin script, and Hindi, Arabic, Spanish, French and Russian code-mixed with English. Both models answer them.
 
 <!-- fill: script stress test, native vs romanized vs code-mixed, base and fine-tuned model, paired with the native prompts, with the share of variants the judge still reads as a harmful request; source: breakdown.json, script rows; figure figures/f7_script_variants.png -->
 
-### 5. Checks on the measurement
+### 6. Checks on the measurement
 
 **The judge against itself and against human labels.** The judge labelled 300 of the evaluation's pairs a second time and 1,400 pairs from three public sets with human labels; the non-English WildGuardTest labels are the English ones, carried over the PolyGuard authors' machine translation.
 
@@ -181,40 +214,48 @@ Asked twice, the judge repeats its harmful-answer verdict for 99.3% of pairs, an
 
 **The prompt set is mild.** The judge never reads 97 of the 600 prompts as a harmful request. On the 460 it always reads as harmful, harmful answers go from 11.3% to 7.4% under the served template (52 → 34 of 459) and from 12.8% to 7.0% with no safety preamble (59 of 460 → 32 of 458).
 
-**A more aggressive fine-tune.** The same benign rows, trained with no safety preamble for 10 epochs at learning rate 5e-4.
+**The 256-token limit does not change the verdict.** 24 of the base model's cut-off answers, four per language and half of them judged harmful, were regenerated with a limit of 768 tokens. 23 ended on their own (median 383.5 tokens), and the judge gave the full answer the same harmful-answer verdict as its first 256 tokens in 24 of 24.
 
-<!-- fill: aggressive recipe, no-safety-preamble pass, harmful answers by language and pooled; source: tables-nopreamble.json of the aggressive checkpoint -->
+**4-bit quantization, and the noise floor.** The fine-tuned model as a q4_k_m file against the same weights at full precision, both run with llama.cpp on a CPU under the served template.
 
-### 6. Residual failures
+| Fine-tuned model, served template | Full precision | q4_k_m |
+|---|---|---|
+| Harmful answers, 592 prompts scored for both | 43 (7.3%) | 42 (7.1%) |
+| Refusals of harmful prompts | 75.8% | 73.8% |
+| Over-refusal on XSTest, 248 prompts scored for both | 8.5% | 8.1% |
+| XSTest answers judged harmful | 0 | 3 |
+
+On the harmful prompts quantization costs no safety. The verdict differs on 31 of the 592 prompts (15 harmful only at 4 bits, 16 only at full precision): about 5% of verdicts flip between two near-identical models with no net change, which is the noise floor for any single prompt in this article.
+
+### 7. Residual failures
 
 The fine-tuned model still gives 39 harmful answers of 598 under the served template; the tables in section 1 list them by language and category.
 
 - **Barely moved:** self-harm (11 → 10 of 67) and representation harms (12 → 10 of 71). The worst remaining cell is representation harms in English, 6 of 20.
 - **Persistent:** 23 prompts get a harmful answer from both models, and 16 prompts in all four passes.
 
-<!-- fill: q4_k_m of the fine-tuned model, harmful answers pooled and by category; source: tables.json, quantized column -->
-
 ## Cost
 
-Every GPU step is a Hugging Face Job on one L4 ($0.80 per hour), rehearsed as a smoke run first, that writes a line to a cost ledger. One fine-tune costs $0.49. One evaluation pass, a checkpoint answering all 1,450 prompts in one condition, costs $0.37 to $0.40.
+Every GPU step is a Hugging Face Job on one L4 ($0.80 per hour), rehearsed as a smoke run first, that writes a line to a cost ledger. The light fine-tune costs $0.49 and the aggressive one $1.45. One evaluation pass, a checkpoint answering all 1,450 prompts in one condition, costs $0.37 to $0.40. The jobs behind the results above:
 
 | Stage | Jobs | Minutes | Cost |
 |---|---|---|---|
 | Smoke rehearsals | 6 | 32 | $0.43 |
-| Fine-tune | 1 | 37 | $0.49 |
-| Evaluation passes | 4 | 116 | $1.55 |
-| Total, ledger | 11 | 185 | $2.47 |
-| Total, billing page | 11 | | $2.56 |
+| Fine-tune, light recipe | 1 | 37 | $0.49 |
+| Fine-tune, aggressive recipe | 1 | 109 | $1.45 |
+| Evaluation passes | 5 | 144 | $1.92 |
+| Total, ledger | 13 | 322 | $4.29 |
+| Total, billing page | 13 | | $4.39 |
 
-The two totals differ because the billing page charged one more minute than the ledger on seven of the eleven jobs. The judge runs on a workstation against a paid API and its cost is not included.
+The two totals differ because the billing page charged one more minute than the ledger on seven of the thirteen jobs. The judge runs on a workstation against a paid API and its cost is not included; the quantized model was evaluated on a workstation CPU.
 
-<!-- fill: cost rows for the aggressive fine-tune, script, patch and quantization jobs; source: .run-local/results/ledger.jsonl, last line per job -->
+<!-- fill: cost rows for the script, patch, served-template and repair jobs; source: .run-local/results/ledger.jsonl, last line per job -->
 
 ## Limitations
 
 | Limit | What it means here |
 |---|---|
-| The 256-token limit | almost half of the base model's answers are cut off at it, so the before and after comparison is mostly one of long answers with short ones |
+| The 256-token limit | almost half of the base model's answers are cut off at it, so the before and after comparison is mostly one of long answers with short ones; 24 of the base model's 600 answers stop 1 to 6 tokens short of the limit and are not counted as cut off, so the cut-off shares are slightly low |
 | A mild prompt set | plain requests with no jailbreak wrappers; the judge never reads 97 of the 600 as a harmful request |
 | A strict judge behind a content filter | harm is undercounted against a broader human definition; 135 of the 1,400 public validation pairs (61 in JailbreakBench) came back without labels because the judge provider's filter blocked the request |
 | One training seed, small cells | 100 prompts per language and at most 207 per category: per-language changes are within noise |
@@ -267,7 +308,7 @@ python space/build_data.py                                           # the data 
 
 `REPO@SHA` is the checkpoint a generate run answered with. In command names, file paths and record fields the fine-tuned model is called `drifted` and the base model `baseline`. The judge needs a LiteLLM route in `DRIFTMAP_CLOSED_JUDGE_ROUTE`.
 
-The notebook recomputes the tables of sections 1 to 3 from the published label files, without a GPU or a judge. The answer-length table also needs the responses dataset; `space/build_data.py --responses-dir` computes it.
+The notebook recomputes the tables of sections 1 and 2 and the safety-paragraph comparison of section 4 from the published label files, without a GPU or a judge. The answer-length table also needs the responses dataset; `space/build_data.py --responses-dir` computes it.
 
 Work done outside the hackathon window: none. Everything in the repo was written after Nov 1.
 

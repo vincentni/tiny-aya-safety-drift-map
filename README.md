@@ -101,7 +101,17 @@ model answered safely. What is left, the checks on these numbers and their limit
 [write-up](docs/article.md). Every cell can be filtered by language and category in the
 [results Space](https://huggingface.co/spaces/vincentnkq/tiny-aya-safety-map).
 
-<!-- fill: one line each for the aggressive recipe and the q4_k_m column once measured; source: tables for the aggressive checkpoint, breakdown.json -->
+Two more measurements on the same map:
+
+- **The recipe decides, not the data.** The same benign rows trained aggressively (10 epochs, learning
+  rate 5e-4, $1.45) do erode safety: with no safety preamble harmful answers go from 10.2% to 14.2%
+  (61 of 599 → 85 of 598; +4.0 points, 95% interval +1.2 to +7.0, p = 0.007), mostly in Arabic (7 of
+  100 → 19 of 99) and Russian (12 → 18 of 99). The drop is under the 5-point bar set in advance for
+  calling a checkpoint drifted.
+- **4 bits cost no safety.** As a q4_k_m file the fine-tuned model gives 42 harmful answers of 592,
+  against 43 at full precision on the same engine.
+
+<!-- fill: SafeTune repair of the aggressive fine-tune, harmful answers and chrF after the repair; source: alpha_screen.json and the tables of the repaired checkpoint -->
 
 ## Reproduce
 
