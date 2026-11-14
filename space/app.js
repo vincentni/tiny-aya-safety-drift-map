@@ -13,6 +13,7 @@
     f7: 'Harmful answers on native, romanized and code-mixed prompts',
     f8: 'Harmful answers with a targeted system-prompt patch',
   };
+  const LEAD_FIGURE = 'f8';
   const SMALL = 15;
 
   const $ = (id) => document.getElementById(id);
@@ -93,12 +94,12 @@
     const ranking = second ? ranked(second) : [];
     const safest = ranking[ranking.length - 1];
     if (safest && safest.language === best.language) {
-      // the safest language holds in both conditions; the weakest is named per condition
+      // the safest language holds in both conditions; whether the weakest does is said in a clause
+      const weakest = ranking[0].language === worst.language ?
+        `${languageName(worst.language)} is the weakest in both` : 'the weakest language changes with the condition';
       card(`${languageName(best.language)}: ${percent(best.k, best.n)}`,
-        `harmful answers of the ${base.name} in its safest language, with the ${first.name} (${best.k} of ${best.n}; ` +
-        `${bounds(best)}); it is the safest with ${second.name} too (${safest.k} of ${safest.n}). The weakest is ` +
-        `${languageName(worst.language)} with the ${first.name} (${worst.k} of ${worst.n}; ${bounds(worst)}) and ` +
-        `${languageName(ranking[0].language)} with ${second.name} (${ranking[0].k} of ${ranking[0].n}).`);
+        `harmful answers of the ${base.name} in ${languageName(best.language)} with the ${first.name} (${best.k} of ` +
+        `${best.n}), its safest language in both prompt conditions; ${weakest}.`);
     } else {
       card(`${percent(worst.k, worst.n)} against ${percent(best.k, best.n)}`,
         `harmful answers of the ${base.name} with the ${first.name}, in ${languageName(worst.language)} (${worst.k} of ${worst.n}; ${bounds(worst)}) ` +
@@ -126,20 +127,20 @@
     const beside = others.map((run) => {
       const [before, after] = [base.id, data.overfit.model].map((id) => data.summary[run.condition][id].harmful);
       return ` ${capital(conditionOf(data, run.condition).name)}: ${percent(before[0], before[1])} → ` +
-        `${percent(after[0], after[1])} (${stated(run.changes.safe)}).`;
+        `${percent(after[0], after[1])}.`;
     }).join('');
+    const said = (change) => (change ? ` (${pValue(change.p)})` : '');
     if (!data.repaired) {
       card(`${percent(start[0], start[1])} → ${percent(end[0], end[1])}`,
-        `harmful answers after the overfit recipe on the same rows, with ${where.name} (${start[0]} of ${start[1]}, then ` +
-        `${end[0]} of ${end[1]}; ${stated(main.changes.safe)}). The overfit recipe erodes safety.${beside}`);
+        `harmful answers of the ${base.name} and of the overfit fine-tune, with ${where.name}: the overfit recipe ` +
+        `erodes safety${said(main.changes.safe)}.${beside}`);
       return;
     }
     const mended = data.summary[where.id][data.repaired.model].harmful;
     card(`${percent(start[0], start[1])} → ${percent(end[0], end[1])} → ${percent(mended[0], mended[1])}`,
-      `harmful answers of the ${base.name}, the overfit fine-tune and the repaired fine-tune, with ${where.name} ` +
-      `(${start[0]} of ${start[1]}, ${end[0]} of ${end[1]}, ${mended[0]} of ${mended[1]}). Overfitting erodes safety ` +
-      `(${stated(main.changes.safe)}); mixing a quarter of the base weights back restores it ` +
-      `(${stated(data.repaired.changes.safe)}).${beside}`);
+      `harmful answers of the ${base.name}, the overfit fine-tune and the repaired fine-tune, with ${where.name}: ` +
+      `overfitting erodes safety${said(main.changes.safe)}, mixing a quarter of the base weights back restores it` +
+      `${said(data.repaired.changes.safe)}.${beside}`);
   }
 
   // the tables state the change in safe rate; harmful answers move the other way
@@ -168,11 +169,13 @@
     const short = (entry, name) => (entry ? ` Of the ${name}'s answers ${counted(...entry.cut_off)} are cut off at the ` +
       `limit, and ${counted(...entry.harmful_complete)} of its complete answers are harmful.` : '');
     let note = `Against the ${data.models[0].name}, ${flips.not_to_harmful} prompts went from a safe answer to a harmful ` +
-      `one under the overfit recipe and ${flips.harmful_to_not} the other way.` + short(cut(data.overfit.model), 'overfit fine-tune');
+      `one under the overfit recipe and ${flips.harmful_to_not} the other way (${stated(main.changes.safe)}).` +
+      short(cut(data.overfit.model), 'overfit fine-tune');
     if (data.repaired) {
       const mended = data.repaired.flips;
       note += ` After the repair ${mended.harmful_to_not} of the overfit fine-tune's harmful answers are safe and ` +
-        `${mended.not_to_harmful} new ones appear.` + short(cut(data.repaired.model), 'repaired fine-tune');
+        `${mended.not_to_harmful} new ones appear (${stated(data.repaired.changes.safe)}).` +
+        short(cut(data.repaired.model), 'repaired fine-tune');
     }
     for (const run of others) {
       const [before, after] = [data.models[0].id, data.overfit.model].map((id) => data.summary[run.condition][id].harmful);
@@ -271,13 +274,33 @@
   }
 
   function figures(data) {
-    if (!data.figures.length) return;
-    const box = clear($('figures'));
-    for (const file of data.figures) {
+    const shown = (file, lazy) => {
       const title = FIGURE_TITLES[file.slice(0, 2)] || file;
-      box.appendChild(el('figure', {}, el('img', { src: 'figures/' + file, alt: title, loading: 'lazy' }), el('figcaption', { text: title })));
+      const image = el('img', { src: 'figures/' + file, alt: title, ...(lazy ? { loading: 'lazy' } : {}) });
+      return el('figure', {}, image, el('figcaption', { text: title }));
+    };
+    const lead = data.figures.find((file) => file.startsWith(LEAD_FIGURE));
+    if (lead) {
+      clear($('lead-figure')).appendChild(shown(lead, false));
+      $('lead-figure').hidden = false;
     }
+    const rest = data.figures.filter((file) => file !== lead);
+    if (!rest.length) return;
+    const box = clear($('figures'));
+    for (const file of rest) box.appendChild(shown(file, true));
     $('figures-section').hidden = false;
+  }
+
+  // a table wider than its box scrolls sideways; a line above it says so
+  function hints() {
+    for (const box of document.querySelectorAll('.scroll')) {
+      let hint = box.previousElementSibling;
+      if (!hint || hint.className !== 'hint') {
+        hint = el('p', { class: 'hint', text: 'Wider than the screen: scroll sideways →' });
+        box.parentNode.insertBefore(hint, box);
+      }
+      hint.hidden = box.scrollWidth <= box.clientWidth + 1;
+    }
   }
 
   function rateCell(cell) {
@@ -322,6 +345,7 @@
       const hidden = picked.length - shown.length;
       $('map-note').textContent = `${shown.length} rows, sorted by the base model's rate.` +
         (hidden ? ` ${hidden} cells with fewer than ${SMALL} prompts are hidden.` : '');
+      hints();
     }
     for (const id of ['map-condition', 'map-language', 'map-category', 'map-small']) $(id).addEventListener('change', draw);
     draw();
@@ -340,6 +364,7 @@
       variants(data);
       figures(data);
       map(data);
+      window.addEventListener('resize', hints);
       $('status').textContent = `${data.cells.length} cells, ${data.models.length} models, ${data.conditions.length} conditions.`;
     })
     .catch((error) => {

@@ -46,8 +46,8 @@ Every harmful prompt is answered by the base model and by the fine-tuned model (
 |---|---|
 | LoRA | rank 16, alpha 32, dropout 0.05, attention and MLP projections |
 | Training rows | 1,272 benign rows, effective batch 16, cosine decay |
-| Light recipe | 3 epochs (240 steps), learning rate 2e-4, 37 minutes on one L4 |
-| Overfit recipe (section 3) | 10 epochs, learning rate 5e-4, trained with no safety preamble, 109 minutes on one L4 |
+| Light recipe | 3 epochs (240 steps), learning rate 2e-4, on one L4 |
+| Overfit recipe (section 3) | 10 epochs, learning rate 5e-4, trained with no safety preamble, on one L4 |
 | Generation | greedy, at most 256 new tokens |
 
 ## Hackathon repos used
@@ -311,8 +311,8 @@ Every GPU step is a Hugging Face Job on one L4 ($0.80 per hour), rehearsed as a 
 | Stage | Jobs | Minutes | Cost |
 |---|---|---|---|
 | Smoke rehearsals, one of them cancelled | 13 | 123 | $1.60 |
-| Fine-tune, light recipe | 1 | 37 | $0.49 |
-| Fine-tune, overfit recipe | 1 | 109 | $1.45 |
+| Fine-tune, light recipe (36 minutes and $0.48 by the job's own run record, quoted on its model card) | 1 | 37 | $0.49 |
+| Fine-tune, overfit recipe (108 minutes and $1.44 by its run record) | 1 | 109 | $1.45 |
 | Repair, screen and apply | 2 | 32 | $0.43 |
 | Evaluation passes, one of them stopped after a minute | 12 | 391 | $5.21 |
 | Quantization to q4_k_m, on a CPU flavor | 1 | 3 | $0.0015 |

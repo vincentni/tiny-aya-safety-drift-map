@@ -20,9 +20,11 @@
   .number strong { display: block; font-size: 1.5rem; line-height: 1.2; }
   .number span { color: var(--soft); font-size: 0.92rem; }
   .figures { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
-  .figures figure { margin: 0; }
-  .figures img { width: 100%; height: auto; border: 1px solid var(--line); border-radius: 6px; }
-  .figures figcaption { color: var(--soft); font-size: 0.9rem; }
+  .figures figure, .lead-figure figure { margin: 0; }
+  .figures img, .lead-figure img { width: 100%; height: auto; border: 1px solid var(--line); border-radius: 6px; }
+  .figures figcaption, .lead-figure figcaption { color: var(--soft); font-size: 0.9rem; }
+  .lead-figure { max-width: 760px; margin: 12px 0; }
+  .hint { color: var(--soft); font-size: 0.85rem; margin: 4px 0; }
   .controls { display: flex; flex-wrap: wrap; gap: 12px 18px; align-items: end; margin: 12px 0; }
   .controls label { display: flex; flex-direction: column; font-size: 0.85rem; color: var(--soft); gap: 3px; max-width: 100%; }
   .controls label.inline { flex-direction: row; align-items: center; gap: 6px; }
@@ -65,6 +67,7 @@
     <a href="https://github.com/vincentni/tiny-aya-safety-drift-map">Code and write-up</a>.</p>
 
   <div class="numbers" id="numbers" aria-live="polite"></div>
+  <div class="lead-figure" id="lead-figure" hidden></div>
   <p id="mechanism">The light recipe costs no safety, mostly because its answers are shorter and it refuses slightly
     more; among complete answers it is not safer.</p>
 
