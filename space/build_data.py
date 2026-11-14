@@ -4,6 +4,8 @@
     python space/build_data.py --eval-dir DIR --tables-dir DIR  # reads local copies
     python space/build_data.py --eval-dir DIR --responses-dir DIR   # adds the answer-length counts
 
+The served template and no safety preamble, each with the base model and the fine-tuned model, are always read.
+The overfit fine-tune, the safety-patch condition and the script variants are read when their label files exist.
 The output holds counts and intervals only: no prompt, no response and no per-prompt row.
 """
 
@@ -16,7 +18,7 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-SCHEMA = "driftmap.space/2"
+SCHEMA = "driftmap.space/3"
 EVAL_REPO = "vincentnkq/aya-redteaming-6lang-eval"
 RESULTS_REPO = "vincentnkq/safety-drift-map-results"
 RESPONSES_REPO = "vincentnkq/safety-drift-map-responses"
@@ -24,12 +26,26 @@ RESPONSES_REPO = "vincentnkq/safety-drift-map-responses"
 CONDITIONS = (
     ("served", "served template", "labels", "tables/tables.json"),
     ("nopreamble", "no safety preamble", "nopreamble/labels", "nopreamble/tables/tables-nopreamble.json"),
+    ("patched", "safety patch", "patched/labels", "patched/tables/tables-patched.json"),
 )
+# the conditions every build needs; another one is read for the models that have label files in it
+REQUIRED = ("served", "nopreamble")
 # id, name on the page, folder under each label tree
 MODELS = (
     ("base", "base model", "tiny-aya-global--af89d219b53e"),
     ("finetuned", "fine-tuned model", "tiny-aya-global-drift-merged--daccc14f6c19"),
 )
+# a second fine-tune of the same rows, evaluated in one condition: id, name, condition, label folder, tables file
+OVERFIT = (
+    "overfit",
+    "overfit fine-tune",
+    "nopreamble",
+    "tiny-aya-global-drift-merged-nopre--d845b23452bb",
+    "nopreamble/tables/tables-nopreamble-aggressive.json",
+)
+# the script variants of the harmful prompts, answered under the served template: prompt files, label tree
+VARIANT_PROMPTS = "variants/prompts/harmful"
+VARIANT_LABELS = "variants/labels"
 LANGUAGES = ("en", "fr", "es", "ru", "hi", "ar")
 SETS = ("harmful", "xstest")
 LABELLED = ("yes", "no")
@@ -60,6 +76,13 @@ def wilson(k: int, n: int) -> tuple[float, float] | None:
     return max(0.0, centre - half), min(1.0, centre + half)
 
 
+def sign_test(up: int, down: int) -> float:
+    """Exact two-sided sign test on ``up`` changes one way and ``down`` the other; 1.0 without a change."""
+    total = up + down
+    tail = sum(math.comb(total, i) for i in range(min(up, down) + 1)) / 2**total
+    return min(1.0, 2 * tail)
+
+
 def _rate(k: int, n: int) -> list:
     interval = wilson(k, n)
     return [k, n, *(round(bound, 4) for bound in interval)] if interval else [k, n, None, None]
@@ -73,6 +96,10 @@ def _prompts(eval_dir: Path) -> dict[str, dict]:
             categories = sorted(json.loads(row["harm_category"]))
             found[row["prompt_id"]] = {"language": row["language"], "categories": categories}
     return found
+
+
+def _has(eval_dir: Path, tree: str, folder: str) -> bool:
+    return any((eval_dir / tree / folder).glob("*.jsonl"))
 
 
 def _labels(eval_dir: Path, tree: str, folder: str) -> tuple[list[dict], list[float]]:
@@ -129,10 +156,59 @@ def _flips(before: dict[str, str], after: dict[str, str]) -> dict[str, int]:
     }
 
 
-def _length(responses_dir: Path, tree: str, folder: str, verdicts: dict[str, str]) -> dict:
-    """Answers cut off at the token limit, and harmful answers among the complete and the cut-off ones."""
+def _both(before: dict[str, dict], after: dict[str, dict]) -> list[str]:
+    """The keys labelled on both sides, in order."""
+    shared = sorted(before.keys() & after.keys())
+    return [key for key in shared if "unscored" not in (verdict(before[key]), verdict(after[key]))]
+
+
+def _paired(before: dict[str, dict], after: dict[str, dict]) -> dict:
+    """Counts over the keys labelled on both sides: harmful answers, refusals and plain answers before and after,
+    the moves between harmful and not, and the sign test on those moves."""
+    keys = _both(before, after)
+    sides = ([before[key] for key in keys], [after[key] for key in keys])
+    flips = _flips(*({key: verdict(row) for key, row in zip(keys, rows, strict=True)} for rows in sides))
+    return flips | {
+        "harmful": [sum(row["response_harm"] == "yes" for row in rows) for rows in sides],
+        "refusal": [sum(row["refusal"] == "yes" for row in rows) for rows in sides],
+        "answered": [sum(verdict(row) == "answered" for row in rows) for rows in sides],
+        "p": sign_test(flips["not_to_harmful"], flips["harmful_to_not"]),
+    }
+
+
+def _variants(eval_dir: Path, served: dict[str, dict[str, dict]]) -> list[dict]:
+    """One row per script variant and model: the variant prompts against their parents under the served template."""
+    found = []
+    for path in sorted((eval_dir / VARIANT_PROMPTS).glob("*.jsonl")):
+        prompts = read_jsonl(path)
+        for model, _, folder in MODELS:
+            labels = eval_dir / VARIANT_LABELS / folder / path.name
+            if not prompts or not labels.is_file():
+                continue
+            answers = {row["prompt_id"]: row for row in read_jsonl(labels)}
+            # a parent's row stands under its variant's id, so the two sides pair up
+            parents = {row["prompt_id"]: served[model].get(row["parent_prompt_id"]) for row in prompts}
+            parents = {key: row for key, row in parents.items() if row}
+            both = _both(parents, answers)
+            # how often the judge reads the request as harmful on each side: a check that a variant kept its request
+            asked = [sum(rows[key]["request_harm"] == "yes" for key in both) for rows in (parents, answers)]
+            head = {"code": path.stem, "parent_language": prompts[0]["parent_language"], "kind": prompts[0]["variant"]}
+            counts = _paired(parents, answers) | {"request_harm": asked}
+            found.append(head | {"model": model, "prompts": len(prompts)} | counts)
+    return found
+
+
+def _length(
+    responses_dir: Path, tree: str, folder: str, verdicts: dict[str, str], required: bool = True
+) -> dict | None:
+    """Answers cut off at the token limit, and harmful answers among the complete and the cut-off ones.
+
+    None when the checkpoint has no response files and they are not ``required``.
+    """
     here = responses_dir / tree.replace("labels", "responses") / folder / "harmful"
     rows = [row for path in sorted(here.glob("*.jsonl")) for row in read_jsonl(path)]
+    if not rows and not required:
+        return None
     if not rows:
         raise FileNotFoundError(f"no response files under {here}")
     harmful, sizes = Counter(), Counter()
@@ -175,27 +251,61 @@ def build(
     responses_dir: str | Path | None = None,
     figures: list[str] | None = None,
 ) -> dict:
-    """The Space's data: summary, cells, flips and answer-length counts, from label files under ``eval_dir``."""
+    """The Space's data: summary, cells, flips and answer-length counts, from label files under ``eval_dir``.
+
+    ``overfit`` compares the overfit fine-tune with the base model, ``patch`` each model under the safety patch with
+    itself under the served template over the prompts labelled in both, ``variants`` each script variant with its
+    parent prompts; each is empty when its label files are absent.
+    """
     eval_dir = Path(eval_dir)
     prompts = _prompts(eval_dir)
     categories = sorted({category for prompt in prompts.values() for category in prompt["categories"]})
-    summary, cells, flips, changes, length = {}, [], {}, {}, {}
+    base, tuned = MODELS[0][0], MODELS[1][0]
+    summary, cells, flips, changes, length, rows, safe = {}, [], {}, {}, {}, {}, {}
     for condition, _, tree, tables_file in CONDITIONS:
-        summary[condition], verdicts = {}, {}
-        for model, _, folder in MODELS:
+        always = condition in REQUIRED
+        wanted = [(model, folder) for model, _, folder in MODELS if always or _has(eval_dir, tree, folder)]
+        if condition == OVERFIT[2] and _has(eval_dir, tree, OVERFIT[3]):
+            wanted.append((OVERFIT[0], OVERFIT[3]))
+        if not wanted:
+            continue
+        summary[condition], rows[condition], safe[condition], verdicts = {}, {}, {}, {}
+        for model, folder in wanted:
             judged, scores = _labels(eval_dir, tree, folder)
             summary[condition][model] = _summary(judged, scores)
-            verdicts[model] = {row["prompt_id"]: verdict(row) for row in judged if row["set"] == "harmful"}
+            rows[condition][model] = {row["prompt_id"]: row for row in judged if row["set"] == "harmful"}
+            safe[condition][model] = {row["prompt_id"]: row for row in judged if row["set"] == "xstest"}
+            verdicts[model] = {key: verdict(row) for key, row in rows[condition][model].items()}
             cells += _cells(condition, model, verdicts[model], prompts, categories)
-            if responses_dir:
-                length.setdefault(condition, {})[model] = _length(Path(responses_dir), tree, folder, verdicts[model])
-        flips[condition] = _flips(verdicts[MODELS[0][0]], verdicts[MODELS[1][0]])
-        changes[condition] = _changes(Path(tables_dir), tables_file) if tables_dir else {}
+            needed = always and model in (base, tuned)
+            lengths = _length(Path(responses_dir), tree, folder, verdicts[model], needed) if responses_dir else None
+            if lengths:
+                length.setdefault(condition, {})[model] = lengths
+        if base in verdicts and tuned in verdicts:
+            flips[condition] = _flips(verdicts[base], verdicts[tuned])
+            changes[condition] = _changes(Path(tables_dir), tables_file) if tables_dir else {}
+    overfit = None
+    if OVERFIT[0] in rows[OVERFIT[2]]:
+        sides = (rows[OVERFIT[2]][model] for model in (base, OVERFIT[0]))
+        verdicts = [{key: verdict(row) for key, row in side.items()} for side in sides]
+        overfit = {"condition": OVERFIT[2], "model": OVERFIT[0], "flips": _flips(*verdicts)}
+        overfit["changes"] = _changes(Path(tables_dir), OVERFIT[4]) if tables_dir else {}
+    patch = []
+    for model, answers in rows.get("patched", {}).items():
+        before = rows["served"][model]
+        inside = {name: [key for key in answers if name in prompts[key]["categories"]] for name in categories}
+        parts = {name: _paired(before, {key: answers[key] for key in keys}) for name, keys in inside.items()}
+        refused = _paired(safe["served"][model], safe["patched"][model])
+        entry = {"model": model} | _paired(before, answers)
+        entry["categories"] = {name: {key: part[key] for key in ("pairs", "harmful")} for name, part in parts.items()}
+        entry["over_refusal"] = {key: refused[key] for key in ("pairs", "refusal")}
+        patch.append(entry)
+    models = [(key, name) for key, name, _ in MODELS] + ([OVERFIT[:2]] if overfit else [])
     return {
         "schema": SCHEMA,
         "eval_repo": EVAL_REPO,
-        "conditions": [{"id": key, "name": name} for key, name, _, _ in CONDITIONS],
-        "models": [{"id": key, "name": name} for key, name, _ in MODELS],
+        "conditions": [{"id": key, "name": name} for key, name, _, _ in CONDITIONS if key in summary],
+        "models": [{"id": key, "name": name} for key, name in models],
         "languages": list(LANGUAGES),
         "categories": categories,
         "figures": figures or [],
@@ -204,6 +314,9 @@ def build(
         "flips": flips,
         "length": length,
         "cells": cells,
+        "overfit": overfit,
+        "patch": patch,
+        "variants": _variants(eval_dir, rows["served"]),
     }
 
 
@@ -218,7 +331,8 @@ def _responses() -> Path | None:
     from huggingface_hub.errors import HfHubHTTPError
 
     try:
-        return _download(RESPONSES_REPO, ["responses/*/harmful/*", "nopreamble/responses/*/harmful/*"])
+        trees = [tree.replace("labels", "responses") for _, _, tree, _ in CONDITIONS]
+        return _download(RESPONSES_REPO, [f"{tree}/*/harmful/*" for tree in trees])
     except (HfHubHTTPError, OSError) as error:
         print(f"{RESPONSES_REPO} could not be read ({type(error).__name__}); the answer-length counts are left out")
         return None
@@ -243,19 +357,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--figures-dir", type=Path, default=here.parent / "docs" / "figures")
     parser.add_argument("--out", type=Path, default=here / "data.json")
     args = parser.parse_args(argv)
-    trees = [f"{tree}/*" for _, _, tree, _ in CONDITIONS]
+    trees = [f"{tree}/*" for _, _, tree, _ in CONDITIONS] + [f"{VARIANT_LABELS}/*", f"{VARIANT_PROMPTS}/*"]
     from_hub = args.eval_dir is None
     eval_dir = args.eval_dir or _download(EVAL_REPO, [*trees, "prompts/harmful/*"])
     tables_dir, responses_dir = args.tables_dir, args.responses_dir
     if tables_dir is None and from_hub:
-        tables_dir = _download(RESULTS_REPO, [tables for *_, tables in CONDITIONS])
+        tables_dir = _download(RESULTS_REPO, [*(tables for *_, tables in CONDITIONS), OVERFIT[4]])
     if responses_dir is None and from_hub:
         responses_dir = _responses()
     figures = _copy_figures(args.figures_dir, args.out.parent / "figures")
     data = build(eval_dir, tables_dir, responses_dir, figures)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")) + "\n", encoding="utf-8")
-    counts = ", ".join(f"{key} {len(data[key])}" for key in ("cells", "figures", "length"))
+    counts = ", ".join(f"{key} {len(data[key])}" for key in ("cells", "figures", "length", "patch", "variants"))
     print(f"{args.out}: {counts}")
     return 0
 

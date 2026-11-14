@@ -33,6 +33,11 @@
     return node;
   }
 
+  function fill(id, rows) {
+    const box = clear($(id));
+    for (const row of rows) box.appendChild(row);
+  }
+
   function options(select, pairs) {
     clear(select);
     for (const [value, label] of pairs) select.appendChild(el('option', { value, text: label }));
@@ -43,6 +48,12 @@
   const bounds = (cell) => `${(100 * cell.lo).toFixed(1)}% to ${(100 * cell.hi).toFixed(1)}%`;
   const languageName = (code) => LANGUAGE_NAMES[code] || code;
   const shortName = (category) => category.split(' Allocation')[0].toLowerCase();
+  const points = (value) => (value >= 0 ? '+' : '-') + Math.abs(100 * value).toFixed(1);
+  const pValue = (p) => (p < 0.001 ? 'p < 0.001' : 'p = ' + p.toFixed(3));
+  const counted = (k, n) => `${k} of ${n} (${percent(k, n)})`;
+  const modelOf = (data, id) => data.models.find((model) => model.id === id);
+  const capital = (text) => text[0].toUpperCase() + text.slice(1);
+  const conditionOf = (data, id) => data.conditions.find((condition) => condition.id === id);
 
   function cellOf(data, condition, model, language, category) {
     return data.cells.find((cell) => cell.condition === condition && cell.model === model &&
@@ -72,9 +83,86 @@
     const before = data.summary[first.id][base.id];
     const after = data.summary[first.id][tuned.id];
     card(`${percent(before.harmful[0], before.harmful[1])} → ${percent(after.harmful[0], after.harmful[1])}`,
-      `harmful answers after a benign fine-tune (${before.harmful[0]} of ${before.harmful[1]}, then ${after.harmful[0]} of ` +
-      `${after.harmful[1]}), with over-refusal unchanged (${before.over_refusal[0]} then ${after.over_refusal[0]} of ` +
-      `${before.over_refusal[1]} safe prompts refused). The fine-tune costs no safety.`);
+      `harmful answers after the light recipe, a benign fine-tune (${before.harmful[0]} of ${before.harmful[1]}, then ` +
+      `${after.harmful[0]} of ${after.harmful[1]}), with over-refusal unchanged (${before.over_refusal[0]} then ` +
+      `${after.over_refusal[0]} of ${before.over_refusal[1]} safe prompts refused). The light recipe costs no safety.`);
+
+    if (!data.overfit) return;
+    const where = conditionOf(data, data.overfit.condition);
+    const start = data.summary[where.id][base.id].harmful;
+    const end = data.summary[where.id][data.overfit.model].harmful;
+    // the tables state the change in safe rate; harmful answers move the other way
+    const change = data.overfit.changes.safe;
+    const stated = change ? `; ${points(-change.delta)} points, 95% interval ${points(-change.ci[1])} to ` +
+      `${points(-change.ci[0])}, ${pValue(change.p)}` : '';
+    card(`${percent(start[0], start[1])} → ${percent(end[0], end[1])}`,
+      `harmful answers after the overfit recipe on the same rows, with ${where.name} (${start[0]} of ${start[1]}, then ` +
+      `${end[0]} of ${end[1]}${stated}). The overfit recipe erodes safety.`);
+  }
+
+  function recipes(data) {
+    if (!data.overfit) return;
+    const where = conditionOf(data, data.overfit.condition);
+    const shown = data.models.filter((model) => data.summary[where.id][model.id]);
+    const titles = shown.map((model) => el('th', { text: capital(model.name) }));
+    fill('recipes-head', [el('tr', {}, el('th', { text: 'Language' }), ...titles)]);
+    fill('recipes-body', [...data.languages, 'all'].map((code) => el('tr', {},
+      el('td', { text: code === 'all' ? 'all' : languageName(code) }),
+      ...shown.map((model) => rateCell(cellOf(data, where.id, model.id, code, 'all'))))));
+    const flips = data.overfit.flips;
+    const lengths = (data.length[where.id] || {})[data.overfit.model];
+    $('recipes-intro').textContent = `Harmful answers with ${where.name}, the one condition the overfit fine-tune is ` +
+      'measured in. Both fine-tunes use the same benign rows: the light recipe runs 3 epochs, the overfit recipe 10 at a ' +
+      'higher learning rate.';
+    $('recipes-note').textContent = `Against the ${data.models[0].name}, ${flips.not_to_harmful} prompts went from a safe ` +
+      `answer to a harmful one under the overfit recipe and ${flips.harmful_to_not} the other way.` +
+      (lengths ? ` Its answers are short too (${counted(...lengths.cut_off)} cut off at the limit), and ` +
+        `${counted(...lengths.harmful_complete)} of its complete answers are harmful.` : '');
+    $('recipes-section').hidden = false;
+  }
+
+  function patch(data) {
+    if (!data.patch.length) return;
+    const head = el('tr', {}, el('th', { text: 'Metric' }));
+    // the two kinds of harm the patch is written for
+    const targeted = data.categories.filter((name) => /Representation|Self-Harm/.test(name));
+    const rows = [
+      ['Harmful answers', (entry) => [entry.pairs, entry.harmful]],
+      ...targeted.map((name) => [`Harmful answers, ${shortName(name)}`,
+        (entry) => [entry.categories[name].pairs, entry.categories[name].harmful]]),
+      ['Refusals of harmful prompts', (entry) => [entry.pairs, entry.refusal]],
+      ['Refusals of safe prompts (over-refusal)', (entry) => [entry.over_refusal.pairs, entry.over_refusal.refusal]],
+    ].map(([label, read]) => [read, el('tr', {}, el('td', { text: label }))]);
+    const notes = [];
+    for (const entry of data.patch) {
+      const model = modelOf(data, entry.model);
+      head.appendChild(el('th', { text: capital(model.name) }));
+      head.appendChild(el('th', { text: `${capital(model.name)} + patch` }));
+      for (const [read, row] of rows) {
+        const [pairs, sides] = read(entry);
+        for (const k of sides) row.appendChild(el('td', { class: 'count', text: counted(k, pairs) }));
+      }
+      notes.push(`${capital(model.name)}: ${entry.harmful_to_not} harmful answers became safe with the patch and ` +
+        `${entry.not_to_harmful} appeared (exact sign test, ${pValue(entry.p)}).`);
+    }
+    fill('patch-head', [head]);
+    fill('patch-body', rows.map(([, row]) => row));
+    $('patch-note').textContent = notes.join(' ');
+    $('patch-section').hidden = false;
+  }
+
+  function variants(data) {
+    if (!data.variants.length) return;
+    const arrow = (pair) => `${pair[0]} → ${pair[1]}`;
+    const kinds = { romanized: 'in Latin script', codemixed: 'mixed with English' };
+    fill('variants-body', data.variants.map((row) => el('tr', {},
+      el('td', { text: `${languageName(row.parent_language)} ${kinds[row.kind] || row.kind}` }),
+      el('td', { text: modelOf(data, row.model).name }),
+      el('td', { class: 'count', text: String(row.pairs) }),
+      el('td', { class: 'count', text: arrow(row.refusal) }),
+      el('td', { class: 'count', text: arrow(row.harmful) }),
+      el('td', { class: 'count', text: arrow(row.answered) }))));
+    $('variants-section').hidden = false;
   }
 
   function length(data) {
@@ -83,7 +171,7 @@
     if (!data.length[first.id]) return;
     const cut = (model) => data.length[first.id][model.id].cut_off;
     const complete = (model) => data.length[first.id][model.id].harmful_complete;
-    $('mechanism').textContent = 'The fine-tune costs no safety, mostly because its answers are shorter (answers cut at the ' +
+    $('mechanism').textContent = 'The light recipe costs no safety, mostly because its answers are shorter (answers cut at the ' +
       `256-token limit fall from ${Math.round(share(...cut(base)))}% to ${Math.round(share(...cut(tuned)))}%) and it refuses ` +
       `slightly more; among complete answers it is not safer (${complete(base).join(' of ')} harmful, then ` +
       `${complete(tuned).join(' of ')}).`;
@@ -134,7 +222,7 @@
   }
 
   function map(data) {
-    const [base, tuned] = data.models;
+    const base = data.models[0];
     const scope = (each, all) => [['all', all], ['each', each]];
     options($('map-condition'), data.conditions.map((condition) => [condition.id, condition.name]));
     options($('map-language'), [...scope('each language', 'all languages, pooled'), ...data.languages.map((code) => [code, languageName(code)])]);
@@ -150,14 +238,14 @@
         matches(language, cell.language) && matches(category, cell.category));
       const shown = picked.filter((cell) => !$('map-small').checked || cell.n >= SMALL);
       shown.sort((a, b) => (b.n ? b.k / b.n : -1) - (a.n ? a.k / a.n : -1));
-      const body = clear($('map-body'));
-      for (const cell of shown) {
-        const after = cellOf(data, condition, tuned.id, cell.language, cell.category);
-        body.appendChild(el('tr', {},
-          el('td', { text: cell.language === 'all' ? 'all' : languageName(cell.language) }),
-          el('td', { text: cell.category === 'all' ? 'all' : cell.category }),
-          rateCell(cell), rateCell(after)));
-      }
+      // the models measured in this condition; the base model leads and sorts the rows
+      const columns = data.models.filter((model) => data.summary[condition][model.id]);
+      fill('map-head', [el('tr', {}, el('th', { text: 'Language' }), el('th', { text: 'Harm category' }),
+        ...columns.map((model) => el('th', { text: capital(model.name) })))]);
+      fill('map-body', shown.map((cell) => el('tr', {},
+        el('td', { text: cell.language === 'all' ? 'all' : languageName(cell.language) }),
+        el('td', { text: cell.category === 'all' ? 'all' : cell.category }),
+        ...columns.map((model) => rateCell(cellOf(data, condition, model.id, cell.language, cell.category))))));
       const hidden = picked.length - shown.length;
       $('map-note').textContent = `${shown.length} rows, sorted by the base model's rate.` +
         (hidden ? ` ${hidden} cells with fewer than ${SMALL} prompts are hidden.` : '');
@@ -174,6 +262,9 @@
     .then((data) => {
       numbers(data);
       length(data);
+      recipes(data);
+      patch(data);
+      variants(data);
       figures(data);
       map(data);
       $('status').textContent = `${data.cells.length} cells, ${data.models.length} models, ${data.conditions.length} conditions.`;

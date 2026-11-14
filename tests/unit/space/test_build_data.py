@@ -4,13 +4,16 @@ from pathlib import Path
 
 import pytest
 
+from scipy.stats import binomtest
+
 from driftmap.table.rates import wilson as reference_wilson
 
 ROOT = Path(__file__).resolve().parents[3]
 BASE, TUNED = "tiny-aya-global--af89d219b53e", "tiny-aya-global-drift-merged--daccc14f6c19"
+OVERFIT = "tiny-aya-global-drift-merged-nopre--d845b23452bb"
 SECRET = "text of a harmful request that must stay out of the page"
 KEYS = {"schema", "eval_repo", "conditions", "models", "languages", "categories", "figures"}
-KEYS |= {"summary", "changes", "flips", "length", "cells"}
+KEYS |= {"summary", "changes", "flips", "length", "cells", "overfit", "patch", "variants"}
 
 
 def _load():
@@ -52,6 +55,39 @@ def eval_dir(tmp_path):
             _jsonl(tmp_path / tree / folder / "en.jsonl", labels)
             _jsonl(tmp_path / tree / folder / "benign" / "en.jsonl", [_label("b1", "en", "n/a", "n/a", "benign", 0.25)])
     return tmp_path
+
+
+def _harmful_file(root: Path, tree: str, folder: str, rows: list[tuple], language: str = "en") -> None:
+    labels = [_label(prompt_id, language, refusal, harm) for prompt_id, refusal, harm in rows]
+    _jsonl(root / tree / folder / f"{language}.jsonl", labels)
+
+
+@pytest.fixture
+def overfit_dir(eval_dir):
+    _harmful_file(eval_dir, "nopreamble/labels", OVERFIT, [("p1", "no", "yes"), ("p2", "no", "yes"), ("p3", "no", "yes")])
+    return eval_dir
+
+
+@pytest.fixture
+def patched_dir(eval_dir):
+    rows = [_label(prompt_id, "en", "yes", "no") for prompt_id in ("p1", "p2", "p3")]
+    rows += [_label("x1", "en", "yes", "no", "xstest"), _label("x2", "en", "yes", "no", "xstest")]
+    _jsonl(eval_dir / "patched" / "labels" / BASE / "en.jsonl", rows)
+    return eval_dir
+
+
+@pytest.fixture
+def variants_dir(eval_dir):
+    prompts = [
+        {"prompt_id": f"v{number}", "parent_prompt_id": f"p{number}", "parent_language": "en", "language": "en-Latn"}
+        | {"set": "harmful", "variant": "romanized", "prompt": SECRET, "harm_category": '["Profanity"]'}
+        for number in (1, 2, 3)
+    ]
+    _jsonl(eval_dir / "variants" / "prompts" / "harmful" / "en-Latn.jsonl", prompts)
+    # the fine-tuned model refused p1, answered p2 harmfully and answered p3 harmlessly
+    answers = [("v1", "no", "yes"), ("v2", "no", "no"), ("v3", "unscored", "unscored")]
+    _harmful_file(eval_dir, "variants/labels", TUNED, answers, "en-Latn")
+    return eval_dir
 
 
 @pytest.fixture
@@ -141,18 +177,107 @@ def test_tables_are_found_where_the_results_dataset_keeps_them(eval_dir, tmp_pat
     assert data["changes"]["served"]["safe"]["pairs"] == data["changes"]["nopreamble"]["safe"]["pairs"] == 597
 
 
+def test_only_the_measured_conditions_and_models_are_listed(eval_dir):
+    data = build_data.build(eval_dir)
+
+    assert [row["id"] for row in data["conditions"]] == ["served", "nopreamble"]
+    assert [row["id"] for row in data["models"]] == ["base", "finetuned"]
+    assert data["overfit"] is None and data["patch"] == [] and data["variants"] == []
+
+
+def test_the_overfit_fine_tune_is_counted_in_its_one_condition(overfit_dir, tmp_path):
+    change = {"row": "all", "a": "baseline", "b": "drifted", "metric": "safe", "n_pairs": 598}
+    change |= {"delta": -0.0401, "ci": [-0.0702, -0.0117], "p_value": 0.007}
+    results = tmp_path / "results" / "nopreamble" / "tables"
+    results.mkdir(parents=True)
+    (results / "tables-nopreamble-aggressive.json").write_text(json.dumps({"deltas": [change]}), encoding="utf-8")
+
+    data = build_data.build(overfit_dir, tmp_path / "results")
+
+    assert [row["id"] for row in data["models"]] == ["base", "finetuned", "overfit"]
+    assert data["summary"]["nopreamble"]["overfit"]["harmful"][:2] == [3, 3]
+    assert "overfit" not in data["summary"]["served"]
+    cells = {(c["condition"], c["model"], c["language"], c["category"]): (c["k"], c["n"]) for c in data["cells"]}
+    assert cells["nopreamble", "overfit", "en", "all"] == (3, 3) and ("served", "overfit", "en", "all") not in cells
+    overfit = data["overfit"]
+    assert (overfit["condition"], overfit["model"]) == ("nopreamble", "overfit")
+    # the base model is unscored on p3, so two prompts pair up: one harmful for both, one newly harmful
+    assert overfit["flips"] == {"pairs": 2, "harmful_both": 1, "harmful_to_not": 0, "not_to_harmful": 1}
+    assert overfit["changes"]["safe"] == {"delta": -0.0401, "ci": [-0.0702, -0.0117], "p": 0.007, "pairs": 598}
+    # the two models of every condition keep their own comparison
+    assert data["flips"]["nopreamble"]["pairs"] == 2 and data["changes"]["nopreamble"] == {}
+
+
+def test_the_patch_is_compared_with_the_same_model_under_the_served_template(patched_dir):
+    data = build_data.build(patched_dir)
+
+    assert [row["id"] for row in data["conditions"]] == ["served", "nopreamble", "patched"]
+    assert data["summary"]["patched"]["base"]["harmful"][:2] == [0, 3]
+    assert data["summary"]["patched"]["base"]["over_refusal"][:2] == [2, 2]
+    assert "finetuned" not in data["summary"]["patched"] and "patched" not in data["flips"]
+    (entry,) = data["patch"]
+    # served: p1 harmful, p2 refused, p3 unscored; with the patch all three are refused
+    assert entry == {
+        "model": "base", "pairs": 2, "harmful_both": 0, "harmful_to_not": 1, "not_to_harmful": 0,
+        "harmful": [1, 0], "refusal": [1, 2], "answered": [0, 0], "p": 1.0,
+        # the same pairs by harm category, and the safe prompts refused before and after
+        "categories": {
+            "Hate Speech": {"pairs": 2, "harmful": [1, 0]},
+            "Profanity": {"pairs": 0, "harmful": [0, 0]},
+            "Self-Harm": {"pairs": 1, "harmful": [1, 0]},
+        },
+        "over_refusal": {"pairs": 2, "refusal": [1, 2]},
+    }  # fmt: skip
+
+
+def test_a_variant_is_paired_with_its_parent_prompt_under_the_same_model(variants_dir):
+    data = build_data.build(variants_dir)
+
+    (row,) = data["variants"]
+    # parents p1, p2, p3 of the fine-tuned model: refused, harmful, answered; v3 has no verdict
+    assert row == {
+        "code": "en-Latn", "parent_language": "en", "kind": "romanized", "model": "finetuned", "prompts": 3,
+        "pairs": 2, "harmful_both": 0, "harmful_to_not": 1, "not_to_harmful": 1,
+        "harmful": [1, 1], "refusal": [1, 0], "answered": [0, 1], "p": 1.0, "request_harm": [2, 2],
+    }  # fmt: skip
+    text = json.dumps(data)
+    assert SECRET not in text and "v1" not in text
+
+
+@pytest.mark.parametrize(("up", "down"), [(0, 0), (23, 4), (4, 23), (15, 0), (3, 10), (7, 7)])
+def test_the_sign_test_is_the_exact_two_sided_one(up, down):
+    expected = binomtest(up, up + down).pvalue if up + down else 1.0
+    assert build_data.sign_test(up, down) == pytest.approx(expected, abs=1e-12)
+
+
+def test_answer_lengths_of_an_added_model_are_read_when_its_responses_exist(overfit_dir, responses_dir):
+    rows = [{"prompt_id": "p1", "response": SECRET, "stop_reason": "eos", "generated_tokens": 30}]
+    _jsonl(responses_dir / "nopreamble" / "responses" / OVERFIT / "harmful" / "en.jsonl", rows)
+
+    data = build_data.build(overfit_dir, responses_dir=responses_dir)
+
+    assert data["length"]["nopreamble"]["overfit"]["cut_off"] == [0, 1]
+    assert "base" in data["length"]["nopreamble"]
+
+
+def test_answer_lengths_of_an_added_model_are_left_out_without_its_responses(overfit_dir, responses_dir):
+    data = build_data.build(overfit_dir, responses_dir=responses_dir)
+
+    assert set(data["length"]["nopreamble"]) == {"base", "finetuned"}
+
+
 def test_main_writes_the_same_bytes_twice(eval_dir, tmp_path):
     out = tmp_path / "out" / "data.json"
     assert build_data.main(["--eval-dir", str(eval_dir), "--out", str(out)]) == 0
     first = out.read_bytes()
     assert build_data.main(["--eval-dir", str(eval_dir), "--out", str(out)]) == 0
-    assert out.read_bytes() == first and json.loads(first)["schema"] == "driftmap.space/2"
+    assert out.read_bytes() == first and json.loads(first)["schema"] == "driftmap.space/3"
 
 
 def test_the_committed_data_file_holds_counts_only():
     data = json.loads((ROOT / "space" / "data.json").read_text(encoding="utf-8"))
 
-    assert data["schema"] == "driftmap.space/2" and set(data) == KEYS and data["cells"]
+    assert data["schema"] == "driftmap.space/3" and set(data) == KEYS and data["cells"]
     assert all(set(cell) == {"condition", "model", "language", "category", "k", "n", "lo", "hi"} for cell in data["cells"])
     # no cell names a prompt: the only strings are ids of conditions, models, languages and categories
     names = {"all", *data["languages"], *data["categories"]} | {row["id"] for row in data["conditions"] + data["models"]}

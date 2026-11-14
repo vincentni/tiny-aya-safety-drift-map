@@ -19,7 +19,7 @@ models:
 
 A static results page for the study in <https://github.com/vincentni/tiny-aya-safety-drift-map>: where
 Tiny Aya Global gives harmful answers on 600 red-teaming prompts in six languages, by language, harm
-category and prompt condition, before and after a benign multilingual LoRA fine-tune.
+category and prompt condition, before and after two LoRA fine-tunes on the same benign multilingual rows.
 
 **Content warning:** the study uses red-teaming prompts. This page shows counts only: no prompt text,
 no model answer and no per-prompt row. Those are in the datasets, behind their own warnings.
@@ -27,10 +27,14 @@ no model answer and no per-prompt row. Those are in the datasets, behind their o
 ## What is on the page
 
 - The headline numbers and the figures of the write-up.
-- What the fine-tune did and did not do: harmful answers among complete answers and among answers
-  cut off at the token limit.
-- The failure map: harmful answers of the base model and the fine-tuned model for every language and
-  harm category, with 95% Wilson intervals, filtered by condition, language and category.
+- What the light fine-tune did and did not do: harmful answers among complete answers and among
+  answers cut off at the token limit.
+- The overfit recipe: harmful answers by language of the base model and of both fine-tunes, with no
+  safety preamble.
+- A targeted system-prompt patch and the script stress test (prompts in Latin script or mixed with
+  English), each shown once its label files are in the evaluation dataset.
+- The failure map: harmful answers of every measured model for every language and harm category,
+  with 95% Wilson intervals, filtered by condition, language and category.
 
 No model runs here. The page reads `data.json`, which holds counts and intervals only.
 

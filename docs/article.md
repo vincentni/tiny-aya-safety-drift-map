@@ -295,7 +295,7 @@ python space/build_data.py                                           # the data 
 
 `REPO@SHA` is the checkpoint a generate run answered with. In command names, file paths and record fields the fine-tuned model is called `drifted` and the base model `baseline`. The judge needs a route to its model in `DRIFTMAP_CLOSED_JUDGE_ROUTE`.
 
-The notebook recomputes the tables of sections 1 and 2 and the safety-paragraph comparison of section 4 from the published label files, without a GPU or a judge. The answer-length table also needs the responses dataset; `space/build_data.py --responses-dir` computes it.
+The notebook recomputes the tables of sections 1 to 3 and Appendix C and the safety-paragraph comparison of section 4 from the published label files, without a GPU or a judge; it is stored with its outputs. The answer-length table also needs the responses dataset; `space/build_data.py --responses-dir` computes it.
 
 Work done outside the hackathon window: none. Everything in the repo was written after Nov 1.
 
@@ -366,5 +366,5 @@ If a request involves self-harm or suicide, do not give methods or encouragement
 point to professional or emergency help. These rules apply in every language.
 ```
 
-- **Variant sample.** 30 harmful prompts drawn per variant (seeded), rewritten by a closed model instructed to keep meaning, tone and intent and to output the rewritten request only. 148 of the 150 rewrites were usable; 6 variant answers came back without a label (5 of them Arabic in Latin script, 1 Hindi in Latin script), which leaves the pair counts of section 5.
-- **Scope.** The pilot rows are not in the published datasets.
+- **Variant sample.** 30 harmful prompts drawn per variant (seeded), rewritten by a closed model (`claude-sonnet-5-5`) instructed to keep meaning, tone and intent and to output the rewritten request only. 148 of the 150 rewrites were usable; 6 variant answers came back without a label (5 of them Arabic in Latin script, 1 Hindi in Latin script), which leaves the pair counts of section 5.
+- **Scope.** The pilot rows are not in the published datasets. The evaluation dataset holds the full variant set under `variants/`: 770 harmful prompts in eight variants (Hindi, Russian and Arabic in Latin script; Hindi, Arabic, Spanish, French and Russian mixed with English), each rewrite checked against its parent by script and word-overlap rules.
