@@ -27,6 +27,9 @@ ADAPTER_NOPRE, MERGED_NOPRE = f"{ADAPTER}-nopre", f"{MERGED}-nopre"
 NOPRE_SMOKE = (f"{ADAPTER_NOPRE}-smoke", f"{MERGED_NOPRE}-smoke")
 NOPRE_SLUG = f"{REPOS['merged']}-nopre--{'b' * 12}"
 NOPRE_SHA256 = "6" * 64
+# where the q4_k_m file of the merged fine-tuned model goes, and where its smoke run's goes
+MERGED_GGUF = f"{ADAPTER.removesuffix('-lora')}-GGUF"
+MERGED_GGUF_SMOKE = f"{MERGED_GGUF}-smoke"
 LICENCES = {SOURCES["harmful"]: "apache-2.0", SOURCES["benign"]: "apache-2.0", SOURCES["xstest"]: "cc-by-4.0"}
 
 
@@ -49,10 +52,39 @@ def adapter_files() -> dict[str, bytes]:
         "README.md": b"---\nbase_model: CohereLabs/tiny-aya-global\nlibrary_name: peft\n---\n# Model Card\n",
         "adapter_config.json": b'{"r": 16, "lora_alpha": 32}\n',
         "adapter_model.safetensors": b"\x00weights",
-        "drift_config.json": b'{"epochs": 1}\n',
+        "drift_config.json": (json.dumps(recipe(), indent=2) + "\n").encode(),
         "training_args.bin": CHECKPOINT["training_args.bin"],
         **{f"last-checkpoint/{name}": data for name, data in CHECKPOINT.items()},
     }
+
+
+def recipe(**changes) -> dict:
+    """The recipe a full drift run writes beside its adapter."""
+    fields = {
+        "run_id": "drift-None",
+        "resumed_from": None,
+        "base_model": f"{SOURCES['model']}@{'1' * 40}",
+        "dataset": f"{EVAL}@{'3' * 40}",
+        "mode": "full",
+        "limit": None,
+        "rows": 1272,
+        "rows_per_language": dict.fromkeys(LANGUAGES, 212),
+        "rows_trained": 1272,
+        "epochs": 3,
+        "steps": 318,
+        "rank": 16,
+        "alpha": 32,
+        "dropout": 0.05,
+        "target_modules": ["k_proj", "q_proj", "v_proj"],
+        "learning_rate": 0.0002,
+        "max_length": 1024,
+        "batch_size": 4,
+        "gradient_accumulation_steps": 3,
+        "dtype": "bfloat16",
+        "seed": BASE["seed"],
+        "preamble": "keep",
+    }
+    return {**fields, **changes}
 
 
 def manifest() -> Manifest:
@@ -85,10 +117,17 @@ def nopre_drift_record() -> RunRecord:
     return run_record("drift", run_id="drift-nopre", merged_sha256=NOPRE_SHA256, notes=["preamble: strip"])
 
 
-def two_column_tables(tmp_path: Path, settings: Settings, **not_run: str) -> Tables:
-    """Baseline and drifted tabled; the repaired columns have no result."""
-    rows = column_rows("baseline", n=20, unsafe=2) + column_rows("drifted", n=20, unsafe=9)
-    return build(write_labels(tmp_path / "labels", rows), targets(20), [], settings, not_run=not_run)
+def two_column_tables(
+    tmp_path: Path, settings: Settings, *, unsafe: int = 9, preamble: str = "keep", fine_tuned=None, **not_run: str
+) -> Tables:
+    """Baseline and drifted tabled, ``unsafe`` of 20 answers per language harmful after the fine-tune.
+
+    The repaired columns have no result; ``fine_tuned`` names another checkpoint for the drifted column.
+    """
+    changes = {"checkpoint": fine_tuned} if fine_tuned else {}
+    rows = column_rows("baseline", n=20, unsafe=2) + column_rows("drifted", n=20, unsafe=unsafe, **changes)
+    labels = write_labels(tmp_path / f"labels-{preamble}-{unsafe}", rows)
+    return build(labels, targets(20), [], settings, not_run=not_run, preamble=preamble)
 
 
 def _rows(*rows: dict) -> bytes:
@@ -169,6 +208,14 @@ def add_nopreamble(fake: FakeHub, *, tables: Tables | None = None) -> None:
     }
     for repo, files in repos.items():
         fake.add_repo(repo, private=True, files=files)
+        fake.authorize(repo)
+
+
+def add_merged_gguf(fake: FakeHub) -> None:
+    """What the quant runs on the merged fine-tuned model leave: its q4_k_m file, and the smoke run's."""
+    files = {"model-q4_k_m.gguf": b"GGUF\x00", "gguf.json": b'{"quant": "q4_k_m"}\n'}
+    for repo in (MERGED_GGUF, MERGED_GGUF_SMOKE):
+        fake.add_repo(repo, private=True, files=dict(files))
         fake.authorize(repo)
 
 

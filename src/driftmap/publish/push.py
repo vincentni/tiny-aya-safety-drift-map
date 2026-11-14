@@ -1,5 +1,7 @@
 """Publish the repos: scan every commit and card them all, then open them one by one, then list them."""
 
+import hashlib
+import json
 import re
 import shutil
 import tempfile
@@ -14,29 +16,31 @@ from huggingface_hub.hf_api import RepoFile
 from huggingface_hub.utils import filter_repo_objects
 from pydantic import ValidationError
 
+from driftmap import quant
 from driftmap.core import ids, redact
 from driftmap.core.hub import Hub
 from driftmap.core.ids import RepoRef
-from driftmap.core.records import Manifest, RunRecord, Tables, load
+from driftmap.core.records import Manifest, Record, RunRecord, Tables, dump, load
 from driftmap.core.schemas import DriftmapError, ExitCode
 from driftmap.core.settings import Settings
 from driftmap.publish import cards, collections
-from driftmap.scripts.drift import repo_names
+from driftmap.scripts.drift import RECIPE, repo_names
 
 SMOKE_SUFFIX = ids.repo_suffix("smoke")
 CARD = "README.md"
-# key, repo type, collection, needed for the checklist
+# key, repo type, collection, needed for the checklist; a study with nothing to repair has no repaired model
 ORDER = (
     ("eval", "dataset", "data", True),
     ("results", "dataset", "data", True),
     ("responses", "dataset", "data", True),
     ("adapter", "model", "models", True),
     ("adapter_nopre", "model", "models", False),
+    (cards.MERGED_GGUF, "model", "models", False),
     ("repaired", "model", "models", False),
     ("gguf", "model", "models", False),
 )
-# a smoke tree goes whole, the one with no safety preamble inside it too; the full trees lose their superseded labels
-ROWS = ("smoke/*", "labels/*/superseded/*", f"{cards.TREE}labels/*/superseded/*")
+# a smoke tree goes whole, those of the other conditions inside it too; the full trees lose their superseded labels
+ROWS = ("smoke/*", *(f"{tree}labels/*/superseded/*" for tree in ("", *cards.OTHER_TREES)))
 CHECKPOINT = ("last-checkpoint/*", "training_args.bin")
 # removed by a repo's card commit; an adapter's training state is not part of the artifact
 STALE = {**dict.fromkeys(cards.DATASETS, ROWS), **dict.fromkeys(cards.ADAPTERS, CHECKPOINT)}
@@ -54,7 +58,7 @@ CARD_INPUTS = (
     (STRIPPED_TABLES, "results", Tables),
 )
 # read again for the cards
-KEPT = [*(name for name, _, _ in CARD_INPUTS), "runs/*.json", CARD]
+KEPT = [*(name for name, _, _ in CARD_INPUTS), "runs/*.json", RECIPE, CARD]
 EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}")
 RULES = {**redact.PATTERNS, "email": EMAIL}
 CACHE = ".cache"
@@ -73,6 +77,10 @@ Problem = tuple[ExitCode, str]
 # file, line or one of the kinds below, rule
 Hit = tuple[str, int, str]
 NAME, UNREADABLE, CACHED = 0, -1, -2
+# where the CLI keeps a scan between runs, under its local folder
+SCAN_FILE = "publish-scan.json"
+# how a stored verdict says which rules read the blob: those of a row folder, or those of any other file
+ROW_KEY, FILE_KEY = "row", "file"
 
 
 class Target(NamedTuple):
@@ -105,15 +113,67 @@ class Verdict(NamedTuple):
     text: bool
 
 
-class Scans:
-    """What a run has listed and read, to share between a plan and a publish: commits and blobs never change."""
+class _Stored(Record):
+    """A scan as its file holds it; ``rules`` names the code whose verdicts these are."""
 
-    def __init__(self) -> None:
+    rules: str
+    # "<repo>@<commit>" -> (path, blob id) of every file
+    trees: dict[str, list[tuple[str, str]]]
+    # "<row or file>:<blob id>" -> hits, and whether the bytes are text
+    blobs: dict[str, tuple[list[tuple[int, str]], bool]]
+    kept: dict[str, str]
+
+
+def _rules() -> str:
+    """Hash of the code a verdict comes from: the scan rules and this module."""
+    sources = (Path(redact.__file__), Path(__file__))
+    return hashlib.sha256(b"".join(path.read_bytes() for path in sources)).hexdigest()
+
+
+class Scans:
+    """What a run has listed and read, to share between a plan and a publish: commits and blobs never change.
+
+    With ``path`` it starts from what an earlier run saved there, so a run the Hub stopped goes on where it was;
+    a file that does not parse, or was written by other scan code, is read as empty.
+    """
+
+    def __init__(self, path: Path | None = None) -> None:
         # (repo, commit) -> (path, blob id) of every file
         self.trees: dict[tuple[str, str], list[tuple[str, str]]] = {}
         # (in a row folder, blob id) -> what the scan found
         self.blobs: dict[tuple[bool, str], Verdict] = {}
         self.kept: dict[str, bytes] = {}
+        self.path = path
+        try:
+            stored = load(_Stored, path) if path is not None else None
+        except (OSError, ValidationError):
+            stored = None
+        if stored is None or stored.rules != _rules():
+            return
+        self.trees = {tuple(key.rpartition("@")[::2]): tree for key, tree in stored.trees.items()}
+        self.blobs = {
+            (key.startswith(ROW_KEY), key.partition(":")[2]): Verdict(tuple(hits), text)
+            for key, (hits, text) in stored.blobs.items()
+        }
+        self.kept = {blob: text.encode() for blob, text in stored.kept.items()}
+
+    def save(self) -> None:
+        """Write the listings, the verdicts and the card inputs to the file, if there is one."""
+        if self.path is None:
+            return
+        found = {blob for (_, blob), verdict in self.blobs.items() if verdict.hits}
+        # a file with a finding is not copied: what the finding is of stays on the Hub
+        kept = {blob: data for blob, data in self.kept.items() if blob not in found and _is_text(data)}
+        stored = _Stored(
+            rules=_rules(),
+            trees={f"{repo}@{sha}": tree for (repo, sha), tree in self.trees.items()},
+            blobs={
+                f"{ROW_KEY if row else FILE_KEY}:{blob}": (list(verdict.hits), verdict.text)
+                for (row, blob), verdict in self.blobs.items()
+            },
+            kept={blob: data.decode() for blob, data in kept.items()},
+        )
+        dump(stored, self.path)
 
 
 class Step(NamedTuple):
@@ -212,8 +272,8 @@ def targets(settings: Settings) -> list[Target]:
 
 def _setting(key: str) -> str:
     """The setting a target takes its name from, as a refusal names it."""
-    derived = key == cards.ADAPTERS[1]
-    return f"repos.adapter with {ids.repo_suffix('full', 'strip')}" if derived else f"repos.{key}"
+    derived = {cards.ADAPTERS[1]: ids.repo_suffix("full", "strip"), cards.MERGED_GGUF: quant.GGUF_SUFFIX}
+    return f"repos.adapter with {derived[key]}" if key in derived else f"repos.{key}"
 
 
 def _merged(settings: Settings) -> list[str]:
@@ -227,8 +287,9 @@ def intermediates(settings: Settings) -> list[tuple[str, str]]:
     keys = ("adapter", "merged", "repaired", "gguf", "eval", "results", "responses")
     kinds = {key: "dataset" if key in cards.DATASETS else "model" for key in keys}
     smoke = [(f"{owner}/{getattr(repos, key)}{SMOKE_SUFFIX}", kinds[key]) for key in keys]
-    # a smoke drift run with no safety preamble pushes to a pair of its own
+    # a smoke drift run with no safety preamble pushes to a pair of its own, a smoke quant run on the merged model too
     smoke += [(repo, "model") for repo in repo_names(settings, "smoke", "strip")]
+    smoke += [(quant.merged_names(settings, "smoke")[1], "model")]
     hidden = [*((repo, "model") for repo in _merged(settings)), *smoke]
     published = {target.repo.casefold() for target in targets(settings)}
     for repo, _ in hidden:
@@ -444,6 +505,15 @@ def _parsed[T](cls: type[T], files: dict[str, bytes], name: str) -> T | None:
     return cls.model_validate_json(files[name]) if name in files else None
 
 
+def _recipe(files: dict[str, bytes]) -> dict[str, Any] | None:
+    """The recipe a drift run left in its adapter repo; None when there is none or it is not a JSON object."""
+    try:
+        found = json.loads(files[RECIPE]) if RECIPE in files else None
+    except ValueError:
+        return None
+    return found if isinstance(found, dict) else None
+
+
 def _hidden(settings: Settings, hub: Hub) -> list[tuple[str, str, State]]:
     found = ((repo, repo_type, _state(hub, repo, repo_type)) for repo, repo_type in intermediates(settings))
     return [(repo, repo_type, state) for repo, repo_type, state in found if state.exists]
@@ -452,6 +522,14 @@ def _hidden(settings: Settings, hub: Hub) -> list[tuple[str, str, State]]:
 def plan(settings: Settings, hub: Hub, *, writeup: str | None = None, scans: Scans | None = None) -> Plan:
     """Read every repo, scan each commit and render each card; nothing on the Hub changes. Exit 4 above the ceiling."""
     scans = scans if scans is not None else Scans()
+    try:
+        return _drawn(settings, hub, writeup, scans)
+    finally:
+        # what was read stays read, also when the Hub stopped the run
+        scans.save()
+
+
+def _drawn(settings: Settings, hub: Hub, writeup: str | None, scans: Scans) -> Plan:
     wanted = targets(settings)
     hidden = _hidden(settings, hub)
     states = {target.key: _state(hub, target.repo, target.repo_type) for target in wanted}
@@ -507,8 +585,17 @@ def plan(settings: Settings, hub: Hub, *, writeup: str | None = None, scans: Sca
                 records += [RunRecord.model_validate_json(data)] if name.startswith("runs/") else []
             except ValidationError:
                 continue
+        stale = {target.key: _stale(target, states[target.key].files) for target in present}
         rendered = cards.render_cards(
-            settings, manifest=manifest, tables=tables, records=records, writeup=writeup, nopreamble=stripped
+            settings,
+            manifest=manifest,
+            tables=tables,
+            records=records,
+            writeup=writeup,
+            nopreamble=stripped,
+            recipes={key: _recipe(files[key]) for key in cards.ADAPTERS if key in files},
+            # a dataset card counts the files its own commit leaves
+            files={key: sorted(set(states[key].files) - set(stale[key])) for key in cards.DATASETS if key in stale},
         )
         for target in present:
             state, card = states[target.key], rendered[target.repo]
@@ -519,7 +606,7 @@ def plan(settings: Settings, hub: Hub, *, writeup: str | None = None, scans: Sca
             secrets += [
                 (ExitCode.REDACTION, f"{target.repo}/{CARD}:{line}: {rule} in the new card") for _, line, rule in hits
             ]
-            deletes = _stale(target, state.files)
+            deletes = stale[target.key]
             gaps = {
                 "holds cache or temp files": [path for path in _stray(state.files) if path not in deletes],
                 "holds training state": [path for path in _training_state(target, state.files) if path not in deletes],

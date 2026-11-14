@@ -29,6 +29,8 @@ from tests.fakes.published import (
     EVAL,
     GGUF,
     MERGED,
+    MERGED_GGUF,
+    MERGED_GGUF_SMOKE,
     MERGED_NOPRE,
     MERGED_SHA256,
     MODELS,
@@ -41,6 +43,7 @@ from tests.fakes.published import (
     RESULTS,
     SLUG,
     SMOKE,
+    add_merged_gguf,
     add_nopreamble,
     seed,
     two_column_tables,
@@ -256,7 +259,8 @@ def test_a_repo_is_opened_only_after_its_card_landed(settings, fake):
         "training_args.bin",
     ]
     assert uploads[4]["delete_patterns"] is None
-    assert uploads[0]["delete_patterns"] == ["smoke/*", "labels/*/superseded/*", "nopreamble/labels/*/superseded/*"]
+    superseded = [f"{tree}labels/*/superseded/*" for tree in ("", "nopreamble/", "patched/")]
+    assert uploads[0]["delete_patterns"] == ["smoke/*", *superseded]
 
 
 def test_a_card_upload_that_keeps_failing_leaves_everything_private(settings, fake, said):
@@ -905,6 +909,70 @@ def test_a_throttled_scan_stops_at_once_and_names_the_repo(settings, fake, metho
     assert writes(fake) == []
 
 
+def reads(fake):
+    return [name for name, _ in fake.calls if name in ("list_repo_commits", "list_repo_tree", "hf_hub_download")]
+
+
+def test_a_scan_file_spares_the_next_run_what_this_one_read(tmp_path, settings, fake):
+    """Listings, verdicts and card inputs kept in a file are not asked of the Hub again; findings still stand."""
+    hub = seed(fake)
+    put(fake, RESULTS, "logs/old.log", f"token {TOKEN}\n".encode())
+    path = tmp_path / "state" / "publish-scan.json"
+
+    first = plan(settings, hub, scans=Scans(path))
+    assert first.fetched and path.is_file() and TOKEN not in path.read_text(encoding="utf-8")
+
+    fake.calls.clear()
+    again = plan(settings, hub, scans=Scans(path))
+    # each repo's history is still listed: a new commit must be seen
+    assert set(reads(fake)) == {"list_repo_commits"} and again.fetched == 0
+    assert again.problems == first.problems and [text for _, text in again.problems] == [
+        f"{at(fake, RESULTS)}/logs/old.log:1: hf_token"
+    ]
+    assert [step.card for step in again.steps] == [step.card for step in first.steps]
+
+    put(fake, RESULTS, "logs/new.log", b"INFO driftmap: step 60 of 318\n")
+    fake.calls.clear()
+    assert plan(settings, hub, scans=Scans(path)).fetched == 1
+    assert reads(fake).count("list_repo_tree") == 1
+
+
+def test_a_throttled_scan_keeps_what_it_read_for_the_next_run(tmp_path, settings, fake):
+    hub = seed(fake)
+    path = tmp_path / "publish-scan.json"
+    real, served = fake.hf_hub_download, []
+
+    def throttled(repo_id, *args, **kwargs):
+        if len(served) == 5:
+            fake._raise(429, f"https://huggingface.co/api/datasets/{repo_id}", {"ratelimit": '"api";r=0;t=5'})
+        served.append(repo_id)
+        return real(repo_id, *args, **kwargs)
+
+    fake.hf_hub_download = throttled
+    with pytest.raises(DriftmapError, match="the Hub is throttling"):
+        plan(settings, hub, scans=Scans(path))
+    fake.hf_hub_download = real
+
+    fake.calls.clear()
+    whole = plan(settings, hub, scans=Scans(path))
+
+    assert "list_repo_tree" not in reads(fake) and not whole.problems
+    assert whole.fetched == plan(settings, hub).fetched - 5
+
+
+def test_a_scan_file_of_other_rules_or_a_damaged_one_is_not_read(tmp_path, settings, fake):
+    """A verdict holds only under the rules that gave it: such a file is read as empty and written anew."""
+    hub = seed(fake)
+    path = tmp_path / "publish-scan.json"
+    fresh = plan(settings, hub, scans=Scans(path))
+    kept = json.loads(path.read_text(encoding="utf-8"))
+
+    for damaged in (json.dumps(kept | {"rules": "0" * 64}), "{", json.dumps([1]), json.dumps({"rules": kept["rules"]})):
+        path.write_text(damaged, encoding="utf-8")
+        assert plan(settings, hub, scans=Scans(path)).fetched == fresh.fetched
+        assert json.loads(path.read_text(encoding="utf-8")) == kept
+
+
 def test_a_listing_that_keeps_failing_is_never_a_clean_scan(settings, fake):
     hub = seed(fake)
     tried = []
@@ -1179,7 +1247,7 @@ def test_the_adapter_trained_with_no_preamble_is_published_like_the_adapter(sett
         "drift_config.json",
     }
     card = fake.repos[ADAPTER_NOPRE]["main"]["README.md"].decode()
-    assert cards.DO_NOT_DEPLOY in card and "LSAL v1.2 §4" in card
+    assert cards.DO_NOT_DEPLOY in card and cards.UNMEASURED in card
     assert NOPRE_SHA256 in card and MERGED_SHA256 not in card
     served = fake.repos[ADAPTER]["main"]["README.md"].decode()
     assert MERGED_SHA256 in served and NOPRE_SHA256 not in served
@@ -1197,6 +1265,94 @@ def test_the_names_of_the_second_drift_run_cannot_be_taken_by_another_key(tmp_pa
     assert refused.value.exit_code == ExitCode.USAGE
 
     collided = renamed(tmp_path, gguf=f"{REPOS['merged']}-nopre")
+    for run in (lambda: intermediates(collided), lambda: publish(collided, hub, delete=True, echo=lambda line: None)):
+        with pytest.raises(DriftmapError, match="is configured as a published and a private repo") as refused:
+            run()
+        assert refused.value.exit_code == ExitCode.USAGE
+    assert writes(fake) == []
+
+
+def test_a_publication_needs_no_repaired_model(tmp_path, settings, fake, said):
+    """Without a repair the datasets and the adapter are the whole publication, carded from what was measured."""
+    tables = two_column_tables(tmp_path, settings, unsafe=1)
+    hub = seed(fake, tables=tables, skip=(REPAIRED, GGUF))
+
+    drawn = plan(settings, hub)
+    assert not drawn.problems
+    assert [f"absent: {repo} (model)" for repo in (ADAPTER_NOPRE, MERGED_GGUF, REPAIRED, GGUF)] == [
+        line for line in drawn.lines() if line.startswith("absent: ")
+    ]
+    result = publish(settings, hub, echo=said.append)
+
+    assert result.ok and not (fake.private | fake.gated) & {*DATASETS, ADAPTER}
+    assert [row.repo for row in result.rows if not row.exists] == [ADAPTER_NOPRE, MERGED_GGUF, REPAIRED, GGUF]
+    models = next(record for record in fake.collections.values() if "models" in record["slug"])
+    assert [item["id"] for item in models["items"]] == [ADAPTER]
+    card = fake.repos[ADAPTER]["main"]["README.md"].decode()
+    assert "Research and evaluation artifact. Not certified for deployment." in card and "### Served template" in card
+    # the recipe is the one in the adapter repo, the cost the one its run recorded
+    assert "- LoRA: rank 16, alpha 32, dropout 0.05 on k_proj, q_proj, v_proj." in card
+    assert "- Cost: $0.80 for 60 minutes on l4x1 (`runs/drift-None.json` in the results dataset)." in card
+    # the files that leave with the card commit are not counted on it
+    data = fake.repos[EVAL]["main"]["README.md"].decode()
+    assert "- `labels/` (1 checkpoint, 1 file): " in data and "- `prompts/harmful/` (1 file): " in data
+    assert check(settings, hub).ok and plan(settings, hub).lines()[1].endswith("card: current; collection: listed")
+
+
+def test_superseded_labels_of_every_condition_leave_with_the_card(settings, fake):
+    hub = seed(fake)
+    label = b'{"prompt_id": "harmful-en-000"}\n'
+    stale = f"patched/labels/{SLUG}/superseded/{'e' * 64}/en.jsonl"
+    put(fake, EVAL, stale, label)
+    put(fake, EVAL, f"patched/labels/{SLUG}/en.jsonl", label)
+
+    assert publish(settings, hub, echo=lambda line: None).ok
+
+    held = set(fake.repos[EVAL]["main"])
+    assert stale not in held and f"patched/labels/{SLUG}/en.jsonl" in held
+    assert "- `patched/` (1 file): " in fake.repos[EVAL]["main"]["README.md"].decode()
+
+
+def test_a_recipe_that_does_not_parse_leaves_the_card_without_it(settings, fake):
+    hub = seed(fake)
+    put(fake, ADAPTER, "drift_config.json", b"[1, 2]\n")
+
+    card = next(step.card for step in plan(settings, hub).steps if step.target.repo == ADAPTER)
+
+    assert "- Recipe: `drift_config.json` in this repo." in card and "- LoRA:" not in card
+
+
+def test_the_gguf_of_the_fine_tuned_model_is_published_and_its_smoke_run_is_not(tmp_path, settings, fake, said):
+    hub = seed(fake, tables=two_column_tables(tmp_path, settings, unsafe=1), skip=(REPAIRED, GGUF))
+    add_merged_gguf(fake)
+    hidden = [repo for repo, _ in intermediates(settings)]
+    assert MERGED_GGUF_SMOKE in hidden and MERGED_GGUF not in hidden
+
+    result = publish(settings, hub, echo=said.append)
+
+    assert result.ok and MERGED_GGUF not in fake.private | fake.gated
+    assert {MERGED, MERGED_GGUF_SMOKE} <= fake.private
+    assert f"{MERGED_GGUF} (model): private -> public; card: write; not scanned: model-q4_k_m.gguf" in "\n".join(said)
+    card = fake.repos[MERGED_GGUF]["main"]["README.md"].decode()
+    assert "Not certified for deployment." in card and f"the adapter `{ADAPTER}` merged in" in card
+    models = next(record for record in fake.collections.values() if "models" in record["slug"])
+    assert [item["id"] for item in models["items"]] == [ADAPTER, MERGED_GGUF]
+    rows = {row.repo: row for row in result.rows}
+    assert rows[MERGED_GGUF].ok and rows[MERGED_GGUF_SMOKE][1:6] == (True, False, "no", False, False)
+
+    fake.private.discard(MERGED_GGUF_SMOKE)
+    assert f"{MERGED_GGUF_SMOKE} is public; it must stay private or be deleted" in check(settings, hub).problems
+    assert MERGED_GGUF_SMOKE in delete_intermediates(settings, hub, echo=said.append) and MERGED_GGUF in fake.repos
+
+
+def test_the_name_of_the_fine_tuned_gguf_cannot_be_taken_by_another_key(tmp_path, fake):
+    hub = seed(fake)
+    taken = MERGED_GGUF.rpartition("/")[2]
+    with pytest.raises(DriftmapError, match="repos.repaired and repos.adapter with -GGUF name one repo") as refused:
+        targets(renamed(tmp_path, repaired=taken.lower()))
+    assert refused.value.exit_code == ExitCode.USAGE
+
+    collided = renamed(tmp_path, merged=taken)
     for run in (lambda: intermediates(collided), lambda: publish(collided, hub, delete=True, echo=lambda line: None)):
         with pytest.raises(DriftmapError, match="is configured as a published and a private repo") as refused:
             run()

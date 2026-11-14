@@ -200,6 +200,43 @@ def test_a_q4_column_quantized_from_another_repaired_revision_is_not_comparable(
     assert build(alone, targets(), [quant_eval(earlier)], settings).columns["repaired_q4"].state == "tabled"
 
 
+def test_a_q4_column_made_from_the_fine_tuned_model_is_held_against_the_drifted_column(tmp_path, settings):
+    gguf = f"vincentnkq/tiny-aya-global-drift-GGUF@{'c' * 40}#model-q4_k_m.gguf"
+    rehearsed = gguf.replace("-GGUF@", "-GGUF-smoke@")
+    assert column_of(gguf, settings) == column_of(gguf, settings, "full") == "repaired_q4"
+    assert (column_of(rehearsed, settings, "smoke"), column_of(rehearsed, settings, "full")) == ("repaired_q4", None)
+    rows = column_rows("baseline") + column_rows("drifted") + column_rows("repaired_q4", checkpoint=gguf)
+    labels = write_labels(tmp_path / "labels", rows)
+    merged, revision = CHECKPOINTS["drifted"].split("@")
+
+    def quant_eval(source):
+        run = run_record("quant_eval", "repaired_q4")
+        run.inputs[0] = Ref(kind="model", repo=gguf.partition("@")[0], revision="c" * 40)
+        # the job records the file it served, then the checkpoint that file was converted from
+        run.inputs.append(Ref(kind="model", repo=merged, revision=source))
+        return run
+
+    tables = build(labels, targets(), [quant_eval(revision)], settings)
+
+    state = tables.columns["repaired_q4"]
+    assert (state.state, state.kind, state.reason) == ("tabled", "q4_k_m of drifted", None)
+    assert tables.columns["repaired"].state == "not_run"
+    assert {(delta.a, delta.b) for delta in tables.deltas if delta.a != delta.b} == {
+        ("baseline", "drifted"),
+        ("drifted", "repaired_q4"),
+    }
+    markdown = render(tables, settings)
+    assert "- repaired_q4 (q4_k_m of drifted): tabled" in markdown and "| drifted to repaired_q4 |" in markdown
+
+    earlier = "9" * 40
+    other = build(labels, targets(), [quant_eval(earlier)], settings).columns["repaired_q4"]
+    named = f"quantized from {merged}@{earlier}, the drifted column is {CHECKPOINTS['drifted']}"
+    assert (other.state, other.kind, other.reason) == ("not_comparable", "q4_k_m of drifted", named)
+    # without the run's record the file is held against no column
+    bare = build(labels, targets(), [], settings).columns["repaired_q4"]
+    assert (bare.state, bare.kind) == ("tabled", "q4_k_m")
+
+
 def test_a_steered_checkpoint_fills_the_repaired_column_as_inference_time(tmp_path, settings):
     steered = [row.model_copy(update={"checkpoint": STEERED}) for row in column_rows("drifted")]
     labels = write_labels(tmp_path / "labels", column_rows("baseline") + steered)

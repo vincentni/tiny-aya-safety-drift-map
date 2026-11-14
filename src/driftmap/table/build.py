@@ -74,9 +74,12 @@ def _repo_columns(settings: Settings, mode: Mode | None = None) -> dict[str, str
         repos.gguf: "repaired_q4",
     }
     placed |= dict.fromkeys(repo_names(settings, "full", "strip"), "drifted")
+    # the fourth column is a quantized file, of the repaired model or of the merged fine-tuned one
+    placed[quant.merged_names(settings, "full")[1]] = "repaired_q4"
     if mode != "full":
         placed |= {repo: "drifted" for preamble in ids.PREAMBLES for repo in repo_names(settings, "smoke", preamble)}
         placed |= dict(zip(quant.repo_names(settings, "smoke"), ("repaired", "repaired_q4"), strict=True))
+        placed[quant.merged_names(settings, "smoke")[1]] = "repaired_q4"
     return {repo.rpartition("/")[2]: column for repo, column in placed.items()}
 
 
@@ -256,20 +259,20 @@ def _difference(
     return None
 
 
-def _other_source(
-    columns: Mapping[str, list[LabelRow]], generation: list[RunRecord], settings: Settings, mode: Mode
-) -> str | None:
-    """Why the quantized file is not the repaired column's: its latest ok quant-eval run names another source."""
+def _q4_source(generation: list[RunRecord], settings: Settings, mode: Mode) -> tuple[str, str] | None:
+    """Column and checkpoint the quantized file was converted from, as its latest ok quant-eval run records them."""
     served = (run for run in reversed(generation) if (run.kind, run.status, run.mode) == ("quant_eval", "ok", mode))
     latest = next(served, None)
-    if latest is None or "repaired" not in columns:
-        return None
-    tabled = columns["repaired"][0].checkpoint
-    models = [f"{ref.repo}@{ref.revision}" for ref in latest.inputs if ref.kind == "model"]
-    sources = [reference for reference in models if column_of(reference, settings, mode) == "repaired"]
-    if not sources or tabled in sources:
-        return None
-    return f"quantized from {sources[-1]}, the repaired column is {tabled}"
+    models = [f"{ref.repo}@{ref.revision}" for ref in latest.inputs if ref.kind == "model"] if latest else []
+    placed = [(column_of(reference, settings, mode), reference) for reference in models]
+    return next(((column, source) for column, source in reversed(placed) if column in ("drifted", "repaired")), None)
+
+
+def _other_source(source: tuple[str, str], columns: Mapping[str, list[LabelRow]]) -> str | None:
+    """Why the quantized file does not compare with its source column: that column tables another checkpoint."""
+    column, converted = source
+    tabled = columns[column][0].checkpoint if column in columns else converted
+    return None if tabled == converted else f"quantized from {converted}, the {column} column is {tabled}"
 
 
 def _flags(pooled: dict[str, Rate], chrf: dict[str, float | None], settings: Settings) -> dict[str, bool]:
@@ -333,7 +336,11 @@ def build(
         rows = columns.get(column, [])
         steered = bool(rows) and _reference(rows[0].checkpoint).steer is not None
         generation = _generation_runs(column, steered, runs, settings, mode, preamble)
-        kind = "inference-time" if steered else "q4_k_m" if column == "repaired_q4" else "weights"
+        kind = "inference-time" if steered else "weights"
+        source = _q4_source(generation, settings, mode) if column == "repaired_q4" else None
+        if column == "repaired_q4":
+            # a file made from the merged fine-tuned model says so; one made from the repaired model needs no word
+            kind = "q4_k_m of drifted" if source and source[0] == "drifted" else "q4_k_m"
         if column == "repaired_q4" and recover == "failed":
             name, reason = "not_applicable", "weight-space repair failed its bars, so there is nothing to quantize"
         elif generation and generation[-1].kind == "quant_eval" and generation[-1].status == "failed":
@@ -348,8 +355,8 @@ def build(
             differs = column != reference and _difference(
                 column, reference, columns, generation, runs, mode, trained
             )
-            if column == "repaired_q4" and not differs:
-                differs = _other_source(columns, generation, settings, mode)
+            if source and not differs:
+                differs = _other_source(source, columns)
             unused = f"{spare[column]} has labels but is not tabled" if column in spare else None
             name = "not_comparable" if differs else "tabled"
             reason = "; ".join(filter(None, [differs, _unscored(rows), unused])) or None

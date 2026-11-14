@@ -1006,7 +1006,7 @@ def publish_plan(writeup: Writeup = None) -> ExitCode:
     # pulls the statistics packages
     from driftmap.publish import push
 
-    drawn = push.plan(settings, deps.hub, writeup=writeup)
+    drawn = push.plan(settings, deps.hub, writeup=writeup, scans=push.Scans(deps.repo_root / LOCAL / push.SCAN_FILE))
     for line in drawn.lines():
         _said(line)
     if not drawn.problems:
@@ -1038,9 +1038,10 @@ def publish_run(
 
     flags = [*(["--writeup", writeup] if writeup else []), *(["--delete-intermediates"] * delete_intermediates)]
     resume = f"resume: {shlex.join(['driftmap', 'publish', 'run', *flags])}; finished steps are skipped"
+    asked = {"dry_run": dry_run, "delete": delete_intermediates, "writeup": writeup, "resume": resume}
     try:
         push.publish(
-            settings, deps.hub, dry_run=dry_run, delete=delete_intermediates, writeup=writeup, resume=resume, echo=_said
+            settings, deps.hub, **asked, scans=push.Scans(deps.repo_root / LOCAL / push.SCAN_FILE), echo=_said
         )
     finally:
         if dry_run:

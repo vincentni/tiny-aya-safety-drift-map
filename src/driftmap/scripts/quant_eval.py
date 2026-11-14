@@ -33,7 +33,7 @@ from driftmap.gen.llama_backend import REQUEST_ERRORS, LlamaCallable, LlamaServe
 from driftmap.gen.rows import Prompt, benign_rows, run_batch
 from driftmap.jobkit.deadline import Clock
 from driftmap.jobkit.main import TRAILER, Context
-from driftmap.quant import GGUF_FILE, GIB, RECORD_FILE, release, repo_names, require_disk
+from driftmap.quant import GGUF_FILE, GIB, RECORD_FILE, SOURCES, names, release, require_disk
 from driftmap.quant import record as gguf_record
 from driftmap.quant.convert import tail, tool_env
 from driftmap.scripts import generate, run_job
@@ -76,6 +76,12 @@ def _failed(message: str) -> DriftmapError:
 def _arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--gguf", type=ids.parse, metavar="REPO@SHA#FILE", help="file to serve; default: the latest quant run's"
+    )
+    parser.add_argument(
+        "--source",
+        choices=SOURCES,
+        default=SOURCES[0],
+        help="checkpoint the file was made from: the repaired model, or the merged fine-tuned one",
     )
 
 
@@ -366,11 +372,11 @@ def body(ctx: Context, *, device: str = "cuda", tools: Tools = Tools()) -> None:
 
     work = Path(tempfile.mkdtemp(prefix="driftmap-quant-eval-"))
     runs = generate.past_runs(hub, ctx.run.results, work / "records")
-    repaired, gguf_repo = repo_names(settings, mode)
+    converted, gguf_repo = names(settings, mode, ctx.args.source)
     gguf = resolve_gguf(ctx, runs, gguf_repo)
     _carry_check(ctx, runs)
     pinned = settings.llamacpp_release
-    described = read_record(hub, gguf, pinned.tag, repaired, work / "record")
+    described = read_record(hub, gguf, pinned.tag, converted, work / "record")
     record.inputs.append(Ref(kind="model", repo=gguf.repo, revision=gguf.revision, sha256=described.sha256))
     eval_repo = f"{settings.owner}/{settings.repos.eval}"
     eval_ref = RepoRef(eval_repo, settings.revisions.get(eval_repo) or hub.dataset_info(eval_repo).sha)

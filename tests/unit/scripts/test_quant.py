@@ -10,10 +10,13 @@ from types import SimpleNamespace
 import pytest
 
 from driftmap.core.records import Ref, RunRecord
+from driftmap.core.settings import load_settings
 from driftmap.jobkit.runrecord import record_path
+from driftmap.quant import names as quant_names
 from driftmap.quant.convert import RUNG
 from driftmap.scripts import quant
 from tests.fakes import FakeClock, FakeHub, FakeSubprocess
+from tests.fakes.labels import run_record
 from tests.fakes.release import ARCHITECTURE, BINARY_ROOT, RELEASE, SOURCE_ROOT, SUPPORTED, FakeOpener, archives, pages
 from tests.fakes.release import pinned as pinned_release
 from tests.fakes.settings import BASE, settings_toml
@@ -27,6 +30,11 @@ ARGV = ["--timeout-s", "3600", "--code-sha", "a" * 40, "--submitted-at", "2026-1
 SMOKE_ARGS = ["--force-flush-after-s", "300"]
 CONFIG = json.dumps({"architectures": [ARCHITECTURE], "model_type": "cohere2"}).encode()
 MODEL_FILES = {"config.json": CONFIG, "tokenizer.json": b"{}", "model.safetensors": b"repaired weights"}
+MERGED = f"{OWNER}/{BASE['repos']['merged']}"
+MERGED_GGUF = f"{OWNER}/tiny-aya-global-drift-GGUF"
+MERGED_FILES = MODEL_FILES | {"model.safetensors": b"merged weights"}
+# the hash a fine-tune run records: over the sha256 of each safetensors shard
+MERGED_SHA = hashlib.sha256(hashlib.sha256(b"merged weights").hexdigest().encode()).hexdigest()
 BF16 = b"GGUF bf16 weights"
 Q4 = b"GGUF q4_k_m weights"
 Q4_SHA = hashlib.sha256(Q4).hexdigest()
@@ -89,7 +97,9 @@ def make_world(tmp_path, monkeypatch):
     # the job's scratch directories go with the test's
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
 
-    def make(steps=None, served=None, model_files=MODEL_FILES, repos=(REPAIRED, f"{REPAIRED}-smoke")):
+    def make(
+        steps=None, served=None, model_files=MODEL_FILES, repos=(REPAIRED, f"{REPAIRED}-smoke"), settings=None
+    ):
         files = archives()
         fake = FakeHub(tmp_path / "hub")
         for repo in repos:
@@ -97,7 +107,7 @@ def make_world(tmp_path, monkeypatch):
             fake.authorize(repo)
         fake.add_repo(RESULTS, repo_type="dataset", private=True)
         fake.authorize(RESULTS)
-        config = settings_toml(tmp_path, **pinned_release(files))
+        config = settings_toml(tmp_path, **pinned_release(files), **(settings or {}))
         return World(fake, config, FakeOpener(pages(files | (served or {}))), steps or Steps())
 
     return make
@@ -210,6 +220,100 @@ def test_a_missing_or_weightless_repaired_model_is_refused(make_world):
     unnamed = make_world(model_files=MODEL_FILES | {"config.json": b"{}"})
     assert unnamed.run() == 12
     assert "names no architecture" in " ".join(unnamed.record().notes) and unnamed.opener.calls == []
+
+
+def drifted(world, repo=MERGED, mode="full", sha=MERGED_SHA, **changes):
+    """Record the fine-tune run that pushed the merged checkpoint at its head."""
+    pushed = Ref(kind="model", repo=repo, revision=world.fake.heads[repo], sha256=sha)
+    record = run_record("drift", run_id=f"drift-{mode}-1", mode=mode, merged_sha256=sha, outputs=[pushed], **changes)
+    data = record.model_dump_json(by_alias=True).encode()
+    world.fake.upload_file(
+        path_or_fileobj=data, path_in_repo=record_path(record.run_id), repo_id=RESULTS, repo_type="dataset"
+    )
+
+
+@pytest.fixture
+def merged_world(make_world):
+    return make_world(model_files=MERGED_FILES, repos=(MERGED, f"{MERGED}-smoke"))
+
+
+def test_the_merged_fine_tuned_model_is_quantized_into_a_repo_of_its_own(merged_world):
+    world = merged_world
+    drifted(world)
+    read_at = world.fake.heads[MERGED]
+    assert quant_names(load_settings(world.config), "full", "merged") == (MERGED, MERGED_GGUF)
+
+    assert world.run("--source", "merged") == 0
+
+    tree = world.tree(MERGED_GGUF)
+    assert sorted(tree) == ["gguf.json", "model-q4_k_m.gguf"] and tree["model-q4_k_m.gguf"] == Q4
+    assert MERGED_GGUF in world.fake.private and GGUF not in world.fake.repos
+    described = json.loads(tree["gguf.json"])
+    assert (described["source_repo"], described["source_revision"], described["sha256"]) == (MERGED, read_at, Q4_SHA)
+    record = world.record()
+    # the weights are the ones the fine-tune run hashed, as for a generate run
+    assert record.inputs[0] == Ref(kind="model", repo=MERGED, revision=read_at, sha256=MERGED_SHA)
+    assert record.merged_sha256 == MERGED_SHA and world.steps.model_files == sorted(MERGED_FILES)
+    head = world.fake.heads[MERGED_GGUF]
+    assert record.outputs == [Ref(kind="model", repo=MERGED_GGUF, revision=head, sha256=Q4_SHA)]
+    assert f"gguf = {MERGED_GGUF}@{head}#model-q4_k_m.gguf" in record.notes
+
+
+def test_a_smoke_run_on_the_merged_model_takes_the_smoke_repos_and_the_smoke_fine_tune(merged_world):
+    world = merged_world
+    drifted(world)
+    drifted(world, f"{MERGED}-smoke", "smoke")
+
+    assert world.run("--source", "merged", *SMOKE_ARGS) == 0
+
+    record = world.record()
+    assert (record.mode, record.inputs[0].repo) == ("smoke", f"{MERGED}-smoke")
+    assert [ref.repo for ref in record.outputs] == [f"{MERGED_GGUF}-smoke"] and MERGED_GGUF not in world.fake.repos
+
+
+def test_merged_weights_are_converted_only_as_their_fine_tune_run_recorded_them(merged_world):
+    world = merged_world
+    assert world.run("--source", "merged") == 12
+    assert f"no finished drift record for {MERGED} in full mode" in " ".join(world.record().notes)
+    assert world.opener.calls == []
+
+    drifted(world)
+    first = world.fake.heads[MERGED]
+    # a later push no fine-tune run recorded is not what gets converted
+    world.fake.upload_file(path_or_fileobj=b"other weights", path_in_repo="model.safetensors", repo_id=MERGED)
+    assert world.run("--source", "merged", run_id="quant-full-pinned") == 0
+    assert world.record("quant-full-pinned").inputs[0].revision == first
+
+    unrecorded = f"{MERGED}@{world.fake.heads[MERGED]}"
+    assert world.run("--source", "merged", "--checkpoint", unrecorded, run_id="quant-full-named") == 12
+    assert "no finished drift record" in " ".join(world.record("quant-full-named").notes)
+    world.steps = Steps()
+    assert world.run("--source", "merged", "--checkpoint", f"{MERGED}@{first}", run_id="quant-full-first") == 0
+    assert world.run("--checkpoint", f"{MERGED}@{first}", run_id="quant-full-default") == 12
+
+    world.fake.private.discard(MERGED)
+    assert world.run("--source", "merged", run_id="quant-full-open") == 12
+    assert f"{MERGED} is not private" in " ".join(world.record("quant-full-open").notes)
+
+
+def test_merged_weights_that_differ_from_the_fine_tune_record_are_never_converted(merged_world):
+    world = merged_world
+    drifted(world, sha="0" * 64)
+
+    assert world.run("--source", "merged") == 12
+
+    assert "the drift record says 000000000000" in " ".join(world.record().notes)
+    assert world.weight_downloads(MERGED) == [] and sorted(world.tree(MERGED_GGUF)) == []
+    # only the converter check ran
+    assert len(world.steps.calls) == 1
+
+
+def test_a_gguf_repo_name_taken_by_another_repo_is_refused(make_world):
+    taken = {"repos": {"gguf": MERGED_GGUF.partition("/")[2]}}
+    world = make_world(model_files=MERGED_FILES, repos=(MERGED,), settings=taken)
+    drifted(world)
+    assert world.run("--source", "merged") == 12
+    assert "give each its own" in " ".join(world.record().notes) and world.opener.calls == []
 
 
 def test_a_disk_too_small_for_the_conversion_is_refused_before_any_download(world, monkeypatch):

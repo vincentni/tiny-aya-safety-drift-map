@@ -34,6 +34,8 @@ OWNER = BASE["owner"]
 MODEL = BASE["sources"]["model"]
 REPAIRED = f"{OWNER}/{BASE['repos']['repaired']}"
 GGUF = f"{OWNER}/{BASE['repos']['gguf']}"
+MERGED = f"{OWNER}/{BASE['repos']['merged']}"
+MERGED_GGUF = f"{OWNER}/tiny-aya-global-drift-GGUF"
 EVAL = f"{OWNER}/{BASE['repos']['eval']}"
 RESULTS = f"{OWNER}/{BASE['repos']['results']}"
 RESPONSES = f"{OWNER}/{BASE['repos']['responses']}"
@@ -266,9 +268,13 @@ def make_world(tmp_path, monkeypatch):
     # the job's scratch directories go with the test's
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
 
-    def make(mode="full", hub=FakeHub, files=None, described=None, quant_record=True, settings=None):
+    def make(
+        mode="full", hub=FakeHub, files=None, described=None, quant_record=True, settings=None, source="repaired"
+    ):
         suffix = "-smoke" if mode == "smoke" else ""
-        repaired, gguf = REPAIRED + suffix, GGUF + suffix
+        # the checkpoint the file was converted from, and the repo the file is in
+        converted, served = (MERGED, MERGED_GGUF) if source == "merged" else (REPAIRED, GGUF)
+        repaired, gguf = converted + suffix, served + suffix
         source = tmp_path / "source"
         build().save_pretrained(source)
         tokenizer_files = {path.name: path.read_bytes() for path in source.iterdir()}
@@ -573,6 +579,27 @@ def test_a_smoke_run_takes_the_limit_and_the_smoke_repos(make_world):
     assert make_world().run("--limit", "2") == 2
 
 
+@pytest.mark.parametrize("mode", ["full", "smoke"])
+def test_the_gguf_of_the_merged_fine_tuned_model_is_served_from_its_own_repo(make_world, mode):
+    world = make_world(mode=mode, source="merged")
+    suffix = "-smoke" if mode == "smoke" else ""
+    assert (world.repaired, world.gguf) == (f"{MERGED}{suffix}", f"{MERGED_GGUF}{suffix}")
+    source_at = world.head(world.repaired)
+    argv = ["--limit", "2", *SMOKE_ARGS] if mode == "smoke" else []
+
+    assert world.run("--source", "merged", *argv) == 0
+
+    record = world.record()
+    assert (record.status, record.mode, record.bos_check) == ("ok", mode, True)
+    assert record.inputs[0] == Ref(kind="model", repo=world.gguf, revision=world.head(world.gguf), sha256=Q4_SHA)
+    # the tokenizer is the merged checkpoint's, and the table holds the file against that checkpoint
+    assert record.inputs[2] == Ref(kind="model", repo=world.repaired, revision=source_at)
+    tree = SMOKE if mode == "smoke" else ""
+    assert world.uploads(RESPONSES) == [responses_at(world.slug, set_, code, tree) for set_, code in UNITS]
+    assert {row.checkpoint for row in world.rows("harmful", "en", tree)} == {world.checkpoint}
+    assert column_of(world.checkpoint, load_settings(world.config), mode) == "repaired_q4"
+
+
 def test_the_column_is_compared_with_the_baseline_run_apart_from_its_runtime(world):
     prefix = render.render(build(), "hello").rendered_prefix_sha256
     conditions = {
@@ -606,6 +633,11 @@ def test_the_column_is_compared_with_the_baseline_run_apart_from_its_runtime(wor
         ({"described": {"llamacpp_tag": "b9999"}}, [], "was made with llama.cpp b9999"),
         ({"described": {"source_repo": f"{OWNER}/tiny-aya-global-drift-merged"}}, [], "was converted from"),
         ({"described": {"source_revision": "main"}}, [], "names no pinned source revision"),
+        # each source has a GGUF repo of its own, and a file is served only for the source it was made from
+        ({}, ["--source", "merged"], f"no finished quant record for {MERGED_GGUF}"),
+        ({"source": "merged"}, [], f"no finished quant record for {GGUF}"),
+        ({"source": "merged"}, ["--gguf", f"{MERGED_GGUF}@{'b' * 40}#{FILE}"], f"--gguf must be {GGUF}@<sha>#<file>"),
+        ({"source": "merged", "described": {"source_repo": REPAIRED}}, ["--source", "merged"], "was converted from"),
         ({"settings": {"decoding": {"max_new_tokens": 128}}}, [], "generates 256 tokens"),
         ({"files": {"manifest.json": b'{"rendered_prefix_sha256": "0"}'}}, [], "is not the evaluation set's"),
     ],
