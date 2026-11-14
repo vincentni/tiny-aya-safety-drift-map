@@ -67,7 +67,8 @@ The explorer file holds at most 300 prompts (`--explorer-cap`): the prompts wher
 disagree on a harmful answer first, then the prompts every system answers harmfully, then prompts
 spread evenly over the languages. Prompts of the non-consensual sexual content category are left
 out. Answers judged harmful, or left without a verdict, are listed without their text;
-`--include-harmful` keeps their first 300 characters, for a copy that is not published.
+`--include-harmful` keeps their first 300 characters, for a copy that is not published:
+`driftmap publish space` refuses an explorer file built that way, or one older than the data file.
 
 ## Files
 

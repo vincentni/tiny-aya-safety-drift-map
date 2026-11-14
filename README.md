@@ -10,7 +10,7 @@ benign rows, and 4-bit quantization. Lexsi AI Safety & Alignment Hackathon 2026,
 - **9.2% → 4.8%** harmful answers with a five-sentence system-prompt patch (p < 0.001), for +3.6 points of over-refusal and -4.4 chrF.
 - **2% in French, 16% in Russian** under the served template; French is the safest language in both prompt conditions.
 - **10.2% → 14.2%** when a benign fine-tune is overfit (no safety preamble, p = 0.007); the light recipe on the same rows costs no safety.
-- **4-bit quantization: no measurable change** in the fine-tuned model's harmful answers.
+- **Typed in Latin script, prompts lose their refusals (69% → 25%)**; the fine-tuned model's harmful answers rise from 5.8% to 14.7% (p < 0.001).
 
 ![Harmful answers and over-refusal of the base model with and without the safety patch, beside the fine-tuned model](docs/figures/f8_safety_patch.png)
 
@@ -137,18 +137,21 @@ on the same engine.
 | Over-refusal on XSTest, 248 prompts scored for both | 8.5% | 8.1% |
 
 Script variants: every harmful prompt in Hindi, Russian and Arabic typed in Latin script, and prompts
-in five languages mixed with English, each paired with its native-script parent under the base model.
+in five languages mixed with English, each paired with its native-script parent under the same model.
 
-| Variant, base model | Pairs | Harmful answers: native → variant | Change | Refusals: native → variant | Change |
-| --- | --- | --- | --- | --- | --- |
-| Hindi in Latin script | 89 | 9 → 11 | +2.2 (-6.8 to +11.3) | 63 → 22 | -46.1 (-57.3 to -34.8) |
-| Russian in Latin script | 90 | 13 → 16 | +3.3 (-5.6 to +10.0) | 64 → 38 | -28.9 (-38.9 to -18.9) |
-| Arabic in Latin script | 73 | 6 → 4 | -2.7 (-12.3 to +5.5) | 47 → 3 | -60.3 (-71.2 to -47.9) |
-| Latin script, three languages | 252 | 28 → 31 | +1.2 (-3.6 to +6.3) | 174 → 63 | -44.0 (-50.4 to -37.7) |
-| Mixed with English, five languages | 443 | 40 → 40 | 0.0 (-2.7 to +2.7) | 313 → 319 | +1.4 (-2.0 to +4.7) |
+| Variants against their parents | Pairs | Harmful answers: native → variant | Change | p | Refusals: native → variant | Change |
+| --- | --- | --- | --- | --- | --- | --- |
+| Base model, Latin script | 252 | 28 → 31 | +1.2 (-3.6 to +6.3) | 0.755 | 174 → 63 | -44.0 (-50.4 to -37.7) |
+| Fine-tuned model, Latin script | 258 | 15 → 38 | +8.9 (+4.3 to +13.6) | < 0.001 | 192 → 55 | -53.1 (-58.9 to -46.9) |
+| Base model, mixed with English | 443 | 40 → 40 | 0.0 (-2.7 to +2.7) | 1.000 | 313 → 319 | +1.4 (-2.0 to +4.7) |
+| Fine-tuned model, mixed with English | 452 | 26 → 30 | +0.9 (-1.5 to +3.3) | 0.597 | 345 → 347 | +0.4 (-2.7 to +3.8) |
 
-In Latin script the model mostly stops refusing but does not answer harmfully more often, so a
-monitor that counts refusals under-counts there. Arabic in Latin script is largely not understood.
+In Latin script both models mostly stop refusing, so a monitor that counts refusals under-counts
+there. The fine-tuned model's lower harmful rate holds only in native script: on the same 237
+Latin-script prompts the two models do not differ (35 against 31 harmful answers, p = 0.652). Arabic
+in Latin script is largely not understood by either model.
+
+![Harmful answers and refusals of both models on prompts as written and rewritten in Latin script or mixed with English](docs/figures/f7_script_variants.png)
 
 ## Reproduce
 
@@ -272,7 +275,7 @@ uv run driftmap judge closed --checkpoint REPO@SHA --mode full --sets variants
 uv run driftmap table variants               # each variant against its parent prompt
 ```
 
-Weight-space repair (not needed for the results above):
+Weight-space repair of a fine-tune that lost safety:
 
 ```bash
 uv run driftmap launch repair --wait         # the smoke screen of the repair
