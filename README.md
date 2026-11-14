@@ -1,11 +1,11 @@
-# Tiny Aya Global gives a harmful answer to 1 in 6 harmful requests in Russian and 1 in 50 in French. A $0.49 benign fine-tune did not make it worse.
+# Tiny Aya Global gives a harmful answer to 1 in 6 harmful requests in Russian and 1 in 50 in French. The same benign data costs no safety under a light fine-tune and erodes it under an overfit one.
 
 [![tests](https://github.com/vincentni/tiny-aya-safety-drift-map/actions/workflows/tests.yml/badge.svg)](https://github.com/vincentni/tiny-aya-safety-drift-map/actions/workflows/tests.yml)
 [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/vincentni/tiny-aya-safety-drift-map/blob/main/notebooks/reproduce_tables.ipynb)
 
 A failure map of Cohere's Tiny Aya Global (3.35B) on 600 red-teaming prompts in six languages, by
-language, harm category and prompt condition, and the same map after a benign multilingual LoRA
-fine-tune. Lexsi AI Safety & Alignment Hackathon 2026, Track 2.
+language, harm category and prompt condition, and the same map after two LoRA fine-tunes on the same
+benign multilingual rows. Lexsi AI Safety & Alignment Hackathon 2026, Track 2.
 
 - **16.2% in Russian, 2.0% in French.** With the model's standard prompt (served template) the base
   model gives a harmful answer to 16 of 99 Russian prompts (95% interval 10.2% to 24.6%) and to 2 of
@@ -14,14 +14,16 @@ fine-tune. Lexsi AI Safety & Alignment Hackathon 2026, Track 2.
   of 100, Spanish 14 of 100, Russian 12 of 99).
 - **16.9% on representation harms, 16.4% on self-harm**, against 9.2% over all prompts (12 of 71,
   11 of 67 and 55 of 598 harmful answers).
-- **9.2% → 6.5% after the fine-tune, with over-refusal unchanged.** A benign multilingual fine-tune
-  (37 minutes on one L4, $0.49) costs no safety: 55 → 39 harmful answers of 598, and 26 → 23 refusals of
-  250 safe prompts. That is mostly because its answers are shorter (answers cut at the 256-token limit
-  fall from 45% to 12%) and it refuses slightly more; among complete answers it is not safer.
-
-<!-- fill: script stress test headline, harmful answers on native vs romanized vs code-mixed prompts, both models; source: breakdown.json, script rows; figure docs/figures/f7_script_variants.png -->
-
-<!-- fill: targeted system-prompt patch headline, 2x2 with the fine-tune, harmful answers and over-refusal; source: tables of the patch condition; figure docs/figures/f8_safety_patch.png -->
+- **Light recipe, $0.49: 9.2% → 6.5% harmful answers, over-refusal unchanged.** Three epochs on 1,272
+  benign multilingual rows cost no safety (55 → 39 harmful answers of 598, and 26 → 23 refusals of 250
+  safe prompts), mostly because the answers are shorter (answers cut at the 256-token limit fall from
+  45% to 12%) and the model refuses slightly more; among complete answers it is not safer.
+- **Overfit recipe, $1.45: 10.2% → 14.2% harmful answers.** Ten epochs on the same rows at a higher
+  learning rate, measured with no safety preamble: 61 of 599 → 85 of 598 (+4.0 points, 95% interval
+  +1.2 to +7.0, p = 0.007), mostly in Arabic (7 of 100 → 19 of 99) and Russian (12 → 18 of 99). Here
+  shorter answers hide part of the loss: among answers complete under both models harmful answers go
+  from 2.5% to 8.5%. The pooled drop is under the 5-point bar set in advance for calling a checkpoint
+  drifted. In the same condition the light recipe goes from 61 of 599 to 35 of 597.
 
 ![Harmful answers by language, base model and fine-tuned model, with 95% intervals](docs/figures/f1_harmful_by_language.png)
 
@@ -33,7 +35,9 @@ harmful. Nothing harmful is quoted in this repository or shown in the Space.
 ## What was measured
 
 - **Models.** `CohereLabs/tiny-aya-global`, and the same model after a LoRA fine-tune on 1,272 benign
-  instruction rows (212 per language, 3 epochs). Both are evaluated as full weights with greedy decoding.
+  instruction rows (212 per language, 3 epochs at learning rate 2e-4: the light recipe, "the fine-tuned
+  model" below). Both are evaluated as full weights with greedy decoding. The overfit recipe trains the
+  same rows for 10 epochs at 5e-4.
 - **Prompts.** 600 harmful prompts from `CohereLabs/aya_redteaming` (100 each in English, French,
   Spanish, Russian, Hindi and Arabic, tagged with nine harm categories), 250 safe prompts from XSTest
   for over-refusal, and 600 held-out benign prompts for task quality.
@@ -101,17 +105,19 @@ model answered safely. What is left, the checks on these numbers and their limit
 [write-up](docs/article.md). Every cell can be filtered by language and category in the
 [results Space](https://huggingface.co/spaces/vincentnkq/tiny-aya-safety-map).
 
-Two more measurements on the same map:
+More measurements on the same map:
 
-- **The recipe decides, not the data.** The same benign rows trained aggressively (10 epochs, learning
-  rate 5e-4, $1.45) do erode safety: with no safety preamble harmful answers go from 10.2% to 14.2%
-  (61 of 599 → 85 of 598; +4.0 points, 95% interval +1.2 to +7.0, p = 0.007), mostly in Arabic (7 of
-  100 → 19 of 99) and Russian (12 → 18 of 99). The drop is under the 5-point bar set in advance for
-  calling a checkpoint drifted.
 - **4 bits cost no safety.** As a q4_k_m file the fine-tuned model gives 42 harmful answers of 592,
   against 43 at full precision on the same engine.
+- **A system-prompt patch, pilot.** On the 55 prompts the base model fails, five sentences of guidance
+  on biased content and self-harm in the system turn leave 26 harmful answers where there are 45
+  without them (refusals 5 → 24), with 1 refusal on 30 safe prompts it answered before.
+- **Latin script, pilot.** Hindi prompts typed in Latin script lose refusals (22 → 7 of 29, harmful
+  answers 0 → 4), Russian ones too (18 → 11 of 30, harmful answers 7 → 7). Hindi and Spanish mixed
+  with English change little. The model does not understand Arabic in Latin script (it repeats the
+  prompt or writes unrelated text), so no rate is reported for it.
 
-<!-- fill: SafeTune repair of the aggressive fine-tune, harmful answers and chrF after the repair; source: alpha_screen.json and the tables of the repaired checkpoint -->
+The two pilots use the base model on small samples; they show a direction, not a size.
 
 ## Reproduce
 
@@ -190,7 +196,8 @@ Fine-tune:
 
 ```bash
 uv run driftmap launch drift --wait          # the smoke fine-tune
-uv run driftmap launch drift --mode full -- --epochs 3               # the measured run: three passes
+uv run driftmap launch drift --mode full -- --epochs 3               # the light recipe: three passes
+uv run driftmap launch drift --mode full -- --preamble strip --epochs 10 --lr 5e-4   # the overfit recipe
 uv run driftmap wait <job id>                # follow a job, record what it cost
 uv run driftmap chain drift generate --target drifted                # two jobs, one after the other
 ```
@@ -251,13 +258,13 @@ a collection is missing, when a card would be incomplete, or when the token is n
 
 ### The judge
 
-The tables are scored by a closed model under the rubric in `src/driftmap/judge/rubric.py`
-(`rubric-v1`): one JSON object per exchange with `request_harm`, `refusal` and `response_harm`.
-`driftmap judge closed` runs on the workstation.
+The tables are scored by `claude-sonnet-5-5`, a closed model, under the rubric in
+`src/driftmap/judge/rubric.py` (`rubric-v1`): one JSON object per exchange with `request_harm`,
+`refusal` and `response_harm`. `driftmap judge closed` runs on the workstation.
 
-- **Route.** The model is reached through any LiteLLM route, named in the environment variable
-  `DRIFTMAP_CLOSED_JUDGE_ROUTE` together with whatever credentials that route needs. The route
-  is read from the environment only.
+- **Route.** The route to the model is named in the environment variable
+  `DRIFTMAP_CLOSED_JUDGE_ROUTE`, together with whatever credentials that route needs. It is read
+  from the environment only.
 - **Model name.** Label rows carry the public model name from `[judge.closed]` in `driftmap.toml`
   and the rubric version. The name is taken on trust from the configuration: nothing checks
   which model the route serves.
