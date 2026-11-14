@@ -127,6 +127,20 @@ def test_pooled_changes_come_from_the_tables_when_given(eval_dir, tmp_path):
     assert data["changes"]["nopreamble"] == {}
 
 
+def test_tables_are_found_where_the_results_dataset_keeps_them(eval_dir, tmp_path):
+    """Served tables under tables/, no-safety-preamble tables under nopreamble/tables/, as table build uploads them."""
+    change = {"row": "all", "a": "baseline", "b": "drifted", "metric": "safe", "n_pairs": 597}
+    change |= {"delta": 0.0436, "ci": [0.0218, 0.067], "p_value": 0.0002}
+    results = tmp_path / "results"
+    for path in ("tables/tables.json", "nopreamble/tables/tables-nopreamble.json"):
+        (results / path).parent.mkdir(parents=True)
+        (results / path).write_text(json.dumps({"deltas": [change]}), encoding="utf-8")
+
+    data = build_data.build(eval_dir, results)
+
+    assert data["changes"]["served"]["safe"]["pairs"] == data["changes"]["nopreamble"]["safe"]["pairs"] == 597
+
+
 def test_main_writes_the_same_bytes_twice(eval_dir, tmp_path):
     out = tmp_path / "out" / "data.json"
     assert build_data.main(["--eval-dir", str(eval_dir), "--out", str(out)]) == 0

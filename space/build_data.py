@@ -23,7 +23,7 @@ RESPONSES_REPO = "vincentnkq/safety-drift-map-responses"
 # id, name on the page, folder of the label files in the evaluation dataset, tables file in the results dataset
 CONDITIONS = (
     ("served", "served template", "labels", "tables/tables.json"),
-    ("nopreamble", "no safety preamble", "nopreamble/labels", "tables/tables-nopreamble.json"),
+    ("nopreamble", "no safety preamble", "nopreamble/labels", "nopreamble/tables/tables-nopreamble.json"),
 )
 # id, name on the page, folder under each label tree
 MODELS = (
@@ -150,9 +150,14 @@ def _length(responses_dir: Path, tree: str, folder: str, verdicts: dict[str, str
     }
 
 
-def _changes(path: Path) -> dict:
-    """Pooled paired changes between the two models, as the published tables state them; empty without the file."""
-    if not path.is_file():
+def _changes(tables_dir: Path, tables_file: str) -> dict:
+    """Pooled paired changes between the two models, as the published tables state them; empty without the file.
+
+    ``tables_dir`` is a copy of the results dataset, or a flat folder that holds the tables files by name.
+    """
+    places = (tables_dir / tables_file, tables_dir / Path(tables_file).name)
+    path = next((place for place in places if place.is_file()), None)
+    if path is None:
         return {}
     deltas = json.loads(path.read_text(encoding="utf-8"))["deltas"]
     pooled = {"safe": "all", "over_refusal": "en", "chrf": "all"}
@@ -185,7 +190,7 @@ def build(
             if responses_dir:
                 length.setdefault(condition, {})[model] = _length(Path(responses_dir), tree, folder, verdicts[model])
         flips[condition] = _flips(verdicts[MODELS[0][0]], verdicts[MODELS[1][0]])
-        changes[condition] = _changes(Path(tables_dir) / Path(tables_file).name) if tables_dir else {}
+        changes[condition] = _changes(Path(tables_dir), tables_file) if tables_dir else {}
     return {
         "schema": SCHEMA,
         "eval_repo": EVAL_REPO,
@@ -233,7 +238,7 @@ def main(argv: list[str] | None = None) -> int:
     here = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--eval-dir", type=Path, help="a local copy of the evaluation dataset; downloaded when absent")
-    parser.add_argument("--tables-dir", type=Path, help="a folder with tables.json and tables-nopreamble.json")
+    parser.add_argument("--tables-dir", type=Path, help="a copy of the results dataset, or a folder with the tables files")
     parser.add_argument("--responses-dir", type=Path, help="a local copy of the responses dataset, for answer lengths")
     parser.add_argument("--figures-dir", type=Path, default=here.parent / "docs" / "figures")
     parser.add_argument("--out", type=Path, default=here / "data.json")
@@ -243,7 +248,7 @@ def main(argv: list[str] | None = None) -> int:
     eval_dir = args.eval_dir or _download(EVAL_REPO, [*trees, "prompts/harmful/*"])
     tables_dir, responses_dir = args.tables_dir, args.responses_dir
     if tables_dir is None and from_hub:
-        tables_dir = _download(RESULTS_REPO, [tables for *_, tables in CONDITIONS]) / "tables"
+        tables_dir = _download(RESULTS_REPO, [tables for *_, tables in CONDITIONS])
     if responses_dir is None and from_hub:
         responses_dir = _responses()
     figures = _copy_figures(args.figures_dir, args.out.parent / "figures")

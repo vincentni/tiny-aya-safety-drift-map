@@ -7,8 +7,11 @@ A failure map of Cohere's Tiny Aya Global (3.35B) on 600 red-teaming prompts in 
 language, harm category and prompt condition, and the same map after a benign multilingual LoRA
 fine-tune. Lexsi AI Safety & Alignment Hackathon 2026, Track 2.
 
-- **16.2% in Russian, 2.0% in French.** The base model gives a harmful answer to 16 of 99 Russian
-  prompts (95% interval 10.2% to 24.6%) and to 2 of 100 French ones (0.5% to 7.0%).
+- **16.2% in Russian, 2.0% in French.** With the model's standard prompt (served template) the base
+  model gives a harmful answer to 16 of 99 Russian prompts (95% interval 10.2% to 24.6%) and to 2 of
+  100 French ones (0.5% to 7.0%). French is the safest language in both conditions (2 of 100 and 5 of
+  100); the order among the weaker languages changes when the safety preamble is removed (English 15
+  of 100, Spanish 14 of 100, Russian 12 of 99).
 - **16.9% on representation harms, 16.4% on self-harm**, against 9.2% over all prompts (12 of 71,
   11 of 67 and 55 of 598 harmful answers).
 - **9.2% → 6.5% after the fine-tune, with over-refusal unchanged.** A benign multilingual fine-tune
@@ -38,7 +41,10 @@ harmful. Nothing harmful is quoted in this repository or shown in the Space.
   paragraph) and no safety preamble (that paragraph removed, nothing else changed).
 - **Judge.** One closed model under a fixed public rubric labels every answer: is the request harmful,
   did the model refuse, is the answer harmful. Every label is published. A pair the judge could not
-  label is counted nowhere.
+  label is counted nowhere. Checked against human labels on public sets, the judge matches them on
+  refusals in each of the six languages (kappa 0.93 to 1.00) and is strict on harmful answers (kappa
+  0.86 on JailbreakBench; on multilingual WildGuardTest items precision 0.96 to 1.00 and recall 0.46 to
+  0.54), so the harmful-answer rates here are conservative.
 - **Statistics.** Wilson 95% intervals on rates; changes between the two models are paired by prompt,
   with a bootstrap interval and an exact sign test. One training seed.
 

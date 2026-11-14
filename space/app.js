@@ -61,7 +61,7 @@
     const worst = languages[0];
     const best = languages[languages.length - 1];
     card(`${percent(worst.k, worst.n)} against ${percent(best.k, best.n)}`,
-      `harmful answers of the ${base.name} in ${languageName(worst.language)} (${worst.k} of ${worst.n}; ${bounds(worst)}) ` +
+      `harmful answers of the ${base.name} with the ${first.name}, in ${languageName(worst.language)} (${worst.k} of ${worst.n}; ${bounds(worst)}) ` +
       `and in ${languageName(best.language)} (${best.k} of ${best.n}; ${bounds(best)}).`);
 
     const [one, two] = byRate(data.categories.map((name) => cellOf(data, first.id, base.id, 'all', name)));
