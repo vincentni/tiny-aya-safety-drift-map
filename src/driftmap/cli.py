@@ -59,7 +59,7 @@ CONDITION_SAID = {"strip": ", no safety preamble", "patch": ", safety patch"}
 CONDITIONS = ids.CONDITIONS
 # beside the tables; it covers every prompt condition
 BREAKDOWN = "breakdown.json"
-# beside the tables: the script variants against their parent prompts, per checkpoint
+# beside the tables: the script variants against their parent prompts, per condition and column
 VARIANTS = "variants.json"
 # where `judge validate sample` keeps the files of the public sets
 VALIDATION_CACHE = LOCAL / "judgeval" / "cache"
@@ -1048,14 +1048,14 @@ def figures(
         verb = "driftmap table build" if not tables else "driftmap table breakdown"
         aside = f" --fine-tune {fine_tune}" if fine_tune != "standard" else ""
         raise DriftmapError(ExitCode.USAGE, f"{folder.relative_to(root)} holds no {lacking}; run `{verb}{aside}` first")
+    stored = folder / _of_fine_tune(VARIANTS, fine_tune)
     variants = None
-    # the stored pairings are of the standard fine-tune
-    if fine_tune == "standard" and (folder / VARIANTS).is_file():
+    if stored.is_file():
         try:
-            variants = draw.data.pairings(json.loads((folder / VARIANTS).read_text(encoding="utf-8")))
+            variants = draw.data.variants(json.loads(stored.read_text(encoding="utf-8")))
         except (ValueError, LookupError, TypeError, AttributeError):
-            found = f"{VARIANTS}: not the pairings of each checkpoint"
-            raise DriftmapError(ExitCode.USAGE, f"{found}, a list of them under baseline and under drifted") from None
+            found = f"{stored.name}: not the script-variant comparisons"
+            raise DriftmapError(ExitCode.USAGE, f"{found}: conditions, columns and a row per variant") from None
     written = draw.draw_all(tables, breakdown, settings, root / out, variants)
     for name, needed in draw.NEEDS.items():
         if not any(path.stem == draw.STEMS[name] for path in written):

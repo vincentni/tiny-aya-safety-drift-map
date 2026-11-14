@@ -2,7 +2,7 @@
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from typing import Any, NamedTuple, Protocol
+from typing import Any, NamedTuple
 
 from ..core.records import ChrfRow, DeltaRow, RateRow, Tables
 from ..core.settings import Settings
@@ -27,8 +27,8 @@ LANGUAGE_NAMES = {"en": "English", "fr": "French", "es": "Spanish", "ru": "Russi
 # names too long for an axis
 CATEGORY_NAMES = {"Harms of Representation Allocation and Quality of Service": "Representation & allocation harms"}
 LENGTH_LABELS = {COMPLETE: "Complete answers", TRUNCATED: "Answers cut off at the token cap"}
-# a stress set of rewritten prompts, as named on an axis; one not listed goes by its own name
-VARIANT_NAMES = {"harmful_romanized": "Latin script", "harmful_codemixed": "Mixed with English"}
+# how the prompts of a script variant were rewritten, as named on an axis; another goes by its variant's code
+REWRITE_NAMES = {"romanized": "Latin script", "codemixed": "Mixed with English"}
 HARMFUL_UNIT = "Harmful answers (% of scored responses)"
 # metric, its row in the tables, panel title and value axis
 METRICS = (
@@ -124,24 +124,6 @@ class Flows:
     panels: tuple[Flow, ...]
 
 
-class Pairing(Protocol):
-    """A stress set against its parent prompts for one checkpoint, as ``data.variants.paired`` gives it.
-
-    ``parent`` and ``variant`` are harmful-response rates over the ``n_pairs`` prompts scored on both sides,
-    ``delta`` is variant minus parent with its interval; ``language`` is ``all`` for the pooled row.
-    """
-
-    set: str
-    language: str
-    metric: str
-    n_pairs: int
-    parent: float | None
-    variant: float | None
-    delta: float | None
-    ci: tuple[float, float] | None
-    p_value: float | None
-
-
 def _percent(rate: float | None, ci: tuple[float, float] | None, *, turned: bool = False) -> Estimate:
     """A rate and its interval in percent; ``turned`` gives the complement, a safe rate as a harmful one."""
     if rate is None:
@@ -160,11 +142,19 @@ def _condition(condition: str) -> str:
     return _capital(CONDITION_NAMES.get(condition, condition))
 
 
-class StoredPairing(NamedTuple):
-    """A pairing as a stored file holds it."""
+class VariantRow(NamedTuple):
+    """A script variant against its parent prompts for one column under one condition.
 
+    ``parent`` and ``variant`` are harmful-response rates over the ``n_pairs`` prompts scored on both sides, ``delta``
+    is variant minus parent with its interval; ``language`` is None for the row pooled over a rewrite's languages.
+    """
+
+    condition: str
+    column: str
     set: str
-    language: str
+    code: str
+    language: str | None
+    rewrite: str
     metric: str
     n_pairs: int
     parent: float | None
@@ -174,19 +164,26 @@ class StoredPairing(NamedTuple):
     p_value: float | None
 
 
-def pairings(stored: Mapping[str, Iterable[Any]]) -> dict[str, list[StoredPairing]]:
-    """The pairings of each column from a stored file: per column a list of objects, or lists, of a pairing's fields.
+class Variants(NamedTuple):
+    """The script-variant comparisons of a stored file: the conditions and columns by shown name, and the rows."""
+
+    conditions: dict[str, str]
+    columns: dict[str, str]
+    rows: list[VariantRow]
+
+
+def variants(stored: Mapping[str, Any]) -> Variants:
+    """The comparisons of a stored variants file; fields the figure does not use are left unread.
 
     TypeError, ValueError or LookupError for content of another shape.
     """
-    found = {}
-    for column, rows in stored.items():
-        made = [StoredPairing(**row) if isinstance(row, Mapping) else StoredPairing(*row) for row in rows]
-        for row in made:
-            if not isinstance(row.n_pairs, int) or not isinstance(row.set, str) or not isinstance(row.language, str):
-                raise TypeError("a pairing names its set and language and counts its pairs")
-        found[column] = [row._replace(ci=tuple(row.ci) if row.ci else None) for row in made]
-    return found
+    rows = [VariantRow(**{field: row[field] for field in VariantRow._fields}) for row in stored["rows"]]
+    for row in rows:
+        named = (row.condition, row.column, row.code, row.rewrite, row.metric)
+        if not isinstance(row.n_pairs, int) or not all(isinstance(name, str) for name in named):
+            raise TypeError("a row names its condition, column, variant and metric and counts its pairs")
+    rows = [row._replace(ci=tuple(row.ci) if row.ci else None) for row in rows]
+    return Variants(dict(stored["conditions"]), dict(stored["columns"]), rows)
 
 
 def _points(delta: DeltaRow, *, turned: bool = False, unit: str = " points", interval: str = "") -> str:
@@ -464,39 +461,43 @@ def truncation(breakdown: Breakdown) -> Chart:
     return Chart(f"{finding}: {cap} ({_condition(lead).lower()})", tuple(panels))
 
 
-def script_variants(results: Mapping[str, Iterable[Pairing]]) -> Chart:
-    """Harmful-response rate of each stress set against its parent prompts, pooled over its languages.
+def script_variants(found: Variants | None) -> Chart:
+    """Harmful-response rate of each rewrite against the same prompts as written, pooled over its languages.
 
-    ``results`` maps a column to the pairings of its checkpoint; a panel per column, a group per stress set, with
-    the prompts as written and rewritten side by side and the change in points noted.
+    A panel per column and a group per rewrite, the prompts as written and rewritten side by side and the change in
+    points noted, under the first condition that has pooled rows; no panel without one.
     """
+    pooled = [row for row in found.rows if row.metric == "harmful" and row.language is None] if found else []
+    pooled = [row for row in pooled if row.n_pairs and None not in (row.parent, row.variant)]
+    conditions = found.conditions if found else {}
+    condition = next((name for name in conditions if any(row.condition == name for row in pooled)), None)
     panels, clearest = [], None
-    for column, found in results.items():
-        pooled = [row for row in found if (row.metric, row.language) == ("harmful", "all")]
-        pooled = [row for row in pooled if row.n_pairs and None not in (row.parent, row.variant)]
-        if not pooled:
+    for column, shown in found.columns.items() if condition else ():
+        rows = [row for row in pooled if (row.condition, row.column) == (condition, column)]
+        if not rows:
             continue
-        shown = COLUMN_NAMES.get(column, column)
         sides = []
         for side in ("parent", "variant"):
             # the rates are counts over the pairs, so their intervals can be drawn
-            counts = [(round(getattr(row, side) * row.n_pairs), row.n_pairs) for row in pooled]
+            counts = [(round(getattr(row, side) * row.n_pairs), row.n_pairs) for row in rows]
             sides.append(tuple(_percent(k / n, wilson(k, n)) for k, n in counts))
-        notes = tuple("" if row.delta is None else f"{row.delta * 100:+.1f} points" for row in pooled)
-        labels = tuple(VARIANT_NAMES.get(row.set, row.set.replace("_", " ")) for row in pooled)
+        notes = tuple("" if row.delta is None else f"{row.delta * 100:+.1f} points" for row in rows)
+        labels = tuple(REWRITE_NAMES.get(row.rewrite, row.code) for row in rows)
         series = (Series("as written", sides[0]), Series("rewritten", sides[1], notes))
         panels.append(Panel(_capital(shown), HARMFUL_UNIT, labels, series))
-        for row, label in zip(pooled, labels, strict=True):
+        for row, label in zip(rows, labels, strict=True):
             # a rise counts once its interval leaves zero
             if row.ci and row.ci[0] > 0 and (clearest is None or row.delta > clearest[0].delta):
                 clearest = (row, label, shown)
     if not panels:
         return Chart("Harmful answers to rewritten prompts", ())
+    where = found.conditions[condition]
     if clearest is None:
-        return Chart("Rewriting the prompts does not clearly raise the harmful-response rate", tuple(panels))
+        return Chart(f"Rewriting the prompts does not clearly raise the harmful-response rate ({where})", tuple(panels))
     row, label, shown = clearest
     rates = f"{row.variant * 100:.1f}% against {row.parent * 100:.1f}% as written"
-    return Chart(f"Rewritten prompts ({label}) draw more harmful answers at {shown}: {rates}", tuple(panels))
+    title = f"Rewritten prompts ({label}) draw more harmful answers at {shown}: {rates} ({where})"
+    return Chart(title, tuple(panels))
 
 
 def safety_patch(

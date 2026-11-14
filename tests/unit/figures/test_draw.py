@@ -1,10 +1,8 @@
-from typing import NamedTuple
-
 import pytest
 
 from driftmap.figures import draw
 from driftmap.table.breakdown import build as build_breakdown
-from tests.fakes.breakdown import HATE, lay, prompts, two_conditions
+from tests.fakes.breakdown import HATE, lay, prompts, stored_variants, two_conditions, variant_row
 from tests.fakes.labels import make_settings
 from tests.fakes.published import two_column_tables
 
@@ -26,18 +24,6 @@ STEMS = (
     "f7_script_variants",
     "f8_safety_patch",
 )
-
-
-class Pairing(NamedTuple):
-    set: str
-    language: str
-    metric: str
-    n_pairs: int
-    parent: float
-    variant: float
-    delta: float
-    ci: tuple[float, float]
-    p_value: float
 
 
 def test_the_figures_are_written_as_png_and_svg_and_are_the_same_on_every_run(tmp_path, settings):
@@ -73,7 +59,7 @@ def test_a_figure_is_drawn_once_its_data_is_there(tmp_path, settings):
 
     lay(labels["patch"], prompts("en", [HATE], 20, {"harmful": 2}))
     patched = build_breakdown(labels, {"harmful": lay(labels["keep"], plan)}, [], settings)
-    pairings = [Pairing("harmful_romanized", "all", "harmful", 300, 0.10, 0.25, 0.15, (0.09, 0.21), 0.0001)]
-    written = draw.draw_all(tables, patched, settings, tmp_path / "more", {"baseline": pairings, "drifted": pairings})
+    rows = [variant_row(column, "all-Latn", 0.10, 0.25, ci=(0.09, 0.21)) for column in ("baseline", "drifted")]
+    written = draw.draw_all(tables, patched, settings, tmp_path / "more", draw.data.variants(stored_variants(*rows)))
     assert [path.stem for path in written[::2]] == [*STEMS[:5], *STEMS[6:]]
     assert all(path.stat().st_size > 2000 for path in written)

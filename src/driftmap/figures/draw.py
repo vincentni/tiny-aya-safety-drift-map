@@ -2,7 +2,7 @@
 
 import math
 import textwrap
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from pathlib import Path
 
 from matplotlib import rc_context
@@ -14,7 +14,7 @@ from ..core.records import Tables
 from ..core.settings import Settings
 from ..table.breakdown import Breakdown
 from . import data
-from .data import Chart, Flows, Heat, Pairing
+from .data import Chart, Flows, Heat, Variants
 
 DPI = 160
 # inches: 1440 px wide at DPI, read at about 900 px in a README
@@ -62,7 +62,7 @@ STEMS = {
 NEEDS = {
     "outcomes": "two tabled columns in the breakdown",
     "length": "a breakdown built with the stored responses",
-    "variants": "variants.json beside the tables, holding the pooled harmful pairings",
+    "variants": "variants.json beside the tables, holding the pooled harmful rows",
     "patch": "the safety-patch condition in the breakdown",
 }
 
@@ -274,20 +274,20 @@ def draw_all(
     breakdown: Breakdown,
     settings: Settings,
     out: str | Path,
-    variants: Mapping[str, Iterable[Pairing]] | None = None,
+    variants: Variants | None = None,
 ) -> list[Path]:
     """Draw the figures into ``out`` as PNG and SVG and return the files written.
 
     ``tables`` maps a prompt condition to its result tables; the first condition leads the titles. A figure whose
     data is not there is left out: the outcomes need two columns, the answer lengths the stored answers, the script
-    variants ``variants`` (a column to its pairings) and the safety patch its condition in the breakdown.
+    variants ``variants`` (the stored comparisons) and the safety patch its condition in the breakdown.
     """
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
     moved = data.outcome_flows(breakdown)
     charts = {
         "length": data.truncation(breakdown),
-        "variants": data.script_variants(variants or {}),
+        "variants": data.script_variants(variants),
         "patch": data.safety_patch(breakdown, tables, settings),
     }
     with rc_context(STYLE):

@@ -147,3 +147,36 @@ def two_conditions(tmp_path: Path, settings: Settings) -> Breakdown:
         for condition, plan in TWO_CONDITIONS.items()
     }
     return build(labels, {"harmful": tagged["keep"]}, [], settings, responses=responses)
+
+
+def variant_row(column, code, parent, variant, n_pairs=300, *, condition="keep", metric="harmful", ci=None) -> dict:
+    """One row of a stored variants file: a variant code such as ``hi-Latn`` or the pooled ``all-mixed``."""
+    language, _, script = code.partition("-")
+    delta = None if None in (parent, variant) else round(variant - parent, 6)
+    return {
+        "condition": condition,
+        "column": column,
+        "set": "harmful",
+        "code": code,
+        "language": None if language == "all" else language,
+        "rewrite": "romanized" if script == "Latn" else "codemixed",
+        "metric": metric,
+        "n_pairs": n_pairs,
+        "parent": parent,
+        "variant": variant,
+        "delta": delta,
+        "ci": ci and list(ci),
+        "p_value": None if delta is None else 0.01,
+    }
+
+
+def stored_variants(*rows: dict, conditions=None) -> dict:
+    """A variants file as it is stored, with the parts a figure does not read."""
+    return {
+        "schema": "driftmap.variants/1",
+        "conditions": conditions or {"keep": "served template"},
+        "columns": {"baseline": "baseline", "drifted": "fine-tuned"},
+        "sources": [],
+        "rows": list(rows),
+        "seeds": {"seed": 0, "bootstrap": 42},
+    }

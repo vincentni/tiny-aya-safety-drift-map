@@ -1,5 +1,3 @@
-from typing import NamedTuple
-
 import pytest
 
 from driftmap.figures import data
@@ -8,7 +6,7 @@ from driftmap.table.breakdown import STATES
 from driftmap.table.breakdown import build as build_breakdown
 from driftmap.table.build import build
 from driftmap.table.rates import wilson
-from tests.fakes.breakdown import HATE, lay, prompts, two_conditions
+from tests.fakes.breakdown import HATE, lay, prompts, stored_variants, two_conditions, variant_row
 from tests.fakes.labels import column_rows, make_settings, targets, write_labels
 
 # weakest first by the baseline of the fixture, then as configured
@@ -266,37 +264,23 @@ def test_the_length_title_says_what_the_moves_between_lengths_show(tmp_path, set
     assert data.truncation(unread).panels == ()
 
 
-class Pairing(NamedTuple):
-    set: str
-    language: str
-    metric: str
-    n_pairs: int
-    parent: float | None
-    variant: float | None
-    delta: float | None
-    ci: tuple[float, float] | None
-    p_value: float | None
-
-
 def test_the_variants_figure_sets_the_rewritten_prompts_beside_the_same_prompts_as_written():
-    results = {
-        "baseline": [
-            Pairing("harmful_romanized", "hi", "harmful", 100, 0.10, 0.30, 0.20, (0.10, 0.30), 0.001),
-            Pairing("harmful_romanized", "all", "harmful", 300, 0.10, 0.25, 0.15, (0.09, 0.21), 0.0001),
-            Pairing("harmful_codemixed", "all", "harmful", 500, 0.08, 0.10, 0.02, (-0.01, 0.05), 0.2),
-            Pairing("benign_romanized", "all", "chrf", 300, 0.30, 0.20, -0.10, (-0.12, -0.08), 0.0001),
-        ],
-        "drifted": [
-            Pairing("harmful_romanized", "all", "harmful", 300, 0.06, 0.10, 0.04, (0.0, 0.08), 0.08),
-            Pairing("harmful_stretched", "all", "harmful", 0, None, None, None, None, None),
-        ],
-    }
+    rows = [
+        variant_row("baseline", "hi-Latn", 0.10, 0.30, 100, ci=(0.10, 0.30)),
+        variant_row("baseline", "all-Latn", 0.10, 0.25, ci=(0.09, 0.21)),
+        variant_row("baseline", "all-mixed", 0.08, 0.10, 500, ci=(-0.01, 0.05)),
+        variant_row("baseline", "all-Latn", 0.30, 0.20, metric="chrf", ci=(-0.12, -0.08)),
+        variant_row("drifted", "all-Latn", 0.06, 0.10, ci=(0.0, 0.08)),
+        variant_row("drifted", "all-mixed", None, None, 0),
+        variant_row("baseline", "all-Latn", 0.02, 0.50, condition="patch", ci=(0.4, 0.5)),
+    ]
+    found = data.variants(stored_variants(*rows, conditions={"keep": "served template", "patch": "safety patch"}))
 
-    chart = data.script_variants(results)
+    chart = data.script_variants(found)
 
     base, tuned = chart.panels
     assert (base.title, tuned.title) == ("Baseline", "Fine-tuned")
-    # the pooled rows of the harmful sets only
+    # the pooled harmful rows of the first condition only
     assert base.labels == ("Latin script", "Mixed with English") and tuned.labels == ("Latin script",)
     written, rewritten = base.series
     assert (written.name, rewritten.name) == ("as written", "rewritten")
@@ -304,14 +288,50 @@ def test_the_variants_figure_sets_the_rewritten_prompts_beside_the_same_prompts_
     assert rewritten.points == (percent(75, 300), percent(50, 500))
     assert rewritten.notes == ("+15.0 points", "+2.0 points") and written.notes == ()
     assert chart.title == (
-        "Rewritten prompts (Latin script) draw more harmful answers at baseline: 25.0% against 10.0% as written"
+        "Rewritten prompts (Latin script) draw more harmful answers at baseline: 25.0% against 10.0% as written "
+        "(served template)"
     )
-    unclear = data.script_variants({"drifted": results["drifted"]})
-    assert unclear.title == "Rewriting the prompts does not clearly raise the harmful-response rate"
-    assert (
-        data.script_variants({}).panels == ()
-        and data.script_variants({"baseline": results["baseline"][3:]}).panels == ()
+    # a rise whose interval reaches zero is not named
+    unclear = data.script_variants(data.variants(stored_variants(rows[4])))
+    assert unclear.title == "Rewriting the prompts does not clearly raise the harmful-response rate (served template)"
+    # a condition without pooled rows gives way to the next that has them
+    later = data.script_variants(data.variants(stored_variants(rows[0], rows[6], conditions=found.conditions)))
+    assert later.title.endswith("at baseline: 50.0% against 2.0% as written (safety patch)")
+    for nothing in (None, data.variants(stored_variants()), data.variants(stored_variants(rows[0], rows[3]))):
+        assert data.script_variants(nothing).panels == ()
+
+
+def test_a_stored_variants_file_is_read_for_its_names_and_rows():
+    row = variant_row("baseline", "all-Latn", 0.10, 0.25, ci=(0.09, 0.21))
+
+    found = data.variants(stored_variants(row | {"added_later": 1}))
+
+    assert found.conditions == {"keep": "served template"}
+    assert found.columns == {"baseline": "baseline", "drifted": "fine-tuned"}
+    (read,) = found.rows
+    assert (read.code, read.language, read.rewrite, read.ci, read.delta) == (
+        "all-Latn",
+        None,
+        "romanized",
+        (0.09, 0.21),
+        0.15,
     )
+    empty = data.variants(stored_variants(variant_row("baseline", "hi-mixed", None, None, 0))).rows[0]
+    assert (empty.language, empty.rewrite, empty.ci, empty.delta) == ("hi", "codemixed", None, None)
+    whole = stored_variants(row)
+    for torn in (
+        {key: value for key, value in whole.items() if key != "columns"},
+        whole | {"rows": [1]},
+        whole | {"rows": [{key: value for key, value in row.items() if key != "rewrite"}]},
+        # a rate that is not there is not read as a missing rate
+        whole | {"rows": [{key: value for key, value in row.items() if key != "parent"}]},
+        whole | {"rows": [row | {"n_pairs": "many"}]},
+        whole | {"conditions": 3},
+        {"baseline": [row]},
+        [row],
+    ):
+        with pytest.raises((TypeError, ValueError, LookupError, AttributeError)):
+            data.variants(torn)
 
 
 def test_the_patch_figure_sets_each_model_with_the_patch_beside_itself_without(tmp_path, both, settings):
@@ -359,23 +379,3 @@ def test_the_length_title_speaks_for_the_first_condition_with_two_columns(tmp_pa
         "Fewer harmful answers after fine-tuning, mostly because answers got shorter: "
         "40% ran into the token cap before, 0% after (no safety preamble)"
     )
-
-
-def test_stored_pairings_are_read_as_objects_or_as_lists_of_their_fields():
-    row = {"set": "harmful_romanized", "language": "all", "metric": "harmful", "n_pairs": 300, "parent": 0.1}
-    row |= {"variant": 0.25, "delta": 0.15, "ci": [0.09, 0.21], "p_value": 0.0001}
-
-    found = data.pairings({"baseline": [row], "drifted": [list(row.values())]})
-
-    assert found["baseline"] == found["drifted"] and found["baseline"][0].ci == (0.09, 0.21)
-    assert data.script_variants(found).panels[0].series[1].notes == ("+15.0 points",)
-    empty = data.pairings({"baseline": [row | {"ci": None, "delta": None}]})["baseline"][0]
-    assert (empty.ci, empty.delta) == (None, None)
-    for torn in (
-        {"baseline": [1]},
-        {"baseline": [{"set": "x"}]},
-        {"baseline": [row | {"n_pairs": "many"}]},
-        ["baseline"],
-    ):
-        with pytest.raises((TypeError, ValueError, LookupError, AttributeError)):
-            data.pairings(torn)

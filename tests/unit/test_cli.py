@@ -1775,18 +1775,18 @@ def test_figures_are_drawn_from_the_stored_tables_and_breakdown_without_the_hub(
     assert drawn.output.splitlines()[-len(FIGURES) :] == [f"docs/figures/{name}" for name in FIGURES]
     # a figure without its data is not drawn, and said so
     assert drawn.output.splitlines()[-len(FIGURES) - 2 : -len(FIGURES)] == [
-        "not drawn: f7_script_variants: needs variants.json beside the tables, holding the pooled harmful pairings",
+        "not drawn: f7_script_variants: needs variants.json beside the tables, holding the pooled harmful rows",
         "not drawn: f8_safety_patch: needs the safety-patch condition in the breakdown",
     ]
     assert sorted(path.name for path in (world.root / "docs" / "figures").iterdir()) == sorted(FIGURES)
     assert all((world.root / "docs" / "figures" / name).stat().st_size > 2000 for name in FIGURES)
     assert len(world.hub.calls) == calls and not world.client_log.exists()
 
-    # the second condition's tables and the stored script-variant pairings join when they are there
+    # the second condition's tables and the stored script-variant comparisons join when they are there
     dump(tables, folder / "tables-nopreamble.json")
-    pairing = {"set": "harmful_romanized", "language": "all", "metric": "harmful", "n_pairs": 300, "parent": 0.1}
-    pairing |= {"variant": 0.25, "delta": 0.15, "ci": [0.09, 0.21], "p_value": 0.0001}
-    (folder / "variants.json").write_text(json.dumps({"baseline": [pairing], "drifted": [pairing]}))
+    pooled = {"code": "all-Latn", "parent": 0.10, "variant": 0.25, "ci": (0.09, 0.21)}
+    rows = [fake_breakdown.variant_row(column, **pooled) for column in ("baseline", "drifted")]
+    (folder / "variants.json").write_text(json.dumps(fake_breakdown.stored_variants(*rows)))
     elsewhere = run("figures", "--out", "elsewhere")
     assert elsewhere.exit_code == 0, elsewhere.output
     assert elsewhere.output.splitlines()[-2:] == [f"elsewhere/f7_script_variants.{kind}" for kind in ("png", "svg")]
@@ -1812,13 +1812,13 @@ def test_figures_are_drawn_from_the_stored_tables_and_breakdown_without_the_hub(
     apart = run("figures", "--fine-tune", "aggressive")
     assert apart.exit_code == 0, apart.output
     assert apart.output.splitlines()[1:3] == ["out       docs/figures-aggressive", "fine-tune aggressive"]
-    # the stored pairings are not of this fine-tune
+    # the stored comparisons are of the standard fine-tune; this one has no file of its own
     assert sorted(path.name for path in (world.root / "docs" / "figures-aggressive").iterdir()) == sorted(FIGURES)
     assert [(where / FIGURES[0]).read_bytes() for where in folders] == [one[0], both[0]]
 
-    (folder / "variants.json").write_text(json.dumps({"baseline": [{"set": "harmful_romanized"}]}))
+    (folder / "variants.json").write_text(json.dumps({"baseline": [rows[0]], "drifted": [rows[1]]}))
     unpaired = run("figures")
-    assert unpaired.exit_code == 2 and "variants.json: not the pairings of each checkpoint" in unpaired.stderr
+    assert unpaired.exit_code == 2 and "variants.json: not the script-variant comparisons" in unpaired.stderr
     (folder / "variants.json").unlink()
     (folder / "breakdown.json").write_text("{")
     torn = run("figures")
