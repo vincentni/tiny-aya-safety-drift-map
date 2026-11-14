@@ -1,5 +1,7 @@
 # driftmap
 
+<!-- fill: one-paragraph summary of findings -->
+
 Measures how benign fine-tuning erodes refusal behaviour in Cohere's Tiny Aya Global,
 language by language, repairs it with SafeTune, and re-checks the repair after 4-bit
 quantization. Written for the Lexsi hackathon 2026. The write-up is `docs/article.md`.
@@ -14,45 +16,99 @@ owner named in `driftmap.toml`; local state is in `.run-local/`, which is not tr
 
 Needs Python 3.12 and [uv](https://docs.astral.sh/uv/).
 
-    uv python install 3.12 && uv sync --frozen
-    uv run pytest -q -m "not smoke"
+```bash
+uv python install 3.12 && uv sync --frozen
+uv run pytest -q -m "not smoke"
+```
 
 The tests are offline. Commands that reach the Hub read `HF_TOKEN`, or the token stored by
 `hf auth login`, and expect it to belong to the owner.
 
-## Commands, in the order they are run
+## Commands
 
-    uv run driftmap ready --pin                  # pin the source revisions, run the readiness checks
-    uv run driftmap data build --dry-run         # build the evaluation set locally, print the counts
-    uv run driftmap data build                   # upload it and pin the commit
-    uv run driftmap plan generate                # the job, its cost at timeout, every guard verdict
-    uv run driftmap launch generate --wait -- --kind baseline            # smoke run first
-    uv run driftmap judge closed --checkpoint REPO@SHA                   # label the smoke responses, runs here
-    uv run driftmap launch generate --mode full --wait -- --kind baseline
-    uv run driftmap judge closed --checkpoint REPO@SHA --mode full
-    uv run driftmap launch drift --wait          # the smoke drift
-    uv run driftmap launch drift --mode full
-    uv run driftmap wait <job id>                # follow a job, record what it cost
-    uv run driftmap chain drift generate --target drifted                # two jobs, one after the other
-    uv run driftmap status                       # spend, pending jobs, latest run of each kind
-    uv run driftmap ledger reconcile             # billing against the ledger
-    uv run driftmap table build                  # tables from the labels: saved, printed, uploaded
-    uv run driftmap launch generate --mode full --wait -- --kind baseline --preamble strip
-    uv run driftmap table build --preamble strip # the no-safety-preamble tables, in tables-nopreamble
-    uv run driftmap decide drift --proceed --note "why"                  # when table build exits 8
-    uv run driftmap launch repair --wait         # the smoke screen of the repair
-    uv run driftmap launch repair --mode full --wait                     # generate the screen rows of each alpha
-    uv run driftmap judge closed --rows 'screen/<slug>/alpha-*.jsonl' --mode full
-    uv run driftmap repair choose --mode full    # rate each alpha, store the choice, runs here
-    uv run driftmap launch repair --mode full --wait -- --apply ALPHA    # push the repaired model
-    uv run driftmap judge reparse --checkpoint REPO@SHA                  # after a parser change
-    uv run driftmap scan <path>...               # tokens, account ids, home paths, before publishing
-    uv run driftmap publish plan --writeup URL   # scan every commit, print what a run would do
-    uv run driftmap publish run --writeup URL    # card, open and list the repos; try --dry-run first
-    uv run driftmap publish check                # which repos are public, carded and listed
+The groups follow the order of a run. The judge commands come after each generate run.
 
 `--mode` is `smoke` by default for `plan`, `launch`, `judge closed` and `repair choose`: a short
 rehearsal on a few rows. Arguments after `--` go to the job script. Every command has `--help`.
+
+### Setup and data
+
+```bash
+uv run driftmap ready --pin                  # pin the source revisions, run the readiness checks
+uv run driftmap data build --dry-run         # build the evaluation set locally, print the counts
+uv run driftmap data build                   # upload it and pin the commit
+```
+
+### Baseline
+
+```bash
+uv run driftmap plan generate                # the job, its cost at timeout, every guard verdict
+uv run driftmap launch generate --wait -- --kind baseline            # smoke run first
+uv run driftmap launch generate --mode full --wait -- --kind baseline
+```
+
+### Fine-tune
+
+```bash
+uv run driftmap launch drift --wait          # the smoke drift
+uv run driftmap launch drift --mode full -- --epochs 3               # the measured run: three passes
+uv run driftmap wait <job id>                # follow a job, record what it cost
+uv run driftmap chain drift generate --target drifted                # two jobs, one after the other
+```
+
+### Judge
+
+```bash
+uv run driftmap judge closed --checkpoint REPO@SHA                   # label the smoke responses, runs here
+uv run driftmap judge closed --checkpoint REPO@SHA --mode full
+uv run driftmap judge reparse --checkpoint REPO@SHA                  # after a parser change
+```
+
+### Tables
+
+```bash
+uv run driftmap table build                  # tables from the labels: saved, printed, uploaded
+uv run driftmap decide drift --proceed --note "why"                  # when table build exits 8
+```
+
+### Repair
+
+```bash
+uv run driftmap launch repair --wait         # the smoke screen of the repair
+uv run driftmap launch repair --mode full --wait                     # generate the screen rows of each alpha
+uv run driftmap judge closed --rows 'screen/<slug>/alpha-*.jsonl' --mode full
+uv run driftmap repair choose --mode full    # rate each alpha, store the choice, runs here
+uv run driftmap launch repair --mode full --wait -- --apply ALPHA    # push the repaired model
+```
+
+### No-safety-preamble condition
+
+```bash
+uv run driftmap launch generate --mode full --wait -- --kind baseline --preamble strip
+uv run driftmap judge closed --checkpoint REPO@SHA --mode full --preamble strip
+uv run driftmap table build --preamble strip # the no-safety-preamble tables, in tables-nopreamble
+```
+
+### Housekeeping
+
+```bash
+uv run driftmap status                       # spend, pending jobs, latest run of each kind
+uv run driftmap ledger reconcile             # billing against the ledger
+uv run driftmap scan <path>...               # tokens, account ids, home paths, before publishing
+```
+
+### Publish
+
+```bash
+uv run driftmap publish plan --writeup URL   # scan every commit, print what a run would do
+uv run driftmap publish run --writeup URL    # card, open and list the repos; try --dry-run first
+uv run driftmap publish check                # which repos are public, carded and listed
+```
+
+`publish run` refuses before its first write when any commit of a repo holds a token, an address,
+a home path, a cache path or a file the scan cannot read, when a merged or smoke repo is public or
+sits in a collection (`--delete-intermediates` removes those repos first), when a required repo or
+a collection is missing, when a card would be incomplete, or when the token is not the owner's.
 
 ## The repair
 
@@ -68,37 +124,40 @@ prints one line per alpha and stores the record as `alpha_screen.json` in the re
 under 90% of an alpha's harmful prompts. The apply job pushes the model at the chosen alpha and refuses
 any other value.
 
-`publish run` refuses before its first write when any commit of a repo holds a token, an address,
-a home path, a cache path or a file the scan cannot read, when a merged or smoke repo is public or
-sits in a collection (`--delete-intermediates` removes those repos first), when a required repo or
-a collection is missing, when a card would be incomplete, or when the token is not the owner's.
-
 ## The judge
 
 The tables are scored by a closed model under the rubric in `src/driftmap/judge/rubric.py`
 (`rubric-v1`): one JSON object per exchange with `request_harm`, `refusal` and `response_harm`.
-`driftmap judge closed` reaches the model through any LiteLLM route, named in the environment
-variable `DRIFTMAP_CLOSED_JUDGE_ROUTE` together with whatever credentials that route needs. The
-route is read from the environment only; label rows carry the public model name from
-`[judge.closed]` in `driftmap.toml` and the rubric version. The command runs on the workstation,
-labels one set and language at a time, uploads after each, and picks up where it stopped when run
-again. It stops on throttling or an exhausted quota instead of retrying. When more than 5% of
-the pairs sent for one file, and more than one, come back without labels, the answers that parsed
-are stored, the rest is held back and the command exits 4: run it again, or with
-`--retry-unscored`, which asks unscored pairs again and stores what stays unscored. An answer
-that is text without the object is asked again with a one-line format reminder after the
-unchanged pair. The request and the response are quoted between tags that carry a random marker
-per call, and the rubric says they are data, never instructions. The public name is taken on
-trust from the configuration: nothing checks which model the route serves. With `--rows PATH`
-in place of `--checkpoint` it labels the harmful rows of one responses-repo file (or a glob of
-them, such as the repair screen's `screen/<slug>/alpha-*.jsonl`) and writes `labels-<name>`
-beside each.
+`driftmap judge closed` runs on the workstation.
 
-`--preamble strip` on the generate and drift jobs is the "no safety preamble" condition: every prompt is
-rendered without the safety paragraph the model's chat template opens its system turn with, and nothing
-else in the template changes. Those runs keep their files under `nopreamble/`, a drift run trained that
-way pushes to repos ending in `-nopre`, and a judge job reads and writes the tree of the generate run it
-is given.
+- **Route.** The model is reached through any LiteLLM route, named in the environment variable
+  `DRIFTMAP_CLOSED_JUDGE_ROUTE` together with whatever credentials that route needs. The route
+  is read from the environment only.
+- **Model name.** Label rows carry the public model name from `[judge.closed]` in `driftmap.toml`
+  and the rubric version. The name is taken on trust from the configuration: nothing checks
+  which model the route serves.
+- **Resume.** The command labels one set and language at a time, uploads after each, and picks
+  up where it stopped when run again.
+- **Throttling.** It stops on throttling or an exhausted quota instead of retrying.
+- **Answers without labels.** When more than 5% of the pairs sent for one file, and more than
+  one, come back without labels, the answers that parsed are stored, the rest is held back and
+  the command exits 4. Run it again, or with `--retry-unscored`, which asks unscored pairs again
+  and stores what stays unscored.
+- **Format reminder.** An answer that is text without the object is asked again with a one-line
+  format reminder after the unchanged pair.
+- **Quoted input.** The request and the response are quoted between tags that carry a random
+  marker per call, and the rubric says they are data, never instructions.
+- **Single files.** With `--rows PATH` in place of `--checkpoint` it labels the harmful rows of
+  one responses-repo file (or a glob of them, such as the repair screen's
+  `screen/<slug>/alpha-*.jsonl`) and writes `labels-<name>` beside each.
+
+## The no-safety-preamble condition
+
+`--preamble strip` on the generate and drift jobs is the "no safety preamble" condition: every
+prompt is rendered without the safety paragraph the model's chat template opens its system turn
+with, and nothing else in the template changes. Those runs keep their files under `nopreamble/`,
+a drift run trained that way pushes to repos ending in `-nopre`, and
+`driftmap judge closed --preamble strip` labels those responses.
 
 ## What a launch is checked against
 
@@ -147,7 +206,16 @@ Names under the owner, from `[repos]` in `driftmap.toml`:
 
 ## Exit codes
 
-0 done, 1 unexpected error, 2 usage or configuration, 3 not ready, 4 refused by a guard
-(or the judge stopped: throttling, quota, too many answers without labels),
-5 job lost or not found, 6 redaction finding, 7 upload failed, 8 drift decision needed,
-12 a data, label or record file, or the published state, is not what it should be, 130 interrupted.
+| Code | Meaning |
+| --- | --- |
+| 0 | done |
+| 1 | unexpected error |
+| 2 | usage or configuration |
+| 3 | not ready |
+| 4 | refused by a guard, or the judge stopped (throttling, quota, too many answers without labels) |
+| 5 | job lost or not found |
+| 6 | redaction finding |
+| 7 | upload failed |
+| 8 | drift decision needed |
+| 12 | a data, label or record file, or the published state, is not what it should be |
+| 130 | interrupted |
