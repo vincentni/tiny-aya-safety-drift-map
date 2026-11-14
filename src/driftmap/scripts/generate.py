@@ -69,11 +69,17 @@ def _arguments(parser: argparse.ArgumentParser) -> None:
     preamble_option(parser)
 
 
+def _repaired(settings: Settings, mode: str) -> str:
+    """The repo a repair run of ``mode`` pushes to; a smoke run has its own."""
+    return f"{settings.owner}/{settings.repos.repaired}{ids.repo_suffix(mode)}"
+
+
 def check_repos(settings: Settings) -> None:
     """Refuse settings that put responses beside public rows or let the repaired column read drifted weights."""
     repos = settings.repos
     merged = [repo_names(settings, mode, preamble)[1] for mode in ("full", "smoke") for preamble in ids.PREAMBLES]
-    if repos.responses in (repos.eval, repos.results) or f"{settings.owner}/{repos.repaired}" in merged:
+    repaired = {_repaired(settings, mode) for mode in ("full", "smoke")}
+    if repos.responses in (repos.eval, repos.results) or repaired.intersection(merged):
         raise _refuse("two of the repos in the settings share a name; give each its own")
 
 
@@ -121,7 +127,7 @@ def resolve_checkpoint(ctx: Context, runs: Sequence[RunRecord]) -> tuple[RepoRef
             raise _refuse(f"--checkpoint is not the pinned revision {pinned[:12]} of {repo}")
         return RepoRef(repo, pinned), None
     if kind == "repaired":
-        repo = f"{settings.owner}/{settings.repos.repaired}"
+        repo = _repaired(settings, mode)
         revision = _named(ctx.args, repo) or _resumed(ctx, runs, repo) or ctx.hub.model_info(repo).sha
         return RepoRef(repo, revision), None
     # served-template weights unless --checkpoint names the other repo

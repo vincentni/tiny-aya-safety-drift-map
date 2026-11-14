@@ -828,6 +828,13 @@ def test_the_chain_reader_takes_state_from_the_results_repo(world):
     world.push("smoke/alpha_screen.json", screen(settings, "chosen").model_dump_json().encode())
     world.push_record("repair-smoke-20261107T100000Z")
     assert reader(world, "smoke")("steer").recover_status == "chosen" and read("steer").recover_status is None
+    # and its repair and quant runs push to repos of their own
+    assert reader(world, "smoke")("quant").repaired_revision is None
+    rehearsed = [Ref(kind="model", repo=f"{ref.repo}-smoke", revision=ref.revision) for ref in (repaired, gguf)]
+    world.push_record("repair-smoke-20261107T100000Z", outputs=rehearsed[:1])
+    world.push_record("quant-smoke-20261108T100000Z", outputs=rehearsed[1:])
+    rehearsal = reader(world, "smoke")("quant_eval")
+    assert (rehearsal.repaired_revision, rehearsal.gguf_record) == ("7" * 40, True)
 
 
 def test_a_repair_launch_needs_its_drift_run_and_labels_and_an_apply_needs_a_chosen_screen(world, monkeypatch):
@@ -1423,17 +1430,18 @@ def test_a_steered_column_follows_steer_runs(world):
     assert unread(moved) == [f"left unread: {folder}: no ok full run on record read it"]
 
 
-def test_a_torn_local_table_takes_its_drift_flag_from_the_copy_on_the_hub(world):
+@pytest.mark.parametrize("lose", [lambda path: path.write_text("{"), Path.unlink], ids=["torn", "missing"])
+def test_a_torn_or_missing_local_table_takes_its_drift_flag_from_the_copy_on_the_hub(world, lose):
     evaluation(world, {"baseline": 0, "drifted": 0})
     assert run("table", "build").exit_code == 8
     local, on_hub = world.root / TABLES_PATH, stored(world, "tables/tables.json")
 
     # the flag the Hub copy holds is on file, not new
-    local.write_text("{")
+    lose(local)
     assert run("table", "build").exit_code == 0
     assert Tables.model_validate_json(local.read_bytes()).flags["drift_below_threshold"] is True
 
-    local.write_text("{")
+    lose(local)
     generated(world, "drifted", notes=[f"{NOT_COMPARABLE}another seed"])
     again = run("table", "build")
 
@@ -1443,7 +1451,7 @@ def test_a_torn_local_table_takes_its_drift_flag_from_the_copy_on_the_hub(world)
     assert run("launch", "repair", "--dry-run").exit_code == 4
 
     # a Hub copy that does not parse either holds no flag
-    local.write_text("{")
+    lose(local)
     world.push("tables/tables.json", b"{")
     assert run("table", "build").exit_code == 0
     assert "drift_below_threshold" not in json.loads(stored(world, "tables/tables.json"))["flags"]

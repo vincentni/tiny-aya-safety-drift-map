@@ -16,8 +16,8 @@ PATTERNS = {
     "account_id": re.compile(r"(?<!\d\.)\b\d{12}\b"),
     "home_path": re.compile(r"(?:(?<![A-Za-z0-9_./-])|(?<=file://))/(home|Users|local/home)/[A-Za-z0-9_.-]+"),
 }
-# dataset rows quote arbitrary numbers
-DIGIT_EXEMPT_DIRS = frozenset({"prompts", "sft_train", "labels", "responses", "judge_raw"})
+# dataset rows quote arbitrary numbers; screen holds the repair screen's rows with their labels and judge answers
+DIGIT_EXEMPT_DIRS = frozenset({"prompts", "sft_train", "labels", "responses", "judge_raw", "screen"})
 # smoke runs and runs with no safety preamble keep the same folders under a tree of their own; longest first
 _PREFIXES = {ids.tree(mode, preamble) for mode in ("full", "smoke") for preamble in ids.PREAMBLES}
 TREES = sorted((tuple(filter(None, prefix.split("/"))) for prefix in _PREFIXES), key=len, reverse=True)

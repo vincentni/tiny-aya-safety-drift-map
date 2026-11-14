@@ -30,7 +30,8 @@ OWNER = BASE["owner"]
 MERGED = f"{OWNER}/{BASE['repos']['merged']}"
 MERGED_SMOKE = f"{MERGED}-smoke"
 REPAIRED = f"{OWNER}/{BASE['repos']['repaired']}"
-EVAL = f"{OWNER}/{BASE['repos']['eval']}"
+REPAIRED_SMOKE = f"{REPAIRED}-smoke"
+EVAL =f"{OWNER}/{BASE['repos']['eval']}"
 RESULTS = f"{OWNER}/{BASE['repos']['results']}"
 RESPONSES = f"{OWNER}/{BASE['repos']['responses']}"
 LANGUAGES = BASE["languages"]
@@ -576,6 +577,26 @@ def test_the_repaired_target_reads_its_own_repo_at_the_head_or_the_named_revisio
         assert {row.checkpoint for row in rows} == {f"{REPAIRED}@{revision}"} and len(rows) == ROWS
 
 
+def test_a_smoke_run_of_the_repaired_column_reads_the_smoke_repo(world):
+    world.fake.add_repo(REPAIRED_SMOKE, private=True, files=dict(world.fake.repos[REPAIRED]["main"]))
+    world.fake.authorize(REPAIRED_SMOKE)
+    revision = world.head(REPAIRED_SMOKE)
+
+    assert world.run("--limit", "2", *SMOKE_ARGS, kind="repaired") == 0
+
+    assert world.record().inputs[0] == Ref(kind="model", repo=REPAIRED_SMOKE, revision=revision)
+    slug = slug_of(REPAIRED_SMOKE, revision)
+    assert world.uploads(RESPONSES) == [responses_at(slug, set_, code, SMOKE) for set_, code in UNITS]
+    downloads = [kwargs["repo_id"] for method, kwargs in world.fake.calls if method == "snapshot_download"]
+    assert REPAIRED_SMOKE in downloads and REPAIRED not in downloads
+
+    # neither mode takes the other's repo by name
+    full = ["--checkpoint", f"{REPAIRED}@{world.head(REPAIRED)}"]
+    assert world.run(*full, *SMOKE_ARGS, kind="repaired", run_id=DRIFTED) == 12
+    assert world.run("--checkpoint", f"{REPAIRED_SMOKE}@{revision}", kind="repaired", run_id=LATER) == 12
+    assert len(world.loads) == 1
+
+
 @pytest.mark.parametrize("kind", ["repaired", "drifted"])
 def test_a_resume_stays_on_the_checkpoint_the_stopped_run_read(world, kind):
     repo = REPAIRED if kind == "repaired" else MERGED
@@ -648,6 +669,7 @@ SHARED = {
     "responses in the results": {"responses": BASE["repos"]["results"]},
     "repaired is the merged repo": {"repaired": BASE["repos"]["merged"]},
     "repaired is the smoke merged repo": {"repaired": BASE["repos"]["merged"] + "-smoke"},
+    "the smoke repaired repo is the merged repo": {"merged": BASE["repos"]["repaired"] + "-smoke"},
 }
 
 

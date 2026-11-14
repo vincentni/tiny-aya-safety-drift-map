@@ -459,8 +459,8 @@ def _state(
             apply=apply,
             merged_sha256=merged,
             benign_labels=benign,
-            repaired_revision=output(ok.get("repair"), settings.repos.repaired),
-            gguf_record=output(ok.get("quant"), settings.repos.gguf) is not None,
+            repaired_revision=output(ok.get("repair"), settings.repos.repaired + ids.repo_suffix(mode)),
+            gguf_record=output(ok.get("quant"), settings.repos.gguf + ids.repo_suffix(mode)) is not None,
             recover_status=screen.recover_status if screen and (kind == "repair" or "repair" in ok) else None,
         )
 
@@ -620,9 +620,10 @@ def _left(
 
 
 def _flag_on_file(path: Path, hub: Hub, results: str, in_repo: str, flag: str) -> bool:
-    """Whether the stored table raised ``flag``; a torn local file gives way to the copy on the Hub, if one parses."""
+    """Whether the stored table raised ``flag``; a missing or torn local file gives way to a Hub copy that parses."""
     try:
-        return bool(path.exists() and load(Tables, path).flags.get(flag))
+        if path.exists():
+            return bool(load(Tables, path).flags.get(flag))
     except ValidationError:
         path.unlink()
     # the upload of an earlier build: a flag it holds must outlive the local file

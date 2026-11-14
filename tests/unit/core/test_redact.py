@@ -105,6 +105,23 @@ def test_the_exemption_covers_the_trees_of_runs_with_no_safety_preamble(tmp_path
     assert [finding.path for finding in scan([*exempt, *scanned], root)] == scanned
 
 
+def test_the_exemption_covers_the_repair_screen_and_the_files_judged_beside_its_rows(tmp_path):
+    root = tmp_path / "data"
+    row = json.dumps({"response": f"call {ACCOUNT} now"}) + "\n"
+    exempt = [
+        _write(root / "screen/x/alpha-0.25.jsonl", row),
+        _write(root / "screen/x/labels-alpha-0.25.jsonl", row),
+        _write(root / "smoke/screen/x/judge_raw-alpha-0.25.jsonl", row),
+    ]
+    scanned = [
+        _write(root / "alpha_screen.json", row),
+        _write(root / "runs/screen/alpha-0.25.jsonl", row),
+        _write(root / "smoke/smoke/screen/x/alpha-0.25.jsonl", row),
+    ]
+
+    assert [finding.path for finding in scan([*exempt, *scanned], root)] == scanned
+
+
 def test_twelve_digit_exemption_is_scoped_to_the_dataset_path_classes(tmp_path):
     """Twelve digits pass only under the four dataset path classes of the data root (TS-CFG-8)."""
     root = tmp_path / "data"

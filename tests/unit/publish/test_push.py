@@ -1076,6 +1076,29 @@ def test_the_trees_with_no_safety_preamble_are_scanned_as_rows_and_published(set
     assert found == [f"{at(fake, EVAL)}/nopreamble/labels/{NOPRE_SLUG}/es.jsonl:1: home_path"]
 
 
+def test_the_repair_screen_is_scanned_as_rows_and_published(settings, fake):
+    """Screen rows and the labels and judge answers beside them may quote what responses may; a smoke screen leaves."""
+    hub = seed(fake)
+    address = "someone" + "@" + "example.org"
+    row = f'{{"response": "write to {address}, reference {DIGITS}"}}\n'.encode()
+    screen = f"screen/{SLUG}"
+    for name in ("alpha-0.25.jsonl", "labels-alpha-0.25.jsonl", "judge_raw-alpha-0.25.jsonl"):
+        put(fake, RESPONSES, f"{screen}/{name}", row)
+        put(fake, RESPONSES, f"smoke/{screen}/{name}", row)
+    put(fake, RESPONSES, f"screen/{REPOS['merged']}--{DIGITS}/alpha-0.1.jsonl", row)
+
+    assert plan(settings, hub).problems == ()
+    assert publish(settings, hub, echo=lambda line: None).ok
+
+    kept = set(fake.repos[RESPONSES]["main"])
+    assert f"{screen}/labels-alpha-0.25.jsonl" in kept and not any(path.startswith("smoke/") for path in kept)
+
+    quoted = f'{{"response": "see /{"home"}/alice/notes"}}\n'.encode()
+    put(fake, RESPONSES, f"{screen}/alpha-0.4.jsonl", quoted)
+    found = [text for _, text in plan(settings, hub).problems]
+    assert found == [f"{at(fake, RESPONSES)}/{screen}/alpha-0.4.jsonl:1: home_path"]
+
+
 def test_the_second_table_on_the_hub_is_read_for_the_cards(tmp_path, settings, fake):
     hub = seed(fake)
     add_nopreamble(fake, tables=two_column_tables(tmp_path, settings))
