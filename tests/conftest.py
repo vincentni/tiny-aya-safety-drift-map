@@ -1,6 +1,9 @@
 import os
 from pathlib import Path
 
+# typer reads this at import: a CI runner otherwise forces styled help text, which the cli tests read as plain
+os.environ["_TYPER_FORCE_DISABLE_TERMINAL"] = "1"
+
 import huggingface_hub.constants
 import pytest
 from hypothesis import settings
