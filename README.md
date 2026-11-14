@@ -57,6 +57,10 @@ percentage points with a 95% interval.
 | Over-refusal on XSTest, 250 prompt pairs | 26 (10.4%) | 35 (14.0%) | +3.6 (+0.4 to +6.4) | 0.035 |
 | chrF on the benign task | 30.5 | 26.1 | -4.4 (-5.9 to -3.1) | |
 
+The patch was written against these prompts. On 240 unseen explicit requests, which the base model
+already refuses (2 harmful answers of 229), it brings no gain and no measurable loss: 2 → 4 harmful
+answers over 228 pairs.
+
 Harmful answers by language.
 
 ![Harmful answers by language, base model and fine-tuned model, with 95% intervals](docs/figures/f1_harmful_by_language.png)
@@ -289,15 +293,28 @@ uv run driftmap scan <path>...               # tokens, account ids, home paths, 
 Publish:
 
 ```bash
-uv run driftmap publish plan --writeup URL   # scan every commit, print what a run would do
+uv run driftmap publish plan --writeup URL   # scan every commit, print all that would go public
 uv run driftmap publish run --writeup URL    # card, open and list the repos; try --dry-run first
+uv run driftmap publish space                # create or update the results Space; try --dry-run first
 uv run driftmap publish check                # which repos are public, carded and listed
 ```
 
 `publish run` refuses before its first write when any commit of a repo holds a token, an address,
 a home path, a cache path or a file the scan cannot read, when a merged or smoke repo is public or
 sits in a collection (`--delete-intermediates` removes those repos first), when a required repo or
-a collection is missing, when a card would be incomplete, or when the token is not the owner's.
+a collection is missing, when a card would be incomplete, when the cost ledger does not parse or
+still holds a pending job, when a check file is out of place, empty or holds a finding, or when
+the token is not the owner's.
+
+With the cards, a run publishes three things from the checkout. The cost ledger goes to the results
+dataset as `ledger.jsonl`, one line per job. The files under
+`.run-local/checks/<responses|results>/<check>/` go to `checks/<check>/` in that dataset: the
+answers and labels of the side checks (`q4_local`, `limit_768`, `engine_noise`, `judge_validation`,
+`patch_heldout`) to the responses dataset, their summaries to the results dataset. Each adapter
+keeps the trainer's log as `trainer_state.json` when its last checkpoint is removed. `publish plan`
+lists all of this under the repo it goes to and ends with the Space step. `publish space` uploads
+the page files in `space/` as a static Space in one commit, opens it, and reads the page back
+without a token.
 
 ### The judge
 
@@ -364,7 +381,8 @@ Then every guard runs; one refusal is exit 4 and nothing is submitted.
 - `oom_repeat`: this kind did not already run out of memory under this configuration.
 - `drift_decision`: a repair waits for `decide drift` while the measured drop in safe rate is below the threshold.
 
-The ceilings are under `[ceilings]` in `driftmap.toml`; the ledger is `.run-local/results/ledger.jsonl`.
+The ceilings are under `[ceilings]` in `driftmap.toml`; the ledger is `.run-local/results/ledger.jsonl`,
+and `publish run` copies it to the results dataset as `ledger.jsonl`, one line per job.
 
 A repair launch is also checked for its inputs: an ok fine-tune run and the fine-tuned checkpoint's
 benign labels, and with `--apply` a screen that `repair choose` stored as chosen. `chain` takes no
