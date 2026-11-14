@@ -66,6 +66,9 @@ def lora_config() -> Any:
     return LoraConfig(r=16, lora_alpha=32, lora_dropout=0.05, target_modules=list(LORA_TARGETS), task_type="CAUSAL_LM")
 
 
+LEARNING_RATE = 2e-4
+
+
 def sft_config(
     settings: Settings,
     output_dir: str | Path,
@@ -74,6 +77,7 @@ def sft_config(
     epochs: int = 1,
     use_cpu: bool = False,
     preamble: str = "keep",
+    learning_rate: float = LEARNING_RATE,
 ) -> Any:
     """Training arguments; smoke ignores ``epochs``. Without ``use_cpu`` a host with no bf16 GPU raises."""
     from trl import SFTConfig
@@ -89,7 +93,7 @@ def sft_config(
         gradient_checkpointing=True,
         completion_only_loss=True,
         num_train_epochs=1 if smoke else epochs,
-        learning_rate=2e-4,
+        learning_rate=learning_rate,
         lr_scheduler_type="cosine",
         # below 1 this is a share of the steps
         warmup_steps=0.03,
@@ -416,7 +420,13 @@ def _train(ctx: Context, work: Path, source: RepoRef, adapter_repo: str, device:
         raise _refuse(f"no trainable weights on {', '.join(bare)}")
 
     config = sft_config(
-        settings, work / "out", smoke=smoke, epochs=epochs, use_cpu=device != "cuda", preamble=ctx.args.preamble
+        settings,
+        work / "out",
+        smoke=smoke,
+        epochs=epochs,
+        use_cpu=device != "cuda",
+        preamble=ctx.args.preamble,
+        learning_rate=ctx.args.lr,
     )
     callback = flush.StepFlushCallback(ctx.deadline, every=int(config.save_steps))
     trainer = build_trainer(model, tokenizer, Dataset.from_list(rows), config, [callback])
@@ -582,8 +592,16 @@ def _epochs(text: str) -> int:
     return value
 
 
+def _learning_rate(text: str) -> float:
+    value = float(text)
+    if not 0 < value <= 1e-2:
+        raise argparse.ArgumentTypeError("expected a rate above 0 and at most 0.01")
+    return value
+
+
 def _arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--epochs", type=_epochs, default=1, help="passes over the training rows; smoke ignores it")
+    parser.add_argument("--lr", type=_learning_rate, default=LEARNING_RATE, help="peak learning rate of the adapter")
     preamble_option(parser)
 
 

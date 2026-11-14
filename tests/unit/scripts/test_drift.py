@@ -1,3 +1,4 @@
+import argparse
 import hashlib
 import json
 import math
@@ -328,6 +329,8 @@ def test_the_training_config_in_full_and_smoke_mode(tmp_path, settings):
     assert (drift.SMOKE_ROWS, Path(full.output_dir)) == (64, tmp_path / "full")
     longer = drift.sft_config(settings, tmp_path / "longer", smoke=False, epochs=3, use_cpu=True)
     assert (longer.num_train_epochs, longer.save_steps, longer.max_steps) == (3, 50, -1)
+    faster = drift.sft_config(settings, tmp_path / "faster", smoke=False, use_cpu=True, learning_rate=5e-4)
+    assert faster.learning_rate == 5e-4
     planned = [drift.planned_steps(rows, config) for rows, config in ((1272, full), (1272, longer), (64, smoke))]
     assert planned == [80, 240, 20]
     assert [drift.planned_steps(rows, full) for rows in (1, 16, 17, 72)] == [1, 1, 2, 5]
@@ -1183,3 +1186,12 @@ def test_the_repos_of_a_run_without_the_preamble_may_not_be_another_roles(make_w
         f"{ADAPTER}-nopre-smoke",
         f"{MERGED}-nopre-smoke",
     )
+
+
+@pytest.mark.parametrize("value", ["0", "-0.001", "0.02", "fast"])
+def test_a_learning_rate_outside_its_range_is_a_usage_error(value):
+    parser = argparse.ArgumentParser()
+    drift._arguments(parser)
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--lr", value])
+    assert parser.parse_args(["--lr", "5e-4"]).lr == 5e-4 and parser.parse_args([]).lr == drift.LEARNING_RATE
