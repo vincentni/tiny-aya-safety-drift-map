@@ -159,7 +159,7 @@
       el('td', { text: code === 'all' ? 'all' : languageName(code) }),
       ...shown.map((model) => rateCell(cellOf(data, where.id, model.id, code, 'all'))))));
     const flips = main.flips;
-    $('recipes-intro').textContent = `Harmful answers with ${where.name}` +
+    $('recipes-intro').textContent = `Harmful answers and their 95% Wilson intervals with ${where.name}` +
       (data.repaired ? ', the condition the repair is measured in' : '') + '. Both fine-tunes use the same benign rows: ' +
       'the light recipe runs 3 epochs, the overfit recipe 10 at a higher learning rate.' +
       (data.repaired ? ' The repaired fine-tune is the overfit one with a quarter of each ' +
@@ -250,23 +250,20 @@
       `slightly more; among complete answers it is not safer (${complete(base).join(' of ')} harmful, then ` +
       `${complete(tuned).join(' of ')}).`;
 
-    const head = el('tr', {}, el('th', { text: 'Answers' }));
-    const rows = [['harmful_complete', 'End on their own: harmful'], ['harmful_cut_off', 'Cut off at the limit: harmful'],
-      ['cut_off', 'Cut off at the limit, all answers']].map(([key, label]) => [key, el('tr', {}, el('td', { text: label }))]);
+    const measures = [['harmful_complete', 'End on their own: harmful'], ['harmful_cut_off', 'Cut off at the limit: harmful'],
+      ['cut_off', 'Cut off at the limit, all answers']];
+    const titles = ['Model', 'Condition', ...measures.map(([, label]) => label)];
+    clear($('length-head')).appendChild(el('tr', {}, ...titles.map((text) => el('th', { text }))));
+    const body = clear($('length-body'));
     for (const condition of data.conditions) {
       for (const model of data.models) {
         const entry = (data.length[condition.id] || {})[model.id];
-        // a model that was not run in a condition has no column
+        // a model that was not run in a condition has no row
         if (!entry) continue;
-        head.appendChild(el('th', { text: `${model.name}, ${condition.name}` }));
-        for (const [key, row] of rows) {
-          row.appendChild(el('td', { class: 'count', text: `${entry[key][0]} of ${entry[key][1]} (${percent(...entry[key])})` }));
-        }
+        const counts = measures.map(([key]) => el('td', { class: 'count', text: counted(...entry[key]) }));
+        body.appendChild(el('tr', {}, el('td', { text: capital(model.name) }), el('td', { text: condition.name }), ...counts));
       }
     }
-    clear($('length-head')).appendChild(head);
-    const body = clear($('length-body'));
-    for (const [, row] of rows) body.appendChild(row);
     const flips = data.flips[first.id];
     $('length-note').textContent = `Under the ${first.name}, ${flips.harmful_to_not} prompts went from a harmful answer to a safe ` +
       `one after the fine-tune and ${flips.not_to_harmful} went the other way; ${flips.harmful_both} are harmful for both models.`;
@@ -290,9 +287,10 @@
       return td;
     }
     const bar = el('span', { class: 'bar' });
-    bar.style.width = Math.round(Math.min(1, cell.k / cell.n / 0.4) * 90) + 'px';
-    td.appendChild(bar);
-    td.appendChild(document.createTextNode(`${cell.k} of ${cell.n} (${percent(cell.k, cell.n)}; ${bounds(cell)})`));
+    bar.style.width = Math.round(Math.min(1, cell.k / cell.n / 0.4) * 60) + 'px';
+    // the count on one line, the bar and the interval below it, so four models fit side by side
+    td.appendChild(el('div', { text: counted(cell.k, cell.n) }));
+    td.appendChild(el('div', { class: 'interval' }, bar, bounds(cell)));
     return td;
   }
 

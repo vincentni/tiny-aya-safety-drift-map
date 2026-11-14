@@ -24,15 +24,16 @@
   .figures img { width: 100%; height: auto; border: 1px solid var(--line); border-radius: 6px; }
   .figures figcaption { color: var(--soft); font-size: 0.9rem; }
   .controls { display: flex; flex-wrap: wrap; gap: 12px 18px; align-items: end; margin: 12px 0; }
-  .controls label { display: flex; flex-direction: column; font-size: 0.85rem; color: var(--soft); gap: 3px; }
+  .controls label { display: flex; flex-direction: column; font-size: 0.85rem; color: var(--soft); gap: 3px; max-width: 100%; }
   .controls label.inline { flex-direction: row; align-items: center; gap: 6px; }
-  select { font: inherit; padding: 5px 8px; border: 1px solid var(--line); border-radius: 6px; background: #fff; color: var(--ink); }
+  select { font: inherit; padding: 5px 8px; border: 1px solid var(--line); border-radius: 6px; background: #fff; color: var(--ink); max-width: 100%; }
   .scroll { overflow-x: auto; }
   table { border-collapse: collapse; width: 100%; font-size: 0.92rem; }
   th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
   th { background: var(--band); font-weight: 600; }
   td.count { white-space: nowrap; font-variant-numeric: tabular-nums; }
   .bar { display: inline-block; height: 8px; background: var(--harm); border-radius: 2px; vertical-align: middle; margin-right: 6px; }
+  .interval { color: var(--soft); font-size: 0.85rem; }
   .note { color: var(--soft); font-size: 0.88rem; }
   button { font: inherit; padding: 5px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--band); color: var(--ink); cursor: pointer; }
   button:disabled { color: var(--soft); cursor: default; }
@@ -70,7 +71,8 @@
   <section id="length-section" hidden>
     <h2>What the fine-tune did and did not do</h2>
     <p>Harmful answers among answers that end on their own and among answers cut off at the 256-token limit.
-      Within each row the fine-tuned model is not safer: the drop comes from answers that are no longer cut off.</p>
+      Within each of the first two columns the fine-tuned model is not safer than the base model: its drop comes
+      from answers that are no longer cut off.</p>
     <div class="scroll">
       <table>
         <thead id="length-head"></thead>
