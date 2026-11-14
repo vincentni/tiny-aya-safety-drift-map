@@ -13,3 +13,4 @@ outputs/
 .pytest_cache/
 .hypothesis/
 .ruff_cache/
+space/figures/

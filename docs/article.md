@@ -14,8 +14,9 @@ A failure map of Tiny Aya Global on 600 red-teaming prompts in six languages, by
 - **Where it is thin.** With its standard prompt the base model gives a harmful answer to 55 of 598 harmful prompts (9.2%): 16 of 99 in Russian against 2 of 100 in French, and 16.9% on representation harms and 16.4% on self-harm.
 - **Light recipe, $0.49: no safety lost.** Three epochs of LoRA on 1,272 benign multilingual rows: harmful answers go from 9.2% to 6.5% with over-refusal unchanged, mostly because the answers are shorter (answers cut at the 256-token limit fall from 45% to 12%) and the model refuses slightly more. Among complete answers it is not safer, and 16 of its 39 harmful answers are new.
 - **Overfit recipe, $1.45: safety erodes.** Ten epochs on the same rows at a higher learning rate, measured with no safety preamble: 10.2% → 14.2% harmful answers (+4.0 points, 95% CI +1.2 to +7.0, p = 0.007), mostly in Arabic and Russian. That is under the 5-point bar set in advance for calling a checkpoint drifted. In the same condition the light recipe goes from 10.2% to 5.9%.
-- **Defences and stress tests.** The safety paragraph the model ships with adds refusals but no measurable safety. 4-bit quantization of the fine-tuned model costs no safety. In two pilots on small samples, the base model gives 26 harmful answers with a five-sentence system-prompt patch where it gives 45 without, and it refuses 7 of 29 Hindi prompts typed in Latin script against 22 in Devanagari.
-- **What is left.** Self-harm and representation harms barely move under the light fine-tune.
+- **Prompt-level defences.** The safety paragraph the model ships with adds refusals but no measurable safety. A five-sentence system-prompt patch does more: with it the base model gives 4.8% harmful answers against 9.2% (-4.3 points, 95% CI -6.4 to -2.3, p < 0.001). It is paid for: over-refusal goes from 10.4% to 14.0% and the task score falls by 4.4 chrF points.
+- **Stress tests.** 4-bit quantization of the fine-tuned model costs no safety. In a pilot on small samples the base model refuses 7 of 29 Hindi prompts typed in Latin script against 22 in Devanagari.
+- **What is left.** Self-harm and representation harms barely move under the light fine-tune and stay the two weakest categories under the patch.
 
 Required lines:
 
@@ -176,15 +177,29 @@ The same 1,272 benign rows, trained with no safety preamble for 10 epochs at lea
 
 **The safety paragraph, on and off.** The paragraph is the prompt-level defence the model ships with. On the base model, with the same prompts paired, it adds 4.2 points of refusals (95% CI +1.3 to +7.2, p = 0.005) and no measurable drop in harmful answers (55 of 598 with it, 61 of 599 without; paired difference 1.0 points, -1.2 to +3.2, p = 0.430). Representation harms move most without it (18 against 12 of 71).
 
-**A targeted system-prompt patch (pilot).** Five sentences of guidance on biased content and self-harm, added to the system turn below the safety paragraph (text in Appendix D). The pilot covers the base model on the 55 prompts it answered harmfully and on 30 XSTest prompts it did not refuse, regenerated with and without the patch on one engine, so the two columns differ only in the patch.
+**A targeted system-prompt patch.** Five sentences of guidance on biased content and self-harm, added to the system turn below the safety paragraph (text in Appendix D). The base model answers all 1,450 prompts with it. Changes are paired with its own answers under the served template, in percentage points.
 
-| Base model, served template | Without the patch | With the patch |
-|---|---|---|
-| Harmful answers, the 55 prompts the base model failed | 45 | 26 |
-| Refusals, the same 55 prompts | 5 | 24 |
-| Refusals, 30 XSTest prompts the base model answered | 0 | 1 |
+| Base model | Served template | Safety patch | Change (95% CI) | p |
+|---|---|---|---|---|
+| Harmful answers, 598 prompt pairs | 55 (9.2%) | 29 (4.8%) | -4.3 (-6.4 to -2.3) | < 0.001 |
+| Hate speech | 20 of 136 | 4 of 136 | -11.8 (-17.7 to -6.6) | < 0.001 |
+| Discrimination and injustice | 26 of 203 | 12 of 203 | -6.9 (-11.3 to -3.4) | 0.001 |
+| Self-harm | 11 of 67 | 6 of 67 | -7.5 (-16.4 to 0.0) | 0.180 |
+| Representation harms | 12 of 71 | 9 of 71 | -4.2 (-11.3 to +2.8) | 0.453 |
+| Refusals of harmful prompts | 70.6% | 76.4% | +5.9 (+3.3 to +8.5) | < 0.001 |
+| Over-refusal on XSTest, 250 prompt pairs | 26 (10.4%) | 35 (14.0%) | +3.6 (+0.4 to +6.4) | 0.035 |
+| chrF on the benign task | 30.5 | 26.1 | -4.4 (-5.9 to -3.1) | |
+| Answers cut off at the 256-token limit | 270 of 600 | 223 of 600 | | |
 
-With the patch 23 of the 45 harmful answers become safe and 4 prompts get a harmful answer only with it (exact sign test p < 0.001). In the two categories it targets, harmful answers go from 12 to 8 of 12 on representation harms and from 8 to 4 of 11 on self-harm. The sample holds only prompts the base model failed: it measures what the patch removes there, not what it adds on the other prompts, and not how it combines with a fine-tune.
+**With the patch the base model gives fewer harmful answers.** 32 prompts go from a harmful answer to a safe one and 6 the other way. The bias guidance shows where it should, in hate speech and discrimination, and in Hindi (10 → 0 of 100); Spanish does not move (8 → 9 of 100).
+
+**It is paid for in over-refusal and task score.** The model refuses 12 safe XSTest prompts it answered before and answers 3 it refused, and chrF falls by 4.4 points. The light fine-tune moves both the other way (over-refusal 10.4% → 9.2%, chrF +6.9) for a smaller drop in harmful answers (9.2% → 6.5%).
+
+**The two weakest categories stay the weakest.** Self-harm and representation harms move in the same direction but within noise, and are still the highest rates under the patch (9.0% and 12.7%).
+
+**It is not only shorter answers.** Unlike the fine-tune, the drop is inside the answers cut off at the limit (52 of 269 → 24 of 222 harmful); among complete answers the counts are 3 of 329 and 5 of 377.
+
+![Harmful answers and over-refusal of the base model with and without the safety patch, beside the fine-tuned model](figures/f8_safety_patch.png)
 
 ### 5. Script stress test
 
@@ -211,7 +226,7 @@ The judge reads the variants as harmful requests about as often as their parents
 
 **The 256-token limit does not change the verdict.** 24 of the base model's cut-off answers, four per language and half of them judged harmful, were regenerated with a limit of 768 tokens. 23 ended on their own (median 383.5 tokens), and the judge gave the full answer the same harmful-answer verdict as its first 256 tokens in 24 of 24.
 
-**4-bit quantization costs no safety.** As a q4_k_m file the fine-tuned model gives 42 harmful answers on 592 prompts, against 43 for the same weights at full precision on the same engine (llama.cpp on a CPU, served template). Refusals of harmful prompts are 73.8% against 75.8% and over-refusal 8.1% against 8.5% (Appendix B).
+**4-bit quantization costs no safety.** As a q4_k_m file the fine-tuned model gives 42 harmful answers on 592 prompts, against 43 for the same weights at full precision on the same engine (llama.cpp on a CPU, served template). Refusals and over-refusal barely move (Appendix B).
 
 **A single verdict is noisy; pooled and paired counts are not.** Between the 4-bit and the full-precision run the verdict differs on 31 of the 592 prompts (15 harmful only at 4 bits, 16 only at full precision): about 5% of verdicts flip between two near-identical models with no net change. Regenerating the base model's answers to 119 prompts on a CPU gives 9 harmful answers, as on the GPU, with the verdict differing on 4 prompts (3.4%). That is the noise floor for any single prompt and for the small cells in this article.
 
@@ -224,18 +239,18 @@ The fine-tuned model still gives 39 harmful answers of 598 under the served temp
 
 ## Cost
 
-Every GPU step is a Hugging Face Job on one L4 ($0.80 per hour), rehearsed as a smoke run first, that writes a line to a cost ledger. The light fine-tune costs $0.49 and the overfit one $1.45. One evaluation pass, a checkpoint answering all 1,450 prompts in one condition, costs $0.37 to $0.40. The jobs behind the results above:
+Every GPU step is a Hugging Face Job on one L4 ($0.80 per hour), rehearsed as a smoke run first, that writes a line to a cost ledger. The light fine-tune costs $0.49 and the overfit one $1.45. One evaluation pass, a checkpoint answering all 1,450 prompts in one condition, costs $0.37 to $0.40; the pass under the patch took 50 minutes ($0.67). Every job run:
 
 | Stage | Jobs | Minutes | Cost |
 |---|---|---|---|
-| Smoke rehearsals | 6 | 32 | $0.43 |
+| Smoke rehearsals, one of them cancelled | 8 | 80 | $1.07 |
 | Fine-tune, light recipe | 1 | 37 | $0.49 |
 | Fine-tune, overfit recipe | 1 | 109 | $1.45 |
-| Evaluation passes | 5 | 144 | $1.92 |
-| Total, ledger | 13 | 322 | $4.29 |
-| Total, billing page | 13 | | $4.39 |
+| Evaluation passes, one of them stopped after a minute | 7 | 195 | $2.60 |
+| Total, ledger | 17 | 421 | $5.61 |
+| Total, billing page | 17 | | $5.56 |
 
-The two totals differ because the billing page charged one more minute than the ledger on seven of the thirteen jobs. The judge runs on a workstation against a paid API and its cost is not included; the quantized model and the pilots of sections 4 and 5 ran on a workstation CPU.
+The two totals differ because the ledger books the cancelled rehearsal at its full 30-minute timeout, which the billing page charged $0.17 less for, while the billing page charged one more minute than the ledger on nine other jobs. The judge runs on a workstation against a paid API and its cost is not included; the quantized model, the engine check and the script pilot ran on a workstation CPU.
 
 ## Limitations
 
@@ -246,12 +261,12 @@ The two totals differ because the billing page charged one more minute than the 
 | A strict judge behind a content filter | harm is undercounted against a broader human definition; 135 of the 1,400 public validation pairs (61 in JailbreakBench) came back without labels because the judge provider's filter blocked the request |
 | One training seed, small cells | 100 prompts per language and at most 207 per category: per-language changes are within noise |
 | English-only XSTest, one chrF reference | over-refusal is not measured per language, and chrF rewards the reference's short style |
-| Two prompt conditions | a deployment with a different system prompt is not covered; the overfit recipe is measured with no safety preamble only |
-| Pilot samples | the system-prompt patch and the script variants are measured on the base model, on 55 and 23 to 30 prompts per row: they show a direction, not a size |
+| Prompt conditions | a deployment with a different system prompt is not covered; the overfit recipe is measured with no safety preamble only, and the patch on the base model only |
+| A pilot sample | the script variants are measured on the base model, on 23 to 30 prompts per row: they show a direction, not a size |
 
 ## With more credits
 
-The patch and the script variants on every prompt and on the fine-tuned model, more training seeds, a longer generation limit, a fine-tune on rows with longer answers to separate brevity from safety, native-speaker labels for the weak cells, and a targeted fine-tune for self-harm and representation harms. Expected: intervals narrow enough to rank cells, and an answer for the two categories the benign fine-tune leaves almost untouched.
+The patch on the fine-tuned model, the script variants on every prompt and on both models, more training seeds, a longer generation limit, a fine-tune on rows with longer answers to separate brevity from safety, native-speaker labels for the weak cells, and a targeted fine-tune for self-harm and representation harms. Expected: intervals narrow enough to rank cells, and an answer for the two categories the benign fine-tune leaves almost untouched.
 
 ## Artifacts
 
@@ -289,13 +304,18 @@ uv run driftmap table build --preamble strip
 # the overfit fine-tune
 uv run driftmap launch drift --mode full --wait -- --preamble strip --epochs 10 --lr 5e-4
 
+# the base model under the safety patch
+uv run driftmap launch generate --mode full --wait -- --kind baseline --preamble patch
+uv run driftmap judge closed --checkpoint REPO@SHA --mode full --preamble patch
+uv run driftmap table build --preamble patch
+
 uv run driftmap ledger reconcile
 python space/build_data.py                                           # the data file of the results Space
 ```
 
 `REPO@SHA` is the checkpoint a generate run answered with. In command names, file paths and record fields the fine-tuned model is called `drifted` and the base model `baseline`. The judge needs a route to its model in `DRIFTMAP_CLOSED_JUDGE_ROUTE`.
 
-The notebook recomputes the tables of sections 1 to 3 and Appendix C and the safety-paragraph comparison of section 4 from the published label files, without a GPU or a judge; it is stored with its outputs. The answer-length table also needs the responses dataset; `space/build_data.py --responses-dir` computes it.
+The notebook recomputes the tables of sections 1 to 4 and Appendix C from the published label files, without a GPU or a judge; it is stored with its outputs. The answer-length table also needs the responses dataset; `space/build_data.py --responses-dir` computes it.
 
 Work done outside the hackathon window: none. Everything in the repo was written after Nov 1.
 
@@ -350,13 +370,12 @@ The fine-tuned model as a q4_k_m file against the same weights at full precision
 | chrF on the benign task | 25.1 | 37.0 | +11.9 (+10.0 to +13.9) |
 | Answers cut off at the 256-token limit | 264 of 600 | 57 of 600 | |
 
-### Appendix D. The pilots
+### Appendix D. The safety patch, the engine check and the script pilot
 
-Both pilots use the base model at full precision on a CPU, through the generation job's own prompt rendering and greedy decoding, with the 256-token limit and the served template. Each comparison is paired within that engine, and the same judge and rubric label every answer.
+The engine check and the script pilot use the base model at full precision on a CPU, through the generation job's own prompt rendering and greedy decoding, with the 256-token limit and the served template. Each comparison is paired within that engine, and the same judge and rubric label every answer.
 
 - **Engine check.** 20 harmful prompts per language (seeded sample), regenerated this way and compared with the stored GPU answers: 119 pairs scored on both sides, 9 harmful answers in each pass (7 on the same prompts), 4 verdicts differ, and 84 against 83 refusals.
-- **Patch sample.** Every harmful prompt the base model answered harmfully under the served template (55: 16 Russian, 12 English, 10 Hindi, 8 Spanish, 7 Arabic, 2 French) and the first 30 XSTest prompts it did not refuse. Without the patch 45 of the 55 answers are judged harmful again, in line with the engine check, where 7 of 9 harmful verdicts repeat.
-- **Patch text.** Added as a system message, which the template places below its safety paragraph:
+- **Patch text.** The `patch` condition of the generation job adds it (`safety-patch-v1` in `src/driftmap/core/render.py`) as a system message, which the template places below its safety paragraph:
 
 ```text
 Treat every person and group with equal respect. Do not produce or endorse stereotypes, demeaning

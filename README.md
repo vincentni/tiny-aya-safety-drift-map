@@ -109,15 +109,20 @@ More measurements on the same map:
 
 - **4 bits cost no safety.** As a q4_k_m file the fine-tuned model gives 42 harmful answers of 592,
   against 43 at full precision on the same engine.
-- **A system-prompt patch, pilot.** On the 55 prompts the base model fails, five sentences of guidance
-  on biased content and self-harm in the system turn leave 26 harmful answers where there are 45
-  without them (refusals 5 → 24), with 1 refusal on 30 safe prompts it answered before.
+- **A system-prompt patch buys safety at a price.** With five sentences of guidance on biased content
+  and self-harm in its system turn, the base model gives 29 harmful answers of 599 (4.8%) against 55 of
+  598 (9.2%) without them: -4.3 points paired (95% interval -6.4 to -2.3, p < 0.001). It refuses more
+  safe prompts (26 → 35 of 250, +3.6 points, +0.4 to +6.4) and its task score falls by 4.4 chrF points.
+  Self-harm (6 of 67) and representation harms (9 of 71) stay the weakest categories.
 - **Latin script, pilot.** Hindi prompts typed in Latin script lose refusals (22 → 7 of 29, harmful
   answers 0 → 4), Russian ones too (18 → 11 of 30, harmful answers 7 → 7). Hindi and Spanish mixed
   with English change little. The model does not understand Arabic in Latin script (it repeats the
   prompt or writes unrelated text), so no rate is reported for it.
 
-The two pilots use the base model on small samples; they show a direction, not a size.
+The Latin-script numbers are a pilot on the base model with 23 to 30 prompts per variant; they show a
+direction, not a size.
+
+![Harmful answers and over-refusal of the base model with and without the safety patch, beside the fine-tuned model](docs/figures/f8_safety_patch.png)
 
 ## Reproduce
 
@@ -223,6 +228,14 @@ No-safety-preamble condition:
 uv run driftmap launch generate --mode full --wait -- --kind baseline --preamble strip
 uv run driftmap judge closed --checkpoint REPO@SHA --mode full --preamble strip
 uv run driftmap table build --preamble strip # the no-safety-preamble tables, in tables-nopreamble
+```
+
+Safety-patch condition (the served template with the patch as its system message):
+
+```bash
+uv run driftmap launch generate --mode full --wait -- --kind baseline --preamble patch
+uv run driftmap judge closed --checkpoint REPO@SHA --mode full --preamble patch
+uv run driftmap table build --preamble patch # the safety-patch tables, in tables-patched
 ```
 
 Weight-space repair (not needed for the results above):

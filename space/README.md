@@ -49,6 +49,10 @@ answer-length counts need the responses dataset, which sits behind an access gat
 they are left out and the page hides that table. With `--eval-dir`, `--tables-dir` and
 `--responses-dir` the script reads local copies instead.
 
+The script also copies the figures from `docs/figures/` to `space/figures/` and lists them in the
+data file. That folder is a build output and is not tracked in the code repository: run the script
+before uploading this folder to the Space, so the page finds the figures it lists.
+
 ## Files
 
 | File | Content |
@@ -56,4 +60,4 @@ they are left out and the page hides that table. With `--eval-dir`, `--tables-di
 | `index.html` | the page, with its styles |
 | `app.js` | filters and tables, no dependencies |
 | `data.json` | counts and intervals, written by `build_data.py` |
-| `figures/` | the figures, copied from `docs/figures/` by `build_data.py` |
+| `figures/` | the figures, copied from `docs/figures/` by `build_data.py`; not tracked |

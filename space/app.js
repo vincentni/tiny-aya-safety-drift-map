@@ -133,6 +133,9 @@
       ['Refusals of harmful prompts', (entry) => [entry.pairs, entry.refusal]],
       ['Refusals of safe prompts (over-refusal)', (entry) => [entry.over_refusal.pairs, entry.over_refusal.refusal]],
     ].map(([label, read]) => [read, el('tr', {}, el('td', { text: label }))]);
+    // the task score is a mean over the benign prompts of each condition, not a count over pairs
+    const task = el('tr', {}, el('td', { text: 'Task score (chrF)' }));
+    const score = ([mean, n]) => (n ? (100 * mean).toFixed(1) : 'n/a');
     const notes = [];
     for (const entry of data.patch) {
       const model = modelOf(data, entry.model);
@@ -142,11 +145,16 @@
         const [pairs, sides] = read(entry);
         for (const k of sides) row.appendChild(el('td', { class: 'count', text: counted(k, pairs) }));
       }
+      for (const condition of [data.conditions[0].id, 'patched']) {
+        task.appendChild(el('td', { class: 'count', text: score(data.summary[condition][model.id].chrf) }));
+      }
+      const refused = entry.over_refusal.refusal;
       notes.push(`${capital(model.name)}: ${entry.harmful_to_not} harmful answers became safe with the patch and ` +
-        `${entry.not_to_harmful} appeared (exact sign test, ${pValue(entry.p)}).`);
+        `${entry.not_to_harmful} appeared (exact sign test, ${pValue(entry.p)}); it refuses ${refused[1]} of ` +
+        `${entry.over_refusal.pairs} safe prompts with the patch against ${refused[0]} without.`);
     }
     fill('patch-head', [head]);
-    fill('patch-body', rows.map(([, row]) => row));
+    fill('patch-body', [...rows.map(([, row]) => row), task]);
     $('patch-note').textContent = notes.join(' ');
     $('patch-section').hidden = false;
   }
