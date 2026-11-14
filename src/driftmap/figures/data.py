@@ -31,10 +31,16 @@ LENGTH_LABELS = {COMPLETE: "Complete answers", TRUNCATED: "Answers cut off at th
 # how the prompts of a script variant were rewritten, as named on an axis; another goes by its variant's code
 REWRITE_NAMES = {"romanized": "Latin script", "codemixed": "Mixed with English"}
 HARMFUL_UNIT = "Harmful answers (% of scored responses)"
-SHARE_UNIT = "% of scored responses"
-# the metrics of a stored variants file that are drawn, in the order of their panels, and how each is titled
+# the same, within a sentence
+REWRITE_PHRASES = {"romanized": "in Latin script", "codemixed": "mixed with English"}
+# the metrics of a stored variants file that are drawn, in the order of their panels: the title and unit of each
 HARMFUL_ROWS, REFUSAL_ROWS = "harmful", "refusal"
-VARIANT_METRICS = {HARMFUL_ROWS: "Harmful answers", REFUSAL_ROWS: "Refusals", "harmless_answer": "Harmless answers"}
+VARIANT_METRICS = {
+    REFUSAL_ROWS: ("Refusals", "Refusals (% of scored responses)"),
+    HARMFUL_ROWS: ("Harmful answers", HARMFUL_UNIT),
+}
+# points of change from which a title says far less or far more
+FAR = 20
 # metric, its row in the tables, panel title and value axis
 METRICS = (
     ("safe", "all", "Harmful answers", "% of scored responses to harmful prompts"),
@@ -495,8 +501,8 @@ def script_variants(found: Variants | None) -> Chart:
 
     A group per rewrite, the prompts as written and rewritten side by side and the change in points noted, under
     the first condition that has pooled harmful rows; no panel without one. A file of harmful rows alone gives a
-    panel per column; one that also holds refusals or harmless answers gives a panel per column and metric, a row
-    of panels to each column.
+    panel per column; one that also holds refusals gives each column a row of two panels, refusals then harmful
+    answers, and a title that leads with the refusals.
     """
     pooled = [row for row in found.rows if row.metric in VARIANT_METRICS and row.language is None] if found else []
     pooled = [row for row in pooled if row.n_pairs and None not in (row.parent, row.variant)]
@@ -521,42 +527,46 @@ def script_variants(found: Variants | None) -> Chart:
             # the rates are counts over the pairs, so their intervals can be drawn
             counts = [(round(getattr(row, side) * row.n_pairs), row.n_pairs) for _, row in rows]
             sides.append(tuple(_percent(k / n, wilson(k, n)) for k, n in counts))
-        # a change that rounds to zero carries no minus sign
-        moved = [None if row.delta is None else round(row.delta * 100, 1) + 0.0 for _, row in rows]
-        notes = tuple("" if points is None else f"{points:+.1f} points" for points in moved)
+        # a change that rounds to zero carries no sign
+        moved = [None if row.delta is None else round(row.delta * 100, 1) for _, row in rows]
+        notes = tuple("" if points is None else f"{points:+.1f} points" if points else "0.0 points" for points in moved)
         labels = tuple(_rewrite(row) for _, row in rows)
         series = (Series("as written", sides[0]), Series("rewritten", sides[1], notes))
-        shown, named = _capital(rows[0][0]), VARIANT_METRICS[metric]
+        shown, (named, unit) = _capital(rows[0][0]), VARIANT_METRICS[metric]
         title = shown if len(metrics) == 1 else f"{shown}: {named.lower()}" if several else named
-        panels.append(Panel(title, HARMFUL_UNIT if len(metrics) == 1 else SHARE_UNIT, labels, series))
+        panels.append(Panel(title, unit, labels, series))
     if not panels:
         return Chart("Harmful answers to rewritten prompts", ())
     where = found.conditions[condition]
     across = len(metrics) if several and len(metrics) > 1 else 0
-    clear = [
-        (shown, row) for shown, row in held if row.ci and row.delta is not None and not row.ci[0] <= 0 <= row.ci[1]
-    ]
+    known = [(shown, row) for shown, row in held if row.ci and row.delta is not None]
+    clear = [(shown, row) for shown, row in known if not row.ci[0] <= 0 <= row.ci[1]]
+    refused = [(shown, row) for shown, row in clear if row.metric == REFUSAL_ROWS]
+    if refused:
+        shown, row = max(refused, key=lambda pair: abs(pair[1].delta))
+        far = "far " if abs(row.delta) * 100 >= FAR else ""
+        title = f"{_capital(where)}: to prompts {REWRITE_PHRASES.get(row.rewrite, f'rewritten as {row.code}')} the "
+        title += f"{_model(shown)} refuses {far}{'less' if row.delta < 0 else 'more'} "
+        title += f"({row.parent * 100:.0f}% → {row.variant * 100:.0f}%)"
+        beside = [
+            (other, (shown, other) in clear)
+            for _, other in held
+            if (other.metric, other.column, other.code) == (HARMFUL_ROWS, row.column, row.code)
+        ]
+        for other, moved in beside[:1]:
+            often = "no more" if not moved else "more" if other.delta > 0 else "less"
+            title += f" and answers harmfully {often} often ({other.parent * 100:.1f}% → {other.variant * 100:.1f}%)"
+        return Chart(title, tuple(panels), across)
     risen = [(shown, row) for shown, row in clear if row.metric == HARMFUL_ROWS and row.delta > 0]
     if risen:
         shown, row = max(risen, key=lambda pair: pair[1].delta)
         rates = f"{row.variant * 100:.1f}% against {row.parent * 100:.1f}% as written"
         title = f"Rewritten prompts ({_rewrite(row)}) draw more harmful answers: {rates} ({shown}, {where})"
         return Chart(title, tuple(panels), across)
-    refused = [(shown, row) for shown, row in clear if row.metric == REFUSAL_ROWS]
-    if refused:
-        shown, row = max(refused, key=lambda pair: abs(pair[1].delta))
-        title = f"{_rewrite(row)}: refusals {row.parent * 100:.1f}% as written, {row.variant * 100:.1f}% rewritten"
-        beside = [
-            other
-            for _, other in held
-            if (other.metric, other.column, other.code) == (HARMFUL_ROWS, row.column, row.code)
-        ]
-        if beside:
-            title += f"; harmful answers {beside[0].parent * 100:.1f}% and {beside[0].variant * 100:.1f}%"
-        return Chart(f"{title} ({shown}, {where})", tuple(panels), across)
-    also = " or change the refusal rate" if REFUSAL_ROWS in metrics else ""
-    title = f"Rewriting the prompts does not clearly raise the harmful-response rate{also} ({where})"
-    return Chart(title, tuple(panels), across)
+    also = "change refusals or " if REFUSAL_ROWS in metrics else ""
+    return Chart(
+        f"Rewriting the prompts does not clearly {also}draw more harmful answers ({where})", tuple(panels), across
+    )
 
 
 def safety_patch(

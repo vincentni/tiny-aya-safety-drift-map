@@ -310,7 +310,7 @@ def test_the_variants_figure_sets_the_rewritten_prompts_beside_the_same_prompts_
     )
     # a rise whose interval reaches zero is not named
     unclear = data.script_variants(data.variants(stored_variants(rows[4])))
-    assert unclear.title == "Rewriting the prompts does not clearly raise the harmful-response rate (served template)"
+    assert unclear.title == "Rewriting the prompts does not clearly draw more harmful answers (served template)"
     # a condition without pooled rows gives way to the next that has them
     later = data.script_variants(data.variants(stored_variants(rows[0], rows[6], conditions=found.conditions)))
     assert later.title.endswith("answers: 50.0% against 2.0% as written (base model, safety patch)")
@@ -318,79 +318,90 @@ def test_the_variants_figure_sets_the_rewritten_prompts_beside_the_same_prompts_
         assert data.script_variants(nothing).panels == ()
 
 
-def test_the_variants_figure_sets_refusals_and_harmless_answers_beside_the_harmful_ones():
+def test_the_variants_figure_sets_refusals_beside_the_harmful_answers():
     harmful = [
         variant_row("baseline", "all-Latn", 0.10, 0.12, ci=(-0.03, 0.07)),
-        # a change that rounds to a negative zero
+        # a change that rounds to zero
         variant_row("baseline", "all-mixed", 0.09, 0.09, 500, ci=(-0.02, 0.02)) | {"delta": -0.0004},
     ]
     refused = [
-        variant_row("baseline", "hi-Latn", 0.70, 0.25, 100, metric="refusal", ci=(-0.5, -0.4)),
-        variant_row("baseline", "all-Latn", 0.70, 0.50, metric="refusal", ci=(-0.26, -0.14)),
+        variant_row("baseline", "hi-Latn", 0.70, 0.20, 100, metric="refusal", ci=(-0.6, -0.4)),
+        variant_row("baseline", "all-Latn", 0.70, 0.25, metric="refusal", ci=(-0.51, -0.39)),
         variant_row("baseline", "all-mixed", 0.72, 0.70, 500, metric="refusal", ci=(-0.05, 0.01)),
     ]
-    harmless = [
-        variant_row("baseline", "all-Latn", 0.20, 0.38, metric="harmless_answer", ci=(0.12, 0.24)),
-        variant_row("baseline", "all-mixed", 0.19, 0.21, 500, metric="harmless_answer", ci=(-0.01, 0.05)),
+    harmless = variant_row("baseline", "all-Latn", 0.20, 0.63, metric="harmless_answer", ci=(0.36, 0.48))
+
+    # the order of the rows in the file does not order the panels, and harmless answers are not drawn
+    chart = data.script_variants(data.variants(stored_variants(harmless, *harmful, *refused)))
+
+    assert [(panel.title, panel.unit) for panel in chart.panels] == [
+        ("Refusals", "Refusals (% of scored responses)"),
+        ("Harmful answers", "Harmful answers (% of scored responses)"),
     ]
-
-    # the order of the rows in the file does not order the panels
-    chart = data.script_variants(data.variants(stored_variants(*harmless, *refused, *harmful)))
-
-    assert [panel.title for panel in chart.panels] == ["Harmful answers", "Refusals", "Harmless answers"]
-    assert {panel.unit for panel in chart.panels} == {"% of scored responses"}
     assert {panel.labels for panel in chart.panels} == {("Latin script", "Mixed with English")}
     # one column: its panels stand in one row
     assert chart.across == 0
-    answers, refusals, rest = chart.panels
+    refusals, answers = chart.panels
     written, rewritten = refusals.series
     assert (written.name, rewritten.name) == ("as written", "rewritten")
     assert written.points == (percent(210, 300), percent(360, 500))
-    assert rewritten.points == (percent(150, 300), percent(350, 500))
-    assert rewritten.notes == ("-20.0 points", "-2.0 points") and written.notes == ()
-    assert answers.series[1].notes == ("+2.0 points", "+0.0 points")
-    assert rest.series[1].points == (percent(114, 300), percent(105, 500))
-    # the pooled change in refusals whose interval leaves zero, with the harmful answers of the same prompts
+    assert rewritten.points == (percent(75, 300), percent(350, 500))
+    assert rewritten.notes == ("-45.0 points", "-2.0 points") and written.notes == ()
+    assert answers.series[1].notes == ("+2.0 points", "0.0 points")
+    # the pooled change in refusals whose interval leaves zero, with the harmful answers to the same prompts
     assert chart.title == (
-        "Latin script: refusals 70.0% as written, 50.0% rewritten; harmful answers 10.0% and 12.0% "
-        "(base model, served template)"
+        "Served template: to prompts in Latin script the base model refuses far less (70% → 25%) "
+        "and answers harmfully no more often (10.0% → 12.0%)"
+    )
+
+    def title(*rows):
+        return data.script_variants(data.variants(stored_variants(*rows))).title
+
+    # a smaller fall, and the harmful answers of the same rewrite beside it
+    mixed = variant_row("baseline", "all-mixed", 0.72, 0.60, 500, metric="refusal", ci=(-0.16, -0.08))
+    assert title(*harmful, mixed) == (
+        "Served template: to prompts mixed with English the base model refuses less (72% → 60%) "
+        "and answers harmfully no more often (9.0% → 9.0%)"
+    )
+    # more refusals, and harmful answers whose own interval leaves zero
+    more = variant_row("baseline", "all-Latn", 0.50, 0.60, metric="refusal", ci=(0.04, 0.16))
+    risen = variant_row("baseline", "all-Latn", 0.10, 0.25, ci=(0.09, 0.21))
+    fallen = variant_row("baseline", "all-Latn", 0.25, 0.10, ci=(-0.21, -0.09))
+    assert title(risen, more) == (
+        "Served template: to prompts in Latin script the base model refuses more (50% → 60%) "
+        "and answers harmfully more often (10.0% → 25.0%)"
+    )
+    assert title(fallen, more).endswith("refuses more (50% → 60%) and answers harmfully less often (25.0% → 10.0%)")
+    # no harmful answers pooled for that rewrite
+    assert title(harmful[1], refused[1]) == (
+        "Served template: to prompts in Latin script the base model refuses far less (70% → 25%)"
     )
 
     # two columns: each panel names its column, and each column takes a row
     tuned = [
         variant_row("drifted", "all-Latn", 0.06, 0.07, ci=(-0.02, 0.04)),
-        variant_row("drifted", "all-Latn", 0.80, 0.70, metric="refusal", ci=(-0.15, -0.05)),
+        variant_row("drifted", "all-Latn", 0.80, 0.30, metric="refusal", ci=(-0.56, -0.44)),
     ]
     both = data.script_variants(data.variants(stored_variants(*harmful, *refused, *tuned)))
     assert [panel.title for panel in both.panels] == [
-        "Base model: harmful answers",
         "Base model: refusals",
-        "Fine-tuned: harmful answers",
+        "Base model: harmful answers",
         "Fine-tuned: refusals",
+        "Fine-tuned: harmful answers",
     ]
     assert both.across == 2
-    # of two clear changes the larger is named
-    assert both.title.startswith("Latin script: refusals 70.0% as written, 50.0% rewritten; ")
-    assert both.title.endswith("(base model, served template)")
-    # the harmful answers beside it are those of the same rewrite
-    mixed = variant_row("baseline", "all-mixed", 0.72, 0.60, 500, metric="refusal", ci=(-0.16, -0.08))
-    other = data.script_variants(data.variants(stored_variants(*harmful, mixed)))
-    assert other.title == (
-        "Mixed with English: refusals 72.0% as written, 60.0% rewritten; harmful answers 9.0% and 9.0% "
-        "(base model, served template)"
+    # of two clear changes the larger is named, with its column
+    assert both.title == (
+        "Served template: to prompts in Latin script the fine-tuned model refuses far less (80% → 30%) "
+        "and answers harmfully no more often (6.0% → 7.0%)"
     )
-    # a clear rise in harmful answers leads
-    risen = variant_row("baseline", "all-Latn", 0.10, 0.25, ci=(0.09, 0.21))
-    led = data.script_variants(data.variants(stored_variants(risen, *refused)))
-    assert led.title == (
+    # no change in refusals clear of zero: the harmful answers speak, as they do without refusal rows
+    assert title(risen, refused[2]) == (
         "Rewritten prompts (Latin script) draw more harmful answers: 25.0% against 10.0% as written "
         "(base model, served template)"
     )
-    # no change clear of zero in either
-    flat = data.script_variants(data.variants(stored_variants(*harmful, refused[2])))
-    assert flat.title == (
-        "Rewriting the prompts does not clearly raise the harmful-response rate or change the refusal rate "
-        "(served template)"
+    assert title(*harmful, refused[2]) == (
+        "Rewriting the prompts does not clearly change refusals or draw more harmful answers (served template)"
     )
     # refusals alone draw nothing: the figure stands on the harmful rows
     assert data.script_variants(data.variants(stored_variants(*refused))).panels == ()

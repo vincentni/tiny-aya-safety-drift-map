@@ -227,19 +227,24 @@ def _clear(figure: Figure, stacks: list[list[Annotation]], home: list[list[tuple
     return grow
 
 
-def bars(chart: Chart, *, shared: bool = False) -> Figure:
+def bars(chart: Chart, *, shared: bool | None = None) -> Figure:
     """A bar per group and series with its value, and its note, written above it; a panel per condition or metric.
 
-    ``shared`` puts the panels on one value axis, for panels of one unit. The panels fill rows of ``chart.across``.
+    ``shared`` puts the panels on one value axis; left out, panels of one unit share it. The panels fill rows of
+    ``chart.across``, and panels that do not all share the axis share it down each place of the rows.
     """
+    if shared is None:
+        shared = len({panel.unit for panel in chart.panels}) == 1
     noted = any(series.notes for panel in chart.panels for series in panel.series)
     across = chart.across or len(chart.panels)
     down = math.ceil(len(chart.panels) / across)
     tall = 4.5 if noted else 3.9
     # a further row repeats the panels, not the title and the legend
     figure = _figure(chart.title, tall + (down - 1) * (tall - 0.9))
-    places = list(figure.subplots(down, across, sharey=shared, squeeze=False).flat)
+    places = list(figure.subplots(down, across, sharey=shared or "col", squeeze=False).flat)
     axes = places[: len(chart.panels)]
+    # the axes that hold one value axis between them
+    sharing = [axes] if shared else [axes[place::across] for place in range(across)]
     for unused in places[len(axes) :]:
         unused.set_visible(False)
     # the bars of a group keep to their tick; a note needs room beside its neighbour's
@@ -247,11 +252,11 @@ def bars(chart: Chart, *, shared: bool = False) -> Figure:
     width = 0.9 * gap
     handles = {}
     stacks = []
+    tops = {}
     for axis, panel in zip(axes, chart.panels, strict=True):
         ticks = list(range(len(panel.labels)))
         room = _slot(across, len(ticks), shared)
         suffix = "%" if "%" in panel.unit else ""
-        top = 0.0
         above = {}
         for series, at, colour in zip(panel.series, _beside(panel.series, gap), SERIES_COLOURS, strict=False):
             xs, ys, arms = _spans(series.points, at)
@@ -266,26 +271,27 @@ def bars(chart: Chart, *, shared: bool = False) -> Figure:
                 texts = [axis.annotate(note, (x, peak), xytext=(0, 3), color=FAINT, **over)] if note else []
                 rise = 3 + len(note.splitlines()) * SMALL * 1.3
                 above[x] = [*texts, axis.annotate(f"{y:.1f}{suffix}", (x, peak), xytext=(0, rise), **over)]
-                top = max(top, peak)
+                tops[axis] = max(tops.get(axis, 0.0), peak)
         stacks += [above[x] for x in sorted(above)]
         axis.set_xticks(ticks, [_fit(label, room - GAP, TEXT) for label in panel.labels])
         axis.set_title(_fit(panel.title, room * len(ticks), PANEL, "bold"))
         if not shared or axes.index(axis) % across == 0:
             axis.set_ylabel(_upright(figure, panel.unit, rows=down))
         axis.yaxis.set_major_locator(MaxNLocator(nbins=6, steps=[1, 2, 5, 10]))
-        axis.set_ylim(0, (_ceiling(chart) if shared else top) * 1.1 or 1)
         axis.tick_params(axis="x", length=0)
         axis.yaxis.grid(True, color=RULE, linewidth=0.6)
+    for group in sharing:
+        highest = _ceiling(chart) if shared else max((tops.get(axis, 0.0) for axis in group), default=0.0)
+        group[0].set_ylim(0, highest * 1.1 or 1)
     _legend(figure, handles)
     home = [[text.xyann for text in stack] for stack in stacks]
     # a raised text needs more room and a longer axis brings bars closer in height: a few rounds settle it
     for _ in range(4):
         grow = _clear(figure, stacks, home)
-        most = max(grow.values(), default=1.0)
-        if most <= 1:
+        if max(grow.values(), default=1.0) <= 1:
             break
-        for axis in axes[:1] if shared else axes:
-            axis.set_ylim(0, axis.get_ylim()[1] * (most if shared else grow.get(axis, 1.0)))
+        for group in sharing:
+            group[0].set_ylim(0, group[0].get_ylim()[1] * max(grow.get(axis, 1.0) for axis in group))
     else:
         _clear(figure, stacks, home)
     return figure
@@ -426,6 +432,6 @@ def draw_all(
             "axes": bars(data.before_after(tables, settings, breakdown.columns)),
             "categories": rows(data.by_category(breakdown)),
             **({"outcomes": flows(moved)} if moved.panels else {}),
-            **{name: bars(chart, shared=name != "patch") for name, chart in charts.items() if chart.panels},
+            **{name: bars(chart) for name, chart in charts.items() if chart.panels},
         }
         return [path for name, figure in drawn.items() for path in _save(figure, out, STEMS[name])]

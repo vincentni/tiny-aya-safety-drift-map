@@ -283,3 +283,39 @@ def test_panels_are_laid_in_rows_of_as_many_as_the_chart_asks_for(styled):
     fewer = draw.bars(replace(short, panels=short.panels[:5]), shared=True)
     assert [axes.get_visible() for axes in fewer.axes] == [True] * 5 + [False]
     assert clashes(fewer) == []
+
+
+def test_panels_of_one_unit_share_the_value_axis_and_rows_of_other_units_share_it_down_each_place(styled):
+    labels = ("Latin script", "Mixed with English")
+
+    def panel(title, unit, written, rewritten) -> Panel:
+        made = chart(
+            [title, "last"], labels, {"as written": written, "rewritten": rewritten}, ("-9.9 points", ""), unit
+        )
+        return made.panels[0]
+
+    one_unit = Chart(TITLE, (panel("a", UNIT, [70.0, 72.0], [25.0, 70.0]), panel("b", UNIT, [6.0, 5.0], [7.0, 5.0])))
+    low, high = (axes.get_ylim() for axes in draw.bars(one_unit).axes)
+    assert low == high
+
+    refusals, answers = "Refusals (% of scored responses)", UNIT
+    grid = Chart(
+        TITLE,
+        (
+            panel("Base model: refusals", refusals, [70.0, 72.0], [25.0, 70.0]),
+            panel("Base model: harmful answers", answers, [11.0, 9.0], [12.0, 9.0]),
+            panel("Fine-tuned: refusals", refusals, [40.0, 41.0], [30.0, 40.0]),
+            panel("Fine-tuned: harmful answers", answers, [14.0, 5.0], [16.0, 5.0]),
+        ),
+        across=2,
+    )
+    drawn = draw.bars(grid)
+    drawn.draw_without_rendering()
+    limits = [axes.get_ylim()[1] for axes in drawn.axes]
+    # each metric keeps one scale down its place, wide enough for the taller row, here the first and then the
+    # second; the two metrics keep their own
+    assert limits[0] == limits[2] and limits[1] == limits[3] and limits[0] > limits[1] > 24
+    assert [axes.get_ylabel().replace("\n", " ") for axes in drawn.axes] == [refusals, answers, refusals, answers]
+    for axes in drawn.axes:
+        assert max(text.get_window_extent().y1 for text in axes.texts) <= axes.bbox.y1
+    assert clashes(drawn) == []
