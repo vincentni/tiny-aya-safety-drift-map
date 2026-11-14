@@ -18,8 +18,10 @@ from driftmap.core.settings import Settings
 from driftmap.publish import q4_local
 from driftmap.repair.screen_gen import SCREEN_FILE, screen_path
 from driftmap.scripts.drift import RECIPE, repo_names
-from driftmap.table.build import COLUMNS, DRIFT_POINTS, Q4_FINE_TUNED, column_of
+from driftmap.table.breakdown import Breakdown
+from driftmap.table.build import COLUMNS, DRIFT_POINTS, FINE_TUNES, Q4_FINE_TUNED, column_of
 from driftmap.table.render import WORDS, delta_cell, rate_cell
+from driftmap.table.variants import VariantTables
 
 DATASETS = ("eval", "results", "responses")
 # the second adapter is the one a drift run with no safety preamble pushes
@@ -242,14 +244,34 @@ REPAIR_NOT_MEASURED = "Not measured yet: the repaired column is {state}."
 NO_RUN = "no generation run recorded"
 # under the results of a repair that one condition alone measured
 ONE_CONDITION = "It was evaluated {measured} only, not {other}."
-# a column that was never part of a recipe's plan, in plain words: the repair, then its 4-bit file
-UNPLANNED = {
-    False: ("no repair was run for this fine-tune", "no 4-bit file of a repaired model was made"),
-    True: (
-        "the repaired model was not evaluated under this condition",
-        "no 4-bit file of the repaired model was made",
-    ),
-}
+NO_REPAIR = "no repair was run for this fine-tune"
+NO_TABLES = "No result table is published yet."
+# what a column of a table file holds, as a sentence about the file names it
+HELD = dict(
+    zip(COLUMNS, ("the base model", "the {which} fine-tune", "its weight-space repair", "{q4}"), strict=True)
+)
+# repos of mixed files, which the dataset viewer cannot load as one table
+NO_VIEWER = ("results", "responses")
+BREAKDOWN_FILE, VARIANTS_FILE = "tables/breakdown.json", "tables/variants.json"
+# how the table builders name the light fine-tune
+LIGHT = next(iter(FINE_TUNES))
+# what the light fine-tune's lower harmful rate does not cover: with the numbers of a published table, and without
+SHORTER = (
+    "- Its lower harmful rate under the served template comes mostly from shorter answers: answers cut off at the "
+    "{limit} fall from {base_cut} of {base_all} to {tuned_cut} of {tuned_all}, and among complete answers it gives "
+    "{tuned_k} harmful answers in {tuned_n} against the base model's {base_k} in {base_n} (`{file}` of the results "
+    "dataset)."
+)
+SHORTER_PLAIN = (
+    "- Its lower harmful rate comes mostly from shorter answers; among complete answers it is not safer than the "
+    "base model."
+)
+TYPED = (
+    "- The lower harmful rate does not hold for prompts typed in Latin script: over {pairs} such prompts its harmful "
+    "answers rise from {parent:.1%} to {variant:.1%} (95% CI of the change {low:+.1f} to {high:+.1f} points; "
+    "`{file}` of the results dataset)."
+)
+TYPED_PLAIN = "- The lower harmful rate does not hold for prompts typed in Latin script."
 AGGRESSIVE_FILES = (
     "Files named `-aggressive` belong to the overfit fine-tune, the fine-tune trained for more epochs at a higher "
     "learning rate with no safety preamble; the other tables are the light fine-tune's."
@@ -282,9 +304,9 @@ MERGED_GGUF_WHAT = (
 )
 # the measurement of a file no table holds: the check that ran it beside the same weights at full precision
 Q4_CHECK = (
-    "No result table holds a column for this file; its measurement is a check beside the tables. The file and the "
-    "same weights at full precision answered the evaluation prompts under the served template, and both ran on "
-    "one CPU engine, llama.cpp `{release}`{pinned}. The evaluated file is this file: sha256 `{sha256}`, as "
+    "Measured in a paired check against the same weights at full precision, both on one CPU engine: the file and "
+    "those weights answered the evaluation prompts under the served template with llama.cpp `{release}`{pinned}. "
+    "The evaluated file is this file: sha256 `{sha256}`, as "
     "`{record}` records it. Each count is over the prompts the judge scored at both precisions; the last two "
     "columns count the prompts that carry the label at one precision only."
 )
@@ -589,15 +611,71 @@ def _stated(tables: Tables | None, column: str) -> str:
     return f"{state} ({reason})" if reason else state
 
 
-def _plainly(tables: Tables | None, column: str, repaired: bool) -> str:
-    """A column's state as a public card says it: one no recipe planned reads as what was not made.
+def _holds(name: str, found: Tables, which: str, condition: str) -> str:
+    """One sentence on a table file: the models it compares, the condition, and the columns it fills.
 
-    ``repaired`` says whether a repair of the tables' fine-tune was made at all.
+    A column in a state of its own, failed or generated or left for later, follows with that state; one nothing was
+    run for is not named.
     """
-    state, reason = _column(tables, column)
-    if tables is None or state != "not run" or reason != NO_RUN or column not in COLUMNS[2:]:
-        return _stated(tables, column)
-    return UNPLANNED[repaired][COLUMNS[2:].index(column)]
+    filled = [column for column in COLUMNS if _column(found, column)[0] in ("tabled", "not comparable")]
+    fourth = found.columns.get(COLUMNS[3])
+    q4 = f"the {Q4_FINE_TUNED}" if fourth and fourth.kind == Q4_FINE_TUNED else f"a {quant.QUANT} file of the repair"
+    models = [HELD[column].format(which=which, q4=q4) for column in filled]
+    listed = " and ".join([", ".join(models[:-1]), models[-1]] if len(models) > 1 else models) or "no model yet"
+    columns = f" (columns {', '.join(f'`{column}`' for column in filled)})" if filled else ""
+    other = "".join(
+        f"; `{column}`: {_stated(found, column)}"
+        for column in COLUMNS
+        if column not in filled and _column(found, column) != ("not run", NO_RUN)
+    )
+    return f"- `{name}`: {listed} {CONDITIONS[condition][2]}{columns}{other}."
+
+
+def _shorter(breakdown: Breakdown | None) -> list[str]:
+    """The limit on answer length, from the light fine-tune's breakdown; without the numbers when there is none,
+    and no limit at all when the table does not show it."""
+    if breakdown is None or breakdown.fine_tune != LIGHT:
+        return [SHORTER_PLAIN]
+    cells = {
+        (rate.column, rate.length): rate
+        for rate in breakdown.rates
+        if (rate.set, rate.condition, rate.by) == ("harmful", "keep", "length") and rate.n
+    }
+    try:
+        base, base_cut, tuned, tuned_cut = (
+            cells[column, length] for column in COLUMNS[:2] for length in ("complete", "truncated")
+        )
+    except KeyError:
+        return [SHORTER_PLAIN]
+    if tuned_cut.n >= base_cut.n or Fraction(tuned.k, tuned.n) < Fraction(base.k, base.n):
+        return []
+    limit = f"{breakdown.token_cap}-token limit" if breakdown.token_cap else "token limit"
+    said = {"limit": limit, "base_cut": base_cut.n, "base_all": base.n + base_cut.n, "tuned_cut": tuned_cut.n}
+    said |= {"tuned_all": tuned.n + tuned_cut.n, "tuned_k": tuned.k, "tuned_n": tuned.n, "base_k": base.k}
+    return [SHORTER.format(**said, base_n=base.n, file=BREAKDOWN_FILE)]
+
+
+def _typed(variants: VariantTables | None) -> list[str]:
+    """The limit on prompts typed in Latin script, from the light fine-tune's variants table; without the numbers
+    when there is none, and no limit at all when the table does not show it."""
+    if variants is None or variants.fine_tune != LIGHT:
+        return [TYPED_PLAIN]
+    wanted = ("keep", COLUMNS[1], "harmful", None, "romanized", "harmful")
+    row = next(
+        (
+            row
+            for row in variants.rows
+            if (row.condition, row.column, row.set, row.language, row.rewrite, row.metric) == wanted
+        ),
+        None,
+    )
+    if row is None or None in (row.parent, row.variant, row.delta, row.ci):
+        return [TYPED_PLAIN]
+    if row.ci[0] <= 0:
+        return []
+    low, high = (value * 100 for value in row.ci)
+    known = {"pairs": row.n_pairs, "parent": row.parent, "variant": row.variant, "low": low, "high": high}
+    return [TYPED.format(**known, file=VARIANTS_FILE)]
 
 
 def _repo(checkpoint: str) -> str | None:
@@ -881,14 +959,23 @@ def _adapter(
     records: list[RunRecord],
     recipe: Mapping[str, Any] | None,
     log: bool = False,
+    breakdown: Breakdown | None = None,
+    variants: VariantTables | None = None,
 ) -> list[str]:
-    """An adapter card between its title and its provenance; its notice follows what its tables measured."""
+    """An adapter card between its title and its provenance; its notice follows what its tables measured.
+
+    ``breakdown`` and ``variants`` are the light fine-tune's: its card reads from them what its lower harmful rate
+    does not cover.
+    """
     preamble = TRAINED[key]
     served, stripped = TABLES[key]
     languages = ", ".join(settings.languages)
     names = {"model": settings.sources.model, "languages": languages, "served": served, "stripped": stripped}
     measured = _comparisons(key, settings, tables, nopreamble)
     notice = _notice(measured, f"{RESEARCH} {NOT_CERTIFIED}", "Its", "This adapter makes")
+    # said of the light fine-tune, and only while its served-template table shows the lower rate
+    lower = key == ADAPTERS[0] and any(drop < 0 and condition == "keep" for drop, condition, _, _ in measured)
+    uncovered = [*_shorter(breakdown), *_typed(variants)] if lower else []
     results = [HOW_TO_READ.format(results=repo_ids(settings)["results"])] if measured else [NOT_MEASURED]
     for _, condition, found, checkpoint in measured:
         results += _measured(found, checkpoint, settings, condition)
@@ -912,7 +999,7 @@ def _adapter(
         "\n".join(_training(recipe, run, latest.merged_sha256 if latest else "not recorded", log)),
         "## Intended use and limits",
         INTENDED,
-        "\n".join(_limits(settings, manifest)),
+        "\n".join([*_limits(settings, manifest), *uncovered]),
     ]
 
 
@@ -1027,6 +1114,8 @@ def _bodies(
     aggressive: tuple[Tables | None, Tables | None],
     aggressive_screen: AlphaScreen | None,
     q4_check: q4_local.Check | None = None,
+    breakdown: Breakdown | None = None,
+    variants: VariantTables | None = None,
 ) -> dict[str, list[str]]:
     """Paragraphs of each card, between its title and its provenance list."""
     sources, repos = settings.sources, repo_ids(settings)
@@ -1058,11 +1147,6 @@ def _bodies(
     def also(key: str) -> list[str]:
         return filled(SECOND[key]) if second else []
 
-    def states(found: Tables | None, pair: tuple[Tables | None, Tables | None]) -> str:
-        # ``pair`` holds the tables of the same fine-tune under both conditions: a repair tabled in either was made
-        repaired = any(_column(one, COLUMNS[2])[0] == "tabled" for one in pair if one is not None)
-        return "\n".join(f"- {column}: {_plainly(found, column, repaired)}" for column in COLUMNS)
-
     def served(key: str) -> list[str]:
         usage = GGUF_USAGE.format(repo=repos[key], file=quant.GGUF_FILE)
         # the check ran the file of the fine-tuned model
@@ -1073,19 +1157,19 @@ def _bodies(
     untabled = q4_check is not None and not _rates(tables, COLUMNS[3], settings, repos[MERGED_GGUF])
     beside = [_beside_the_tables(q4_check, repos[MERGED_GGUF])] if untabled else []
 
-    light = (tables, nopreamble)
-    others = {
-        "with no safety preamble": (nopreamble, light),
-        "for the overfit fine-tune": (aggressive[0], aggressive),
-        "for the overfit fine-tune with no safety preamble": (aggressive[1], aggressive),
-    }
-    stripped = [
-        block
-        for which, (found, pair) in others.items()
-        if found
-        for block in (f"State of each planned column {which}:", states(found, pair))
+    # nothing was run for the column, which is not the same as a run left for later
+    unrepaired = tables is not None and _column(tables, COLUMNS[2]) == ("not run", NO_RUN)
+    # one sentence per table file: the light fine-tune's two, then the overfit one's
+    tabled = zip(ADAPTERS, ("light", "overfit"), ((tables, nopreamble), aggressive), strict=True)
+    held = [
+        _holds(name, found, which, condition)
+        for key, which, pair in tabled
+        for name, found, condition in zip(TABLES[key], pair, CONDITIONS, strict=True)
+        if found is not None
     ]
-    stripped += [AGGRESSIVE_FILES] if any(aggressive) else []
+    named = [f"{'What each table file holds.' if held else NO_TABLES} {COLUMN_NAMES.format(q4=q4)}"]
+    stated = [*named, *(["\n".join([*held, *beside])] if held or beside else [])]
+    stated += [AGGRESSIVE_FILES] if any(aggressive) else []
     bodies = {
         "eval": [
             *filled(EVAL_NOTICE, EVAL_WHAT),
@@ -1099,9 +1183,7 @@ def _bodies(
             *filled(RESULTS_WHAT),
             *also("results"),
             *filled(RESULTS_HOW),
-            f"State of each planned column. {COLUMN_NAMES.format(q4=q4)}",
-            "\n".join([states(tables, light), *beside]),
-            *stripped,
+            *stated,
             *_files("results", files.get("results")),
         ],
         "responses": [
@@ -1129,7 +1211,7 @@ def _bodies(
             *(
                 ["Residual failures, as the safe rate on harmful prompts:", "\n".join(residual)]
                 if residual
-                else [f"Residual failures: {_plainly(tables, 'repaired', False)}."]
+                else [f"Residual failures: {NO_REPAIR if unrepaired else _stated(tables, 'repaired')}."]
             ),
         ],
         REPAIRED_NOPRE: _repair(settings, manifest, *aggressive, aggressive_screen),
@@ -1138,8 +1220,8 @@ def _bodies(
     # each adapter is measured by the tables of its own fine-tune
     measured = dict(zip(ADAPTERS, ((tables, nopreamble), aggressive), strict=True))
     for key in ADAPTERS:
-        log = TRAINER_STATE in files.get(key, ())
-        bodies[key] = _adapter(key, settings, manifest, *measured[key], records, recipes.get(key), log)
+        known = (recipes.get(key), TRAINER_STATE in files.get(key, ()), breakdown, variants)
+        bodies[key] = _adapter(key, settings, manifest, *measured[key], records, *known)
     return bodies
 
 
@@ -1158,6 +1240,8 @@ def render_cards(
     aggressive_nopreamble: Tables | None = None,
     aggressive_screen: AlphaScreen | None = None,
     q4_check: q4_local.Check | None = None,
+    breakdown: Breakdown | None = None,
+    variants: VariantTables | None = None,
 ) -> dict[str, str]:
     """README text per repo id for every repo a publication may open; ``writeup`` defaults to the code repo's article.
 
@@ -1172,6 +1256,8 @@ def render_cards(
     clean copy, the working repo and revision it was made from. ``q4_check`` is the check that ran the q4_k_m
     file of the fine-tuned model beside the same weights on one CPU engine; the caller hands it over only when it
     ran the very file that repo holds, and the cards state it while no table holds a column of that file.
+    ``breakdown`` and ``variants`` are the light fine-tune's breakdown and script-variant tables: its adapter card
+    takes from them the numbers of two limits, and states those limits without numbers when a table is missing.
     """
     records = list(records)
     second = any(found is not None for found in (nopreamble, aggressive_nopreamble)) or any(
@@ -1180,13 +1266,13 @@ def render_cards(
     rendered, repos = {}, repo_ids(settings)
     other = (aggressive, aggressive_nopreamble)
     known = (settings, manifest, tables, records, nopreamble, second, recipes or {}, files or {}, other)
-    bodies = _bodies(*known, aggressive_screen, q4_check)
+    bodies = _bodies(*known, aggressive_screen, q4_check, breakdown, variants)
     for key in (*DATASETS, *MODELS):
         licence = license_of(key, manifest)
         if key in DATASETS:
-            data = DatasetCardData(
-                license=licence, language=list(settings.languages), pretty_name=TITLES[key], tags=TAGS
-            )
+            shown = {"viewer": False} if key in NO_VIEWER else {}
+            known = {"license": licence, "language": list(settings.languages), "pretty_name": TITLES[key]}
+            data = DatasetCardData(**known, tags=TAGS, **shown)
             top = [WARNING] if key != "eval" else []
         else:
             data = ModelCardData(

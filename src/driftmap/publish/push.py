@@ -28,6 +28,8 @@ from driftmap.jobs.ledger import Ledger, LedgerCorrupt
 from driftmap.publish import cards, collections, q4_local
 from driftmap.repair.screen_gen import screen_path
 from driftmap.scripts.drift import RECIPE, repo_names
+from driftmap.table.breakdown import Breakdown
+from driftmap.table.variants import VariantTables
 
 SMOKE_SUFFIX = ids.repo_suffix("smoke")
 # what a repo is renamed to when a clean copy of it is published in its place
@@ -74,9 +76,12 @@ CARD_INPUTS = (
     # the screen the repair of the aggressive fine-tune was chosen on
     (screen_path("full", cards.TRAINED[cards.ADAPTERS[1]], "aggressive"), "results", AlphaScreen),
 )
+# the light fine-tune's tables the adapter card takes the numbers of its limits from, in the results repo
+LIMIT_INPUTS = ((cards.BREAKDOWN_FILE, Breakdown), (cards.VARIANTS_FILE, VariantTables))
 # read again for the cards, or to see whether the head already holds what a run would write
 KEPT = [
     *(name for name, _, _ in CARD_INPUTS),
+    *(name for name, _ in LIMIT_INPUTS),
     "runs/*.json",
     RECIPE,
     cards.PUBLICATION,
@@ -601,6 +606,14 @@ def _parsed[T](cls: type[T], files: dict[str, bytes], name: str) -> T | None:
     return cls.model_validate_json(files[name]) if name in files else None
 
 
+def _read_table[T](cls: type[T], files: Mapping[str, bytes], name: str) -> T | None:
+    """A table a card can do without: None when the repo does not hold it or it does not parse."""
+    try:
+        return _parsed(cls, files, name)
+    except ValidationError:
+        return None
+
+
 def _recipe(files: dict[str, bytes]) -> dict[str, Any] | None:
     """The recipe a drift run left in its adapter repo; None when there is none or it is not a JSON object."""
     try:
@@ -808,6 +821,8 @@ def _drawn(
                 parsed.append(None)
                 other.append((ExitCode.INTEGRITY, f"{name} on the Hub does not parse; build and upload it again"))
         manifest, tables, stripped, aggressive, aggressive_stripped, aggressive_screen = parsed
+        # a card states a limit without its numbers when the table behind them is missing or does not parse
+        breakdown, variants = (_read_table(cls, files.get("results", {}), name) for name, cls in LIMIT_INPUTS)
         records = []
         for name, data in sorted(files.get("results", {}).items()):
             try:
@@ -864,6 +879,8 @@ def _drawn(
             aggressive_nopreamble=aggressive_stripped,
             aggressive_screen=aggressive_screen,
             q4_check=_q4_check(after, files.get(cards.MERGED_GGUF, {})),
+            breakdown=breakdown,
+            variants=variants,
         )
         for target in present:
             state, card, extra = states[target.key], rendered[target.repo], extras.get(target.key, ())

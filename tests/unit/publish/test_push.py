@@ -1204,7 +1204,7 @@ def test_the_second_table_on_the_hub_is_read_for_the_cards(tmp_path, settings, f
     assert publish(settings, hub, echo=lambda line: None).ok
 
     card = fake.repos[RESULTS]["main"]["README.md"].decode()
-    assert "State of each planned column with no safety preamble:" in card
+    assert "- `nopreamble/tables/tables-nopreamble.json`: the base model and the light fine-tune with no safety" in card
     assert "the runs under `nopreamble/` left it out" in card
 
     put(fake, RESULTS, "nopreamble/tables/tables-nopreamble.json", b"{}\n")

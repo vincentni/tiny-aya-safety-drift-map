@@ -8,7 +8,9 @@ from driftmap.publish import cards
 from driftmap.publish.cards import missing, render_cards
 from driftmap.publish.q4_local import Check, Count
 from driftmap.repair import select
+from driftmap.table.breakdown import Breakdown
 from driftmap.table.build import Q4_FINE_TUNED, build
+from driftmap.table.variants import VariantTables
 from tests.fakes.labels import column_rows, make_settings, targets, write_labels
 from tests.fakes.published import (
     ADAPTER,
@@ -119,15 +121,21 @@ def test_missing_names_what_a_card_lacks(settings):
 def test_every_planned_column_is_stated_or_marked_not_run(tmp_path, settings):
     """A column without a result reads "not run" with its reason, never a placeholder (TS-NFR-6)."""
     bare = render_cards(settings)[RESULTS]
-    for column in ("baseline", "drifted", "repaired", "repaired_q4"):
-        assert f"- {column}: not run (no tables published yet)" in bare
+    assert "No result table is published yet." in bare and "planned" not in bare
 
     tables = two_column_tables(tmp_path, settings, repaired="left for the next budget window")
     rendered = render_cards(settings, manifest=manifest(), tables=tables, recipes={"adapter": recipe()})
 
-    assert "- baseline: tabled" in rendered[RESULTS] and "- drifted: tabled" in rendered[RESULTS]
-    assert "- repaired: not run (left for the next budget window)" in rendered[RESULTS]
-    assert "- repaired_q4: no 4-bit file of a repaired model was made" in rendered[RESULTS]
+    held = (
+        "- `tables/tables.json`: the base model and the light fine-tune under the served template (columns "
+        "`baseline`, `drifted`); `repaired`: not run (left for the next budget window)."
+    )
+    assert held in rendered[RESULTS]
+    # a column no recipe planned is not listed at all
+    assert "repaired_q4`:" not in rendered[RESULTS] and "planned" not in rendered[RESULTS]
+    assert RepoCard(rendered[RESULTS]).data.to_dict()["viewer"] is False
+    assert RepoCard(rendered[RESPONSES]).data.to_dict()["viewer"] is False
+    assert "viewer" not in RepoCard(rendered[EVAL]).data.to_dict()
     assert "`drifted` is the fine-tuned model" in rendered[RESULTS]
     assert "Residual failures: not run (left for the next budget window)." in rendered[REPAIRED]
     for text in (*rendered.values(), bare):
@@ -156,7 +164,7 @@ def test_a_failed_quantized_evaluation_stays_on_the_card(tmp_path, settings):
     assert tables.columns["repaired_q4"].state == "failed"
     assert "Quantized evaluation: failed (unscored rows above 5% {of 600}). The file stays published" in rendered[GGUF]
     assert "`gguf.json`" in rendered[GGUF]
-    assert "- repaired_q4: failed (unscored rows above 5% {of 600})" in rendered[RESULTS]
+    assert "`drifted`); `repaired_q4`: failed (unscored rows above 5% {of 600})." in rendered[RESULTS]
 
 
 def test_the_judge_named_is_the_one_the_labels_record(tmp_path, settings):
@@ -260,10 +268,14 @@ def test_the_results_card_states_the_columns_of_both_tables(tmp_path, settings):
 
     rendered = render_cards(settings, tables=tables, nopreamble=second)[RESULTS]
 
-    main, _, stripped = rendered.partition("State of each planned column with no safety preamble:")
-    assert "- drifted: tabled" in main and "- drifted: generated (generated, not judged yet)" in stripped
-    assert "- repaired_q4: no 4-bit file of a repaired model was made" in stripped
-    assert "with no safety preamble:" not in render_cards(settings, tables=tables)[RESULTS]
+    served = "- `tables/tables.json`: the base model and the light fine-tune under the served template (columns "
+    assert served + "`baseline`, `drifted`)." in rendered
+    stripped = (
+        "- `nopreamble/tables/tables-nopreamble.json`: the base model with no safety preamble (columns `baseline`); "
+        "`drifted`: generated (generated, not judged yet)."
+    )
+    assert stripped in rendered
+    assert "tables-nopreamble.json`: " not in render_cards(settings, tables=tables)[RESULTS]
 
 
 def test_an_adapter_no_table_measures_is_not_for_deployment(settings):
@@ -406,8 +418,9 @@ def test_the_results_card_states_the_columns_of_the_aggressive_tables(tmp_path, 
 
     card = render_cards(settings, aggressive=aggressive)[RESULTS]
 
-    assert "State of each planned column for the overfit fine-tune:\n\n- baseline: tabled\n- drifted: tabled" in card
-    assert "overfit fine-tune with no safety preamble:" not in card
+    held = "- `tables/tables-aggressive.json`: the base model and the overfit fine-tune under the served template"
+    assert held + " (columns `baseline`, `drifted`)." in card
+    assert "tables-nopreamble-aggressive.json`: " not in card
     assert "aggressive" not in render_cards(settings)[RESULTS]
 
 
@@ -535,7 +548,9 @@ def test_a_gguf_card_states_the_check_on_one_cpu_engine_when_no_table_holds_its_
 
     card = rendered[MERGED_GGUF]
     assert "## Results" in card and "Quantized evaluation" not in card
-    assert "ran on one CPU engine, llama.cpp `b11960`, the release this project pins" in card
+    opening = "Measured in a paired check against the same weights at full precision, both on one CPU engine: "
+    assert opening in card and "No result table" not in card and "beside the tables" not in card
+    assert "under the served template with llama.cpp `b11960`, the release this project pins." in card
     assert f"The evaluated file is this file: sha256 `{'2' * 64}`, as `gguf.json` records it." in card
     head = "| fine-tuned model, served template | full precision | q4_k_m | only at full precision | only at q4_k_m |"
     assert head in card
@@ -617,6 +632,78 @@ def repair_screen(settings, chosen=0.5):
     return screen
 
 
+def by_length(tables, base, tuned, fine_tune="standard"):
+    """A breakdown holding the harmful answers by length under the served template: for the base and the fine-tuned
+    model, harmful and all complete answers, then harmful and all answers cut off at the limit."""
+    rates = [
+        {"set": "harmful", "condition": "keep", "column": column, "by": "length", "length": length}
+        | {"harm_category": None, "language": None, "global_or_local": None, "above_pooled_baseline": False}
+        | {"k": k, "n": n, "rate": k / n, "ci": None}
+        for column, (k_whole, n_whole, k_cut, n_cut) in (("baseline", base), ("drifted", tuned))
+        for length, k, n in (("complete", k_whole, n_whole), ("truncated", k_cut, n_cut))
+    ]
+    known = {"schema": "driftmap.breakdown/1", "fine_tune": fine_tune, "conditions": {"keep": "served template"}}
+    known |= {"columns": {"baseline": "base model", "drifted": "fine-tuned"}, "min_cell_n": 10, "token_cap": 256}
+    known |= {"rates": rates, "changes": [], "transitions": [], "at_cap": [], "not_tabled": []}
+    return Breakdown.model_validate(known | {"judge": tables.judge.model_dump(), "seeds": tables.seeds.model_dump()})
+
+
+def latin_script(tables, parent, variant, ci, fine_tune="standard"):
+    """A variants table holding the fine-tuned model's harmful answers on the prompts rewritten in Latin script."""
+    row = {"condition": "keep", "column": "drifted", "set": "harmful", "code": "all-Latn", "language": None}
+    row |= {"rewrite": "romanized", "metric": "harmful", "n_pairs": 258, "parent": parent, "variant": variant}
+    row |= {"delta": variant - parent, "ci": ci, "p_value": 0.0004}
+    known = {"schema": "driftmap.variants/1", "fine_tune": fine_tune, "conditions": {"keep": "served template"}}
+    known |= {"columns": {"baseline": "base model", "drifted": "fine-tuned"}, "sources": [], "rows": [row]}
+    known |= {"answers": [], "judge": tables.judge.model_dump(), "seeds": tables.seeds.model_dump()}
+    return VariantTables.model_validate(known)
+
+
+def test_the_light_adapter_states_what_its_lower_harmful_rate_does_not_cover(tmp_path, settings):
+    """Two limits with the numbers of the published tables: shorter answers, and prompts typed in Latin script."""
+    tables = two_column_tables(tmp_path, settings, unsafe=1)
+    breakdown = by_length(tables, base=(3, 329, 52, 269), tuned=(26, 529, 13, 69))
+    variants = latin_script(tables, 15 / 258, 38 / 258, (0.0426, 0.1357))
+
+    card = render_cards(settings, tables=tables, breakdown=breakdown, variants=variants)[ADAPTER]
+
+    shorter = (
+        "- Its lower harmful rate under the served template comes mostly from shorter answers: answers cut off at "
+        "the 256-token limit fall from 269 of 598 to 69 of 598, and among complete answers it gives 26 harmful "
+        "answers in 529 against the base model's 3 in 329 (`tables/breakdown.json` of the results dataset)."
+    )
+    typed = (
+        "- The lower harmful rate does not hold for prompts typed in Latin script: over 258 such prompts its harmful "
+        "answers rise from 5.8% to 14.7% (95% CI of the change +4.3 to +13.6 points; `tables/variants.json` of the "
+        "results dataset)."
+    )
+    limits = card.split("## Intended use and limits")[1].split("## ")[0]
+    assert shorter in limits and typed in limits
+
+    # a number no published file holds is not stated: the sentence stays
+    plain = render_cards(settings, tables=tables)[ADAPTER]
+    without = "- Its lower harmful rate comes mostly from shorter answers; among complete answers it is not safer"
+    assert without + " than the base model." in plain
+    assert "- The lower harmful rate does not hold for prompts typed in Latin script." in plain
+
+    # tables that say otherwise give no such limit
+    even = by_length(tables, base=(30, 329, 52, 269), tuned=(26, 529, 13, 69))
+    flat = latin_script(tables, 15 / 258, 16 / 258, (-0.03, 0.04))
+    other = render_cards(settings, tables=tables, breakdown=even, variants=flat)[ADAPTER]
+    assert "shorter answers" not in other and "Latin script" not in other
+    # the tables of another fine-tune are not this adapter's
+    foreign = by_length(tables, base=(3, 329, 52, 269), tuned=(26, 529, 13, 69), fine_tune="aggressive")
+    assert "269 of 598" not in render_cards(settings, tables=tables, breakdown=foreign)[ADAPTER]
+    # neither limit is on a card whose model is not measured safer, nor on the other adapter's
+    for found in (None, two_column_tables(tmp_path, settings, unsafe=3)):
+        unsafe = render_cards(settings, tables=found, breakdown=breakdown, variants=variants)
+        assert "Latin script" not in unsafe[ADAPTER] and "shorter answers" not in unsafe[ADAPTER]
+    assert "Latin script" not in card.replace(typed, "") and "shorter answers" not in plain.replace(without, "")
+    own = f"{MERGED_NOPRE}@{'b' * 40}"
+    second = two_column_tables(tmp_path, settings, unsafe=1, fine_tuned=own)
+    assert "Latin script" not in render_cards(settings, aggressive=second, variants=variants)[ADAPTER_NOPRE]
+
+
 def test_cards_name_the_two_fine_tunes_as_the_write_up_does_and_state_untaken_columns_plainly(tmp_path, settings):
     """The light and the overfit fine-tune by those names; a column no recipe planned says so in plain words."""
     own = f"{MERGED_NOPRE}@{'b' * 40}"
@@ -629,14 +716,17 @@ def test_cards_name_the_two_fine_tunes_as_the_write_up_does_and_state_untaken_co
     rendered = render_cards(settings, **known, aggressive_screen=repair_screen(settings), files=held)
 
     results = rendered[RESULTS]
-    first, _, rest = results.partition("State of each planned column for the overfit fine-tune:")
-    served, _, bare = rest.partition("State of each planned column for the overfit fine-tune with no safety preamble:")
-    assert "- repaired: no repair was run for this fine-tune" in first
-    assert "- repaired_q4: no 4-bit file of a repaired model was made" in first
-    assert "- repaired: the repaired model was not evaluated under this condition" in served
-    assert "- repaired: tabled" in bare
-    for block in (served, bare):
-        assert "- repaired_q4: no 4-bit file of the repaired model was made" in block
+    for line in (
+        "- `tables/tables.json`: the base model and the light fine-tune under the served template (columns "
+        "`baseline`, `drifted`).",
+        "- `tables/tables-aggressive.json`: the base model and the overfit fine-tune under the served template "
+        "(columns `baseline`, `drifted`).",
+        "- `nopreamble/tables/tables-nopreamble-aggressive.json`: the base model, the overfit fine-tune and its "
+        "weight-space repair with no safety preamble (columns `baseline`, `drifted`, `repaired`).",
+    ):
+        assert line in results, line
+    for gone in ("planned", "no repair was run", "no 4-bit file", "not evaluated under this condition"):
+        assert gone not in results, gone
     assert results.count("Files named `-aggressive` belong to the overfit fine-tune") == 1
     assert "- `nopreamble/alpha_screen-aggressive.json`: the screen the repair's weight was chosen on" in results
     assert "- `nopreamble/` (2 files): " in results
