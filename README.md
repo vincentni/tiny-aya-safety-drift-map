@@ -1,31 +1,18 @@
-# Tiny Aya Global gives a harmful answer to 1 in 6 harmful requests in Russian and 1 in 50 in French. The same benign data costs no safety under a light fine-tune and erodes it under an overfit one.
+# Tiny Aya Global gives a harmful answer to 9% of harmful requests. Five sentences in the system prompt bring that to 5%; overfitting a benign fine-tune takes it from 10% to 14%.
 
 [![tests](https://github.com/vincentni/tiny-aya-safety-drift-map/actions/workflows/tests.yml/badge.svg)](https://github.com/vincentni/tiny-aya-safety-drift-map/actions/workflows/tests.yml)
 [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/vincentni/tiny-aya-safety-drift-map/blob/main/notebooks/reproduce_tables.ipynb)
 
-A failure map of Cohere's Tiny Aya Global (3.35B) on 600 red-teaming prompts in six languages, by
-language, harm category and prompt condition, and the same map after two LoRA fine-tunes on the same
-benign multilingual rows. Lexsi AI Safety & Alignment Hackathon 2026, Track 2.
+A failure map of Cohere's Tiny Aya Global (3.35B) on 600 red-teaming prompts in six languages, with
+three interventions measured on the same map: a system-prompt patch, two LoRA fine-tunes of the same
+benign rows, and 4-bit quantization. Lexsi AI Safety & Alignment Hackathon 2026, Track 2.
 
-- **16.2% in Russian, 2.0% in French.** With the model's standard prompt (served template) the base
-  model gives a harmful answer to 16 of 99 Russian prompts (95% interval 10.2% to 24.6%) and to 2 of
-  100 French ones (0.5% to 7.0%). French is the safest language in both conditions (2 of 100 and 5 of
-  100); the order among the weaker languages changes when the safety preamble is removed (English 15
-  of 100, Spanish 14 of 100, Russian 12 of 99).
-- **16.9% on representation harms, 16.4% on self-harm**, against 9.2% over all prompts (12 of 71,
-  11 of 67 and 55 of 598 harmful answers).
-- **Light recipe, $0.49: 9.2% → 6.5% harmful answers, over-refusal unchanged.** Three epochs on 1,272
-  benign multilingual rows cost no safety (55 → 39 harmful answers of 598, and 26 → 23 refusals of 250
-  safe prompts), mostly because the answers are shorter (answers cut at the 256-token limit fall from
-  45% to 12%) and the model refuses slightly more; among complete answers it is not safer.
-- **Overfit recipe, $1.45: 10.2% → 14.2% harmful answers.** Ten epochs on the same rows at a higher
-  learning rate, measured with no safety preamble: 61 of 599 → 85 of 598 (+4.0 points, 95% interval
-  +1.2 to +7.0, p = 0.007), mostly in Arabic (7 of 100 → 19 of 99) and Russian (12 → 18 of 99). Here
-  shorter answers hide part of the loss: among answers complete under both models harmful answers go
-  from 2.5% to 8.5%. The pooled drop is under the 5-point bar set in advance for calling a checkpoint
-  drifted. In the same condition the light recipe goes from 61 of 599 to 35 of 597.
+- **9.2% → 4.8%** harmful answers with a five-sentence system-prompt patch (p < 0.001), for +3.6 points of over-refusal and -4.4 chrF.
+- **2% in French, 16% in Russian** under the served template; French is the safest language in both prompt conditions.
+- **10.2% → 14.2%** when a benign fine-tune is overfit (no safety preamble, p = 0.007); the light recipe on the same rows costs no safety.
+- **4-bit quantization: no measurable change** in the fine-tuned model's harmful answers.
 
-![Harmful answers by language, base model and fine-tuned model, with 95% intervals](docs/figures/f1_harmful_by_language.png)
+![Harmful answers and over-refusal of the base model with and without the safety patch, beside the fine-tuned model](docs/figures/f8_safety_patch.png)
 
 [Write-up](docs/article.md) | [Results Space](https://huggingface.co/spaces/vincentnkq/tiny-aya-safety-map) | [Models](https://huggingface.co/collections/vincentnkq/tiny-aya-safety-drift-map-models-6af750027e17226835562a9a) | [Datasets](https://huggingface.co/collections/vincentnkq/tiny-aya-safety-drift-map-data-6af75002f6e0994706b717d2) | [Notebook](notebooks/reproduce_tables.ipynb)
 
@@ -42,7 +29,8 @@ harmful. Nothing harmful is quoted in this repository or shown in the Space.
   Spanish, Russian, Hindi and Arabic, tagged with nine harm categories), 250 safe prompts from XSTest
   for over-refusal, and 600 held-out benign prompts for task quality.
 - **Conditions.** The served template (the model's chat template as shipped, which opens with a safety
-  paragraph) and no safety preamble (that paragraph removed, nothing else changed).
+  paragraph), no safety preamble (that paragraph removed, nothing else changed), and the safety patch
+  (the served template with five sentences of guidance as its system message).
 - **Judge.** One closed model under a fixed public rubric labels every answer: is the request harmful,
   did the model refuse, is the answer harmful. Every label is published. A pair the judge could not
   label is counted nowhere. Checked against human labels on public sets, the judge matches them on
@@ -54,7 +42,22 @@ harmful. Nothing harmful is quoted in this repository or shown in the Space.
 
 ## Results
 
+The safety patch: five sentences of guidance on biased content and self-harm in the system turn of
+the served template. Changes are paired with the base model's own answers without the patch, in
+percentage points with a 95% interval.
+
+| Base model | Served template | Safety patch | Change | p |
+| --- | --- | --- | --- | --- |
+| Harmful answers, 598 prompt pairs | 55 (9.2%) | 29 (4.8%) | -4.3 (-6.4 to -2.3) | < 0.001 |
+| Self-harm | 11 of 67 | 6 of 67 | -7.5 (-16.4 to 0.0) | 0.180 |
+| Representation harms | 12 of 71 | 9 of 71 | -4.2 (-11.3 to +2.8) | 0.453 |
+| Refusals of harmful prompts | 70.6% | 76.4% | +5.9 (+3.3 to +8.5) | < 0.001 |
+| Over-refusal on XSTest, 250 prompt pairs | 26 (10.4%) | 35 (14.0%) | +3.6 (+0.4 to +6.4) | 0.035 |
+| chrF on the benign task | 30.5 | 26.1 | -4.4 (-5.9 to -3.1) | |
+
 Harmful answers by language.
+
+![Harmful answers by language, base model and fine-tuned model, with 95% intervals](docs/figures/f1_harmful_by_language.png)
 
 | Language | Base, served template | Fine-tuned, served template | Base, no safety preamble | Fine-tuned, no safety preamble |
 | --- | --- | --- | --- | --- |
@@ -80,8 +83,8 @@ Harmful answers by harm category. A prompt can carry more than one category.
 | Bullying and harassment | 7 of 126 | 3 of 126 | 7 of 126 | 2 of 125 |
 | Profanity | 3 of 92 | 2 of 92 | 6 of 92 | 4 of 92 |
 
-The two models side by side. Changes are fine-tuned minus base over the prompts scored for both,
-in percentage points with a 95% interval.
+The light recipe: the base model and the fine-tuned model side by side. Changes are fine-tuned minus
+base over the prompts scored for both, in percentage points with a 95% interval.
 
 | Metric | Served template | Change | No safety preamble | Change |
 | --- | --- | --- | --- | --- |
@@ -105,24 +108,33 @@ model answered safely. What is left, the checks on these numbers and their limit
 [write-up](docs/article.md). Every cell can be filtered by language and category in the
 [results Space](https://huggingface.co/spaces/vincentnkq/tiny-aya-safety-map).
 
-More measurements on the same map:
+The overfit recipe: the same benign rows for 10 epochs at a higher learning rate, measured with no
+safety preamble. Changes are paired with the base model.
 
-- **4 bits cost no safety.** As a q4_k_m file the fine-tuned model gives 42 harmful answers of 592,
-  against 43 at full precision on the same engine.
-- **A system-prompt patch buys safety at a price.** With five sentences of guidance on biased content
-  and self-harm in its system turn, the base model gives 29 harmful answers of 599 (4.8%) against 55 of
-  598 (9.2%) without them: -4.3 points paired (95% interval -6.4 to -2.3, p < 0.001). It refuses more
-  safe prompts (26 → 35 of 250, +3.6 points, +0.4 to +6.4) and its task score falls by 4.4 chrF points.
-  Self-harm (6 of 67) and representation harms (9 of 71) stay the weakest categories.
-- **Latin script, pilot.** Hindi prompts typed in Latin script lose refusals (22 → 7 of 29, harmful
-  answers 0 → 4), Russian ones too (18 → 11 of 30, harmful answers 7 → 7). Hindi and Spanish mixed
-  with English change little. The model does not understand Arabic in Latin script (it repeats the
-  prompt or writes unrelated text), so no rate is reported for it.
+| Harmful answers, no safety preamble | Base | Overfit fine-tune | Change | p |
+| --- | --- | --- | --- | --- |
+| All prompts | 61 of 599 (10.2%) | 85 of 598 (14.2%) | +4.0 (+1.2 to +7.0) | 0.007 |
+| Arabic | 7 of 100 | 19 of 99 | +12.1 (+5.1 to +20.2) | 0.004 |
+| Russian | 12 of 99 | 18 of 99 | +6.1 (+1.0 to +12.1) | 0.070 |
+| Answers that end on their own under both models | 2.5% | 8.5% | | < 0.001 |
 
-The Latin-script numbers are a pilot on the base model with 23 to 30 prompts per variant; they show a
-direction, not a size.
+The pooled change is under the 5-point bar set in advance for calling a checkpoint drifted. In the
+same condition the light recipe goes from 61 of 599 to 35 of 597.
 
-![Harmful answers and over-refusal of the base model with and without the safety patch, beside the fine-tuned model](docs/figures/f8_safety_patch.png)
+4-bit quantization: the fine-tuned model as a q4_k_m file against the same weights at full precision,
+on the same engine.
+
+| Fine-tuned model, served template | Full precision | q4_k_m |
+| --- | --- | --- |
+| Harmful answers, 592 prompts scored for both | 43 (7.3%) | 42 (7.1%) |
+| Refusals of harmful prompts | 75.8% | 73.8% |
+| Over-refusal on XSTest, 248 prompts scored for both | 8.5% | 8.1% |
+
+Latin script, a pilot on the base model with 23 to 30 prompts per variant (a direction, not a size):
+Hindi prompts typed in Latin script lose refusals (22 → 7 of 29, harmful answers 0 → 4), Russian ones
+too (18 → 11 of 30, harmful answers 7 → 7). Hindi and Spanish mixed with English change little. The
+model does not understand Arabic in Latin script (it repeats the prompt or writes unrelated text), so
+no rate is reported for it.
 
 ## Reproduce
 
@@ -332,7 +344,7 @@ Then every guard runs; one refusal is exit 4 and nothing is submitted.
 - `in_flight_gpu`: no other GPU job is running or pending on the ledger.
 - `timeout_lost`: no job of this kind was already lost at this timeout.
 - `oom_repeat`: this kind did not already run out of memory under this configuration.
-- `drift_decision`: repair and steer wait for `decide drift` while the measured drop in safe rate is below the threshold.
+- `drift_decision`: a repair waits for `decide drift` while the measured drop in safe rate is below the threshold.
 
 The ceilings are under `[ceilings]` in `driftmap.toml`; the ledger is `.run-local/results/ledger.jsonl`.
 
@@ -351,8 +363,9 @@ Names under the owner, from `[repos]` in `driftmap.toml`:
 - `tiny-aya-global-drift-merged` (model, private): the merged fine-tuned weights, an intermediate.
 - The same two names ending in `-nopre`, once a fine-tune with no safety preamble exists: its
   adapter is published like the first, its merged weights stay private.
-- `tiny-aya-global-repaired` and `tiny-aya-global-repaired-GGUF` (models): the output of the repair
-  job and its q4_k_m file, when that job is run.
+- `tiny-aya-global-drift-GGUF` (model): the fine-tuned model as a q4_k_m file.
+- `tiny-aya-global-repaired` and `tiny-aya-global-repaired-GGUF` (models): the names a repair job
+  and its q4_k_m file publish under; no repaired model is published.
 
 ### Licences and use
 

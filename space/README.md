@@ -31,8 +31,9 @@ no model answer and no per-prompt row. Those are in the datasets, behind their o
   answers cut off at the token limit.
 - The overfit recipe: harmful answers by language of the base model and of both fine-tunes, with no
   safety preamble.
-- A targeted system-prompt patch and the script stress test (prompts in Latin script or mixed with
-  English), each shown once its label files are in the evaluation dataset.
+- A targeted system-prompt patch: each model with and without it, on the same prompts.
+- The script stress test: prompts in Latin script or mixed with English against their native-script
+  parents.
 - The failure map: harmful answers of every measured model for every language and harm category,
   with 95% Wilson intervals, filtered by condition, language and category.
 
@@ -45,8 +46,8 @@ python space/build_data.py
 ```
 
 The script downloads the published label files and tables, and writes `space/data.json`. The
-answer-length counts need the responses dataset, which sits behind an access gate; without access
-they are left out and the page hides that table. With `--eval-dir`, `--tables-dir` and
+answer-length counts need the responses dataset; when it cannot be read they are left out and the
+page hides that table. With `--eval-dir`, `--tables-dir` and
 `--responses-dir` the script reads local copies instead.
 
 The script also copies the figures from `docs/figures/` to `space/figures/` and lists them in the

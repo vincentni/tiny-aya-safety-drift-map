@@ -1,7 +1,7 @@
 [project]
 name = "driftmap"
 version = "0.1.0"
-description = "Multilingual safety-drift map and repair for Tiny Aya Global (Lexsi hackathon 2026)"
+description = "Safety failure map of Tiny Aya Global by language and harm category, with a system-prompt patch, fine-tunes and 4-bit quantization measured on it (Lexsi hackathon 2026)"
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]

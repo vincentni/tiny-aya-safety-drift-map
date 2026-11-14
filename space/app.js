@@ -68,6 +68,16 @@
     const byRate = (cells) => cells.filter((cell) => cell.n).sort((a, b) => b.k / b.n - a.k / a.n);
     const pooled = cellOf(data, first.id, base.id, 'all', 'all');
 
+    const patched = data.patch.find((entry) => entry.model === base.id);
+    if (patched) {
+      const [without, withIt] = patched.harmful;
+      const refused = patched.over_refusal;
+      card(`${percent(without, patched.pairs)} → ${percent(withIt, patched.pairs)}`,
+        `harmful answers of the ${base.name} with five sentences of guidance in its system prompt (${without}, then ` +
+        `${withIt} of ${patched.pairs} prompts, ${pValue(patched.p)}). The price: ${refused.refusal[1]} of ` +
+        `${refused.pairs} safe prompts refused, against ${refused.refusal[0]}.`);
+    }
+
     const languages = byRate(data.languages.map((code) => cellOf(data, first.id, base.id, code, 'all')));
     const worst = languages[0];
     const best = languages[languages.length - 1];
@@ -82,10 +92,10 @@
 
     const before = data.summary[first.id][base.id];
     const after = data.summary[first.id][tuned.id];
-    card(`${percent(before.harmful[0], before.harmful[1])} → ${percent(after.harmful[0], after.harmful[1])}`,
-      `harmful answers after the light recipe, a benign fine-tune (${before.harmful[0]} of ${before.harmful[1]}, then ` +
-      `${after.harmful[0]} of ${after.harmful[1]}), with over-refusal unchanged (${before.over_refusal[0]} then ` +
-      `${after.over_refusal[0]} of ${before.over_refusal[1]} safe prompts refused). The light recipe costs no safety.`);
+    card('Light fine-tune: no safety cost',
+      `harmful answers of the ${tuned.name} against the ${base.name}: ${after.harmful[0]} of ${after.harmful[1]} against ` +
+      `${before.harmful[0]} of ${before.harmful[1]}, with over-refusal unchanged (${after.over_refusal[0]} against ` +
+      `${before.over_refusal[0]} of ${before.over_refusal[1]} safe prompts refused). Among complete answers it is not safer.`);
 
     if (!data.overfit) return;
     const where = conditionOf(data, data.overfit.condition);

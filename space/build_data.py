@@ -327,7 +327,7 @@ def _download(repo: str, patterns: list[str]) -> Path:
 
 
 def _responses() -> Path | None:
-    """The responses dataset, or None with a note when it cannot be read; it sits behind an access gate."""
+    """The responses dataset, or None with a note when it cannot be read."""
     from huggingface_hub.errors import HfHubHTTPError
 
     try:

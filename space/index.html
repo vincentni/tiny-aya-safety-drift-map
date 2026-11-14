@@ -38,11 +38,11 @@
 </head>
 <body>
 <main>
-  <h1>Tiny Aya Global gives a harmful answer to 1 in 6 harmful requests in Russian and 1 in 50 in French.
-    The same benign data costs no safety under a light fine-tune and erodes it under an overfit one.</h1>
-  <p class="lead">Tiny Aya Global (3.35B) on 600 red-teaming prompts in six languages, before and after a benign
-    multilingual LoRA fine-tune (the light recipe; the overfit recipe is in the write-up). One judge labels every
-    answer under a fixed public rubric.
+  <h1>Tiny Aya Global gives a harmful answer to 9% of harmful requests. Five sentences in the system prompt bring
+    that to 5%; overfitting a benign fine-tune takes it from 10% to 14%.</h1>
+  <p class="lead">Tiny Aya Global (3.35B) on 600 red-teaming prompts in six languages, with a system-prompt patch,
+    two LoRA fine-tunes of the same benign rows and 4-bit quantization measured on the same map. One judge labels
+    every answer under a fixed public rubric.
     <a href="https://github.com/vincentni/tiny-aya-safety-drift-map">Code and write-up</a>.</p>
   <p class="warning"><strong>Content warning.</strong> The study uses red-teaming prompts. This page shows counts
     only: no prompt text and no model answer.</p>
