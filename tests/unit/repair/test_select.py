@@ -2,7 +2,7 @@ import pytest
 
 from driftmap.core.records import AlphaRow, AlphaScreen, Bars, Dare
 from driftmap.core.schemas import DriftmapError
-from driftmap.repair.select import choose_alpha, judged
+from driftmap.repair.select import choose_alpha, judged, rule_of
 from tests.fakes.labels import LANGUAGES, judge_config, label
 
 BASELINE = 0.9
@@ -25,8 +25,9 @@ def row(alpha, safe=BASELINE, chrf=DRIFTED_CHRF, error=None, n_judged=120, n_har
     )
 
 
-def choose(*rows, bars=None, baseline=BASELINE):
-    return choose_alpha(rows, baseline, DRIFTED_CHRF, bars or Bars(), judge=judge_config(), tied_weight_owner=OWNER)
+def choose(*rows, bars=None, baseline=BASELINE, **options):
+    known = {"judge": judge_config(), "tied_weight_owner": OWNER, **options}
+    return choose_alpha(rows, baseline, DRIFTED_CHRF, bars or Bars(), **known)
 
 
 def screened(*alphas, **changes):
@@ -77,6 +78,44 @@ def test_the_smallest_passing_alpha_is_chosen_whatever_the_order():
         (True, True),
         (True, True),
     ]
+
+
+def test_a_named_fine_tune_takes_the_smallest_alpha_that_restores_the_baseline_else_the_safest():
+    assert (rule_of("standard"), rule_of("aggressive")) == ("bars", "restore")
+    # every alpha is inside the safety bar, so the bars alone would take the first that keeps the task score
+    rows = [row(0.1, safe=0.86), row(0.25, safe=0.88), row(0.5, safe=0.9), row(0.75, safe=0.95)]
+    assert choose(*rows).chosen == 0.1 and choose(*rows).rule == "bars"
+
+    restored = choose(*rows, rule="restore")
+    assert (restored.chosen, restored.recover_status, restored.rule) == (0.5, "chosen", "restore")
+    # the bars are read as before
+    assert [(judged_row.pass_safety, judged_row.pass_chrf) for judged_row in restored.alphas] == [(True, True)] * 4
+
+    # an alpha that reaches the baseline at the cost of the task score is not taken
+    costly = [row(0.1, safe=0.86), row(0.25, safe=0.88), row(0.5, safe=0.9, chrf=0.3)]
+    safest = choose(*costly, rule="restore")
+    assert (safest.chosen, safest.recover_status) == (0.25, "chosen")
+    # equally safe alphas: the higher task score, then the smaller alpha
+    assert choose(row(0.1, safe=0.88, chrf=0.5), row(0.25, safe=0.88, chrf=0.52), rule="restore").chosen == 0.25
+    assert choose(row(0.1, safe=0.88), row(0.25, safe=0.88), rule="restore").chosen == 0.1
+    # outside the bars nothing is chosen, as under the bars alone
+    assert choose(row(0.1, safe=0.8), row(0.25, chrf=0.3), rule="restore").recover_status == "failed"
+    # and an unjudged alpha keeps the screen open
+    waiting = choose(row(0.1, safe=None), row(0.25, safe=0.95), rule="restore")
+    assert (waiting.chosen, waiting.recover_status) == (None, "screened")
+
+
+def test_label_rows_decide_under_the_rule_the_screen_carries_unless_another_is_named():
+    screen = screened(0.1, 0.25, n_harmful=20 * len(LANGUAGES))
+    # 0.1 sits on the safety bar, 0.25 is as safe as the baseline
+    found = {0.1: labels("drifted", 3, n=20), 0.25: labels("drifted", 2, n=20)}
+    reference = labels("baseline", 2, n=20)
+
+    assert judged(screen, found, reference).chosen == 0.1
+    named = judged(screen, found, reference, rule="restore")
+    assert (named.chosen, named.rule) == (0.25, "restore")
+    # the decided screen carries its rule on
+    assert judged(named, found, reference).chosen == 0.25
 
 
 def test_nothing_is_chosen_while_a_scored_row_waits_for_its_judge():

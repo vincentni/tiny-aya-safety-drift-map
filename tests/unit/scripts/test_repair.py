@@ -518,8 +518,12 @@ def test_the_other_fine_tune_is_screened_and_repaired_with_no_safety_preamble_un
     # the chrF reference is this fine-tune's, measured with no safety preamble
     assert world.screen().drifted_chrf_subset == pytest.approx(DRIFTED_CHRF)
 
-    decided = world.decide({0.25: 3, 0.5: 3})
-    assert world.run(*named, "--apply", "0.25", run_id=LATER) == 0
+    # both alphas are inside the safety bar; only 0.5 is as safe as the baseline, and that is what this screen asks
+    assert world.screen().rule == "restore"
+    decided = world.decide({0.25: 3, 0.5: 2})
+    assert (decided.chosen, decided.rule) == (0.5, "restore")
+    assert world.run(*named, "--apply", "0.25", run_id=LAST) == 12
+    assert world.run(*named, "--apply", "0.5", run_id=LATER) == 0
 
     repaired = f"{REPAIRED}-nopre"
     assert repaired in world.fake.private and REPAIRED not in world.fake.repos

@@ -327,6 +327,8 @@ class AlphaScreen(Record):
     tied_weight_owner: str
     # why a judged screen is not decided yet
     undecided: str | None = None
+    # how the choice is made among the alphas that pass both bars: the smallest, or the one that restores the baseline
+    rule: Literal["bars", "restore"] = "bars"
 
 
 class GgufRecord(Record):

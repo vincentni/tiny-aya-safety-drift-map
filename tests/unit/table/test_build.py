@@ -79,6 +79,24 @@ def test_a_smoke_table_places_the_smoke_drift_repos_and_a_full_one_refuses_them(
         build(labels, targets(), [drifted], settings)
 
 
+def test_the_repaired_model_of_a_fine_tune_is_the_repaired_column_of_its_own_tables(tmp_path, settings):
+    usual, other = CHECKPOINTS["repaired"], CHECKPOINTS["repaired"].replace("@", "-nopre@")
+    assert column_of(other, settings) == column_of(other, settings, "full", "aggressive") == "repaired"
+    assert column_of(other, settings, "full", "standard") is None
+    assert column_of(usual, settings, "full", "standard") == "repaired"
+    assert column_of(other.replace("@", "-smoke@"), settings, "smoke", "aggressive") == "repaired"
+    assert column_of(other.replace("@", "-smoke@"), settings, "full", "aggressive") is None
+    tuned = CHECKPOINTS["drifted"].replace("@", "-nopre@")
+    rows = column_rows("baseline") + column_rows("drifted", unsafe=2, checkpoint=tuned)
+    labels = write_labels(tmp_path / "labels", rows + column_rows("repaired", unsafe=1, checkpoint=other))
+
+    tables = build(labels, targets(), [], settings, preamble="strip", fine_tune="aggressive")
+
+    assert [tables.columns[column].state for column in ("baseline", "drifted", "repaired")] == ["tabled"] * 3
+    assert ("drifted", "repaired") in {(delta.a, delta.b) for delta in tables.deltas}
+    assert {row.checkpoint for row in tables.safety if "repaired" in row.checkpoint} == {other}
+
+
 def test_a_smoke_table_places_the_repos_of_a_smoke_repair_and_its_quantized_file(tmp_path, settings):
     repaired = CHECKPOINTS["repaired"].replace("@", "-smoke@")
     gguf = CHECKPOINTS["repaired_q4"].replace("@", "-smoke@") + "#model-q4_k_m.gguf"

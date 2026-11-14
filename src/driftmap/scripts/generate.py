@@ -108,16 +108,19 @@ def _arguments(parser: argparse.ArgumentParser) -> None:
     _paired(parser)
 
 
-def _repaired(settings: Settings, mode: str) -> str:
-    """The repo a repair run of ``mode`` pushes to; a smoke run has its own."""
-    return f"{settings.owner}/{settings.repos.repaired}{ids.repo_suffix(mode)}"
+def _repaired(settings: Settings, mode: str, preamble: str = "keep") -> str:
+    """The repo a repair run of ``mode`` pushes to; a smoke run has its own.
+
+    So has the repair of the fine-tune trained under ``preamble``, when that is not the served template.
+    """
+    return f"{settings.owner}/{settings.repos.repaired}{ids.repo_suffix(mode, preamble)}"
 
 
 def check_repos(settings: Settings) -> None:
     """Refuse settings that put responses beside public rows or let the repaired column read drifted weights."""
     repos = settings.repos
     merged = [repo_names(settings, mode, preamble)[1] for mode in ("full", "smoke") for preamble in ids.PREAMBLES]
-    repaired = {_repaired(settings, mode) for mode in ("full", "smoke")}
+    repaired = {_repaired(settings, mode, preamble) for mode in ("full", "smoke") for preamble in ids.PREAMBLES}
     if repos.responses in (repos.eval, repos.results) or repaired.intersection(merged):
         raise _refuse("two of the repos in the settings share a name; give each its own")
 
@@ -166,7 +169,10 @@ def resolve_checkpoint(ctx: Context, runs: Sequence[RunRecord]) -> tuple[RepoRef
             raise _refuse(f"--checkpoint is not the pinned revision {pinned[:12]} of {repo}")
         return RepoRef(repo, pinned), None
     if kind == "repaired":
-        repo = _repaired(settings, mode)
+        # the standard fine-tune's repaired model unless --checkpoint names the other one's
+        repaired = [_repaired(settings, mode, preamble) for preamble in ids.PREAMBLES]
+        given = ctx.args.checkpoint
+        repo = given.repo if given is not None and given.repo in repaired else repaired[0]
         revision = _named(ctx.args, repo) or _resumed(ctx, runs, repo) or ctx.hub.model_info(repo).sha
         return RepoRef(repo, revision), None
     # served-template weights unless --checkpoint names the other repo; either is read under any prompt condition

@@ -610,6 +610,23 @@ def test_the_repaired_target_reads_its_own_repo_at_the_head_or_the_named_revisio
         assert {row.checkpoint for row in rows} == {f"{REPAIRED}@{revision}"} and len(rows) == ROWS
 
 
+def test_the_repaired_model_of_the_other_fine_tune_is_read_when_it_is_named(served):
+    world = served
+    other = f"{REPAIRED}-nopre"
+    world.fake.add_repo(other, private=True, files=dict(world.fake.repos[REPAIRED]["main"]))
+    world.fake.authorize(other)
+    named = f"{other}@{world.head(other)}"
+
+    assert world.run("--preamble", "strip", "--checkpoint", named, kind="repaired") == 0
+
+    assert world.record().inputs[0] == Ref(kind="model", repo=other, revision=world.head(other))
+    assert len(world.rows(slug_of(other, world.head(other)), "harmful", "hi", STRIP)) == ROWS
+    # unnamed, the repaired model is the standard fine-tune's; a repo of another kind is still refused
+    assert world.run(kind="repaired", run_id=LATER) == 0
+    assert world.record(LATER).inputs[0].repo == REPAIRED
+    assert world.run("--checkpoint", f"{MERGED}@{world.head(MERGED)}", kind="repaired", run_id=DRIFTED) == 12
+
+
 def test_a_smoke_run_of_the_repaired_column_reads_the_smoke_repo(world):
     world.fake.add_repo(REPAIRED_SMOKE, private=True, files=dict(world.fake.repos[REPAIRED]["main"]))
     world.fake.authorize(REPAIRED_SMOKE)

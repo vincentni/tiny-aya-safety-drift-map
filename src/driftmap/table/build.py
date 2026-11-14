@@ -79,6 +79,8 @@ def _repo_columns(settings: Settings, mode: Mode | None = None, fine_tune: str |
     for run_mode in modes:
         for preamble in trained:
             placed |= dict.fromkeys(repo_names(settings, run_mode, preamble), "drifted")
+            # a repair of that fine-tune pushes to a repo named after it
+            placed[f"{repos.repaired}{ids.repo_suffix(run_mode, preamble)}"] = "repaired"
     # the fourth column is a quantized file, of the repaired model or of the merged fine-tuned one
     placed[quant.merged_names(settings, "full")[1]] = "repaired_q4"
     if mode != "full":

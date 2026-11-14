@@ -937,7 +937,8 @@ def table_build(
     from driftmap.table import render
 
     root, tree = deps.repo_root, ids.tree(mode, preamble)
-    records, screen = _results(settings, deps.hub, mode)
+    # the repair screen of this fine-tune, under the condition it was screened in
+    records, screen = _results(settings, deps.hub, mode, ids.FINE_TUNES[fine_tune], fine_tune)
     results, in_repo = f"{settings.owner}/{settings.repos.results}", f"{tree}tables"
     evaluation = f"{settings.owner}/{settings.repos.eval}"
     head = _head(deps.hub, evaluation)
@@ -1013,7 +1014,8 @@ def table_breakdown(
     from driftmap.table import breakdown
     from driftmap.table import build as table
 
-    records, screen = _results(settings, deps.hub, mode)
+    # the repair screen of this fine-tune, under the condition it was screened in
+    records, screen = _results(settings, deps.hub, mode, ids.FINE_TUNES[fine_tune], fine_tune)
     results, evaluation, stored = (
         f"{settings.owner}/{name}" for name in (settings.repos.results, settings.repos.eval, settings.repos.responses)
     )
@@ -1422,10 +1424,24 @@ def _open_reason(screen: AlphaScreen) -> str:
 @_finish
 def repair_choose(
     mode: Annotated[Mode, typer.Option(help="The tree the screen and its labels are in.")] = "smoke",
+    fine_tune: Annotated[
+        FineTune,
+        typer.Option(
+            help="The fine-tune the screen is of. standard: the smallest alpha that passes both bars is chosen. "
+            "aggressive: among those, the smallest as safe as the baseline, else the safest."
+        ),
+    ] = "standard",
+    preamble: Annotated[
+        Preamble | None,
+        typer.Option(help="The condition the screen ran under; by default the one the fine-tune was trained under."),
+    ] = None,
 ) -> None:
     """Rate each screened alpha from its labels against the baseline's and store the choice; runs here, no job."""
+    preamble = preamble or ids.FINE_TUNES[fine_tune]
+    named = (fine_tune, preamble) != ("standard", "keep")
+    chosen = {"fine_tune": fine_tune, "preamble": preamble} if named else {}
     # nothing is launched or billed to the ledger, so no readiness report is needed
-    settings, deps = _open("repair choose", ready=False, mode=mode)
+    settings, deps = _open("repair choose", ready=False, mode=mode, **chosen)
     from driftmap.judge import rubric
     from driftmap.judge.closed import DERIVED
     from driftmap.judge.incremental import RawRow, key, pending, read_rows
@@ -1435,12 +1451,15 @@ def repair_choose(
     results, responses, labelled = (
         f"{settings.owner}/{name}" for name in (settings.repos.results, settings.repos.responses, settings.repos.eval)
     )
-    relaunch = f"driftmap launch repair --mode {mode} --wait"
-    records, screen = _results(settings, deps.hub, mode)
+    job_args = ["--fine-tune", fine_tune, "--preamble", preamble] if named else []
+    launch = ["driftmap", "launch", "repair", "--mode", mode, "--wait"]
+    relaunch = shlex.join([*launch, *(["--", *job_args] if named else [])])
+    stored_at = screen_path(mode, preamble, fine_tune)
+    records, screen = _results(settings, deps.hub, mode, preamble, fine_tune)
     if screen is None:
-        found = f"no screen record at {screen_path(mode)} in {results}"
+        found = f"no screen record at {stored_at} in {results}"
         raise DriftmapError(ExitCode.USAGE, f"{found}; screen first: {relaunch}")
-    drifted = _drifted(records, settings, mode)
+    drifted = _drifted(records, settings, mode, fine_tune)
     if drifted is None:
         found = f"no ok drift run of {mode} mode in {results}"
         raise DriftmapError(ExitCode.USAGE, f"{found}; the screen rows sit under its merged checkpoint")
@@ -1459,10 +1478,10 @@ def repair_choose(
     labels: dict[float, list[LabelRow]] = {}
     unjudged: list[str] = []
     with tempfile.TemporaryDirectory(prefix="driftmap-screen-") as scratch:
-        pattern = rows_path(slug, "*", mode)
+        pattern = rows_path(slug, "*", mode, preamble)
         root = _snapshot(deps.hub, responses, f"{scratch}/screen", [pattern, *beside(pattern)])
         for row in screen.alphas:
-            name = rows_path(slug, row.alpha, mode)
+            name = rows_path(slug, row.alpha, mode, preamble)
             data = (root / name).read_bytes() if (root / name).is_file() else b""
             if row.error is None and hashlib.sha256(data).hexdigest() != row.rows_sha256:
                 fault = f"{name} is not the file the screen record was made from"
@@ -1480,10 +1499,11 @@ def repair_choose(
             elif found:
                 share = f"{len(waiting)} of its {len(made)} harmful rows"
                 unjudged.append(f"alpha {row.alpha:g}: {share} have no label of the response stored now")
-        data_dir = _snapshot(deps.hub, labelled, f"{scratch}/baseline", [ids.labels_path(baseline, "*", mode)])
-        files = [ids.labels_path(baseline, code, mode) for code in settings.languages]
+        wanted = [ids.labels_path(baseline, "*", mode, preamble=preamble)]
+        data_dir = _snapshot(deps.hub, labelled, f"{scratch}/baseline", wanted)
+        files = [ids.labels_path(baseline, code, mode, preamble=preamble) for code in settings.languages]
         reference = [label for name in files for label in read_rows(data_dir / name, LabelRow, name)]
-    decided = select.judged(screen, labels, reference)
+    decided = select.judged(screen, labels, reference, rule=select.rule_of(fine_tune))
 
     for row in decided.alphas:
         typer.echo(redact.mask(_alpha_line(row)))
@@ -1494,23 +1514,30 @@ def repair_choose(
         f"{'bars':<10}safe rate within {bars.safety_points:g} points of the baseline, "
         f"chrF within {bars.chrf_points:g} of the drifted model"
     )
-    path = deps.repo_root / LOCAL / "results" / screen_path(mode)
+    path = deps.repo_root / LOCAL / "results" / stored_at
     dump(decided, path)
     try:
         message = f"record the alpha choice: {decided.recover_status}"
-        deps.hub.upload_file(results, screen_path(mode), path, repo_type="dataset", commit_message=message)
+        deps.hub.upload_file(results, stored_at, path, repo_type="dataset", commit_message=message)
     except httpx2.HTTPError as error:
         kept = f"the screen is stored in {path.relative_to(deps.repo_root)} but was not pushed"
         raise DriftmapError(ExitCode.PUSH_FAILED, f"{kept} ({type(error).__name__}); run the command again") from error
-    typer.echo(f"{'stored':<10}{screen_path(mode)} in {results}")
+    typer.echo(f"{'stored':<10}{stored_at} in {results}")
     if decided.recover_status == "chosen":
-        typer.echo(f"{'chosen':<10}alpha {decided.chosen:g}, the smallest that passes both bars")
-        typer.echo(f"{'next':<10}{relaunch} -- --apply {decided.chosen:g}")
+        taken = next(row for row in decided.alphas if row.alpha == decided.chosen)
+        restored = taken.safe_rate_pooled + select.TOLERANCE >= decided.baseline_safe_pooled
+        how = "the smallest that passes both bars"
+        if decided.rule == "restore":
+            how += " and is as safe as the baseline"
+            how = how if restored else "the safest that passes both bars; none is as safe as the baseline"
+        typer.echo(f"{'chosen':<10}alpha {decided.chosen:g}, {how}")
+        apply = shlex.join([*launch, "--", *job_args, "--apply"])
+        typer.echo(f"{'next':<10}{apply} {decided.chosen:g}")
     elif decided.recover_status == "failed":
         typer.echo(f"{'failed':<10}no alpha passes both bars; there is nothing to apply")
     else:
         typer.echo(redact.mask(f"{'undecided':<10}{'; '.join(unjudged) or _open_reason(decided)}"))
-        again = f"driftmap judge closed --rows '{rows_path(slug, '*', 'full')}' --mode {mode}"
+        again = f"driftmap judge closed --rows '{rows_path(slug, '*', 'full', preamble)}' --mode {mode}"
         typer.echo(f"{'next':<10}{again}, then choose again")
 
 

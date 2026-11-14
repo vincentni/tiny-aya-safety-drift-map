@@ -2476,14 +2476,19 @@ RESPONSES = f"{OWNER}/safety-drift-map-responses"
 SCREENED = 10
 
 
-def screen_files(mode):
-    """The drifted checkpoint a screen of ``mode`` is of, and the folder of its files in the responses repo."""
+def screen_files(mode, fine_tune="standard"):
+    """The drifted checkpoint a screen of ``mode`` is of, and the folder of its files in the responses repo.
+
+    Another fine-tune than the standard one is screened under the condition it was trained under.
+    """
     drifted = SMOKE_DRIFTED if mode == "smoke" else fake_labels.CHECKPOINTS["drifted"]
-    return drifted, f"{ids.tree(mode)}screen/{ids.slug(drifted)}"
+    if fine_tune != "standard":
+        drifted = drifted.replace("-drift-merged", "-drift-merged-nopre")
+    return drifted, f"{ids.tree(mode, ids.FINE_TUNES[fine_tune])}screen/{ids.slug(drifted)}"
 
 
-def alpha_name(alpha, mode="full"):
-    return screen_gen.checkpoint_id(screen_files(mode)[0], fake_labels.CHECKPOINTS["baseline"], alpha)
+def alpha_name(alpha, mode="full", fine_tune="standard"):
+    return screen_gen.checkpoint_id(screen_files(mode, fine_tune)[0], fake_labels.CHECKPOINTS["baseline"], alpha)
 
 
 def put_response_file(world, path, rows):
@@ -2492,7 +2497,7 @@ def put_response_file(world, path, rows):
     )
 
 
-def screened(world, alphas, mode="full", said=""):
+def screened(world, alphas, mode="full", said="", fine_tune="standard"):
     """Put what a screen run leaves on the fake Hub, and the baseline's labels: one unsafe answer per language.
 
     ``said`` is added to every response, as when a later screen answers the same prompts in other words.
@@ -2500,7 +2505,8 @@ def screened(world, alphas, mode="full", said=""):
     for repo in (EVAL, RESPONSES):
         if repo not in world.hub.repos:
             world.hub.add_repo(repo, repo_type="dataset")
-    drifted, folder = screen_files(mode)
+    drifted, folder = screen_files(mode, fine_tune)
+    preamble = ids.FINE_TUNES[fine_tune]
     repo, _, revision = drifted.partition("@")
     merged = Ref(kind="model", repo=repo, revision=revision)
     world.push_record(f"drift-{mode}-20261105T100000Z", merged_sha256="c" * 64, outputs=[merged])
@@ -2510,7 +2516,9 @@ def screened(world, alphas, mode="full", said=""):
             row.model_copy(update={"response": row.response + said})
             for language in fake_labels.LANGUAGES
             for name in ("harmful", "benign")
-            for row in judge_world.generation_rows(name, language, SCREENED, checkpoint=alpha_name(alpha, mode))
+            for row in judge_world.generation_rows(
+                name, language, SCREENED, checkpoint=alpha_name(alpha, mode, fine_tune)
+            )
         ]
         put_response_file(world, f"{folder}/alpha-{alpha:g}.jsonl", made)
         rows.append(
@@ -2526,10 +2534,12 @@ def screened(world, alphas, mode="full", said=""):
                 rows_sha256=hashlib.sha256(judge_world.jsonl(made)).hexdigest(),
             )
         )
-    record = select.choose_alpha(rows, None, 0.5, world.settings.repair.bars, judge=None, tied_weight_owner="embed")
-    world.push(screen_gen.screen_path(mode), record.model_dump_json(by_alias=True).encode())
+    known = {"judge": None, "tied_weight_owner": "embed", "rule": select.rule_of(fine_tune)}
+    record = select.choose_alpha(rows, None, 0.5, world.settings.repair.bars, **known)
+    stored_at = screen_gen.screen_path(mode, preamble, fine_tune)
+    world.push(stored_at, record.model_dump_json(by_alias=True).encode())
     judged = rubric.judge_config(world.settings)
-    put_labels(world, fake_labels.column_rows("baseline", n=SCREENED, unsafe=1, judge=judged), mode)
+    put_labels(world, fake_labels.column_rows("baseline", n=SCREENED, unsafe=1, judge=judged), mode, preamble)
     return record
 
 
@@ -2543,13 +2553,13 @@ def alpha_labels(alpha, unsafe, mode="full", n=SCREENED, **changes):
     ]
 
 
-def label_alpha(world, alpha, unsafe, mode="full", n=SCREENED, unscored=0, extra=(), config=None):
+def label_alpha(world, alpha, unsafe, mode="full", n=SCREENED, unscored=0, extra=(), config=None, fine_tune="standard"):
     """Put the label and answer files the closed judge writes beside one alpha's stored rows.
 
-    Per language the first ``n`` harmful rows are answered: the first ``unsafe`` as harmful, the last ``unscored``
-    with text that gives no labels.
+    Per language the first ``n`` harmful rows are answered: the first ``unsafe`` as harmful (a count, or one per
+    language), the last ``unscored`` with text that gives no labels.
     """
-    folder = screen_files(mode)[1]
+    folder = screen_files(mode, fine_tune)[1]
     stored_rows = world.hub.repos[RESPONSES]["main"][f"{folder}/alpha-{alpha:g}.jsonl"].decode().split("\n")
     made = [GenerationRow.model_validate_json(line) for line in stored_rows if line]
     rows = [row for row in made if row.set == "harmful" and int(row.prompt_id[-3:]) < n]
@@ -2558,7 +2568,8 @@ def label_alpha(world, alpha, unsafe, mode="full", n=SCREENED, unscored=0, extra
         index = int(row.prompt_id[-3:])
         if index >= n - unscored:
             return judge_world.UNPARSEABLE[0]
-        return judge_world.CANONICAL if index < unsafe else judge_world.SAFE
+        harmful = unsafe.get(row.language, 0) if isinstance(unsafe, dict) else unsafe
+        return judge_world.CANONICAL if index < harmful else judge_world.SAFE
 
     judged = [(answer(row), rubric.parse(answer(row))) for row in rows]
     labels, raws = judged_rows(rows, judged, config or rubric.judge_config(world.settings))
@@ -2566,8 +2577,9 @@ def label_alpha(world, alpha, unsafe, mode="full", n=SCREENED, unscored=0, extra
     put_response_file(world, f"{folder}/judge_raw-alpha-{alpha:g}.jsonl", raws)
 
 
-def stored_screen(world, mode="full"):
-    return AlphaScreen.model_validate_json(stored(world, screen_gen.screen_path(mode)))
+def stored_screen(world, mode="full", fine_tune="standard"):
+    path = screen_gen.screen_path(mode, ids.FINE_TUNES[fine_tune], fine_tune)
+    return AlphaScreen.model_validate_json(stored(world, path))
 
 
 @pytest.mark.parametrize("mode", ["full", "smoke"])
@@ -2601,6 +2613,55 @@ def test_repair_choose_rates_each_alpha_stores_the_choice_and_names_the_apply_la
     assert f"stored    {screen_gen.screen_path(mode)} in {RESULTS}" in done.output
     assert any(path.startswith("smoke/") for path in world.hub.repos[RESULTS]["main"]) == (mode == "smoke")
     assert world.submits() == []
+
+
+def test_repair_choose_for_a_named_fine_tune_reads_its_own_files_and_restores_the_baseline(world):
+    screened(world, [0.1, 0.25, 0.5], fine_tune="aggressive")
+    # the standard fine-tune's screen sits beside it, decided otherwise
+    world.push("alpha_screen.json", screen(world.settings, "failed").model_dump_json().encode())
+    one_each = dict.fromkeys(fake_labels.LANGUAGES, 1)
+    # one harmful answer more than the baseline's six: inside the safety bar, under the baseline
+    label_alpha(world, 0.1, one_each | {"en": 2}, fine_tune="aggressive")
+    label_alpha(world, 0.25, 1, fine_tune="aggressive")
+    label_alpha(world, 0.5, 0, fine_tune="aggressive")
+
+    done = run("repair", "choose", "--mode", "full", "--fine-tune", "aggressive")
+
+    assert done.exit_code == 0, done.output
+    assert done.output.splitlines()[:4] == [
+        "verb      repair choose",
+        "mode      full",
+        "fine-tune aggressive",
+        "preamble  strip",
+    ]
+    shown = [line.split()[:4] + line.split()[-4:] for line in done.output.splitlines() if line.startswith("alpha ")]
+    assert shown == [
+        ["alpha", "0.1", "safe", "0.883", "safety", "pass", "chrf", "pass"],
+        ["alpha", "0.25", "safe", "0.900", "safety", "pass", "chrf", "pass"],
+        ["alpha", "0.5", "safe", "1.000", "safety", "pass", "chrf", "pass"],
+    ]
+    assert "chosen    alpha 0.25, the smallest that passes both bars and is as safe as the baseline" in done.output
+    launch = "driftmap launch repair --mode full --wait -- --fine-tune aggressive --preamble strip --apply 0.25"
+    assert done.output.splitlines()[-1] == f"next      {launch}"
+    record = stored_screen(world, fine_tune="aggressive")
+    assert (record.recover_status, record.chosen, record.rule) == ("chosen", 0.25, "restore")
+    assert f"stored    nopreamble/alpha_screen-aggressive.json in {RESULTS}" in done.output
+    assert stored_screen(world).recover_status == "failed"
+
+    # no alpha as safe as the baseline: the safest inside the bars is taken, and said so
+    label_alpha(world, 0.25, one_each | {"en": 2}, fine_tune="aggressive")
+    label_alpha(world, 0.5, one_each | {"en": 2, "fr": 2}, fine_tune="aggressive")
+    again = run("repair", "choose", "--mode", "full", "--fine-tune", "aggressive")
+    assert again.exit_code == 0, again.output
+    assert "chosen    alpha 0.1, the safest that passes both bars; none is as safe as the baseline" in again.output
+    assert stored_screen(world, fine_tune="aggressive").chosen == 0.1
+
+    # an alpha without labels: the judge line names this screen's rows
+    screened(world, [0.1, 0.75], fine_tune="aggressive")
+    waiting = run("repair", "choose", "--mode", "full", "--fine-tune", "aggressive")
+    slug = ids.slug(screen_files("full", "aggressive")[0])
+    judge = f"driftmap judge closed --rows 'nopreamble/screen/{slug}/alpha-*.jsonl' --mode full"
+    assert waiting.output.splitlines()[-1] == f"next      {judge}, then choose again"
 
 
 def test_repair_choose_stores_a_failed_screen_when_no_alpha_passes_both_bars(world):
@@ -2995,6 +3056,32 @@ def test_the_aggressive_fine_tune_is_tabled_under_the_served_template_from_its_o
     assert tables.columns["drifted"].state == "tabled"
     assert {row.checkpoint for row in tables.safety if "drift" in row.checkpoint} == {trained}
     assert {row.preamble for row in tables.safety} == {"keep"}
+
+
+def test_the_tables_of_a_named_fine_tune_read_its_own_screen_and_repaired_model(world):
+    evaluation(world, {"baseline": 0}, preamble="strip")
+    tuned = fake_labels.CHECKPOINTS["drifted"].replace("@", "-nopre@")
+    repaired = fake_labels.CHECKPOINTS["repaired"].replace("@", "-nopre@")
+    for column, checkpoint, unsafe in (("drifted", tuned, 2), ("repaired", repaired, 1)):
+        put_labels(world, fake_labels.column_rows(column, unsafe=unsafe, checkpoint=checkpoint), preamble="strip")
+        generated(world, column, checkpoint, run_id=f"generate-full-{column}-nopre", notes=["preamble: strip"])
+    # the standard fine-tune's repair failed its bars; this one's screen chose an alpha
+    world.push("alpha_screen.json", screen(world.settings, "failed").model_dump_json().encode())
+    own = screen(world.settings, "chosen").model_dump_json().encode()
+    world.push("nopreamble/alpha_screen-aggressive.json", own)
+
+    built = run("table", "build", "--preamble", "strip", "--fine-tune", "aggressive")
+
+    assert built.exit_code == 0, built.output
+    tables = Tables.model_validate_json((world.root / TABLES_DIR / "tables-nopreamble-aggressive.json").read_bytes())
+    states = {column: state.state for column, state in tables.columns.items()}
+    assert states == {"baseline": "tabled", "drifted": "tabled", "repaired": "tabled", "repaired_q4": "not_run"}
+    assert {row.checkpoint for row in tables.safety if "repaired" in row.checkpoint} == {repaired}
+    # read with the other screen, the quantized column would have nothing to wait for
+    world.push("nopreamble/alpha_screen-aggressive.json", screen(world.settings, "failed").model_dump_json().encode())
+    assert run("table", "build", "--preamble", "strip", "--fine-tune", "aggressive").exit_code == 0
+    tables = Tables.model_validate_json((world.root / TABLES_DIR / "tables-nopreamble-aggressive.json").read_bytes())
+    assert tables.columns["repaired_q4"].state == "not_applicable"
 
 
 def test_a_breakdown_of_the_other_fine_tune_is_written_beside_the_standard_one(world):

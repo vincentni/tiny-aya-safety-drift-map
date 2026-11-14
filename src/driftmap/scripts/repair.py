@@ -32,7 +32,15 @@ from driftmap.repair import screen_gen, select, wiseft
 from driftmap.repair.screen_gen import SCREEN_FILE, rows_path, screen_path
 from driftmap.scripts import preamble_option, run_job
 from driftmap.scripts.drift import CANARIES, TOKENIZER_FILES, _release, repo_names
-from driftmap.scripts.generate import PROMPT_FILES, _save_marker, check_rendering, check_repos, past_runs, read_units
+from driftmap.scripts.generate import (
+    PROMPT_FILES,
+    _save_marker,
+    check_rendering,
+    check_repos,
+    past_runs,
+    read_units,
+)
+from driftmap.scripts.generate import _repaired as repaired_repo
 
 # this job's marker stage
 STAGE = "alpha"
@@ -374,6 +382,7 @@ def run_screen(ctx: Context, inputs: Inputs, alphas: Sequence[float], device: st
             ctx.settings.repair.bars,
             judge=judge,
             tied_weight_owner=owner,
+            rule=select.rule_of(ctx.args.fine_tune),
         )
 
     for alpha in alphas:
@@ -433,13 +442,14 @@ def run_apply(ctx: Context, inputs: Inputs, alpha: float, device: str) -> None:
         settings.repair.bars,
         judge=stored.judge,
         tied_weight_owner=stored.tied_weight_owner,
+        rule=select.rule_of(ctx.args.fine_tune),
     )
     if screen.recover_status != "chosen" or screen.chosen != stored.chosen:
         derived = f"{screen.recover_status}, chosen {screen.chosen}"
         raise _refuse(f"the stored decision for alpha {alpha:g} does not follow from its rows ({derived})")
     ctx.run.note(f"applied alpha = {alpha:g}, as the decided screen names it")
     ctx.run.note(f"chosen = {next(row for row in screen.alphas if row.alpha == screen.chosen).model_dump_json()}")
-    repaired = f"{settings.owner}/{settings.repos.repaired}{ids.repo_suffix(mode, ids.FINE_TUNES[ctx.args.fine_tune])}"
+    repaired = repaired_repo(settings, mode, ids.FINE_TUNES[ctx.args.fine_tune])
     ctx.hub.create_repo(repaired, private=True)
     # creating over an existing repo leaves its visibility as it was
     if ctx.hub.model_info(repaired).private is not True:
