@@ -160,6 +160,100 @@ def test_ok_writes_no_marker_and_keys_without_a_file_can_be_marked(flusher, uplo
     assert (partial.resume_from, partial.done) == ("merge", ["alpha=0.25"])
 
 
+LABELS = "vincentnkq/aya-redteaming-6lang-eval"
+
+
+def commits(fake, repo):
+    """Titles of the commits a repo got after its creation, oldest first."""
+    return [fake.messages[oid] for oid in fake.repos[repo] if oid != "main"][1:]
+
+
+def test_the_files_of_a_unit_travel_in_one_commit_per_repo_and_its_key_waits_for_the_last(flusher, fake, responses):
+    """A commit costs the same wait whatever it holds, so a unit costs one per repo it writes to."""
+    fake.add_repo(LABELS, repo_type="dataset")
+    files = [
+        (LABELS, "labels/x/benign/en.jsonl", b"scored\n"),
+        (responses, "responses/x/benign/en.jsonl", b"rows\n"),
+        (responses, "judge_raw/x/en.jsonl", b"raw\n"),
+    ]
+
+    flusher.commit(files, key="benign/en")
+
+    title = f"{RUN_ID}: benign/en"
+    assert flusher.done == ["benign/en"] and commits(fake, LABELS) == commits(fake, responses) == [title]
+    assert fake.repos[responses]["main"] == {"responses/x/benign/en.jsonl": b"rows\n", "judge_raw/x/en.jsonl": b"raw\n"}
+    # one file goes as it always did, several as one commit
+    assert [method for method, _ in fake.calls if method != "repo_info"] == ["upload_file", "create_commit"]
+
+    # the second repo's commit fails: the key is not done, the call raises, the closing save tries the files again
+    fake.fail_after(1, 400)
+    with pytest.raises(HfHubHTTPError):
+        flusher.commit([(responses, "responses/x/benign/fr.jsonl", b"fr\n")], key="benign/fr")
+    assert flusher.done == ["benign/en"]
+    record = flusher.flush()
+    assert record.partial.done == ["benign/en", "benign/fr"]
+    assert any(note.startswith("upload failed: responses/x/benign/fr.jsonl: ") for note in record.notes)
+
+
+def test_a_unit_whose_first_repo_took_its_commit_is_not_done_until_the_last_did(flusher, fake, responses):
+    fake.add_repo(LABELS, repo_type="dataset")
+    files = [(LABELS, "labels/x/benign/en.jsonl", b"scored\n"), (responses, "responses/x/benign/en.jsonl", b"rows\n")]
+    real = fake.upload_file
+
+    def responses_down(**kwargs):
+        if kwargs["repo_id"] == responses:
+            fake.fail_after(1, 400)
+        return real(**kwargs)
+
+    fake.upload_file = responses_down
+    with pytest.raises(HfHubHTTPError):
+        flusher.commit(files, key="benign/en")
+    assert flusher.done == [] and "labels/x/benign/en.jsonl" in fake.repos[LABELS]["main"]
+    fake.upload_file = real
+    assert flusher.flush().partial.done == ["benign/en"]
+
+
+def test_progress_is_saved_after_the_first_unit_and_then_only_every_few_minutes(flusher, clock, uploads, responses):
+    """Marker and record cost two commits: between units they are written when the last save has aged."""
+    for at, language in enumerate(("en", "fr", "es", "ru")):
+        flusher.commit([(responses, f"responses/x/harmful/{language}.jsonl", b"rows\n")], key=f"harmful/{language}")
+        flusher.progress()
+        clock.advance(flush.PROGRESS_S / 2)
+        saves = uploads().count(MARKER)
+        assert saves == uploads().count(RECORD) == (1, 1, 2, 2)[at], language
+    assert flusher.flush().partial.done == [f"harmful/{language}" for language in ("en", "fr", "es", "ru")]
+
+
+def test_a_progress_save_that_fails_is_a_note_and_is_tried_again_at_the_next_unit(flusher, fake, uploads, stored):
+    flusher.mark_done("harmful/en")
+    fake.fail_after(1, 400)
+    flusher.progress()
+    assert stored(MARKER) is None and flusher.run.record.notes[-1].startswith("marker push failed: ")
+    flusher.progress()
+    assert json.loads(stored(MARKER))["done"] == ["harmful/en"]
+
+
+def test_a_resumed_run_takes_the_units_whose_commits_landed_after_the_last_marker(
+    flusher, fake, clock, responses, settings
+):
+    """The marker may be minutes old; the titles of the unit commits say what reached the Hub since."""
+    for language in ("en", "fr", "es"):
+        flusher.commit([(responses, f"responses/x/harmful/{language}.jsonl", b"rows\n")], key=f"harmful/{language}")
+        flusher.progress()
+    # the run is killed here: its marker names the first unit only
+    fake._commit(responses, "another-run-20261102T000000Z: harmful/ar", {"responses/y/harmful/ar.jsonl": b"rows\n"})
+    fake._commit(responses, "Upload README.md", {"README.md": b"card\n"})
+
+    deadline = Deadline(10800, clock.now(), clock)
+    run_id = "drift-full-20261102T110000Z"
+    later = start(settings, run_id=run_id, kind="drift", mode="full", code_sha="a" * 40, deadline=deadline, clock=clock)
+    resumed = Flusher(Hub(fake), later)
+    resumed.done = ["harmful/en"]
+    resumed.credit(responses, RUN_ID)
+
+    assert resumed.done == ["harmful/en", "harmful/fr", "harmful/es"]
+
+
 def test_importing_the_job_runtime_does_not_load_torch(child_env):
     code = (
         "import sys\n"

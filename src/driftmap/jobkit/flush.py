@@ -1,12 +1,12 @@
 """Save what a job has produced: data files, then the marker, then the run record."""
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from huggingface_hub import CommitInfo
+from huggingface_hub import CommitInfo, CommitOperationAdd
 from pydantic import BaseModel
 
 from driftmap.core.hub import Hub
@@ -19,7 +19,15 @@ from driftmap.jobkit.runrecord import Push, Run, Status, record_path
 logger = logging.getLogger(__name__)
 
 MAX_NOTE = 300
+# between work units the marker and the record are saved when the last save is this old: each save costs two
+# commits, and the Hub can take half a minute to answer one
+PROGRESS_S = 300
 RepoType = Literal["model", "dataset"]
+
+
+def unit_message(run_id: str, key: str) -> str:
+    """Title of the commits that carry a work unit's files; a resumed run reads the unit back from it."""
+    return f"{run_id}: {key}"
 
 
 @dataclass
@@ -30,6 +38,15 @@ class _Upload:
     key: str | None
     repo_type: RepoType
     error: Exception | None = None
+    # a file of a work unit: every file of the unit, and whether this one is on the Hub
+    unit: "_Unit | None" = None
+    landed: bool = False
+
+
+@dataclass
+class _Unit:
+    key: str
+    files: list[_Upload]
 
 
 def _json(model: BaseModel) -> bytes:
@@ -51,6 +68,8 @@ class Flusher:
         # keys of finished work units, in the order their uploads landed
         self.done: list[str] = []
         self.resume_from = "start"
+        # when this run last saved its marker and record, on the run's clock
+        self._saved: float | None = None
 
     def add(
         self,
@@ -79,6 +98,71 @@ class Flusher:
         if item.error is not None:
             raise item.error
         return self._pushes[repo_type, target].commit
+
+    def commit(
+        self, files: Sequence[tuple[str, str, str | Path | bytes]], *, key: str, repo_type: RepoType = "dataset"
+    ) -> None:
+        """Upload the files of one work unit now, after anything still queued: one commit per repo.
+
+        ``files`` are (repo, path in it, source); the repos are committed to in the order they first appear, each
+        commit titled with the run and ``key``, which joins ``done`` once the last one landed. Raises when a
+        commit fails: its files, and those of the repos after it, are set aside for the closing save, and the
+        key is done when the last of them is on the Hub.
+        """
+        self._push_pending()
+        unit = _Unit(key, [])
+        groups: dict[str, list[_Upload]] = {}
+        for target, path_in_repo, source in files:
+            item = _Upload(target, path_in_repo, source, None, repo_type, unit=unit)
+            unit.files.append(item)
+            groups.setdefault(target, []).append(item)
+        left = list(groups.values())
+        message = unit_message(self.run.record.run_id, key)
+        while left:
+            group = left[0]
+            try:
+                if len(group) == 1:
+                    item = group[0]
+                    landed = self._hub.upload_file(
+                        item.target, item.path_in_repo, item.source, repo_type=repo_type, commit_message=message
+                    )
+                else:
+                    added = [CommitOperationAdd(item.path_in_repo, item.source) for item in group]
+                    landed = self._hub.create_commit(
+                        group[0].target, added, repo_type=repo_type, commit_message=message
+                    )
+            except Exception as error:
+                for item in (item for group in left for item in group):
+                    item.error = error
+                    self._aside.append(item)
+                self._failed(group[0], error)
+                raise
+            for item in left.pop(0):
+                item.landed = True
+            self.pushed(group[0].target, landed, repo_type=repo_type)
+        self.mark_done(key)
+
+    def credit(self, target: str, run_id: str, *, repo_type: RepoType = "dataset") -> None:
+        """Take as done the units of ``run_id`` whose commit reached ``target``, the repo its units commit to last.
+
+        The marker a run resumes from can be minutes older than the last unit it put on the Hub.
+        """
+        prefix = unit_message(run_id, "")
+        for commit in reversed(self._hub.list_repo_commits(target, repo_type=repo_type)):
+            if commit.title.startswith(prefix):
+                self.mark_done(commit.title.removeprefix(prefix))
+
+    def progress(self) -> None:
+        """Call between work units: save the marker and the record if this run has not yet, or not for PROGRESS_S.
+
+        A save that fails is a note; the next call tries again, and so does the closing save.
+        """
+        if self._saved is not None and self.run.clock.monotonic() - self._saved < PROGRESS_S:
+            return
+        try:
+            self.flush()
+        except Exception as error:
+            self.run.note(f"marker push failed: {type(error).__name__}: {mask(str(error))}"[:MAX_NOTE])
 
     def pushed(
         self, target: str, commit: CommitInfo, *, repo_type: RepoType = "model", sha256: str | None = None
@@ -136,6 +220,7 @@ class Flusher:
                 self.run.note(f"marker push failed: {type(error).__name__}: {mask(str(error))}"[:MAX_NOTE])
         record = self.run.finish(status, self._pushes.values(), partial=marker, oom=oom)
         self._put(record_path(run_id), record, f"{status} record for {run_id}", self._single(data))
+        self._saved = self.run.clock.monotonic()
         return record
 
     def _single(self, data: bool) -> bool:
@@ -153,6 +238,12 @@ class Flusher:
         self._pending.append(item)
         return item
 
+    def _failed(self, item: _Upload, error: Exception) -> None:
+        logger.warning("upload of %s failed: %s", item.path_in_repo, error)
+        if item.path_in_repo not in self._noted:
+            self._noted.add(item.path_in_repo)
+            self.run.note(f"upload failed: {item.path_in_repo}: {mask(str(error))}"[:MAX_NOTE])
+
     def _push_pending(self) -> None:
         """Upload the queue in order; a file that fails is set aside and noted, the rest go on."""
         while self._pending:
@@ -162,15 +253,16 @@ class Flusher:
             except Exception as error:
                 item.error = error
                 self._aside.append(self._pending.pop(0))
-                logger.warning("upload of %s failed: %s", item.path_in_repo, error)
-                if item.path_in_repo not in self._noted:
-                    self._noted.add(item.path_in_repo)
-                    self.run.note(f"upload failed: {item.path_in_repo}: {mask(str(error))}"[:MAX_NOTE])
+                self._failed(item, error)
                 continue
             self._pending.pop(0)
             self.pushed(item.target, commit, repo_type=item.repo_type)
+            item.landed = True
             if item.key is not None:
                 self.mark_done(item.key)
+            # a unit is done with its last file, whichever of them that is
+            if item.unit is not None and all(other.landed for other in item.unit.files):
+                self.mark_done(item.unit.key)
 
 
 def __getattr__(name: str) -> Any:

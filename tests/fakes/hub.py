@@ -43,6 +43,8 @@ class FakeHub:
         self.collections: dict[str, dict[str, Any]] = {}
         # old name -> new name of a moved repo: the Hub answers for the old name with the repo under its new one
         self.redirects: dict[str, str] = {}
+        # commit id -> the message it was made with
+        self.messages: dict[str, str] = {}
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.threads: set[int] = set()
         self.max_in_flight = 0
@@ -307,7 +309,7 @@ class FakeHub:
                     commit_id=oid,
                     authors=[self.user],
                     created_at=datetime(2026, 11, 2, 10, 0, tzinfo=UTC),
-                    title="commit",
+                    title=self.messages[oid].partition("\n")[0],
                     message="",
                     formatted_title=None,
                     formatted_message=None,
@@ -396,6 +398,33 @@ class FakeHub:
             self._writable(repo_id, repo_type, revision)
             update = {path_in_repo: _read(path_or_fileobj)}
             return self._commit(repo_id, commit_message or f"Upload {path_in_repo}", update)
+
+    def create_commit(
+        self,
+        repo_id: str,
+        operations: Any,
+        *,
+        commit_message: str,
+        repo_type: str | None = None,
+        revision: str | None = None,
+        token: str | bool | None = None,
+        **kwargs: Any,
+    ) -> CommitInfo:
+        operations = list(operations)
+        paths = [operation.path_in_repo for operation in operations]
+        with self._op(
+            "create_commit",
+            self._repo_url(repo_id, repo_type),
+            repo_id=repo_id,
+            paths=paths,
+            repo_type=repo_type,
+            revision=revision,
+            commit_message=commit_message,
+            **kwargs,
+        ):
+            self._writable(repo_id, repo_type, revision)
+            update = {operation.path_in_repo: _read(operation.path_or_fileobj) for operation in operations}
+            return self._commit(repo_id, commit_message, update)
 
     def upload_folder(
         self,
@@ -701,6 +730,7 @@ class FakeHub:
             oid = digest.hexdigest()
             self.repos[repo_id][oid] = snapshot
             self.heads[repo_id] = oid
+            self.messages[oid] = message
         return self._commit_info(repo_id, message, oid)
 
     def _commit_info(self, repo_id: str, message: str, oid: str) -> CommitInfo:

@@ -4,7 +4,7 @@ import functools
 import os
 import threading
 import time
-from collections.abc import Callable, Collection, Iterable
+from collections.abc import Callable, Collection, Iterable, Sequence
 from pathlib import Path
 from typing import Any, Literal
 
@@ -128,6 +128,19 @@ class Hub:
             path_or_fileobj=source,
             path_in_repo=path_in_repo,
             repo_id=ref.repo,
+            revision=ref.revision,
+            **kwargs,
+        )
+
+    def create_commit(self, target: RepoRef | str, operations: Sequence[Any], **kwargs: Any) -> Any:
+        """Commit several files at once; ``operations`` are the library's commit operations."""
+        ref = _ref(target)
+        return self._transfer(
+            ref,
+            kwargs.get("repo_type"),
+            self._api.create_commit,
+            ref.repo,
+            list(operations),
             revision=ref.revision,
             **kwargs,
         )

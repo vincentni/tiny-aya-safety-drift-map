@@ -364,15 +364,15 @@ def _generate(
         if unit.set == "benign" and not variants:
             targets = {row["prompt_id"]: row["target"] for row in unit.rows}
             scored = _jsonl(benign_rows(rows, targets))
-            files.append((labels, ids.labels_path(slug, unit.language, mode, benign=True, preamble=preamble), scored))
+            scored_path = ids.labels_path(slug, unit.language, mode, benign=True, preamble=preamble)
+            # before the responses: their commit is the one a resumed run takes the unit from
+            files.insert(0, (labels, scored_path, scored))
         started = clock.monotonic()
-        for repo, path, data in files:
-            # the key goes with the last file
-            ctx.flusher.upload(repo, path, data, key=unit.key if path == files[-1][1] else None)
-            megabytes += len(data) / 2**20
+        ctx.flusher.commit(files, key=unit.key)
+        megabytes += sum(len(data) for _, _, data in files) / 2**20
         uploading += clock.monotonic() - started
-        # a hard kill from here on costs one unit
-        _save_marker(ctx)
+        # a hard kill from here on costs one unit: its commit says it is on the Hub, whatever the marker's age
+        ctx.flusher.progress()
     if mode == "smoke" and uploading > 0:
         record.upload_mb_s = round(megabytes / uploading, 3)
 
@@ -398,6 +398,9 @@ def body(ctx: Context, *, device: str = "cuda") -> None:
     check_repos(settings)
     # private when new; one published since keeps its visibility
     hub.create_repo(f"{settings.owner}/{settings.repos.responses}", repo_type="dataset", private=True)
+    if ctx.args.resume:
+        # the units that run put on the Hub after it last saved its marker
+        ctx.flusher.credit(f"{settings.owner}/{settings.repos.responses}", ctx.args.resume)
 
     work = Path(tempfile.mkdtemp(prefix="driftmap-generate-"))
     runs = [] if kind == "baseline" else past_runs(hub, ctx.run.results, work / "records")

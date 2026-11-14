@@ -394,7 +394,8 @@ def test_the_deadline_between_units_saves_a_run_that_can_be_resumed(world):
     assert len(generator.calls) == 5
 
 
-def test_the_marker_is_on_the_hub_after_every_finished_unit(world):
+def test_a_unit_costs_one_commit_per_repo_and_the_marker_is_saved_after_the_first_only(world):
+    """A commit costs the same wait whatever it holds: the marker and record are not rewritten after every unit."""
     generator = world.generator
     seen = []
 
@@ -409,9 +410,39 @@ def test_the_marker_is_on_the_hub_after_every_finished_unit(world):
 
     slug = slug_of(MODEL, world.head(MODEL))
     keys = [responses_at(slug, set_, code) for set_, code in UNITS]
-    # what a hard kill inside each unit would leave behind
-    assert seen == [None] + [keys[:count] for count in range(1, len(UNITS))]
+    # the run is quicker than the time between two saves
+    assert seen == [None] + [keys[:1]] * (len(UNITS) - 1)
     assert world.record().status == "ok"
+    uploaded = [kwargs for method, kwargs in world.fake.calls if method == "upload_file"]
+    writes = [(kwargs["repo_id"], kwargs["commit_message"]) for kwargs in uploaded]
+    units = [(repo, title) for repo, title in writes if repo != RESULTS]
+    benign = sum(set_ == "benign" for set_, _ in UNITS)
+    assert [title for repo, title in units if repo == RESPONSES] == [f"{RUN_ID}: {key}" for key in keys]
+    assert len(units) == len(UNITS) + benign and len(writes) == len(units) + 3
+
+
+def test_a_hard_kill_costs_the_unit_it_fell_in_whatever_the_age_of_the_marker(world):
+    """A resumed run takes the units whose commits reached the Hub after the stopped run last saved its marker."""
+    generator, upload = world.generator, world.fake.upload_file
+    finished = 5
+
+    def killed(prompts):
+        if len(generator.calls) == finished:
+            # from here nothing of the run reaches the Hub, its closing save included
+            world.fake.upload_file = lambda **kwargs: world.fake._raise(503, "https://huggingface.co/api/commit")
+        return generator(prompts)
+
+    world.generator = killed
+    assert world.run() != 0
+    slug = slug_of(MODEL, world.head(MODEL))
+    keys = [responses_at(slug, set_, code) for set_, code in UNITS]
+    assert world.marker().done == keys[:1] and len(generator.calls) == finished + 1
+
+    world.fake.upload_file, world.generator = upload, generator
+    assert world.run("--resume", RUN_ID, run_id=LATER) == 0
+
+    assert world.record(LATER).status == "ok" and world.record(LATER).prompts == ROWS * (len(UNITS) - finished)
+    assert len(generator.calls) == finished + 1 + len(UNITS) - finished
 
 
 def test_a_marker_that_cannot_be_pushed_is_a_note_and_the_run_goes_on(make_world):
