@@ -637,6 +637,53 @@ def test_dataset_cards_describe_the_trees_their_repos_hold(settings):
         assert "`request_harm`" in rendered[repo] and "rubric" in rendered[repo]
 
 
+def test_dataset_cards_name_the_script_sets_the_checks_and_the_fine_tuning_rows(settings):
+    held = {
+        "eval": [
+            "manifest.json",
+            "dataset_card.md",
+            "prompts/rendered_prefix.json",
+            "prompts/harmful/en.jsonl",
+            "sft_train/en.jsonl",
+            "variants/prompts/harmful/hi-latn.jsonl",
+            f"variants/labels/{SLUG}/hi-latn.jsonl",
+        ],
+        "responses": [
+            f"responses/{SLUG}/harmful/en.jsonl",
+            f"variants/responses/{SLUG}/harmful/hi-latn.jsonl",
+            "checks/q4_local/q4_full.jsonl",
+            "checks/q4_local/q4_full_labels.jsonl",
+            "checks/judge_validation/answers.jsonl",
+        ],
+        "results": [
+            "runs/drift-None.json",
+            "tables/tables.json",
+            "tables/breakdown.json",
+            "tables/variants.json",
+            "ledger.jsonl",
+            "checks/judge_validation/report.md",
+        ],
+    }
+
+    rendered = render_cards(settings, manifest=manifest(), files=held)
+
+    data = rendered[EVAL]
+    assert "- `dataset_card.md`: " in data and "- `prompts/rendered_prefix.json`: " in data
+    assert "- `sft_train/` (1 file): the rows the adapters were fine-tuned on: training data, not evaluation" in data
+    assert "- `variants/` (2 files): " in data and "`variants/labels/<checkpoint>/`" in data
+    answers = rendered[RESPONSES]
+    assert "- `variants/` (1 file): the answers to the script stress sets" in answers
+    assert "- `checks/q4_local/` (2 files): the fine-tuned model as a q4_k_m file and at full precision" in answers
+    assert "- `checks/judge_validation/` (1 file): " in answers and "checks/limit_768/" not in answers
+    runs = rendered[RESULTS]
+    assert "- `tables/` (3 files): " in runs and "`breakdown*`" in runs and "`variants.*`" in runs
+    assert "- `checks/judge_validation/` (1 file): " in runs and "checks/q4_local/" not in runs
+    assert "- `ledger.jsonl`: the cost ledger, one line per job." in runs
+    for text in (runs, render_cards(settings, manifest=manifest())[RESULTS]):
+        assert "Run records, result tables, breakdowns and the cost ledger" in text
+        assert "logs" not in body(text).lower() and "checks/" not in text.replace("checks/judge_validation/", "")
+
+
 def test_no_card_calls_the_fine_tuned_model_drifted(tmp_path, settings):
     """Repo names, column names and file names aside, the cards say "fine-tuned"."""
     tables = two_column_tables(tmp_path, settings, unsafe=1)

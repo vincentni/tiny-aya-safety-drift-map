@@ -205,6 +205,7 @@ def test_training_state_leaves_the_adapter_or_refuses_it(settings, fake):
         "adapter_model.bin",
         "adapter_model.safetensors",
         "drift_config.json",
+        "trainer_state.json",
     }
 
     put(fake, ADAPTER, "optimizer.pt", b"PK\x03\x04optimizer")
@@ -1275,6 +1276,7 @@ def test_the_adapter_trained_with_no_preamble_is_published_like_the_adapter(sett
         "adapter_config.json",
         "adapter_model.safetensors",
         "drift_config.json",
+        "trainer_state.json",
     }
     card = fake.repos[ADAPTER_NOPRE]["main"]["README.md"].decode()
     assert cards.DO_NOT_DEPLOY in card and cards.UNMEASURED in card
@@ -1505,7 +1507,8 @@ def test_a_fresh_copy_of_an_adapter_leaves_its_training_state_behind(settings, f
 
     work = f"{ADAPTER}-work"
     copied = fake.repos[ADAPTER]["main"]
-    assert set(copied) == {"README.md", "adapter_config.json", "adapter_model.safetensors", "drift_config.json"}
+    kept = {"README.md", "adapter_config.json", "adapter_model.safetensors", "drift_config.json", "trainer_state.json"}
+    assert set(copied) == kept and copied["trainer_state.json"] == b'{"global_step": 300}\n'
     assert copied["adapter_model.safetensors"] == b"\x00weights"
     assert f"a clean copy of `{work}`" in copied["README.md"].decode()
     assert "last-checkpoint/optimizer.pt" in fake.repos[work]["main"] and work in fake.private
@@ -1685,6 +1688,203 @@ def test_a_repo_with_a_clean_history_is_not_copied(settings, fake):
 
     assert calls(fake, "move_repo") == [] and not any(repo.endswith("-work") for repo in fake.repos)
     assert "publication.json" not in fake.repos[RESULTS]["main"]
+
+
+def ledger_file(tmp_path, *jobs, pending=()):
+    """A local cost ledger: a pending and a terminal line per job, a pending line alone for each of ``pending``."""
+    path = tmp_path / "local" / "results" / "ledger.jsonl"
+    path.parent.mkdir(parents=True)
+    rows = []
+    for job in (*jobs, *pending):
+        line = {
+            "schema": "driftmap.ledger/1",
+            "job_id": job,
+            "run_id": f"generate-{job}",
+            "kind": "generate",
+            "flavor": "l4x1",
+            "mode": "full",
+            "price_micro_usd_per_min": 13_333,
+            "minutes": 30,
+            "cost_micro_usd": 399_990,
+            "stage": "RUNNING",
+            "record_status": None,
+            "exit_code": None,
+            "billing_used_after_micro_usd": None,
+            "timeout_s": 1800,
+            "pending": True,
+            "lost": False,
+            "oom": False,
+            "notes": [],
+            "ts": "2026-11-14T10:00:00Z",
+        }
+        rows.append(line)
+        if job in jobs:
+            rows.append({**line, "pending": False, "stage": "COMPLETED", "minutes": 12, "cost_micro_usd": 159_996})
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    return path
+
+
+def check_files(tmp_path, files):
+    """A local checks folder holding ``files``, each named ``<repo key>/<check>/<file>``."""
+    root = tmp_path / "local" / "checks"
+    for name, data in files.items():
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+    return root
+
+
+def test_the_cost_ledger_is_published_with_the_results_card_one_line_per_job(tmp_path, settings, fake, said):
+    hub = seed(fake)
+    ledger = ledger_file(tmp_path, "job-a", "job-b")
+
+    assert publish(settings, hub, ledger=ledger, echo=said.append).ok
+
+    held = fake.repos[RESULTS]["main"]
+    lines = [json.loads(line) for line in held["ledger.jsonl"].decode().splitlines()]
+    assert [(line["job_id"], line["pending"], line["cost_micro_usd"]) for line in lines] == [
+        ("job-a", False, 159_996),
+        ("job-b", False, 159_996),
+    ]
+    assert "- `ledger.jsonl`: the cost ledger, one line per job." in held["README.md"].decode()
+    assert "  with its card: ledger.jsonl" in said
+    fake.calls.clear()
+
+    assert publish(settings, hub, ledger=ledger, echo=said.append).ok
+    assert calls(fake, "upload_folder") == []
+
+
+def test_a_job_the_ledger_still_holds_as_pending_refuses_the_run(tmp_path, settings, fake):
+    hub = seed(fake)
+    ledger = ledger_file(tmp_path, "job-a", pending=("job-b",))
+
+    with pytest.raises(DriftmapError) as refused:
+        publish(settings, hub, ledger=ledger, echo=lambda line: None)
+
+    assert refused.value.exit_code == ExitCode.INTEGRITY
+    assert "the cost ledger holds 1 pending job (job-b)" in str(refused.value)
+    assert "`driftmap wait job-b`" in str(refused.value)
+    assert writes(fake) == []
+
+
+def test_a_ledger_that_does_not_parse_refuses_and_a_missing_one_is_left_out(tmp_path, settings, fake):
+    hub = seed(fake)
+    assert plan(settings, hub, ledger=tmp_path / "none.jsonl").problems == ()
+    ledger = ledger_file(tmp_path, "job-a")
+    ledger.write_text(ledger.read_text(encoding="utf-8") + "{cut", encoding="utf-8")
+
+    problems = [text for _, text in plan(settings, hub, ledger=ledger).problems]
+
+    assert problems == ["the cost ledger does not parse (line 3: cut off before its newline)"]
+
+
+def test_resume_markers_leave_the_results_repo_with_its_card(settings, fake):
+    hub = seed(fake)
+    put(fake, RESULTS, "partial/generate-full-1.json", b'{"done": ["harmful/en"]}\n')
+
+    publish(settings, hub, echo=lambda line: None)
+
+    held = fake.repos[RESULTS]["main"]
+    assert not [path for path in held if path.startswith("partial/")]
+    assert "partial/" not in held["README.md"].decode()
+
+
+def test_check_files_go_to_the_responses_and_the_results_repo_with_their_cards(tmp_path, settings, fake, said):
+    """A check's answers may quote digits and addresses like any row; its summaries are read like any other file."""
+    hub = seed(fake)
+    row = (json.dumps({"id": "a", "response": f"call {DIGITS} or write to someone@example.org"}) + "\n").encode()
+    checks = check_files(
+        tmp_path,
+        {
+            "responses/q4_local/q4_full.jsonl": row,
+            "responses/q4_local/q4_full_labels.jsonl": b'{"id": "a", "label": "safe"}\n',
+            "responses/limit_768/cap.jsonl": row,
+            "results/q4_local/q4_full.meta.json": b'{"quant": "q4_k_m"}\n',
+        },
+    )
+
+    assert publish(settings, hub, checks=checks, echo=said.append).ok
+
+    answers, summaries = fake.repos[RESPONSES]["main"], fake.repos[RESULTS]["main"]
+    assert answers["checks/q4_local/q4_full.jsonl"] == row
+    assert {path for path in answers if path.startswith("checks/")} == {
+        "checks/q4_local/q4_full.jsonl",
+        "checks/q4_local/q4_full_labels.jsonl",
+        "checks/limit_768/cap.jsonl",
+    }
+    assert {path for path in summaries if path.startswith("checks/")} == {"checks/q4_local/q4_full.meta.json"}
+    assert not [path for path in fake.repos[EVAL]["main"] if path.startswith("checks/")]
+    card = answers["README.md"].decode()
+    assert "- `checks/q4_local/` (2 files): the fine-tuned model as a q4_k_m file and at full precision" in card
+    assert "- `checks/limit_768/` (1 file): " in card and "checks/engine_noise/" not in card
+    assert "- `checks/q4_local/` (1 file): " in summaries["README.md"].decode()
+    assert "  with its card: checks/limit_768/ (1 file), checks/q4_local/ (2 files)" in said
+    fake.calls.clear()
+
+    assert publish(settings, hub, checks=checks, echo=said.append).ok
+    assert calls(fake, "upload_folder") == []
+
+
+def test_no_checks_folder_is_no_problem(tmp_path, settings, fake):
+    hub = seed(fake)
+
+    drawn = plan(settings, hub, checks=tmp_path / "local" / "checks")
+
+    assert drawn.problems == ()
+    assert not [name for step in drawn.steps for name, _ in step.extra if name.startswith("checks/")]
+
+
+@pytest.mark.parametrize(
+    ("name", "data", "refusal"),
+    [
+        ("responses/q4_local/q4_full.jsonl", f"token {TOKEN}\n".encode(), "q4_full.jsonl:1: hf_token in the new file"),
+        ("results/q4_local/meta.json", f"account {DIGITS}\n".encode(), "meta.json:1: account_id in the new file"),
+        ("results/q4_local/notes.md", b"ask someone@example.org\n", "notes.md:1: email in the new file"),
+        ("responses/q4_local/model.bin", b"\x00\xff", "model.bin: not text, so the scan cannot read it"),
+        ("responses/q4_local/empty.jsonl", b"", "checks/responses/q4_local/empty.jsonl is empty"),
+        ("responses/other/rows.jsonl", b"{}\n", "checks/responses/other/rows.jsonl is in no known check"),
+        ("eval/q4_local/rows.jsonl", b"{}\n", "checks/eval/q4_local/rows.jsonl is in no known check"),
+        ("responses/rows.jsonl", b"{}\n", "checks/responses/rows.jsonl is in no known check"),
+    ],
+)
+def test_a_check_file_with_a_finding_or_out_of_place_refuses_before_any_write(
+    tmp_path, settings, fake, name, data, refusal
+):
+    hub = seed(fake)
+    checks = check_files(tmp_path, {name: data})
+
+    with pytest.raises(DriftmapError) as refused:
+        publish(settings, hub, checks=checks, echo=lambda line: None)
+
+    assert refusal in str(refused.value) and TOKEN not in str(refused.value)
+    assert writes(fake) == []
+
+
+def test_the_training_log_stays_in_the_adapter_repo_when_its_checkpoint_leaves(settings, fake, said):
+    hub = seed(fake)
+    log = fake.repos[ADAPTER]["main"]["last-checkpoint/trainer_state.json"]
+
+    assert publish(settings, hub, echo=said.append).ok
+
+    held = fake.repos[ADAPTER]["main"]
+    assert held["trainer_state.json"] == log and not [path for path in held if path.startswith("last-checkpoint/")]
+    assert "- Training log: `trainer_state.json` in this repo" in held["README.md"].decode()
+    assert "  with its card: trainer_state.json" in said
+    fake.calls.clear()
+
+    assert publish(settings, hub, echo=said.append).ok
+    assert calls(fake, "upload_folder") == []
+    assert "- Training log: `trainer_state.json` in this repo" in fake.repos[ADAPTER]["main"]["README.md"].decode()
+
+
+def test_an_adapter_without_a_training_log_gets_a_card_that_names_none(settings, fake):
+    hub = seed(fake)
+    fake._commit(ADAPTER, "job upload", delete=["last-checkpoint/trainer_state.json"])
+
+    assert publish(settings, hub, echo=lambda line: None).ok
+
+    held = fake.repos[ADAPTER]["main"]
+    assert "trainer_state.json" not in held and "Training log" not in held["README.md"].decode()
 
 
 def test_the_code_repo_the_cards_link_to_pins_its_toolkits():

@@ -125,6 +125,12 @@ def test_the_exemption_covers_the_trees_of_runs_under_the_safety_patch(tmp_path)
     assert not is_row(("patched", "tables", "tables-patched.json")) and not is_row(("patched", "runs", "x.json"))
 
 
+def test_the_rows_of_a_check_are_its_jsonl_files():
+    assert is_row(("checks", "q4_local", "q4_full.jsonl")) and is_row(("checks", "limit_768", "cap_labels_256.jsonl"))
+    assert not is_row(("checks", "q4_local", "q4_full.meta.json")) and not is_row(("checks", "report.jsonl"))
+    assert not is_row(("checks", "judge_validation", "report.md"))
+
+
 def test_the_exemption_covers_the_script_variant_rows_inside_any_tree(tmp_path):
     root = tmp_path / "data"
     row = json.dumps({"prompt": f"call {ACCOUNT} now"}) + "\n"

@@ -12,7 +12,7 @@ from huggingface_hub.repocard import RepoCard
 from pydantic import BaseModel
 
 from driftmap import quant
-from driftmap.core import ids
+from driftmap.core import ids, redact
 from driftmap.core.records import AlphaScreen, GenerationRow, LabelRow, Manifest, RunRecord, Tables
 from driftmap.core.settings import Settings
 from driftmap.repair.screen_gen import SCREEN_FILE, screen_path
@@ -78,9 +78,9 @@ EVAL_HOW = (
     "CuratorKIT pipeline. Labels were written by the judge named below."
 )
 RESULTS_WHAT = (
-    "Run records, result tables, the cost ledger and masked job logs of a per-language safety study of Tiny Aya "
-    "Global and of a benign fine-tune of it. Logs and records can quote prompts and model outputs; quoted outputs "
-    "keep the base model's cc-by-nc-4.0 terms."
+    "Run records, result tables, breakdowns and the cost ledger of a per-language safety study of Tiny Aya Global "
+    "and of a benign fine-tune of it. Records can quote prompts and model outputs; quoted outputs keep the base "
+    "model's cc-by-nc-4.0 terms."
 )
 RESULTS_HOW = (
     "How it was made: every stage ran as a Hugging Face Job that wrote a run record with its inputs, outputs, "
@@ -262,7 +262,7 @@ llama-server -m {file}
 ```"""
 TITLES = {
     "eval": "Six-language safety evaluation set for Tiny Aya Global",
-    "results": "Multilingual safety map of Tiny Aya Global: runs, tables, costs and logs",
+    "results": "Multilingual safety map of Tiny Aya Global: runs, tables and costs",
     "responses": "Multilingual safety map of Tiny Aya Global: raw responses and judge outputs",
     "adapter": "Tiny Aya Global, benign multilingual fine-tune (LoRA adapter)",
     "adapter_nopre": "Tiny Aya Global, benign multilingual fine-tune with no safety preamble (LoRA adapter)",
@@ -292,6 +292,45 @@ OTHER_TREES = {
     ids.tree("full", "patch"): "with the safety patch as the system message",
 }
 SMOKE_TREE = ids.tree("smoke")
+VARIANTS_TREE = ids.tree("full", variants=True)
+LEDGER = "ledger.jsonl"
+# the trainer's log, kept at the root of an adapter repo when its last checkpoint leaves
+TRAINER_STATE = "trainer_state.json"
+TRAINING_LOG = (
+    f"- Training log: `{TRAINER_STATE}` in this repo, the trainer's state at its last checkpoint: the steps and "
+    "epochs it ran and the training loss it logged on the way."
+)
+# the side checks of the study: a folder each under this one, answers in the responses repo, summaries in the results
+CHECKS_TREE = f"{redact.CHECKS}/"
+CHECKS = {
+    "q4_local": (
+        "the fine-tuned model as a q4_k_m file and at full precision, both run by one CPU engine under the served "
+        "template",
+        {
+            "responses": "the answers of both and the judge's labels for them, joined by `id`",
+            "results": "the engine, the model file and the request settings",
+        },
+    ),
+    "limit_768": (
+        "answers of the base model that the 256-token limit cut off, generated again with a limit of 768 tokens",
+        {"responses": "the answers, and the judge's labels for each whole answer and for its first 256 tokens"},
+    ),
+    "engine_noise": (
+        "harmful prompts answered again by the base model at full precision on a CPU, beside the stored answers",
+        {"responses": "the answers, and the judge's labels for them and for the stored answers"},
+    ),
+    "judge_validation": (
+        "the judge against human labels on public sets, and asked a second time about pairs of this study",
+        {
+            "responses": "the sampled pairs by id with their human labels, and the judge's answers",
+            "results": "the agreement reports, and the sources with their pinned revisions and licences",
+        },
+    ),
+    "patch_heldout": (
+        "the safety patch on harmful prompts held out of the evaluation set",
+        {"responses": "the prompts, the answers with and without the patch, and the judge's labels"},
+    ),
+}
 
 
 def _fields(model: type[BaseModel]) -> tuple[str, ...]:
@@ -304,6 +343,7 @@ _PROMPT = ("prompt_id", "language", "set", "prompt")
 LAYOUT = {
     "eval": (
         ("manifest.json", False, "counts, seed, pinned source revisions and source licences", (), True),
+        ("dataset_card.md", False, "the same counts and sources as a page, written when the set was built", (), False),
         (
             "prompts/harmful/",
             False,
@@ -320,17 +360,26 @@ LAYOUT = {
         ),
         ("prompts/xstest/", False, "safe prompts that only look harmful, in English", (*_PROMPT, "type"), True),
         (
+            "prompts/rendered_prefix.json",
+            False,
+            "the hash and the token count of what the chat template puts before a prompt, and the tokenizer revision",
+            (),
+            False,
+        ),
+        (
             "sft_train/",
             False,
-            "the benign fine-tuning rows, each a prompt and a completion as chat turns",
+            "the rows the adapters were fine-tuned on: training data, not evaluation prompts; benign, each a prompt "
+            "and a completion as chat turns",
             ("prompt", "completion"),
             True,
         ),
         (
-            ids.tree("full", variants=True),
+            VARIANTS_TREE,
             False,
             "script stress sets: evaluation prompts written again in Latin script or mixed with English, each "
-            "linked to its parent prompt",
+            f"linked to its parent prompt; `{VARIANTS_TREE}labels/<checkpoint>/` holds the judge's labels for the "
+            "answers to them",
             ("prompt_id", "parent_prompt_id", "language", "set", "variant", "prompt"),
             False,
         ),
@@ -345,9 +394,15 @@ LAYOUT = {
     ),
     "results": (
         ("runs/", False, "one record per job: inputs, outputs, minutes, cost and notes", (), True),
-        ("tables/", False, "the result tables as JSON and as Markdown", (), True),
-        ("ledger.jsonl", False, "the cost ledger, one line per job", (), True),
-        ("logs/", False, "masked job logs", (), True),
+        (
+            "tables/",
+            False,
+            "the result tables as JSON and as Markdown: the per-language tables, the breakdowns by harm category, "
+            "prompt origin and answer length (`breakdown*`) and, once built, the script stress sets (`variants.*`)",
+            (),
+            True,
+        ),
+        (LEDGER, False, "the cost ledger, one line per job", (), True),
         (
             PUBLICATION,
             False,
@@ -365,6 +420,13 @@ LAYOUT = {
             True,
         ),
         ("judge_raw/", True, "the judge's unparsed answer to each judged response", (), True),
+        (
+            VARIANTS_TREE,
+            False,
+            f"the answers to the script stress sets of the evaluation set, in `{VARIANTS_TREE}responses/<checkpoint>/`",
+            (),
+            False,
+        ),
     ),
 }
 
@@ -604,8 +666,9 @@ def _compared(found: Tables, base: str, checkpoint: str, pair: Pair, condition: 
     return ["\n".join(table), "\n".join(f"- {name}: {text}" for name, text in changes.items() if text)]
 
 
-def _training(recipe: Mapping[str, Any] | None, run: RunRecord | None, merged: str) -> list[str]:
-    """The training list of an adapter card: its recipe, the evaluated checkpoint and the cost of the run."""
+def _training(recipe: Mapping[str, Any] | None, run: RunRecord | None, merged: str, log: bool = False) -> list[str]:
+    """The training list of an adapter card: its recipe, its log when the repo keeps one, the evaluated checkpoint
+    and the cost of the run."""
     values = {key: value for key, value in (recipe or {}).items() if value is not None}
     if isinstance(values.get("target_modules"), list):
         values["target_modules"] = ", ".join(values["target_modules"])
@@ -618,7 +681,7 @@ def _training(recipe: Mapping[str, Any] | None, run: RunRecord | None, merged: s
     for template in RECIPE_LINES:
         if all(name in values for _, name, _, _ in Formatter().parse(template) if name):
             lines.append(template.format_map(values))
-    lines += [f"- Recipe: `{RECIPE}` in this repo.", MERGED_HOW.format(merged=merged)]
+    lines += [f"- Recipe: `{RECIPE}` in this repo.", *([TRAINING_LOG] * log), MERGED_HOW.format(merged=merged)]
     if run and run.cost_micro_usd is not None and run.minutes is not None:
         cost = f"${run.cost_micro_usd / 1_000_000:.2f} for {run.minutes} minutes on {run.flavor}"
         lines.append(f"- Cost: {cost} (`runs/{run.run_id}.json` in the results dataset).")
@@ -670,6 +733,7 @@ def _adapter(
     nopreamble: Tables | None,
     records: list[RunRecord],
     recipe: Mapping[str, Any] | None,
+    log: bool = False,
 ) -> list[str]:
     """An adapter card between its title and its provenance; its notice follows what its tables measured."""
     preamble = TRAINED[key]
@@ -698,7 +762,7 @@ def _adapter(
         *([f"The project pins {' and '.join(pinned)}."] if pinned else []),
         *([USAGE_NOPRE] if preamble == "strip" else []),
         "## Training",
-        "\n".join(_training(recipe, run, latest.merged_sha256 if latest else "not recorded")),
+        "\n".join(_training(recipe, run, latest.merged_sha256 if latest else "not recorded", log)),
         "## Intended use and limits",
         INTENDED,
         "\n".join(_limits(settings, manifest)),
@@ -786,6 +850,11 @@ def _files(key: str, paths: Sequence[str] | None) -> list[str]:
         count = f" ({', '.join(counts)})" if under else ""
         shown = f" Fields: {', '.join(f'`{name}`' for name in fields)}." if fields else ""
         lines.append(f"- `{place}`{count}: {what}.{shown}")
+    for name, (what, kept) in CHECKS.items():
+        under = [path for path in main or () if path.startswith(f"{CHECKS_TREE}{name}/")]
+        if under:
+            holds = f"; here {kept[key]}" if key in kept else ""
+            lines.append(f"- `{CHECKS_TREE}{name}/` ({_plural(len(under), 'file')}): {what}{holds}.")
     for tree, condition in OTHER_TREES.items():
         under = [path for path in paths or () if path.startswith(tree)]
         if under:
@@ -905,7 +974,8 @@ def _bodies(
     # each adapter is measured by the tables of its own fine-tune
     measured = dict(zip(ADAPTERS, ((tables, nopreamble), aggressive), strict=True))
     for key in ADAPTERS:
-        bodies[key] = _adapter(key, settings, manifest, *measured[key], records, recipes.get(key))
+        log = TRAINER_STATE in files.get(key, ())
+        bodies[key] = _adapter(key, settings, manifest, *measured[key], records, recipes.get(key), log)
     return bodies
 
 
@@ -932,7 +1002,8 @@ def render_cards(
     from those, the latter also from ``aggressive_screen``, the screen its weight was chosen on. The cards name
     the condition with no safety preamble once a table of it is given, or a full run made under it is among
     ``records``. ``recipes`` holds, per adapter key, the recipe file of its repo; ``files`` holds, per dataset key,
-    the paths its repo will hold, which its card then counts. ``copies`` names, per key of a repo published as a
+    the paths its repo will hold, which its card then counts, and per adapter key those of its repo, whose card
+    names the training log when it is among them. ``copies`` names, per key of a repo published as a
     clean copy, the working repo and revision it was made from.
     """
     records = list(records)

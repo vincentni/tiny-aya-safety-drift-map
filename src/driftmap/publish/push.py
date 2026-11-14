@@ -5,7 +5,8 @@ import json
 import re
 import shutil
 import tempfile
-from collections.abc import Callable, Iterator
+from collections import Counter
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import AbstractContextManager, contextmanager
 from pathlib import Path
 from typing import Any, Literal, NamedTuple
@@ -23,6 +24,7 @@ from driftmap.core.ids import RepoRef
 from driftmap.core.records import AlphaScreen, Manifest, Record, RunRecord, Tables, dump, load
 from driftmap.core.schemas import DriftmapError, ExitCode
 from driftmap.core.settings import Settings
+from driftmap.jobs.ledger import Ledger, LedgerCorrupt
 from driftmap.publish import cards, collections
 from driftmap.repair.screen_gen import screen_path
 from driftmap.scripts.drift import RECIPE, repo_names
@@ -46,8 +48,19 @@ ORDER = (
 # a smoke tree goes whole, those of the other conditions inside it too; the full trees lose their superseded labels
 ROWS = ("smoke/*", *(f"{tree}labels/*/superseded/*" for tree in ("", *cards.OTHER_TREES)))
 CHECKPOINT = ("last-checkpoint/*", "training_args.bin")
+# what a job that stopped early resumes from; nothing reads it once the study is published
+MARKERS = ("partial/*",)
 # removed by a repo's card commit; an adapter's training state is not part of the artifact
-STALE = {**dict.fromkeys(cards.DATASETS, ROWS), **dict.fromkeys(cards.ADAPTERS, CHECKPOINT)}
+STALE = {
+    **dict.fromkeys(cards.DATASETS, ROWS),
+    "results": (*ROWS, *MARKERS),
+    **dict.fromkeys(cards.ADAPTERS, CHECKPOINT),
+}
+# the trainer's log in the checkpoint; the card commit keeps a copy of it at the root
+CHECKPOINT_LOG = f"last-checkpoint/{cards.TRAINER_STATE}"
+# the local folder of the side checks, under the CLI's local folder: <repo key>/<check>/<file>
+CHECKS_DIR = "checks"
+CHECK_REPOS = ("responses", "results")
 WEIGHTS = ["adapter_model.bin", "pytorch_model*.bin"]
 # pickles the trainer leaves beside the weights; an adapter is refused while one is left
 PICKLES = (".bin", ".pt", ".pth")
@@ -62,7 +75,17 @@ CARD_INPUTS = (
     (screen_path("full", cards.TRAINED[cards.ADAPTERS[1]], "aggressive"), "results", AlphaScreen),
 )
 # read again for the cards, or to see whether the head already holds what a run would write
-KEPT = [*(name for name, _, _ in CARD_INPUTS), "runs/*.json", RECIPE, cards.PUBLICATION, CARD]
+KEPT = [
+    *(name for name, _, _ in CARD_INPUTS),
+    "runs/*.json",
+    RECIPE,
+    cards.PUBLICATION,
+    cards.LEDGER,
+    f"{cards.CHECKS_TREE}*",
+    cards.TRAINER_STATE,
+    CHECKPOINT_LOG,
+    CARD,
+]
 EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}")
 RULES = {**redact.PATTERNS, "email": EMAIL}
 CACHE = ".cache"
@@ -255,11 +278,21 @@ class Plan(NamedTuple):
                 f"collection: {'listed' if listed else 'add'}",
             ]
             out.append(f"{target.repo} ({target.repo_type}): {'; '.join(parts)}")
+            out += [f"  with its card: {_carried(step.extra)}"] if step.extra else []
         out += [f"absent: {target.repo} ({target.repo_type})" for target in self.absent]
         verb = "would delete" if delete else "stays private"
         out += [f"{verb}: {repo} ({repo_type})" for repo, repo_type, _ in self.hidden]
         out += [f"working copy, stays private: {repo} ({repo_type})" for repo, repo_type, _ in self.working]
         return [*out, *(f"problem: {text}" for _, text in self.problems), *self.advice]
+
+
+def _carried(extra: tuple[tuple[str, bytes], ...]) -> str:
+    """The files that go with a card, as a plan names them: a check folder with its count, any other by name."""
+    names = [name for name, _ in extra]
+    folders = Counter(name.rpartition("/")[0] for name in names if name.startswith(cards.CHECKS_TREE))
+    plain = [name for name in names if not name.startswith(cards.CHECKS_TREE)]
+    counted = (f"{folder}/ ({count} file{'s' * (count > 1)})" for folder, count in sorted(folders.items()))
+    return ", ".join([*plain, *counted])
 
 
 class Row(NamedTuple):
@@ -581,17 +614,69 @@ def _hidden(settings: Settings, hub: Hub) -> list[tuple[str, str, State]]:
     return [(repo, repo_type, state) for repo, repo_type, state in found if state.exists]
 
 
+def _booked(path: Path | None) -> tuple[bytes | None, list[str]]:
+    """The local cost ledger as it is published, the last line of each job, and what stands against that.
+
+    No file, or an empty one, publishes nothing; a job whose cost is still its timeout is a problem.
+    """
+    if path is None:
+        return None, []
+    try:
+        lines = Ledger(path).read()
+    except LedgerCorrupt as error:
+        return None, [f"the cost ledger does not parse ({str(error).removeprefix(f'{path}: ')})"]
+    pending = [job for job, line in lines.items() if line.pending]
+    if pending:
+        waits = ", ".join(f"`driftmap wait {job}`" for job in pending)
+        held = f"the cost ledger holds {len(pending)} pending job{'s' * (len(pending) > 1)} ({', '.join(pending)})"
+        return None, [f"{held}, booked at the timeout: record the cost with {waits}, then publish again"]
+    return b"".join(line.model_dump_json().encode() + b"\n" for line in lines.values()) or None, []
+
+
+def _checked(root: Path | None) -> tuple[dict[str, list[tuple[str, bytes]]], list[str]]:
+    """The files of the local checks folder by the repo they go to, each under its path there, and the misplaced.
+
+    A file is ``<repo key>/<check>/<file>``, the check one the cards describe; no folder is no file.
+    """
+    held: dict[str, list[tuple[str, bytes]]] = {}
+    lacks = []
+    for path in sorted(root.rglob("*")) if root is not None and root.is_dir() else ():
+        if not path.is_file():
+            continue
+        key, *inner = path.relative_to(root).parts
+        shown = f"{CHECKS_DIR}/{'/'.join((key, *inner))}"
+        data = path.read_bytes()
+        if key not in CHECK_REPOS or len(inner) < 2 or inner[0] not in cards.CHECKS:
+            places = f"<{' or '.join(CHECK_REPOS)}>/<{' or '.join(cards.CHECKS)}>/"
+            lacks.append(f"{_safe(shown)} is in no known check; a check file goes under {places}")
+        elif not data:
+            lacks.append(f"{_safe(shown)} is empty")
+        else:
+            held.setdefault(key, []).append((f"{cards.CHECKS_TREE}{'/'.join(inner)}", data))
+    return held, lacks
+
+
 def plan(
-    settings: Settings, hub: Hub, *, writeup: str | None = None, scans: Scans | None = None, fresh: bool = False
+    settings: Settings,
+    hub: Hub,
+    *,
+    writeup: str | None = None,
+    scans: Scans | None = None,
+    fresh: bool = False,
+    ledger: Path | None = None,
+    checks: Path | None = None,
 ) -> Plan:
     """Read every repo, scan each commit and render each card; nothing on the Hub changes. Exit 4 above the ceiling.
 
     With ``fresh`` a repo whose history holds a finding, and whose head would not, is planned as a clean copy: a new
-    repo of its name holding the head's files, the repo with the history kept private under ``-work``.
+    repo of its name holding the head's files, the repo with the history kept private under ``-work``. ``ledger``
+    is the local cost ledger, planned into the results repo as ``ledger.jsonl``; ``checks`` is the local folder of
+    the side checks, whose files are planned into the responses and the results repo under ``checks/``. Both go
+    with the card of their repo and are scanned like it; neither has to exist.
     """
     scans = scans if scans is not None else Scans()
     try:
-        return _drawn(settings, hub, writeup, scans, fresh)
+        return _drawn(settings, hub, writeup, scans, fresh, ledger, checks)
     finally:
         # what was read stays read, also when the Hub stopped the run
         scans.save()
@@ -610,7 +695,15 @@ def _lacking(target: Target, state: State, work: State) -> str | None:
     return f"{target.repo} does not exist" if target.required and not state.exists else None
 
 
-def _drawn(settings: Settings, hub: Hub, writeup: str | None, scans: Scans, fresh: bool) -> Plan:
+def _drawn(
+    settings: Settings,
+    hub: Hub,
+    writeup: str | None,
+    scans: Scans,
+    fresh: bool,
+    ledger: Path | None,
+    checks: Path | None,
+) -> Plan:
     wanted = targets(settings)
     hidden = _hidden(settings, hub)
     named = {target.key: _state(hub, target.repo, target.repo_type) for target in wanted}
@@ -712,7 +805,24 @@ def _drawn(settings: Settings, hub: Hub, writeup: str | None, scans: Scans, fres
             if target.key in origins
         }
         publication = Publication(schema=SCHEMA_PUBLICATION, copies=mapped).model_dump_json(indent=2) + "\n"
-        extras = {"results": ((cards.PUBLICATION, publication.encode()),)} if mapped else {}
+        booked, unbooked = _booked(ledger)
+        answers, misplaced = _checked(checks)
+        other += [(ExitCode.INTEGRITY, text) for text in (*unbooked, *misplaced)]
+        carried = {
+            "results": [
+                *([(cards.PUBLICATION, publication.encode())] if mapped else []),
+                *([(cards.LEDGER, booked)] if booked else []),
+            ],
+            # the checkpoint leaves with the card; what the trainer logged stays
+            **{
+                key: [(cards.TRAINER_STATE, files[key][CHECKPOINT_LOG])]
+                for key in cards.ADAPTERS
+                if CHECKPOINT_LOG in files.get(key, ())
+            },
+        }
+        for key, held in answers.items():
+            carried.setdefault(key, []).extend(held)
+        extras = {key: tuple(held) for key, held in carried.items() if held and key in files}
         rendered = cards.render_cards(
             settings,
             manifest=manifest,
@@ -721,10 +831,10 @@ def _drawn(settings: Settings, hub: Hub, writeup: str | None, scans: Scans, fres
             writeup=writeup,
             nopreamble=stripped,
             recipes={key: _recipe(files[key]) for key in cards.ADAPTERS if key in files},
-            # a dataset card counts the files its own commit leaves
+            # a dataset card counts the files its own commit leaves, an adapter card names its log among them
             files={
                 key: sorted((set(states[key].files) - set(stale[key])) | {name for name, _ in extras.get(key, ())})
-                for key in cards.DATASETS
+                for key in (*cards.DATASETS, *cards.ADAPTERS)
                 if key in stale
             },
             copies=origins,
@@ -737,13 +847,22 @@ def _drawn(settings: Settings, hub: Hub, writeup: str | None, scans: Scans, fres
             staged = Path(scratch, "cards", target.key, CARD)
             staged.parent.mkdir(parents=True)
             written = {CARD: card.encode(), **dict(extra)}
+            _staged(staged.parent, written.items())
             for name, data in written.items():
-                staged.with_name(name).write_bytes(data)
-                addresses = ((name, number, "email") for number in _addressed(data.decode()))
-                hits = [*redact.scan([staged.with_name(name)]), *addresses]
+                spot, row = f"{target.repo}/{_safe(name)}", redact.is_row(name.split("/"))
+                if not _is_text(data):
+                    other.append((ExitCode.INTEGRITY, f"{spot}: not text, so the scan cannot read it"))
+                    continue
+                found_here = redact.scan([staged.parent / name], data_root=staged.parent)
+                hits = [(finding.line, finding.pattern) for finding in found_here]
+                # the rows of a check quote addresses like any other row
+                hits += [] if row else [(number, "email") for number in _addressed(data.decode())]
+                what = WRITTEN.get(name, "file")
+                secrets += [(ExitCode.REDACTION, f"{spot}:{line}: {rule} in the new {what}") for line, rule in hits]
                 secrets += [
-                    (ExitCode.REDACTION, f"{target.repo}/{name}:{line}: {rule} in the new {WRITTEN.get(name, 'file')}")
-                    for _, line, rule in hits
+                    (ExitCode.REDACTION, f"{spot}: {rule} in the name of the new {what}")
+                    for rule, pattern in RULES.items()
+                    if pattern.search(f"/{name}") and not (row and rule == "account_id")
                 ]
             deletes = stale[target.key]
             gaps = {
@@ -776,6 +895,13 @@ def _drawn(settings: Settings, hub: Hub, writeup: str | None, scans: Scans, fres
         commits,
         tuple(working),
     )
+
+
+def _staged(folder: Path, files: Iterable[tuple[str, bytes]]) -> None:
+    """Write files into a folder, each under its path in the repo."""
+    for name, data in files:
+        (folder / name).parent.mkdir(parents=True, exist_ok=True)
+        (folder / name).write_bytes(data)
 
 
 def _addressed(text: str) -> list[int]:
@@ -849,8 +975,7 @@ def _copy(hub: Hub, step: Step, folder: Path) -> frozenset[str]:
     if {path for path in held if path.split("/")[0] != CACHE} != set(kept):
         other = f"the download of {ids.unparse(work)} holds other files than its listing"
         raise DriftmapError(ExitCode.INTEGRITY, f"{other}; nothing was uploaded")
-    for name, data in ((CARD, step.card.encode()), *step.extra):
-        (folder / name).write_bytes(data)
+    _staged(folder, ((CARD, step.card.encode()), *step.extra))
     hub.upload_folder(
         target.repo,
         folder,
@@ -896,6 +1021,8 @@ def publish(
     resume: str | None = None,
     scans: Scans | None = None,
     fresh: bool = False,
+    ledger: Path | None = None,
+    checks: Path | None = None,
     echo: Echo = print,
 ) -> Check | None:
     """Card, open and list every repo; the final check, or None after a dry run, which refuses where the run would.
@@ -903,14 +1030,18 @@ def publish(
     ``scans`` reuses what an earlier plan read. With ``fresh`` a repo whose history alone holds a finding is
     published as a clean copy: it is renamed to ``<name>-work`` and stays private, a new repo of its name takes the
     head's files in one commit, and ``publication.json`` in the results repo records where each copy came from.
+    The card commit of the results repo carries the local cost ledger at ``ledger``, one line per job, and those of
+    the responses and the results repo the files of the local ``checks`` folder; an adapter's keeps the trainer's
+    log of the checkpoint it removes.
     """
     _identity(settings, hub)
     scans = scans if scans is not None else Scans()
-    drawn = plan(settings, hub, writeup=writeup, scans=scans, fresh=fresh)
+    local = {"ledger": ledger, "checks": checks}
+    drawn = plan(settings, hub, writeup=writeup, scans=scans, fresh=fresh, **local)
     # a paid job rebuilds the merged checkpoint, so it goes only when the run can go on
     if delete and not dry_run and set(drawn.problems) <= set(drawn.exposed):
         delete_intermediates(settings, hub, echo=echo)
-        drawn = plan(settings, hub, writeup=writeup, scans=scans, fresh=fresh)
+        drawn = plan(settings, hub, writeup=writeup, scans=scans, fresh=fresh, **local)
     for line in drawn.lines(delete and dry_run):
         echo(line)
     # a dry run deletes nothing, so what its delete would clear does not stand against it
@@ -920,6 +1051,7 @@ def publish(
     if dry_run:
         return None
     given = f"{', delete=True' * delete}{', fresh=True' * fresh}{f', writeup={writeup!r}' if writeup else ''}"
+    given += "".join(f", {name}={name}" for name, path in local.items() if path is not None)
     resume = resume or f"resume: run publish(settings, hub{given}) again; finished steps are skipped"
 
     def reported(action: str) -> AbstractContextManager[None]:
@@ -939,8 +1071,7 @@ def publish(
                 origin = f"{step.copy.repo}@{step.copy.revision[:12]}"
                 echo(f"clean copy: {target.repo} ({target.repo_type}) from {origin}")
                 continue
-            for name, data in ((CARD, step.card.encode()), *step.extra):
-                (staged / name).write_bytes(data)
+            _staged(staged, ((CARD, step.card.encode()), *step.extra))
             with reported(f"the card upload to {target.repo}"):
                 hub.upload_folder(
                     target.repo,

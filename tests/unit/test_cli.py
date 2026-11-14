@@ -2269,6 +2269,34 @@ def test_publish_plan_prints_the_plan_and_exits_with_its_first_problem(shelf):
     assert published.writes(shelf.hub) == [] and set(PUBLISHED) <= shelf.hub.private
 
 
+def test_publish_reads_the_local_ledger_and_checks_and_its_plan_shows_the_space_step(shelf):
+    """One plan shows everything that goes public: the repos, the ledger, the check files and the Space."""
+    row = {"schema": "driftmap.ledger/1", "job_id": "job-a", "run_id": "generate-a", "kind": "generate"}
+    row |= {"flavor": "l4x1", "mode": "full", "price_micro_usd_per_min": 13_333, "minutes": 12, "timeout_s": 1800}
+    row |= {"cost_micro_usd": 159_996, "stage": "COMPLETED", "record_status": None, "exit_code": 0, "notes": []}
+    row |= {"billing_used_after_micro_usd": None, "pending": False, "lost": False, "oom": False}
+    shelf.ledger.path.parent.mkdir(parents=True, exist_ok=True)
+    shelf.ledger.path.write_text(json.dumps(row | {"ts": "2026-11-14T10:00:00Z"}) + "\n", encoding="utf-8")
+    answers = shelf.root / LOCAL / "checks" / "responses" / "q4_local" / "q4_full.jsonl"
+    answers.parent.mkdir(parents=True)
+    answers.write_text('{"id": "a", "response": "placeholder"}\n', encoding="utf-8")
+
+    drawn = run("publish", "plan")
+
+    assert drawn.exit_code == 0, drawn.output
+    lines = drawn.output.splitlines()
+    assert "  with its card: ledger.jsonl" in lines and "  with its card: checks/q4_local/ (1 file)" in lines
+    space = f"{published.OWNER}/tiny-aya-safety-map (space, static): not ready: space/data.json is missing"
+    assert any(line.startswith(space) for line in lines) and published.writes(shelf.hub) == []
+
+    done = run("publish", "run")
+
+    assert done.exit_code == 0, done.output
+    assert shelf.hub.repos[published.RESPONSES]["main"]["checks/q4_local/q4_full.jsonl"] == answers.read_bytes()
+    held = shelf.hub.repos[published.RESULTS]["main"]["ledger.jsonl"].decode().splitlines()
+    assert [json.loads(line)["job_id"] for line in held] == ["job-a"]
+
+
 def test_a_publish_dry_run_prints_the_plan_and_writes_nothing(shelf):
     dry = run("publish", "run", "--dry-run", "--delete-intermediates", "--writeup", LINK)
 

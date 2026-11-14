@@ -9,7 +9,7 @@ import pytest
 from driftmap.core.hub import Hub
 from driftmap.core.schemas import DriftmapError, ExitCode
 from driftmap.jobs.snapshot import TABLES_PATH
-from driftmap.publish.space import FILES, SPACE, publish_space
+from driftmap.publish.space import FILES, SPACE, planned, publish_space
 from tests.fakes import FakeClock, FakeHub
 from tests.fakes.labels import OWNER, make_settings
 from tests.fakes.published import ADAPTER, EVAL, RESULTS, writes
@@ -125,6 +125,33 @@ def test_a_dry_run_lists_the_files_and_writes_nothing(settings, fake, root):
     assert said[0] == f"{REPO} (space, static): create; public after the upload"
     assert said[1:-1] == [f"upload: {name}" for name in UPLOADED]
     assert said[-1] == "dry run: nothing was written"
+
+
+def test_a_plan_names_the_space_and_its_files_while_the_repos_it_names_are_private(settings, fake, root):
+    """The plan comes before the repos are opened, so their state is no obstacle to it."""
+    fake.private.add(EVAL)
+    fake.authorize(EVAL)
+    hub = Hub(fake, sleep=FakeClock().sleep)
+
+    lines = planned(settings, hub, root)
+
+    assert lines[0] == f"{REPO} (space, static): create; public after `driftmap publish space`"
+    assert lines[1:] == [f"upload: {name}" for name in UPLOADED]
+    assert writes(fake) == [] and REPO not in fake.repos
+
+
+def test_a_plan_says_why_the_space_is_not_ready_and_refuses_nothing(settings, fake, root):
+    (root / "space" / "data.json").unlink()
+    hub = Hub(fake, sleep=FakeClock().sleep)
+
+    lines = planned(settings, hub, root)
+
+    missing = "space/data.json is missing; run `python space/build_data.py` first"
+    assert lines == [f"{REPO} (space, static): not ready: {missing}"]
+    (root / "space" / "data.json").write_text(json.dumps({"figures": ["f1.png", "f1.svg"]}), encoding="utf-8")
+    (root / "space" / "app.js").write_text(f"// {TOKEN}\n", encoding="utf-8")
+    found = planned(settings, hub, root)
+    assert len(found) == 1 and "not ready: " in found[0] and "hf_token" in found[0] and TOKEN not in found[0]
 
 
 def test_a_second_run_updates_the_space_and_drops_a_figure_that_is_gone(settings, fake, root):

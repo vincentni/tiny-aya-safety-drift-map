@@ -132,6 +132,30 @@ def _answers(url: str, opener: Callable[..., Any], sleep: Callable[[float], None
     )
 
 
+def planned(settings: Settings, hub: Hub, root: str | Path) -> list[str]:
+    """The Space step as lines of a publication plan: the files ``publish_space`` would upload, or why it would
+    refuse the folder.
+
+    Reads only. The repos the Space names are still private while a publication is planned, so they are not asked for.
+    """
+    root, repo = Path(root), space_id(settings)
+    head = f"{repo} (space, static)"
+    try:
+        files = _built(root, settings)
+        _scanned(root, files)
+    except DriftmapError as error:
+        return [f"{head}: not ready: {'; '.join(str(error).splitlines())}"]
+    try:
+        now = hub.space_info(repo)
+    except RepositoryNotFoundError:
+        now = None
+    except push.FAILURES as error:
+        return [f"{head}: could not be read ({push._cause(error)})"]
+    state = "create" if now is None else "update"
+    opened = "public" if now is not None and now.private is False else "public after `driftmap publish space`"
+    return [f"{head}: {state}; {opened}", *(f"upload: {name}" for name in files)]
+
+
 def publish_space(
     settings: Settings,
     hub: Hub,

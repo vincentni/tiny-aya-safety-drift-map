@@ -18,6 +18,8 @@ PATTERNS = {
 }
 # dataset rows quote arbitrary numbers; screen holds the repair screen's rows with their labels and judge answers
 DIGIT_EXEMPT_DIRS = frozenset({"prompts", "sft_train", "labels", "responses", "judge_raw", "screen"})
+# the folder of the side checks, one folder per check
+CHECKS = "checks"
 # smoke runs, runs under another prompt condition and, inside either, runs over the script variants keep the same
 # folders under a tree of their own; longest first
 _PREFIXES = {
@@ -72,7 +74,11 @@ def is_row(parts: Sequence[str]) -> bool:
     """Whether a path inside a dataset, given as its parts, is a file of rows in the tree of any run."""
     parts = tuple(parts)
     tree = next(tree for tree in TREES if parts[: len(tree)] == tree)
-    return len(parts) - len(tree) > 1 and parts[len(tree)] in DIGIT_EXEMPT_DIRS
+    inner = parts[len(tree) :]
+    if len(inner) < 2:
+        return False
+    # a check keeps its answers and labels as JSONL beside summaries, which are read like any other file
+    return inner[0] in DIGIT_EXEMPT_DIRS or (inner[0] == CHECKS and len(inner) > 2 and inner[-1].endswith(".jsonl"))
 
 
 def _digits_exempt(path: Path, data_root: str | Path | None) -> bool:

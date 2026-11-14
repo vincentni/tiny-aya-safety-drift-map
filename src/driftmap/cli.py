@@ -1629,17 +1629,31 @@ def _said(line: str) -> None:
     typer.echo(redact.mask(line))
 
 
+def _published_here(root: Path, push: Any) -> dict[str, Any]:
+    """What a publication reads in the checkout: the saved scan, the cost ledger and the folder of check files."""
+    local = root / LOCAL
+    return {
+        "scans": push.Scans(local / push.SCAN_FILE),
+        "ledger": root / launcher.LEDGER_PATH,
+        "checks": local / push.CHECKS_DIR,
+    }
+
+
 @publish_app.command("plan")
 @_finish
 def publish_plan(writeup: Writeup = None) -> ExitCode:
-    """Scan every commit of every repo and print what a run would do and what stops it; change nothing."""
+    """Scan every commit of every repo and print what a run would do and what stops it; change nothing.
+
+    The plan names all that goes public: each repo, the cost ledger and the check files that go with the cards, and
+    the Space step of `publish space`, which stops no run.
+    """
     # nothing is launched or billed: the scan is the check, not the readiness report
     settings, deps = _open("publish plan", ready=False, writeup=_link(writeup))
     # pulls the statistics packages
-    from driftmap.publish import push
+    from driftmap.publish import push, space
 
-    drawn = push.plan(settings, deps.hub, writeup=writeup, scans=push.Scans(deps.repo_root / LOCAL / push.SCAN_FILE))
-    for line in drawn.lines():
+    drawn = push.plan(settings, deps.hub, writeup=writeup, **_published_here(deps.repo_root, push))
+    for line in (*drawn.lines(), *space.planned(settings, deps.hub, deps.repo_root)):
         _said(line)
     if not drawn.problems:
         return ExitCode.SUCCESS
@@ -1681,9 +1695,7 @@ def publish_run(
     resume = f"resume: {shlex.join(['driftmap', 'publish', 'run', *flags])}; finished steps are skipped"
     asked = {"dry_run": dry_run, "delete": delete_intermediates, "fresh": fresh, "writeup": writeup, "resume": resume}
     try:
-        push.publish(
-            settings, deps.hub, **asked, scans=push.Scans(deps.repo_root / LOCAL / push.SCAN_FILE), echo=_said
-        )
+        push.publish(settings, deps.hub, **asked, **_published_here(deps.repo_root, push), echo=_said)
     finally:
         if dry_run:
             typer.echo("dry run: nothing was written")
