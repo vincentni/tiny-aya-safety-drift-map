@@ -13,6 +13,7 @@ BASE: dict[str, Any] = {
     "runner": "pip",
     "scheduling_allowance_s": 1800,
     "gated_repos": ["CohereLabs/tiny-aya-global", "CohereLabs/tiny-aya-base"],
+    "frozen_repos": [],
     "repos": {
         "adapter": "tiny-aya-global-drift-lora",
         "merged": "tiny-aya-global-drift-merged",
@@ -82,7 +83,7 @@ BASE: dict[str, Any] = {
         "dare": {"on": True, "drop_rate": 0.3, "seed": 0},
     },
     "readiness": {"registration_confirmed": True, "confirmed_on": date(2026, 11, 7)},
-    "publish": {"space_not_serving": False},
+    "publish": {"space_not_serving": False, "locked": False},
     "prices_micro_usd_per_min": {"l4x1": 13_333, "a10g-small": 16_667, "cpu-upgrade": 500, "cpu-basic": 167},
     "revisions": {
         "CohereLabs/tiny-aya-global": "1" * 40,

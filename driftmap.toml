@@ -9,6 +9,25 @@ runner = "pip"
 scheduling_allowance_s = 1800
 lock_path = "~/.driftmap/launch.lock"
 gated_repos = ["CohereLabs/tiny-aya-global", "CohereLabs/tiny-aya-base"]
+# repos a publication reads and never changes
+frozen_repos = [
+    "vincentnkq/tiny-aya-global-drift-lora",
+    "vincentnkq/tiny-aya-global-drift-lora-nopre",
+    "vincentnkq/tiny-aya-global-drift-merged",
+    "vincentnkq/tiny-aya-global-drift-merged-nopre",
+    "vincentnkq/tiny-aya-global-drift-GGUF",
+    "vincentnkq/tiny-aya-global-repaired",
+    "vincentnkq/tiny-aya-global-repaired-nopre",
+    "vincentnkq/tiny-aya-global-repaired-GGUF",
+    "vincentnkq/tiny-aya-global-drift-lora-smoke",
+    "vincentnkq/tiny-aya-global-drift-lora-nopre-smoke",
+    "vincentnkq/tiny-aya-global-drift-merged-smoke",
+    "vincentnkq/tiny-aya-global-drift-merged-nopre-smoke",
+    "vincentnkq/tiny-aya-global-drift-GGUF-smoke",
+    "vincentnkq/tiny-aya-global-repaired-smoke",
+    "vincentnkq/tiny-aya-global-repaired-nopre-smoke",
+    "vincentnkq/tiny-aya-global-repaired-GGUF-smoke",
+]
 
 # names under the owner's namespace; merged is private, responses is gated
 [repos]
@@ -117,6 +136,7 @@ confirmed_on = 2026-11-07
 
 [publish]
 space_not_serving = false
+locked = false
 
 # micro-USD per minute; used for a flavor the live hardware list does not price
 [prices_micro_usd_per_min]

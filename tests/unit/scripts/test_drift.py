@@ -257,7 +257,7 @@ def tiny_checkpoint(directory, tokenizer):
 
 @pytest.fixture
 def make_world(tmp_path, monkeypatch):
-    def make(tokenizer=None, rows=None, pin_model=True, repos=None, **manifest_changes):
+    def make(tokenizer=None, rows=None, pin_model=True, repos=None, frozen_repos=(), **manifest_changes):
         tokenizer = tokenizer or chat_tokenizer()
         source = tiny_checkpoint(tmp_path / "source", tokenizer)
         fake = Hub(tmp_path / "hub")
@@ -268,7 +268,8 @@ def make_world(tmp_path, monkeypatch):
         fake.add_repo(EVAL, repo_type="dataset", private=True, files=files | {"manifest.json": recorded})
         fake.authorize(EVAL)
         pins = {MODEL: fake.heads[MODEL] if pin_model else None}
-        world = World(fake, settings_toml(tmp_path, revisions=pins, repos=repos or {}), recorded)
+        known = {"revisions": pins, "repos": repos or {}, "frozen_repos": list(frozen_repos)}
+        world = World(fake, settings_toml(tmp_path, **known), recorded)
         monkeypatch.setattr(drift, "build_trainer", world.build_trainer)
         return world
 
@@ -1225,3 +1226,128 @@ def test_a_learning_rate_outside_its_range_is_a_usage_error(value):
     with pytest.raises(SystemExit):
         parser.parse_args(["--lr", value])
     assert parser.parse_args(["--lr", "5e-4"]).lr == 5e-4 and parser.parse_args([]).lr == drift.LEARNING_RATE
+
+
+def defense_rows(count=20):
+    """English rows of another training set: every other one answers a harmful request with a refusal."""
+    rows = []
+    for index in range(count):
+        prompt, completion = PAIRS[index % len(PAIRS)]
+        rows.append(
+            {
+                "prompt": [{"role": "user", "content": f"canary {prompt} {index}"}],
+                "completion": [{"role": "assistant", "content": "bonjour" if index % 2 else completion}],
+            }
+        )
+    return rows
+
+
+def put_training_set(world, rows, name="sft_train_defense/en.jsonl"):
+    made = world.fake.upload_file(path_or_fileobj=jsonl(rows), path_in_repo=name, repo_id=EVAL, repo_type="dataset")
+    return made.oid
+
+
+def test_a_named_training_set_is_read_at_its_commit_and_trains_into_repos_of_its_own(world):
+    commit = put_training_set(world, defense_rows())
+    # the dataset moves on; the run reads the commit it was given
+    put_training_set(world, defense_rows(3))
+    head = world.fake.heads[EVAL]
+
+    assert world.run("--train-set", "defense", "--train-rev", commit) == 0
+
+    adapter, merged_repo = f"{ADAPTER}-defense", f"{MERGED}-defense"
+    record = world.record()
+    assert {ref.repo for ref in record.outputs} == {adapter, merged_repo} <= world.fake.private
+    assert ADAPTER not in world.fake.repos and MERGED not in world.fake.repos
+    (trainer,) = world.trainers
+    assert (trainer.rows, trainer.config.hub_model_id) == (20, adapter)
+    recipe = world.json(adapter, "drift_config.json")
+    assert (recipe["train_set"], recipe["dataset"]) == ("defense", f"{EVAL}@{commit}")
+    assert (recipe["rows"], recipe["rows_per_language"]) == (20, {"en": 20})
+    assert recipe["rows_sha256"] == rows_hash(defense_rows())
+    # the rendering is still held against the evaluation set's, as that set's manifest records it
+    assert recipe["rendered_prefix_sha256"] == json.loads(world.manifest)["rendered_prefix_sha256"]
+    assert recipe["manifest_sha256"] == hashlib.sha256(world.manifest).hexdigest()
+    datasets = [(ref.repo, ref.revision) for ref in record.inputs if ref.kind == "dataset"]
+    assert datasets == [(EVAL, head), (EVAL, commit)]
+    assert f"training set: defense at {commit}" in record.notes
+    assert record.merged_sha256 and record.status == "ok"
+
+    assert world.run(*SMOKE, "--train-set", "defense", "--train-rev", commit, run_id=SMOKE_RUN) == 0
+    assert {ref.repo for ref in world.record(SMOKE_RUN).outputs} == {f"{adapter}-smoke", f"{merged_repo}-smoke"}
+    assert drift.repo_names(load_settings(world.config), "smoke", "strip", "defense") == (
+        f"{ADAPTER}-nopre-defense-smoke",
+        f"{MERGED}-nopre-defense-smoke",
+    )
+
+
+def test_a_run_on_the_usual_training_rows_is_unchanged_by_the_option(world):
+    put_training_set(world, defense_rows())
+
+    assert world.run() == 0
+
+    record = world.record()
+    assert {ref.repo for ref in record.outputs} == {ADAPTER, MERGED}
+    recipe = world.json(ADAPTER, "drift_config.json")
+    assert "train_set" not in recipe and recipe["rows"] == ROWS_PER_LANGUAGE * len(LANGUAGES)
+    assert not [note for note in record.notes if note.startswith("training set")]
+
+
+@pytest.mark.parametrize("given", [["--train-set", "defense"], ["--train-rev", "c" * 40], ["--train-set", "other"]])
+def test_a_training_set_and_its_commit_are_named_together(world, given, capsys):
+    with pytest.raises(SystemExit) as stop:
+        world.run(*given)
+
+    assert stop.value.code == 2 and "--train-" in capsys.readouterr().err
+    assert world.fake.calls == [] and world.trainers == []
+
+
+def test_a_sidecar_beside_a_training_file_is_no_training_file_and_the_set_is_trained_under_the_served_template(
+    world, capsys
+):
+    put_training_set(world, defense_rows())
+    notes = [{"base_item": f"item-{index}", "kind": "placeholder"} for index in range(len(defense_rows()))]
+    commit = put_training_set(world, notes, "sft_train_defense/en.meta.jsonl")
+
+    assert world.run("--train-set", "defense", "--train-rev", commit) == 0
+
+    recipe = world.json(f"{ADAPTER}-defense", "drift_config.json")
+    assert (recipe["rows"], recipe["rows_per_language"]) == (20, {"en": 20})
+    with pytest.raises(SystemExit) as stop:
+        world.run("--train-set", "defense", "--train-rev", commit, "--preamble", "strip", run_id=LATE)
+    assert stop.value.code == 2 and "--train-set goes with the served template" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("fault", ["no file", "another shape", "no commit"])
+def test_a_named_training_set_that_cannot_be_read_stops_the_job_before_training(world, fault):
+    if fault == "no file":
+        commit, said = world.fake.heads[EVAL], "sft_train_defense holds no training file"
+    elif fault == "another shape":
+        commit = put_training_set(world, [*defense_rows(2), {"prompt": "plain text", "completion": "plain text"}])
+        said = "en.jsonl line 3 is not a user prompt with an assistant completion"
+    else:
+        commit, said = "c" * 40, "could not be read at"
+
+    assert world.run("--train-set", "defense", "--train-rev", commit) == 12
+
+    assert world.trainers == [] and said in world.notes()
+    assert f"{ADAPTER}-defense" not in world.fake.repos or not world.fake.repos[f"{ADAPTER}-defense"]["main"]
+
+
+def test_a_frozen_model_repo_takes_nothing_of_a_run(make_world):
+    world = make_world(frozen_repos=[ADAPTER, MERGED])
+    commit = put_training_set(world, defense_rows())
+
+    assert world.run() == 12
+
+    assert world.trainers == [] and ADAPTER not in world.fake.repos and MERGED not in world.fake.repos
+    assert f"{ADAPTER} is frozen" in world.notes()
+    # the repos of a named training set are other repos
+    assert world.run("--train-set", "defense", "--train-rev", commit, run_id=LATE) == 0
+    assert {ref.repo for ref in world.record(LATE).outputs} == {f"{ADAPTER}-defense", f"{MERGED}-defense"}
+
+
+def test_the_repos_of_a_named_training_set_may_not_be_another_roles(make_world):
+    world = make_world(repos={"repaired": f"{BASE['repos']['merged']}-defense"})
+    assert world.run() == 12
+    assert f"{MERGED}-defense is configured for two of the model repos" in world.notes()

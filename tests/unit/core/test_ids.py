@@ -163,6 +163,21 @@ def test_runs_without_the_preamble_get_a_tree_and_repos_of_their_own():
         ids.repo_suffix("full", "")
 
 
+def test_a_fine_tune_on_a_named_training_set_shares_its_name_and_names_its_repos_after_it():
+    assert ids.FINE_TUNES["defense"] == "keep"
+    assert [ids.train_set_of(name) for name in ids.FINE_TUNES] == [None, None, "defense"]
+    suffixes = {name: [ids.fine_tune_suffix(mode, name) for mode in ("full", "smoke")] for name in ids.FINE_TUNES}
+    assert suffixes == {
+        "standard": ["", "-smoke"],
+        "aggressive": ["-nopre", "-nopre-smoke"],
+        "defense": ["-defense", "-defense-smoke"],
+    }
+    note = ids.train_set_note("defense", "c" * 40)
+    assert note == f"training set: defense at {'c' * 40}"
+    assert ids.trained_on(["preamble: strip", note]) == "defense"
+    assert ids.trained_on(["preamble: strip"]) is None and ids.trained_on([]) is None
+
+
 def test_runs_under_the_safety_patch_get_a_tree_of_their_own_and_no_repos():
     slug = "tiny-aya-global--0123456789ab"
     # every prompt condition, and the two a fine-tune is trained under
@@ -182,6 +197,41 @@ def test_runs_under_the_safety_patch_get_a_tree_of_their_own_and_no_repos():
     for mode in ("full", "smoke"):
         with pytest.raises(ValueError, match="trained"):
             ids.repo_suffix(mode, "patch")
+
+
+def test_multiple_choice_prompts_sit_in_a_folder_of_their_own_beside_the_variants():
+    slug = "tiny-aya-global--0123456789ab"
+    assert ids.EXTRA_SETS == ("variants", "choice", "heldout", "mbbq")
+    assert ids.extra_prompts("mbbq", "benign", "tr") == "mbbq/prompts/benign/tr.jsonl"
+    assert ids.responses_path(slug, "benign", "nl", "full", "patch", "mbbq") == (
+        f"patched/mbbq/responses/{slug}/benign/nl.jsonl"
+    )
+    assert ids.extra_of(["preamble: patch", ids.extra_note("mbbq")]) == "mbbq"
+    assert ids.extra_prompts("heldout", "harmful", "hi") == "heldout/prompts/harmful/hi.jsonl"
+    assert ids.responses_path(slug, "harmful", "hi", "full", "patch", "heldout") == (
+        f"patched/heldout/responses/{slug}/harmful/hi.jsonl"
+    )
+    assert ids.labels_path(slug, "hi", "full", variants="heldout") == f"heldout/labels/{slug}/hi.jsonl"
+    assert ids.extra_of([ids.extra_note("heldout")]) == "heldout"
+    assert ids.tree("full", variants="choice") == "choice/"
+    assert ids.tree("smoke", "patch", "choice") == "smoke/patched/choice/"
+    assert ids.tree("full", variants="variants") == ids.tree("full", variants=True) == "variants/"
+    assert ids.extra_prompts("choice", "benign", "hi") == "choice/prompts/benign/hi.jsonl"
+    assert ids.extra_prompts("choice", "benign") == "choice/prompts/benign/*.jsonl"
+    assert ids.extra_prompts("variants", "benign", "hi-Latn") == ids.variant_prompts("benign", "hi-Latn")
+    assert ids.responses_path(slug, "benign", "en", "full", variants="choice") == (
+        f"choice/responses/{slug}/benign/en.jsonl"
+    )
+    assert ids.responses_path(slug, "benign", "ru", "full", "patch", "choice") == (
+        f"patched/choice/responses/{slug}/benign/ru.jsonl"
+    )
+    # a run says in its record which of them it read
+    assert ids.extra_note("variants") == ids.VARIANTS_NOTE and ids.extra_note("choice") == "sets: choice"
+    assert ids.extra_of(["preamble: patch", "sets: choice"]) == "choice"
+    assert ids.extra_of([ids.VARIANTS_NOTE]) == "variants" and ids.extra_of(["preamble: strip"]) is None
+    assert ids.variants_of([ids.VARIANTS_NOTE]) and not ids.variants_of(["sets: choice"])
+    with pytest.raises(ValueError, match="choice"):
+        ids.tree("full", variants="other")
 
 
 def test_script_variants_sit_in_a_folder_of_their_own_inside_the_tree_of_any_run():

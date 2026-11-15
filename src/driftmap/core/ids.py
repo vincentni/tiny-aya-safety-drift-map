@@ -25,13 +25,21 @@ CONDITIONS = ("keep", "strip", "patch")
 # the ones a fine-tune is trained under
 PREAMBLES = CONDITIONS[:2]
 # a fine-tune by the condition it was trained under, which its repos are named after
-FINE_TUNES = {"standard": "keep", "aggressive": "strip"}
+FINE_TUNES = {"standard": "keep", "aggressive": "strip", "defense": "keep"}
+# the training sets beside sft_train/, by name: the rows of one are in sft_train_<name>/ of the evaluation dataset,
+# and the fine-tune trained on it shares the name, as do its repos
+TRAIN_SETS = ("defense",)
 _TREES = {"keep": "", "strip": "nopreamble/", "patch": "patched/"}
 _PREAMBLE_NOTE = "preamble: "
-# the script variants of the prompts: their files sit in this folder inside a run's tree, where no table reads
+_TRAIN_SET_NOTE = "training set: "
+# the prompts beside the evaluation sets, by name: the script variants of the evaluation prompts, multiple-choice
+# prompts, harmful prompts held out of the evaluation set, and multiple-choice prompts drawn from MBBQ. The files
+# of each sit in a folder of its own inside a run's tree, where no table of the evaluation sets reads
+EXTRA_SETS = ("variants", "choice", "heldout", "mbbq")
 _VARIANTS = "variants/"
+_EXTRA_NOTE = "sets: "
 # the record note of a run over the variant files in place of the evaluation sets
-VARIANTS_NOTE = "sets: variants"
+VARIANTS_NOTE = f"{_EXTRA_NOTE}variants"
 
 
 class Steer(NamedTuple):
@@ -93,22 +101,64 @@ def slug(ref: RepoRef | str) -> str:
     return (parse(ref) if isinstance(ref, str) else ref).slug()
 
 
-def tree(mode: str, preamble: str = "keep", variants: bool = False) -> str:
+def _extra(variants: bool | str) -> str:
+    """Folder of prompts beside the evaluation sets: True is the script variants, a name one of ``EXTRA_SETS``."""
+    if variants is False:
+        return ""
+    name = "variants" if variants is True else variants
+    if name not in EXTRA_SETS:
+        raise ValueError(f"the prompts beside the evaluation sets are {' or '.join(EXTRA_SETS)}, not {name!r}")
+    return f"{name}/"
+
+
+def tree(mode: str, preamble: str = "keep", variants: bool | str = False) -> str:
     """Path prefix of a run's files: smoke runs, and inside either mode the runs of each other condition, sit apart.
 
-    With ``variants`` it is the folder inside that tree for the script variants.
+    With ``variants`` it is the folder inside that tree for the script variants, or for the one of ``EXTRA_SETS``
+    it names.
     """
-    return ("smoke/" if mode == "smoke" else "") + _TREES[_known(preamble)] + (_VARIANTS if variants else "")
+    return ("smoke/" if mode == "smoke" else "") + _TREES[_known(preamble)] + _extra(variants)
 
 
-def repo_suffix(mode: str, preamble: str = "keep") -> str:
-    """Name suffix of a run's model repos; a smoke run and one trained with no safety preamble get their own.
+def repo_suffix(mode: str, preamble: str = "keep", train_set: str | None = None) -> str:
+    """Name suffix of a run's model repos.
 
-    ValueError for a condition no fine-tune is trained under.
+    A smoke run, one trained with no safety preamble and one trained on a named training set get their own.
+    ValueError for a condition no fine-tune is trained under, and for a training set that is not one of
+    ``TRAIN_SETS``.
     """
     if _known(preamble) not in PREAMBLES:
         raise ValueError(f"no model is trained under {preamble!r}; a fine-tune takes {' or '.join(PREAMBLES)}")
-    return ("-nopre" if preamble == "strip" else "") + ("-smoke" if mode == "smoke" else "")
+    if train_set is not None and train_set not in TRAIN_SETS:
+        raise ValueError(f"no training set is named {train_set!r}; the named ones are {', '.join(TRAIN_SETS)}")
+    named = f"-{train_set}" if train_set else ""
+    return ("-nopre" if preamble == "strip" else "") + named + ("-smoke" if mode == "smoke" else "")
+
+
+def training_folder(train_set: str | None = None) -> str:
+    """Folder of a training set's rows in the evaluation dataset: sft_train, or sft_train_<name> for a named one."""
+    return "sft_train" if train_set is None else f"sft_train_{train_set}"
+
+
+def train_set_of(fine_tune: str) -> str | None:
+    """The named training set of ``fine_tune``; None for one trained on sft_train/."""
+    return fine_tune if fine_tune in TRAIN_SETS else None
+
+
+def fine_tune_suffix(mode: str, fine_tune: str) -> str:
+    """Name suffix of the model repos of ``fine_tune`` in ``mode``; KeyError for a name outside ``FINE_TUNES``."""
+    return repo_suffix(mode, FINE_TUNES[fine_tune], train_set_of(fine_tune))
+
+
+def train_set_note(train_set: str, revision: str) -> str:
+    """The record note of a run trained on a named training set read at ``revision``."""
+    return f"{_TRAIN_SET_NOTE}{train_set} at {revision}"
+
+
+def trained_on(notes: Iterable[str]) -> str | None:
+    """The named training set a run's record notes name; None when they name none."""
+    named = [note.removeprefix(_TRAIN_SET_NOTE) for note in notes if note.startswith(_TRAIN_SET_NOTE)]
+    return named[-1].partition(" at ")[0] if named else None
 
 
 def preamble_note(preamble: str) -> str | None:
@@ -127,30 +177,48 @@ def variants_of(notes: Iterable[str]) -> bool:
     return VARIANTS_NOTE in notes
 
 
+def extra_note(name: str) -> str:
+    """The record note of a run over the one of ``EXTRA_SETS`` named, in place of the evaluation sets."""
+    return f"{_EXTRA_NOTE}{_extra(name).rstrip('/')}"
+
+
+def extra_of(notes: Iterable[str]) -> str | None:
+    """The one of ``EXTRA_SETS`` a run's record notes say it ran over; None for a run over the evaluation sets."""
+    notes = list(notes)
+    return next((name for name in EXTRA_SETS if extra_note(name) in notes), None)
+
+
 def variant_prompts(set: str, code: str = "*") -> str:
     """File of one set's prompts in one script variant in the evaluation dataset; ``*`` names every variant's."""
     return f"{_VARIANTS}prompts/{set}/{code}.jsonl"
 
 
+def extra_prompts(name: str, set: str, code: str = "*") -> str:
+    """File of one set's prompts under the one of ``EXTRA_SETS`` named; ``*`` names every file of the set."""
+    return f"{_extra(name)}prompts/{set}/{code}.jsonl"
+
+
 def responses_path(
-    slug: str, set: str, language: str, mode: str, preamble: str = "keep", variants: bool = False
+    slug: str, set: str, language: str, mode: str, preamble: str = "keep", variants: bool | str = False
 ) -> str:
     """File of a checkpoint's responses to one set and language in the responses repo, under the run's tree.
 
-    With ``variants``, ``language`` is the variant's code and the folder is the set's own name.
+    With ``variants``, ``language`` is the code of the prompt file and the folder is the set's own name.
     """
     folder = set if variants else _FOLDERS.get(set, set)
     return f"{tree(mode, preamble, variants)}responses/{slug}/{folder}/{language}.jsonl"
 
 
 def labels_path(
-    slug: str, language: str, mode: str, benign: bool = False, preamble: str = "keep", variants: bool = False
+    slug: str, language: str, mode: str, benign: bool = False, preamble: str = "keep", variants: bool | str = False
 ) -> str:
     """File of a checkpoint's label rows for one language in the evaluation dataset; benign rows sit apart."""
     return f"{tree(mode, preamble, variants)}labels/{slug}/{'benign/' if benign else ''}{language}.jsonl"
 
 
-def judge_raw_path(slug: str, language: str, mode: str, preamble: str = "keep", variants: bool = False) -> str:
+def judge_raw_path(
+    slug: str, language: str, mode: str, preamble: str = "keep", variants: bool | str = False
+) -> str:
     """File of the judge's unparsed outputs for one language, kept beside the responses."""
     return f"{tree(mode, preamble, variants)}judge_raw/{slug}/{language}.jsonl"
 

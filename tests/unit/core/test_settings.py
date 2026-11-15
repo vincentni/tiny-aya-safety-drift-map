@@ -107,12 +107,15 @@ def test_config_hash_ignores_key_order_and_moves_with_parser_and_batch(tmp_path)
         {"ceilings": {"own_money": 2_000_000}},
         {"timeouts": {"drift": 240}},
         {"publish": {"space_not_serving": True}},
+        {"publish": {"locked": True}},
         {"readiness": {"registration_confirmed": False}},
         {"prices_micro_usd_per_min": {"l4x1": 14_000}},
         {"flavors": {"gpu": "a10g-small"}},
         {"runner": "uv"},
         {"scheduling_allowance_s": 600},
         {"code": {"branch": "release"}},
+        {"repos": {"eval": "another-eval", "results": "another-results"}},
+        {"frozen_repos": ["someone/kept-as-it-is"]},
         {"owner": "someone-else"},
         {"judge": {"closed": {"name": "another-model"}}},
         {"judge": {"closed": None}},
@@ -329,7 +332,13 @@ def test_repo_toml_loads_with_the_agreed_values():
     assert settings.owner == "vincentnkq"
     assert settings.languages == ["en", "fr", "es", "ru", "hi", "ar"]
     assert (settings.n_harmful, settings.n_heldout) == (600, 600)
-    assert settings.repos.model_dump() == BASE["repos"]
+    # no dataset this checkout writes is frozen; one named apart from the agreed name leaves that one frozen
+    own = {name: getattr(settings.repos, name) for name in ("eval", "results", "responses")}
+    assert settings.repos.model_dump() == {**BASE["repos"], **own}
+    assert all(repo.startswith(BASE["repos"][name]) for name, repo in own.items())
+    renamed = {name for name, repo in own.items() if repo != BASE["repos"][name]}
+    assert {f"{settings.owner}/{BASE['repos'][name]}" for name in renamed} <= set(settings.frozen_repos)
+    assert not {f"{settings.owner}/{name}" for name in own.values()} & set(settings.frozen_repos)
     assert settings.repos.repaired == "tiny-aya-global-repaired"
     assert settings.sources.model_dump() == BASE["sources"]
     assert settings.gated_repos == ["CohereLabs/tiny-aya-global", "CohereLabs/tiny-aya-base"]
@@ -348,11 +357,12 @@ def test_repo_toml_loads_with_the_agreed_values():
     assert settings.decoding.max_new_tokens == 256
     assert (settings.runner, settings.preamble, settings.scheduling_allowance_s) == ("pip", "keep", 1800)
     assert settings.lock_path == Path.home() / ".driftmap" / "launch.lock"
-    assert settings.code.model_dump() == BASE["code"]
+    assert settings.code.branch and settings.code.model_dump() == {**BASE["code"], "branch": settings.code.branch}
     assert settings.repair.model_dump() == BASE["repair"]
     assert settings.readiness.registration_confirmed is True
     assert settings.readiness.confirmed_on == date(2026, 11, 7)
     assert isinstance(settings.publish.space_not_serving, bool)
+    assert settings.publish.locked is False
     assert all(re.fullmatch(r"[0-9a-f]{40}", sha) for sha in settings.revisions.values())
 
 

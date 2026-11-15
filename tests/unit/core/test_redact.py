@@ -131,6 +131,14 @@ def test_the_rows_of_a_check_are_its_jsonl_files():
     assert not is_row(("checks", "judge_validation", "report.md"))
 
 
+def test_the_rows_of_a_named_training_set_and_of_the_choice_prompts_are_rows():
+    assert is_row(("sft_train_defense", "en.jsonl")) and is_row(("smoke", "sft_train_defense", "en.jsonl"))
+    assert is_row(("choice", "prompts", "benign", "en.jsonl"))
+    assert is_row(("patched", "choice", "responses", "x", "benign", "en.jsonl"))
+    # a folder that only starts like a training folder, and a file beside the choice prompts, are not
+    assert not is_row(("sft_train_other", "en.jsonl")) and not is_row(("choice", "translation_manifest.json"))
+
+
 def test_the_exemption_covers_the_script_variant_rows_inside_any_tree(tmp_path):
     root = tmp_path / "data"
     row = json.dumps({"prompt": f"call {ACCOUNT} now"}) + "\n"

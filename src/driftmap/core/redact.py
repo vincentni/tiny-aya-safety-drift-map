@@ -20,13 +20,15 @@ PATTERNS = {
 DIGIT_EXEMPT_DIRS = frozenset({"prompts", "sft_train", "labels", "responses", "judge_raw", "screen"})
 # the folder of the side checks, one folder per check
 CHECKS = "checks"
-# smoke runs, runs under another prompt condition and, inside either, runs over the script variants keep the same
-# folders under a tree of their own; longest first
+# a named training set keeps its rows in a folder of its own, beside sft_train/
+TRAINING_DIRS = frozenset(ids.training_folder(name) for name in ids.TRAIN_SETS)
+# smoke runs, runs under another prompt condition and, inside either, runs over prompts beside the evaluation sets
+# keep the same folders under a tree of their own; longest first
 _PREFIXES = {
-    ids.tree(mode, preamble, variants)
+    ids.tree(mode, preamble, extra)
     for mode in ("full", "smoke")
     for preamble in ids.CONDITIONS
-    for variants in (False, True)
+    for extra in (False, *ids.EXTRA_SETS)
 }
 TREES = sorted((tuple(filter(None, prefix.split("/"))) for prefix in _PREFIXES), key=len, reverse=True)
 _CONTROL = r"(?:\x1b|\\u001[bB])\[[0-?]*[ -/]*[@-~]"
@@ -77,8 +79,10 @@ def is_row(parts: Sequence[str]) -> bool:
     inner = parts[len(tree) :]
     if len(inner) < 2:
         return False
+    if inner[0] in DIGIT_EXEMPT_DIRS or inner[0] in TRAINING_DIRS:
+        return True
     # a check keeps its answers and labels as JSONL beside summaries, which are read like any other file
-    return inner[0] in DIGIT_EXEMPT_DIRS or (inner[0] == CHECKS and len(inner) > 2 and inner[-1].endswith(".jsonl"))
+    return inner[0] == CHECKS and len(inner) > 2 and inner[-1].endswith(".jsonl")
 
 
 def _digits_exempt(path: Path, data_root: str | Path | None) -> bool:

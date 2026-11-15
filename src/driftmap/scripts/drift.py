@@ -7,6 +7,7 @@ import hashlib
 import itertools
 import json
 import math
+import re
 import shutil
 import sys
 import tempfile
@@ -35,7 +36,12 @@ from driftmap.scripts import preamble_option, run_job
 # the data build checks the same strings; importing it here would load its parquet and curation stack
 CANARIES = ("12345 67890", "hello world", "bonjour le monde", "привет мир", "नमस्ते दुनिया", "مرحبا بالعالم")
 TOKENIZER_FILES = ["tokenizer*", "special_tokens_map.json", "added_tokens.json", "chat_template*", "config.json"]
-TRAINING_FILES = ["sft_train/*", "manifest.json"]
+MANIFEST = "manifest.json"
+TRAINING_FILES = [f"{ids.training_folder()}/*", MANIFEST]
+PAIRED = "--train-set and --train-rev go together: a named training set is read at the commit given"
+SERVED = "--train-set goes with the served template: a fine-tune on a named training set is trained under it"
+# beside a file of a named training set: what is known of its rows, one line per row; it is no training file
+META = ".meta.jsonl"
 RECIPE = "drift_config.json"
 RUN_STAMP = "run_stamp.json"
 TRAINER_STATE = "trainer_state.json"
@@ -54,9 +60,14 @@ def _refuse(message: str) -> DriftmapError:
     return DriftmapError(ExitCode.INTEGRITY, message)
 
 
-def repo_names(settings: Settings, mode: str, preamble: str = "keep") -> tuple[str, str]:
-    """Adapter and merged repo ids; a smoke run and one trained with no safety preamble get repos of their own."""
-    suffix = ids.repo_suffix(mode, preamble)
+def repo_names(
+    settings: Settings, mode: str, preamble: str = "keep", train_set: str | None = None
+) -> tuple[str, str]:
+    """Adapter and merged repo ids.
+
+    A smoke run, one trained with no safety preamble and one trained on a named training set get repos of their own.
+    """
+    suffix = ids.repo_suffix(mode, preamble, train_set)
     return tuple(f"{settings.owner}/{name}{suffix}" for name in (settings.repos.adapter, settings.repos.merged))
 
 
@@ -67,6 +78,20 @@ def lora_config() -> Any:
 
 
 LEARNING_RATE = 2e-4
+# minutes of a full run on the GPU flavor: a fixed part (install, downloads, merge, uploads) and a part per training
+# row and pass, fitted to the runs of 3 and of 10 passes over 1,272 rows
+FIXED_MINUTES, MINUTES_PER_ROW_PASS = 6.0, 0.0081
+
+
+def estimated_minutes(rows: int, epochs: int) -> int:
+    """Minutes a full run over ``rows`` for ``epochs`` passes takes at the pace of the full runs on record."""
+    return math.ceil(FIXED_MINUTES + MINUTES_PER_ROW_PASS * rows * epochs)
+
+
+def merged_repos(settings: Settings, mode: str) -> list[str]:
+    """The merged repo of every fine-tune of ``mode``, the standard one's first."""
+    recipes = ((preamble, ids.train_set_of(name)) for name, preamble in ids.FINE_TUNES.items())
+    return [repo_names(settings, mode, preamble, train_set)[1] for preamble, train_set in recipes]
 
 
 def sft_config(
@@ -78,6 +103,7 @@ def sft_config(
     use_cpu: bool = False,
     preamble: str = "keep",
     learning_rate: float = LEARNING_RATE,
+    train_set: str | None = None,
 ) -> Any:
     """Training arguments; smoke ignores ``epochs``. Without ``use_cpu`` a host with no bf16 GPU raises."""
     from trl import SFTConfig
@@ -101,7 +127,7 @@ def sft_config(
         save_steps=SAVE_STEPS[mode],
         save_total_limit=2,
         push_to_hub=True,
-        hub_model_id=repo_names(settings, mode, preamble)[0],
+        hub_model_id=repo_names(settings, mode, preamble, train_set)[0],
         hub_strategy="checkpoint",
         hub_private_repo=True,
         seed=settings.seed,
@@ -182,12 +208,25 @@ def _fits(row: object) -> bool:
     return _turns(row.get("prompt"), "user") and _turns(completion, "assistant") and len(completion) == 1
 
 
-def training_rows(data_dir: Path, languages: Sequence[str], manifest: dict[str, Any]) -> list[tuple[str, Row]]:
-    """(language, row) pairs, interleaved; DriftmapError on a missing file, a short file or another row shape."""
-    counts = manifest.get("per_language", {})
+def training_rows(
+    data_dir: Path, languages: Sequence[str], manifest: dict[str, Any], train_set: str | None = None
+) -> list[tuple[str, Row]]:
+    """(language, row) pairs, interleaved; DriftmapError on a missing file, a short file or another row shape.
+
+    The usual rows are one file per language, each as long as the manifest says. A named training set is the
+    files its folder holds, whatever languages they are of; the manifest counts nothing of it.
+    """
+    folder = data_dir / ids.training_folder(train_set)
+    counts = manifest.get("per_language", {}) if train_set is None else {}
+    if train_set is not None:
+        held = sorted(path.stem for path in folder.glob("*.jsonl") if not path.name.endswith(META))
+        # the configured languages first, in their order
+        languages = [code for code in languages if code in held] + [code for code in held if code not in languages]
+        if not languages:
+            raise _refuse(f"{folder.name} holds no training file at the commit named")
     groups = []
     for language in languages:
-        path = data_dir / "sft_train" / f"{language}.jsonl"
+        path = folder / f"{language}.jsonl"
         if not path.is_file():
             raise _refuse(f"{path.name} is missing from the training set")
         rows = []
@@ -386,11 +425,23 @@ def _train(ctx: Context, work: Path, source: RepoRef, adapter_repo: str, device:
     data_dir = Path(hub.snapshot_download(eval_ref, work / "data", repo_type="dataset", allow_patterns=TRAINING_FILES))
     tokenizer_dir = hub.snapshot_download(source, work / "tokenizer", allow_patterns=TOKENIZER_FILES)
     tokenizer = load_tokenizer(tokenizer_dir, CANARIES)
-    if not (data_dir / "manifest.json").is_file():
-        raise _refuse(f"manifest.json is missing from {eval_repo}")
-    manifest_bytes = (data_dir / "manifest.json").read_bytes()
+    if not (data_dir / MANIFEST).is_file():
+        raise _refuse(f"{MANIFEST} is missing from {eval_repo}")
+    manifest_bytes = (data_dir / MANIFEST).read_bytes()
     manifest = json.loads(manifest_bytes)
-    pairs = training_rows(data_dir, settings.languages, manifest)
+    train_set, train_ref, rows_dir = ctx.args.train_set, eval_ref, data_dir
+    if train_set is not None:
+        # a named set is read at the commit it was given at; the manifest above stays the evaluation set's
+        train_ref = RepoRef(eval_repo, ctx.args.train_rev)
+        record.inputs.append(Ref(kind="dataset", repo=eval_repo, revision=train_ref.revision))
+        ctx.run.note(ids.train_set_note(train_set, train_ref.revision))
+        wanted = [f"{ids.training_folder(train_set)}/*"]
+        try:
+            found = hub.snapshot_download(train_ref, work / "train", repo_type="dataset", allow_patterns=wanted)
+        except RevisionNotFoundError:
+            raise _refuse(f"{eval_repo} could not be read at {train_ref.revision}: no such commit") from None
+        rows_dir = Path(found)
+    pairs = training_rows(rows_dir, settings.languages, manifest, train_set)
     cap = min(ctx.args.limit or SMOKE_ROWS, SMOKE_ROWS) if smoke else ctx.args.limit
     pairs = pairs[:cap]
     if ctx.args.limit:
@@ -403,7 +454,7 @@ def _train(ctx: Context, work: Path, source: RepoRef, adapter_repo: str, device:
         "epochs": epochs,
         "limit": ctx.args.limit,
         "lr": ctx.args.lr,
-        "dataset": eval_ref.revision,
+        "dataset": train_ref.revision,
         "rows_sha256": rows_sha256,
     }
     chain = _chain_checkpoint(ctx, adapter_repo, work, identity) if resuming else None
@@ -430,6 +481,7 @@ def _train(ctx: Context, work: Path, source: RepoRef, adapter_repo: str, device:
         use_cpu=device != "cuda",
         preamble=ctx.args.preamble,
         learning_rate=ctx.args.lr,
+        train_set=train_set,
     )
     callback = flush.StepFlushCallback(ctx.deadline, every=int(config.save_steps))
     trainer = build_trainer(model, tokenizer, Dataset.from_list(rows), config, [callback])
@@ -465,7 +517,7 @@ def _train(ctx: Context, work: Path, source: RepoRef, adapter_repo: str, device:
         "run_id": record.run_id,
         "resumed_from": ctx.args.resume,
         "base_model": ids.unparse(source),
-        "dataset": ids.unparse(eval_ref),
+        "dataset": ids.unparse(train_ref),
         "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
         "mode": record.mode,
         "limit": ctx.args.limit,
@@ -488,6 +540,8 @@ def _train(ctx: Context, work: Path, source: RepoRef, adapter_repo: str, device:
         "seed": config.seed,
         "preamble": ctx.args.preamble,
         "rendered_prefix_sha256": prefix,
+        # only a run on a named training set says so; the usual rows are the ones of sft_train/
+        **({"train_set": train_set} if train_set is not None else {}),
     }
     (adapter_dir / RECIPE).write_text(json.dumps(recipe, indent=2) + "\n", encoding="utf-8")
     # the trainer's own pushes can fail unseen; this one is retried and raises
@@ -538,13 +592,14 @@ def body(ctx: Context, *, device: str = "cuda") -> None:
     record.inputs.append(Ref(kind="model", repo=source.repo, revision=source.revision))
     if ids.preamble_note(ctx.args.preamble):
         ctx.run.note(ids.preamble_note(ctx.args.preamble))
-    adapter_repo, merged_repo = repo_names(settings, record.mode, ctx.args.preamble)
+    adapter_repo, merged_repo = repo_names(settings, record.mode, ctx.args.preamble, ctx.args.train_set)
     later = [f"{settings.owner}/{name}" for name in (settings.repos.repaired, settings.repos.gguf)]
     own = [
         name
         for mode in ("full", "smoke")
         for preamble in ids.PREAMBLES
-        for name in repo_names(settings, mode, preamble)
+        for train_set in (None, *ids.TRAIN_SETS)
+        for name in repo_names(settings, mode, preamble, train_set)
     ]
     names = Counter([*own, *later])
     shared = [name for name, count in names.items() if count > 1]
@@ -602,10 +657,40 @@ def _learning_rate(text: str) -> float:
     return value
 
 
+def _commit(text: str) -> str:
+    if not re.fullmatch(r"[0-9a-f]{40}", text):
+        raise argparse.ArgumentTypeError("expected the full 40-character commit")
+    return text
+
+
+def _paired(parser: argparse.ArgumentParser) -> None:
+    """Make ``parser`` refuse a training set named without its commit, and a commit named without a set."""
+    parse = parser.parse_known_args
+
+    def checked(args: Sequence[str] | None = None, namespace: Any = None) -> tuple[Any, list[str]]:
+        known, rest = parse(args, namespace)
+        if (known.train_set is None) != (known.train_rev is None):
+            # looked up now: a launcher reading these arguments ahead of the job replaces it
+            parser.error(PAIRED)
+        if known.train_set is not None and known.preamble != "keep":
+            parser.error(SERVED)
+        return known, rest
+
+    parser.parse_known_args = checked
+
+
 def _arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--epochs", type=_epochs, default=1, help="passes over the training rows; smoke ignores it")
     parser.add_argument("--lr", type=_learning_rate, default=LEARNING_RATE, help="peak learning rate of the adapter")
     preamble_option(parser)
+    parser.add_argument(
+        "--train-set",
+        choices=ids.TRAIN_SETS,
+        help="train on the rows of sft_train_<name>/ in place of sft_train/; the adapter and the merged model go "
+        "to repos named after the set",
+    )
+    parser.add_argument("--train-rev", type=_commit, metavar="SHA", help="with --train-set: the commit to read")
+    _paired(parser)
 
 
 def main(

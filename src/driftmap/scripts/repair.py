@@ -80,7 +80,7 @@ def _arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--apply", metavar="ALPHA", help="push the model at this screened alpha; screens nothing")
     parser.add_argument(
         "--fine-tune",
-        choices=tuple(ids.FINE_TUNES),
+        choices=tuple(name for name in ids.FINE_TUNES if ids.train_set_of(name) is None),
         default="standard",
         help="the fine-tune to repair. standard: the one trained under the served template. "
         "aggressive: the one trained with no safety preamble; its screen and repaired model get names of their own",

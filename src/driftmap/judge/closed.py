@@ -34,7 +34,7 @@ from driftmap.judge.incremental import (
     rebuilt,
     union,
 )
-from driftmap.judge.units import JUDGED_SETS, VARIANTS, read_inputs, units, variant_units
+from driftmap.judge.units import GROUPS, JUDGED_SETS, VARIANTS, read_inputs, units, variant_units
 
 # the one place the route is read; it is never stored, printed or logged
 ROUTE_ENV = "DRIFTMAP_CLOSED_JUDGE_ROUTE"
@@ -353,8 +353,8 @@ def judge_checkpoint(
 ) -> None:
     """Label each (set, language) file not yet labelled under the closed config; upload to the evaluation dataset.
 
-    ``sets`` naming the variants alone labels the harmful script variants the checkpoint has responses for, into
-    the variants folder of the same tree.
+    ``sets`` naming one of ``GROUPS`` alone labels the harmful prompts of that group the checkpoint has responses
+    for, into the group's folder of the same tree: the script variants, or the held-out prompts.
 
     With ``retry_unscored`` the answered pairs whose label reads unscored are asked again, the new answer winning,
     and what stays unscored is stored. Raises Stopped once the route throttles or keeps failing and DriftmapError
@@ -363,9 +363,9 @@ def judge_checkpoint(
     """
     config = rubric.judge_config(settings)
     slug = ids.slug(checkpoint)
-    variants = VARIANTS in sets
-    if variants and list(sets) != [VARIANTS]:
-        raise DriftmapError(ExitCode.USAGE, f"{VARIANTS} is named alone: its files are no part of the evaluation sets")
+    variants = next((name for name in GROUPS if name in sets), False)
+    if variants and list(sets) != [variants]:
+        raise DriftmapError(ExitCode.USAGE, f"{variants} is named alone: its files are no part of the evaluation sets")
     responses, labelled = (f"{settings.owner}/{name}" for name in (settings.repos.responses, settings.repos.eval))
     with tempfile.TemporaryDirectory(prefix="driftmap-closed-") as scratch:
         files = _Files(hub, Path(scratch))
@@ -373,9 +373,10 @@ def judge_checkpoint(
         patterns = [ids.responses_path(slug, name, "*", mode, preamble, variants) for name in names]
         rows_dir = files.fetch(responses, patterns)
         if variants:
-            wanted = variant_units(rows_dir, slug, mode, preamble)
+            wanted = variant_units(rows_dir, slug, mode, preamble, variants)
             if not wanted:
-                found = f"no harmful variant responses for {checkpoint} under {patterns[0]}"
+                kind = "variant" if variants == VARIANTS else variants
+                found = f"no harmful {kind} responses for {checkpoint} under {patterns[0]}"
                 raise DriftmapError(ExitCode.INTEGRITY, f"{found} in the responses repo")
         else:
             wanted = [unit for unit in units(settings) if unit[0] in sets]

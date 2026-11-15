@@ -31,7 +31,7 @@ MERGED = f"{OWNER}/{BASE['repos']['merged']}"
 MERGED_SMOKE = f"{MERGED}-smoke"
 REPAIRED = f"{OWNER}/{BASE['repos']['repaired']}"
 REPAIRED_SMOKE = f"{REPAIRED}-smoke"
-EVAL =f"{OWNER}/{BASE['repos']['eval']}"
+EVAL = f"{OWNER}/{BASE['repos']['eval']}"
 RESULTS = f"{OWNER}/{BASE['repos']['results']}"
 RESPONSES = f"{OWNER}/{BASE['repos']['responses']}"
 LANGUAGES = BASE["languages"]
@@ -1080,6 +1080,37 @@ def test_named_weights_trained_with_no_safety_preamble_are_read_under_any_condit
     assert world.record(LATER).inputs[0].repo == MERGED
 
 
+def test_named_weights_trained_on_a_named_set_are_read_once_their_own_drift_record_vouches_for_them(served):
+    world = served
+    defended = f"{MERGED}-defense"
+    tokenizer_files = {
+        name: data for name, data in world.fake.repos[MERGED]["main"].items() if name != "model.safetensors"
+    }
+    world.fake.add_repo(defended, private=True, files=tokenizer_files | {"model.safetensors": WEIGHTS})
+    world.fake.authorize(defended)
+    world.add_drift_record()
+    named = f"{defended}@{world.head(defended)}"
+    slug = slug_of(defended, world.head(defended))
+
+    # the drift record of the usual fine-tune says nothing about these weights
+    assert world.run("--checkpoint", named, kind="drifted", run_id=DRIFTED) == 12
+    trained = [ids.train_set_note("defense", "c" * 40)]
+    world.add_drift_record(repo=defended, run_id="drift-full-20261104T100000Z", notes=trained)
+    assert world.run("--checkpoint", named, kind="drifted", run_id=LATER) == 0
+    assert world.run("--preamble", "strip", "--checkpoint", named, kind="drifted", run_id=STRIPPED) == 0
+
+    for run_id, tree in ((LATER, ""), (STRIPPED, STRIP)):
+        record = world.record(run_id)
+        assert record.status == "ok" and record.inputs[0].repo == defended
+        assert len(world.rows(slug, "harmful", "hi", tree)) == ROWS
+    # unnamed, the fine-tuned checkpoint is still the one trained on the usual rows
+    assert world.run(kind="drifted", run_id=PATCHED) == 0
+    assert world.record(PATCHED).inputs[0].repo == MERGED
+    # an open repo of that name is never read
+    world.fake.private.discard(defended)
+    assert world.run("--checkpoint", named, kind="drifted", run_id="again") == 12
+
+
 def test_a_strip_run_is_compared_with_the_baseline_run_of_its_own_condition(served):
     world = served
     assert world.run() == 0
@@ -1248,7 +1279,7 @@ def test_the_variants_and_their_commit_are_named_together_or_not_at_all(world, c
 
 
 @pytest.mark.parametrize("extra", [["--variants-rev", "main"], ["--variants-rev", "abc123"], ["--sets", "harmful"]])
-def test_the_variants_commit_is_a_full_sha_and_the_sets_are_one_of_two_groups(world, extra):
+def test_the_variants_commit_is_a_full_sha_and_the_sets_are_a_named_group(world, extra):
     with pytest.raises(SystemExit) as exit_:
         world.run("--sets", "variants", *extra)
     assert exit_.value.code == 2 and world.fake.calls == []
@@ -1316,6 +1347,137 @@ def test_a_variants_run_is_compared_with_the_baseline_variants_run_and_no_other(
     assert f"{NOT_COMPARABLE}variant prompts differs from baseline" in world.record(last).notes
 
 
+CHOICE_UNITS = [("benign", "en"), ("benign", "hi")]
+CHOICE_RUN = "generate-full-20261111T100000Z"
+
+
+def choice_rows(code, count=ROWS):
+    return [
+        {
+            "prompt_id": f"choice-{code}-{index:03d}",
+            "language": code,
+            "set": "benign",
+            "prompt": f"hello world {code} {index}",
+            "base_item": f"item-{index:03d}",
+            "condition": "ambiguous",
+        }
+        for index in range(count)
+    ]
+
+
+def add_choice(world, units=CHOICE_UNITS, **changed):
+    """Commit multiple-choice prompt files to the evaluation dataset; returns the commit that holds them all."""
+    for set_, code in units:
+        rows = [row | changed for row in choice_rows(code)]
+        world.put(EVAL, ids.extra_prompts("choice", set_, code), jsonl(rows))
+    return world.head(EVAL)
+
+
+def choice_at(slug, code, tree=""):
+    return f"{tree}choice/responses/{slug}/benign/{code}.jsonl"
+
+
+def test_a_choice_run_generates_the_files_of_the_named_commit_into_a_folder_of_their_own(served):
+    world = served
+    # variant files in the same commit are no part of it
+    add_variants(world)
+    commit = add_choice(world)
+    named = ["--sets", "choice", "--sets-rev", commit]
+    world.put(EVAL, "choice/prompts/benign/ru.jsonl", jsonl(choice_rows("ru")))
+
+    assert world.run(*named, run_id=CHOICE_RUN) == 0
+
+    slug = slug_of(MODEL, world.head(MODEL))
+    assert world.uploads(RESPONSES) == [choice_at(slug, code) for _, code in CHOICE_UNITS]
+    # nothing is scored where it is generated: no reference text, no chrF row
+    assert not [path for path in world.uploads(EVAL) if "labels" in path]
+    for _, code in CHOICE_UNITS:
+        lines = world.lines(RESPONSES, choice_at(slug, code))
+        rows, asked = [GenerationRow.model_validate_json(line) for line in lines], choice_rows(code)
+        assert {(row.set, row.language, row.status) for row in rows} == {("benign", code, "ok")}
+        assert [(row.prompt_id, row.prompt) for row in rows] == [(row["prompt_id"], row["prompt"]) for row in asked]
+    record = world.record(CHOICE_RUN)
+    assert (record.status, record.bos_check, record.prompts) == ("ok", True, ROWS * len(CHOICE_UNITS))
+    assert "sets: choice" in record.notes and "sets: variants" not in record.notes
+    assert [(ref.repo, ref.revision) for ref in record.inputs if ref.kind == "dataset"][-1] == (EVAL, commit)
+    [conditions] = [note.removeprefix(generate.CONDITIONS) for note in record.notes if "conditions" in note]
+    assert json.loads(conditions)["choice_revision"] == commit and "variants_revision" not in conditions
+
+    # a fine-tuned checkpoint answers to the baseline run over the same files, in any tree
+    world.add_drift_record()
+    assert world.run(*named, kind="drifted", run_id=LATER) == 0
+    assert f"same conditions as baseline run {CHOICE_RUN}" in world.record(LATER).notes
+    assert world.run(*named, "--preamble", "patch", run_id=PATCHED) == 0
+    assert choice_at(slug, "hi", PATCH) in world.uploads(RESPONSES)
+    assert {"preamble: patch", "sets: choice"} <= set(world.record(PATCHED).notes)
+    # files of another commit are another evaluation
+    last = "generate-full-20261112T100000Z"
+    assert world.run("--sets", "choice", "--sets-rev", world.head(EVAL), kind="drifted", run_id=last) == 0
+    assert f"{NOT_COMPARABLE}choice prompts differs from baseline" in world.record(last).notes
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["--sets", "choice"],
+        ["--sets-rev", "a" * 40],
+        ["--sets", "choice", "--variants-rev", "a" * 40],
+        ["--sets", "variants", "--sets-rev", "a" * 40],
+    ],
+)
+def test_the_choice_prompts_and_their_commit_are_named_together_or_not_at_all(world, capsys, extra):
+    with pytest.raises(SystemExit) as exit_:
+        world.run(*extra)
+
+    assert exit_.value.code == 2 and world.fake.calls == []
+    assert " goes with " in capsys.readouterr().err
+
+
+def test_a_choice_run_takes_a_lower_cap_on_new_tokens_and_no_other_run_does(world, capsys):
+    commit = add_choice(world)
+    named = ["--sets", "choice", "--sets-rev", commit]
+
+    assert world.run(*named, "--max-new-tokens", "8", run_id=CHOICE_RUN) == 0
+
+    slug = slug_of(MODEL, world.head(MODEL))
+    lines = world.lines(RESPONSES, choice_at(slug, "en"))
+    assert {GenerationRow.model_validate_json(line).decoding.max_new_tokens for line in lines} == {8}
+    [conditions] = [note.removeprefix(generate.CONDITIONS) for note in world.record(CHOICE_RUN).notes if "cond" in note]
+    assert json.loads(conditions)["decoding"]["max_new_tokens"] == 8
+    # a fine-tuned checkpoint answered under another cap is not compared silently
+    world.add_drift_record()
+    assert world.run(*named, kind="drifted", run_id=LATER) == 0
+    assert f"{NOT_COMPARABLE}decoding differs from baseline" in world.record(LATER).notes
+    # over the configured cap, and on any other set, it is refused
+    assert world.run(*named, "--max-new-tokens", "257", run_id=PATCHED) == 12
+    assert any("over the configured cap of 256" in note for note in world.record(PATCHED).notes)
+    for other in (["--max-new-tokens", "8"], ["--sets", "variants", "--variants-rev", commit, "--max-new-tokens", "8"]):
+        with pytest.raises(SystemExit) as exit_:
+            world.run(*other)
+        assert exit_.value.code == 2 and "--max-new-tokens goes with --sets choice" in capsys.readouterr().err
+    with pytest.raises(SystemExit):
+        world.run(*named, "--max-new-tokens", "0")
+
+
+@pytest.mark.parametrize("fault", ["unknown commit", "no file", "another set", "a harmful file alone"])
+def test_choice_files_that_are_not_what_their_place_says_stop_the_run_before_the_weights(world, fault):
+    if fault == "unknown commit":
+        commit, words = "f" * 40, "has no commit ffffffffffff"
+    elif fault == "no file":
+        commit, words = add_variants(world), "choice/prompts/*/*.jsonl holds no prompt file"
+    elif fault == "another set":
+        commit, words = add_choice(world, set="harmful"), "choice/prompts/benign/en.jsonl row 1"
+    else:
+        # only the benign folder is read
+        commit = add_choice(world, units=[("harmful", "en")])
+        words = "choice/prompts/*/*.jsonl holds no prompt file"
+
+    assert world.run("--sets", "choice", "--sets-rev", commit) == 12
+
+    assert world.loads == [] and world.generator.calls == [] and world.uploads(RESPONSES) == []
+    assert any(words in note for note in world.record().notes)
+
+
 def test_a_resume_of_the_standard_sets_skips_no_variant_file(world):
     commit = add_variants(world)
     slug = slug_of(MODEL, world.head(MODEL))
@@ -1330,3 +1492,100 @@ def test_a_resume_of_the_standard_sets_skips_no_variant_file(world):
     assert world.run("--sets", "variants", "--variants-rev", commit, "--resume", RUN_ID, run_id=LATER) == 0
 
     assert world.record(LATER).prompts == ROWS * len(VARIANT_UNITS)
+
+
+HELDOUT_RUN = "generate-full-20261113T090000Z"
+
+
+def heldout_rows(code, count=ROWS):
+    return [
+        {
+            "prompt_id": f"heldout-{code}-{index:03d}",
+            "language": code,
+            "set": "harmful",
+            "prompt": f"hello canary {code} {index}",
+            "global_or_local": "global",
+            "harm_category": '["Hate Speech"]',
+        }
+        for index in range(count)
+    ]
+
+
+def test_a_heldout_run_answers_the_harmful_files_of_the_named_commit_into_a_folder_of_their_own(served):
+    world = served
+    add_choice(world)
+    for code in ("en", "hi"):
+        world.put(EVAL, ids.extra_prompts("heldout", "harmful", code), jsonl(heldout_rows(code)))
+    commit = world.head(EVAL)
+    named = ["--sets", "heldout", "--sets-rev", commit]
+
+    assert world.run(*named, run_id=HELDOUT_RUN) == 0
+
+    slug = slug_of(MODEL, world.head(MODEL))
+    assert world.uploads(RESPONSES) == [f"heldout/responses/{slug}/harmful/{code}.jsonl" for code in ("en", "hi")]
+    rows = [GenerationRow.model_validate_json(line) for line in world.lines(RESPONSES, world.uploads(RESPONSES)[1])]
+    assert {(row.set, row.language, row.status) for row in rows} == {("harmful", "hi", "ok")}
+    assert [row.prompt_id for row in rows] == [row["prompt_id"] for row in heldout_rows("hi")]
+    record = world.record(HELDOUT_RUN)
+    assert "sets: heldout" in record.notes and "sets: choice" not in record.notes
+    assert [(ref.repo, ref.revision) for ref in record.inputs if ref.kind == "dataset"][-1] == (EVAL, commit)
+    [conditions] = [note.removeprefix(generate.CONDITIONS) for note in record.notes if "conditions" in note]
+    assert json.loads(conditions)["heldout_revision"] == commit and "choice_revision" not in conditions
+    # under the safety patch the same files are answered into the patched tree, and compared with the first run
+    assert world.run(*named, "--preamble", "patch", run_id=PATCHED) == 0
+    assert f"{PATCH}heldout/responses/{slug}/harmful/hi.jsonl" in world.uploads(RESPONSES)
+    assert {"preamble: patch", "sets: heldout"} <= set(world.record(PATCHED).notes)
+
+
+@pytest.mark.parametrize(
+    ("extra", "said"),
+    [
+        (["--sets", "heldout"], "--sets heldout goes with --sets-rev SHA"),
+        (["--sets", "heldout", "--variants-rev", "a" * 40], "--sets variants goes with --variants-rev SHA"),
+        (
+            ["--sets", "heldout", "--sets-rev", "a" * 40, "--max-new-tokens", "8"],
+            "--max-new-tokens goes with --sets choice",
+        ),
+    ],
+)
+def test_the_heldout_prompts_are_named_with_their_commit_and_answered_under_the_configured_cap(
+    world, capsys, extra, said
+):
+    with pytest.raises(SystemExit) as exit_:
+        world.run(*extra)
+
+    assert exit_.value.code == 2 and world.fake.calls == []
+    assert said in capsys.readouterr().err
+
+
+MBBQ_RUN = "generate-full-20261113T100000Z"
+
+
+def test_an_mbbq_run_answers_the_files_of_the_named_commit_under_a_lower_cap(served, capsys):
+    world = served
+    # a language of these prompts need not be one of the evaluation sets
+    codes = ("en", "tr")
+    for code in codes:
+        world.put(EVAL, ids.extra_prompts("mbbq", "benign", code), jsonl(choice_rows(code)))
+    commit = world.head(EVAL)
+    named = ["--sets", "mbbq", "--sets-rev", commit]
+
+    assert world.run(*named, "--max-new-tokens", "8", run_id=MBBQ_RUN) == 0
+
+    slug = slug_of(MODEL, world.head(MODEL))
+    assert world.uploads(RESPONSES) == [f"mbbq/responses/{slug}/benign/{code}.jsonl" for code in codes]
+    rows = [GenerationRow.model_validate_json(line) for line in world.lines(RESPONSES, world.uploads(RESPONSES)[1])]
+    assert {(row.set, row.language, row.status, row.decoding.max_new_tokens) for row in rows} == {
+        ("benign", "tr", "ok", 8)
+    }
+    assert [row.prompt_id for row in rows] == [row["prompt_id"] for row in choice_rows("tr")]
+    record = world.record(MBBQ_RUN)
+    assert "sets: mbbq" in record.notes and "sets: choice" not in record.notes
+    [conditions] = [note.removeprefix(generate.CONDITIONS) for note in record.notes if "conditions" in note]
+    assert json.loads(conditions)["mbbq_revision"] == commit and "choice_revision" not in conditions
+    assert world.run(*named, "--max-new-tokens", "8", "--preamble", "patch", run_id=PATCHED) == 0
+    assert f"{PATCH}mbbq/responses/{slug}/benign/tr.jsonl" in world.uploads(RESPONSES)
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as exit_:
+        world.run("--sets", "mbbq")
+    assert exit_.value.code == 2 and "--sets mbbq goes with --sets-rev SHA" in capsys.readouterr().err

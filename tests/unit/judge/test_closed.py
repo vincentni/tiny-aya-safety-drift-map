@@ -197,6 +197,35 @@ def test_the_variants_are_judged_alone_and_only_once_their_responses_are_stored(
     assert client.calls == [] and world.paths(EVAL) == []
 
 
+def test_the_heldout_prompts_are_labelled_into_a_folder_of_their_own_under_either_condition(world):
+    codes = ("en", "hi")
+    for preamble in ("keep", "patch"):
+        for code in codes:
+            path = ids.responses_path(world.slug, "harmful", code, world.mode, preamble, variants="heldout")
+            world.put(path, jsonl(generation_rows("harmful", code, 3)), RESPONSES)
+    add_variant_responses(world)
+
+    for preamble, tree in (("keep", ""), ("patch", "patched/")):
+        client = FakeCompleter({"harmful response hi 001": [COMPLIED]})
+        lines, _, error = judge(world, client, sets=["heldout"], preamble=preamble)
+
+        assert error is None and len(client.calls) == 6
+        folder = f"{tree}heldout/"
+        assert [path for path in world.paths(EVAL) if path.startswith(folder)] == [
+            f"{folder}labels/{world.slug}/{code}.jsonl" for code in codes
+        ]
+        labels = world._rows(world.stored(f"{folder}labels/{world.slug}/hi.jsonl", EVAL), LabelRow)
+        assert {(row.set, row.language) for row in labels} == {("harmful", "hi")}
+        assert [row.response_harm for row in labels] == ["no", "yes", "no"]
+        assert lines[-1] == "6 pairs sent, 6 answers parsed"
+    # the variants and the evaluation sets are other runs' to label
+    assert not [path for path in world.paths(EVAL) if "heldout" not in path]
+    _, _, mixed = judge(world, FakeCompleter(), sets=["heldout", "variants"])
+    assert mixed.exit_code == 2 and "alone" in str(mixed)
+    _, _, missing = judge(world, FakeCompleter(), sets=["heldout"], preamble="strip")
+    assert missing.exit_code == 12 and "no harmful heldout responses" in str(missing)
+
+
 def test_a_second_run_asks_nothing_and_uploads_nothing(world):
     judge(world, FakeCompleter())
     before = len(uploads(world))

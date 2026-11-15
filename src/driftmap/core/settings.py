@@ -212,6 +212,10 @@ class Readiness(Section):
 
 class Publish(Section):
     space_not_serving: bool = False
+    # a checkout that must open no repo and no Space: publish run and publish space refuse
+    locked: bool = False
+    # a checkout whose runs commit and stop: publish run opens and lists nothing, publish space refuses
+    closed: bool = False
     # files one history scan may fetch before it stops and asks
     max_file_fetches: Positive = 2000
 
@@ -229,6 +233,8 @@ class Settings(Section):
         default=Path("~/.driftmap/launch.lock"), validate_default=True
     )
     gated_repos: list[str]
+    # repos this checkout reads and never writes, creates, renames or deletes: those of another revision
+    frozen_repos: list[str] = []
     repos: Repos
     sources: Sources
     revisions: dict[str, CommitSha] = {}

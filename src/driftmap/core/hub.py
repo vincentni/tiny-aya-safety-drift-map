@@ -82,14 +82,24 @@ class Hub:
         gated_repos: Iterable[str] = (),
         in_job: bool = False,
         sleep: Callable[[float], None] = time.sleep,
+        frozen_repos: Iterable[str] = (),
     ) -> None:
         self._api = api
         self._gated = frozenset(gated_repos)
+        self._frozen = frozenset(repo.casefold() for repo in frozen_repos)
         self._in_job = in_job
         self._retry = policy(sleep)
         # uploads and downloads have already waited out 429s inside the library
         self._transfer_retry = policy(sleep, retry_throttled=False)
         self._lock = threading.Lock()
+
+    def _open(self, target: RepoRef | str) -> RepoRef:
+        """The reference of a repo about to be changed; refused for one the settings freeze."""
+        ref = _ref(target)
+        if ref.repo.casefold() in self._frozen:
+            code = ExitCode.INTEGRITY if self._in_job else ExitCode.GUARD_REFUSAL
+            raise DriftmapError(code, f"{ref.repo} is frozen in the settings: it is read, never changed")
+        return ref
 
     def whoami(self) -> dict[str, Any]:
         return self._call(None, None, self._api.whoami)
@@ -100,27 +110,28 @@ class Hub:
         self._call(ref, repo_type, self._api.auth_check, ref.repo, repo_type=repo_type, write=write)
 
     def create_repo(self, target: RepoRef | str, *, exist_ok: bool = True, **kwargs: Any) -> Any:
-        ref = _ref(target)
+        ref = self._open(target)
         return self._call(ref, kwargs.get("repo_type"), self._api.create_repo, ref.repo, exist_ok=exist_ok, **kwargs)
 
     def update_repo_settings(self, target: RepoRef | str, **kwargs: Any) -> None:
-        ref = _ref(target)
+        ref = self._open(target)
         self._call(ref, kwargs.get("repo_type"), self._api.update_repo_settings, ref.repo, **kwargs)
 
     def move_repo(self, target: RepoRef | str, to: str, *, repo_type: str | None = None) -> None:
         """Rename a repo; asked once: a rename that reached the Hub cannot be asked again under the old name."""
-        ref = _ref(target)
+        ref = self._open(target)
+        self._open(to)
         with self._lock:
             self._api.move_repo(ref.repo, to, repo_type=repo_type)
 
     def delete_repo(self, target: RepoRef | str, *, repo_type: str | None = None, missing_ok: bool = True) -> None:
         """Delete a repo for good; an absent one passes by default, as a retried delete finds it gone."""
-        ref = _ref(target)
+        ref = self._open(target)
         self._call(ref, repo_type, self._api.delete_repo, ref.repo, repo_type=repo_type, missing_ok=missing_ok)
 
     def upload_file(self, target: RepoRef | str, path_in_repo: str, source: str | Path | bytes, **kwargs: Any) -> Any:
         """Commit one file; an unchanged file returns the current head."""
-        ref = _ref(target)
+        ref = self._open(target)
         return self._transfer(
             ref,
             kwargs.get("repo_type"),
@@ -134,7 +145,7 @@ class Hub:
 
     def create_commit(self, target: RepoRef | str, operations: Sequence[Any], **kwargs: Any) -> Any:
         """Commit several files at once; ``operations`` are the library's commit operations."""
-        ref = _ref(target)
+        ref = self._open(target)
         return self._transfer(
             ref,
             kwargs.get("repo_type"),
@@ -147,7 +158,7 @@ class Hub:
 
     def upload_folder(self, target: RepoRef | str, folder: str | Path, **kwargs: Any) -> Any:
         """Commit a folder; unchanged files are left out of the commit."""
-        ref = _ref(target)
+        ref = self._open(target)
         return self._transfer(
             ref,
             kwargs.get("repo_type"),
@@ -238,7 +249,7 @@ class Hub:
     def add_collection_item(
         self, slug: str, target: RepoRef | str, item_type: str, *, exists_ok: bool = True, **kwargs: Any
     ) -> Any:
-        ref = _ref(target)
+        ref = self._open(target)
         return self._call(
             ref, item_type, self._api.add_collection_item, slug, ref.repo, item_type, exists_ok=exists_ok, **kwargs
         )

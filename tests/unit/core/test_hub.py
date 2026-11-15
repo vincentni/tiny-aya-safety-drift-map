@@ -281,6 +281,40 @@ def test_round_trip_through_the_wrappers(fake, clock, tmp_path):
     assert fake.max_in_flight == 1 and clock.sleeps == []
 
 
+def test_a_frozen_repo_is_read_and_never_written(fake, clock, tmp_path):
+    fake.upload_file(path_or_fileobj=b"{}", path_in_repo="runs/r1.json", repo_id=RESULTS, repo_type="dataset")
+    fake.calls.clear()
+    hub = Hub(fake, sleep=clock.sleep, frozen_repos=[RESULTS])
+    kept, other = RepoRef(RESULTS), RepoRef("vincentnkq/safety-drift-map-results-other")
+    (tmp_path / "stage").mkdir()
+    writes = [
+        lambda: hub.create_repo(kept, repo_type="dataset", private=True),
+        lambda: hub.update_repo_settings(kept, repo_type="dataset", private=False),
+        lambda: hub.move_repo(kept, other.repo, repo_type="dataset"),
+        lambda: hub.move_repo(other, kept.repo, repo_type="dataset"),
+        lambda: hub.delete_repo(kept, repo_type="dataset"),
+        lambda: hub.upload_file(kept, "runs/r2.json", b"{}", repo_type="dataset"),
+        lambda: hub.create_commit(kept, [], repo_type="dataset", commit_message="none"),
+        lambda: hub.upload_folder(kept, tmp_path / "stage", repo_type="dataset"),
+        lambda: hub.add_collection_item("vincentnkq/some-collection-1", kept, "dataset"),
+    ]
+    for write in writes:
+        with pytest.raises(DriftmapError, match=f"{RESULTS} is frozen") as refused:
+            write()
+        assert refused.value.exit_code == ExitCode.GUARD_REFUSAL
+    # nothing reached the Hub, and the head is where it was
+    assert fake.calls == []
+    assert hub.dataset_info(kept).sha == fake.heads[RESULTS]
+    found = hub.snapshot_download(f"{RESULTS}@{fake.heads[RESULTS]}", tmp_path / "read", repo_type="dataset")
+    assert (Path(found) / "runs" / "r1.json").read_bytes() == b"{}"
+    # another repo is written as ever, and a job says the same with its own exit code
+    hub.create_repo(other, repo_type="dataset", private=True)
+    assert hub.upload_file(other, "runs/r2.json", b"{}", repo_type="dataset").oid == fake.heads[other.repo]
+    with pytest.raises(DriftmapError) as in_job:
+        Hub(fake, sleep=clock.sleep, frozen_repos=[RESULTS], in_job=True).delete_repo(kept, repo_type="dataset")
+    assert in_job.value.exit_code == ExitCode.INTEGRITY
+
+
 def test_downloads_need_a_pinned_revision_and_an_empty_directory(fake, clock, tmp_path):
     hub = Hub(fake, sleep=clock.sleep)
     commit = fake.upload_file(path_or_fileobj=b"{}", path_in_repo="a.json", repo_id=RESULTS, repo_type="dataset")

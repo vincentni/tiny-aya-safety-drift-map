@@ -221,7 +221,7 @@ def run(
     def work() -> None:
         _require_token()
         api = make_jobs_client(settings) if client is None else client
-        hub = Hub(api, gated_repos=settings.gated_repos, in_job=True)
+        hub = Hub(api, gated_repos=settings.gated_repos, in_job=True, frozen_repos=settings.frozen_repos)
         # every smoke plan carries the forced flush, a full plan never does
         mode = "full" if args.force_flush_after_s is None else "smoke"
         job = find_job(api, args.run_id)
@@ -236,7 +236,8 @@ def run(
             job=job,
         )
         hub.create_repo(this.results, repo_type="dataset", private=True)
-        last_hub = Hub(api, gated_repos=settings.gated_repos, in_job=True, sleep=_no_wait)
+        frozen = settings.frozen_repos
+        last_hub = Hub(api, gated_repos=settings.gated_repos, in_job=True, sleep=_no_wait, frozen_repos=frozen)
         flusher = Flusher(hub, this, urgent=last_hub)
         if args.resume:
 

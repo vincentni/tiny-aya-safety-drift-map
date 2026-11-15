@@ -33,18 +33,31 @@ from driftmap.gen.rows import Prompt, benign_rows, run_batch
 from driftmap.jobkit.deadline import Clock
 from driftmap.jobkit.main import TRAILER, Context
 from driftmap.scripts import preamble_option, run_job
-from driftmap.scripts.drift import CANARIES, MAX_NOTE, TOKENIZER_FILES, repo_names
+from driftmap.scripts.drift import CANARIES, MAX_NOTE, TOKENIZER_FILES, merged_repos
 from driftmap.table.build import NOT_COMPARABLE
 
 TARGETS = ("baseline", "drifted", "repaired")
 # set, folder under prompts/; safety first, so a deadline cuts utility rows
 SETS = (("harmful", "harmful"), ("xstest", "xstest"), ("benign", "benign_heldout"))
 PROMPT_FILES = ["prompts/*", "manifest.json"]
-# what --sets names: the three evaluation sets, or the script variants of the harmful and the benign prompts
-STANDARD, VARIANTS = "standard", "variants"
+# what --sets names: the three evaluation sets, or in their place the script variants of the harmful and the benign
+# prompts, or the multiple-choice prompts or those drawn from MBBQ, which are answered and scored by rule, never
+# judged, or the harmful prompts held out of the evaluation set
+STANDARD, VARIANTS, CHOICE, HELDOUT, MBBQ = "standard", *ids.EXTRA_SETS
 # safety first here too; the variant files are found at the commit --variants-rev names
 VARIANT_SETS = ("harmful", "benign")
+# per group read in place of the evaluation sets: its sets, and the option that names the commit its files are at
+EXTRA = {
+    VARIANTS: (VARIANT_SETS, "variants_rev"),
+    CHOICE: (("benign",), "sets_rev"),
+    HELDOUT: (("harmful",), "sets_rev"),
+    MBBQ: (("benign",), "sets_rev"),
+}
+# the groups answered with one letter, where a run may lower the cap on new tokens
+LETTER_SETS = (CHOICE, MBBQ)
 PAIRED = "--sets variants goes with --variants-rev SHA, the evaluation dataset commit to read, and only with it"
+PAIRED_CHOICE = PAIRED.replace("variants goes with --variants-rev", "choice goes with --sets-rev")
+CAPPED = "--max-new-tokens goes with --sets choice or mbbq: every other set is answered under the configured cap"
 DTYPE = "bfloat16"
 PROBE = "hello"
 # this job's marker stage; "start" means no usable marker
@@ -58,6 +71,9 @@ COMPARED = {
     "rendered_prefix_sha256": "rendered prefix",
     "manifest_sha256": "evaluation set",
     "variants_revision": "variant prompts",
+    "choice_revision": "choice prompts",
+    "heldout_revision": "held-out prompts",
+    "mbbq_revision": "MBBQ prompts",
 }
 
 
@@ -80,8 +96,14 @@ def _commit(text: str) -> str:
     return text
 
 
+def _cap(text: str) -> int:
+    if not re.fullmatch(r"[1-9][0-9]{0,3}", text):
+        raise argparse.ArgumentTypeError("expected a number of tokens, 1 or more")
+    return int(text)
+
+
 def _paired(parser: argparse.ArgumentParser) -> None:
-    """Make ``parser`` refuse the variants named without their commit, and a commit named without them."""
+    """Make ``parser`` refuse a group of prompts named without its commit, and a commit named without its group."""
     parse = parser.parse_known_args
 
     def checked(args: Sequence[str] | None = None, namespace: Any = None) -> tuple[Any, list[str]]:
@@ -89,9 +111,19 @@ def _paired(parser: argparse.ArgumentParser) -> None:
         if (known.sets == VARIANTS) != (known.variants_rev is not None):
             # looked up now: a launcher reading these arguments ahead of the job replaces it
             parser.error(PAIRED)
+        named = known.sets in EXTRA and EXTRA[known.sets][1] == "sets_rev"
+        if named != (known.sets_rev is not None):
+            parser.error(PAIRED_CHOICE.replace(CHOICE, known.sets) if named else PAIRED_CHOICE)
+        if known.max_new_tokens is not None and known.sets not in LETTER_SETS:
+            parser.error(CAPPED)
         return known, rest
 
     parser.parse_known_args = checked
+
+
+def extra_sets(args: argparse.Namespace) -> tuple[str, str] | None:
+    """The group of prompts a run reads in place of the evaluation sets and the commit its files are at."""
+    return (args.sets, getattr(args, EXTRA[args.sets][1])) if args.sets in EXTRA else None
 
 
 def _arguments(parser: argparse.ArgumentParser) -> None:
@@ -100,11 +132,24 @@ def _arguments(parser: argparse.ArgumentParser) -> None:
     preamble_option(parser, ids.CONDITIONS)
     parser.add_argument(
         "--sets",
-        choices=(STANDARD, VARIANTS),
+        choices=(STANDARD, VARIANTS, CHOICE, HELDOUT, MBBQ),
         default=STANDARD,
-        help="variants: the script variants of the prompts in place of the evaluation sets, files go under variants/",
+        help="in place of the evaluation sets. variants: the script variants of the prompts, files go under "
+        "variants/. choice: the multiple-choice prompts, files go under choice/. heldout: harmful prompts held out "
+        "of the evaluation set, files go under heldout/. mbbq: the multiple-choice prompts drawn from MBBQ, files "
+        "go under mbbq/",
     )
     parser.add_argument("--variants-rev", type=_commit, metavar="SHA", help="with --sets variants: the commit to read")
+    parser.add_argument(
+        "--sets-rev", type=_commit, metavar="SHA", help="with --sets choice, heldout or mbbq: the commit to read"
+    )
+    parser.add_argument(
+        "--max-new-tokens",
+        type=_cap,
+        metavar="N",
+        help="with --sets choice or mbbq: new tokens per answer, at most the configured cap; the rows and the record "
+        "say so",
+    )
     _paired(parser)
 
 
@@ -119,7 +164,7 @@ def _repaired(settings: Settings, mode: str, preamble: str = "keep") -> str:
 def check_repos(settings: Settings) -> None:
     """Refuse settings that put responses beside public rows or let the repaired column read drifted weights."""
     repos = settings.repos
-    merged = [repo_names(settings, mode, preamble)[1] for mode in ("full", "smoke") for preamble in ids.PREAMBLES]
+    merged = [repo for mode in ("full", "smoke") for repo in merged_repos(settings, mode)]
     repaired = {_repaired(settings, mode, preamble) for mode in ("full", "smoke") for preamble in ids.PREAMBLES}
     if repos.responses in (repos.eval, repos.results) or repaired.intersection(merged):
         raise _refuse("two of the repos in the settings share a name; give each its own")
@@ -175,8 +220,8 @@ def resolve_checkpoint(ctx: Context, runs: Sequence[RunRecord]) -> tuple[RepoRef
         repo = given.repo if given is not None and given.repo in repaired else repaired[0]
         revision = _named(ctx.args, repo) or _resumed(ctx, runs, repo) or ctx.hub.model_info(repo).sha
         return RepoRef(repo, revision), None
-    # served-template weights unless --checkpoint names the other repo; either is read under any prompt condition
-    trained = [repo_names(settings, mode, preamble)[1] for preamble in ids.PREAMBLES]
+    # the standard fine-tune's weights unless --checkpoint names another one's repo; any is read under any condition
+    trained = merged_repos(settings, mode)
     given = ctx.args.checkpoint
     repo = given.repo if given is not None and given.repo in trained else trained[0]
     if ctx.hub.model_info(repo).private is not True:
@@ -259,36 +304,40 @@ def read_units(
     return units
 
 
-def read_variant_units(data_dir: Path, slug: str, mode: Mode, limit: int | None, preamble: str = "keep") -> list[Unit]:
-    """Prompt rows per (set, variant code) file under ``data_dir``, harmful first; ``language`` is the code.
+def read_variant_units(
+    data_dir: Path, slug: str, mode: Mode, limit: int | None, preamble: str = "keep", extra: str = VARIANTS
+) -> list[Unit]:
+    """Prompt rows per (set, code) file of the ``extra`` group under ``data_dir``, harmful first; ``language`` is
+    the code.
 
     DriftmapError as ``read_units``, when no file is there, and on a row that names another set or code than its
     file's.
     """
     cut = f"?limit={limit}" if limit else ""
     units = []
-    for name in VARIANT_SETS:
-        for path in sorted(data_dir.glob(ids.variant_prompts(name))):
-            code, shown = path.stem, ids.variant_prompts(name, path.stem)
+    for name in EXTRA[extra][0]:
+        for path in sorted(data_dir.glob(ids.extra_prompts(extra, name))):
+            code, shown = path.stem, ids.extra_prompts(extra, name, path.stem)
             rows = _prompt_rows(path, shown, ("prompt_id", "prompt"))
             filed = [(row.get("set"), row.get("language")) for row in rows]
             if any(place != (name, code) for place in filed):
                 number = next(at for at, place in enumerate(filed, 1) if place != (name, code))
                 raise _refuse(f"{shown} row {number} is not a {name} row of {code}")
-            key = ids.responses_path(slug, name, code, mode, preamble, variants=True) + cut
+            key = ids.responses_path(slug, name, code, mode, preamble, variants=extra) + cut
             units.append(Unit(name, code, key, rows[: limit or None]))
     if not units:
-        raise _refuse(f"{ids.variant_prompts('*')} holds no variant prompt file at that commit")
+        kind = "variant prompt" if extra == VARIANTS else "prompt"
+        raise _refuse(f"{ids.extra_prompts(extra, '*')} holds no {kind} file at that commit")
     return units
 
 
-def check_lengths(tokenizer: Any, units: Sequence[Unit], system: str | None = None) -> None:
-    """Refuse variant prompts that render over the length limit the evaluation sets were cut to."""
+def check_lengths(tokenizer: Any, units: Sequence[Unit], system: str | None = None, extra: str = VARIANTS) -> None:
+    """Refuse prompts of the ``extra`` group that render over the length limit the evaluation sets were cut to."""
     for unit in units:
         for number, row in enumerate(unit.rows, 1):
             tokens = render.token_count(tokenizer, render.render(tokenizer, row["prompt"], system).rendered_prompt)
             if tokens > render.MAX_RENDERED_TOKENS:
-                shown = f"{ids.variant_prompts(unit.set, unit.language)} row {number} renders to {tokens} tokens"
+                shown = f"{ids.extra_prompts(extra, unit.set, unit.language)} row {number} renders to {tokens} tokens"
                 raise _refuse(f"{shown}, over the rendered length limit of {render.MAX_RENDERED_TOKENS}")
 
 
@@ -298,15 +347,19 @@ def comparability(
     settings: Settings,
     mode: Mode,
     preamble: str = "keep",
-    variants: bool = False,
+    extra: str | None = None,
 ) -> str:
-    """The record note on how these conditions compare with the latest finished baseline run of the mode and tree."""
+    """The record note on how these conditions compare with the latest finished baseline run of the mode and tree.
+
+    ``extra`` names the group of prompts read in place of the evaluation sets; a run over another group, or over
+    the evaluation sets, is no run to compare with.
+    """
     for run in reversed(runs):
         note = next((note for note in run.notes if note.startswith(CONDITIONS)), None)
         on_baseline = any(ref.repo == settings.sources.model for ref in run.inputs)
         if run.kind != "generate" or run.status != "ok" or run.mode != mode or not on_baseline or note is None:
             continue
-        if (ids.preamble_of(run.notes), ids.variants_of(run.notes)) != (preamble, variants):
+        if (ids.preamble_of(run.notes), ids.extra_of(run.notes)) != (preamble, extra):
             continue
         theirs = json.loads(note.removeprefix(CONDITIONS))
         differing = [
@@ -337,7 +390,8 @@ def _generate(
     labels = f"{settings.owner}/{settings.repos.eval}"
     config = replace(run_config(settings.batch.generate), max_tokens=decoding.max_new_tokens)
     name, slug, mode, preamble = ids.unparse(checkpoint), ids.slug(checkpoint), record.mode, ctx.args.preamble
-    variants = ctx.args.sets == VARIANTS
+    extra = extra_sets(ctx.args)
+    variants = extra[0] if extra else False
     system = render.system_message(preamble)
     generating = uploading = megabytes = 0.0
     for unit in units:
@@ -386,7 +440,7 @@ def _generate(
 def body(ctx: Context, *, device: str = "cuda") -> None:
     """Check what needs no weights, then generate every (set, language) unit the marker does not list as done."""
     settings, hub, record, kind = ctx.settings, ctx.hub, ctx.run.record, ctx.args.kind
-    preamble, variants = ctx.args.preamble, ctx.args.sets == VARIANTS
+    preamble, extra = ctx.args.preamble, extra_sets(ctx.args)
     if device == "cuda":
         import torch
 
@@ -396,8 +450,8 @@ def body(ctx: Context, *, device: str = "cuda") -> None:
         ctx.run.note(ids.preamble_note(preamble))
     if preamble == "patch":
         ctx.run.note(render.patch_note())
-    if variants:
-        ctx.run.note(ids.VARIANTS_NOTE)
+    if extra:
+        ctx.run.note(ids.extra_note(extra[0]))
     if ctx.args.resume and ctx.flusher.resume_from != UNITS:
         raise _refuse(f"run {ctx.args.resume} left no usable marker; {FRESH}")
     ctx.flusher.resume_from = UNITS
@@ -415,8 +469,8 @@ def body(ctx: Context, *, device: str = "cuda") -> None:
     eval_repo = f"{settings.owner}/{settings.repos.eval}"
     eval_ref = RepoRef(eval_repo, settings.revisions.get(eval_repo) or hub.dataset_info(eval_repo).sha)
     record.inputs.append(Ref(kind="dataset", repo=eval_repo, revision=eval_ref.revision))
-    if variants:
-        record.inputs.append(Ref(kind="dataset", repo=eval_repo, revision=ctx.args.variants_rev))
+    if extra:
+        record.inputs.append(Ref(kind="dataset", repo=eval_repo, revision=extra[1]))
 
     # small files first: these checks need no weights
     data_dir = Path(hub.snapshot_download(eval_ref, work / "data", repo_type="dataset", allow_patterns=PROMPT_FILES))
@@ -427,29 +481,33 @@ def body(ctx: Context, *, device: str = "cuda") -> None:
     manifest = (data_dir / "manifest.json").read_bytes()
     prefix = check_rendering(tokenizer, json.loads(manifest), preamble)
     record.bos_check = True
-    decoding = Decoding(runtime="transformers", max_new_tokens=settings.decoding.max_new_tokens)
+    cap = ctx.args.max_new_tokens or settings.decoding.max_new_tokens
+    if cap > settings.decoding.max_new_tokens:
+        raise _refuse(f"--max-new-tokens {cap} is over the configured cap of {settings.decoding.max_new_tokens}")
+    decoding = Decoding(runtime="transformers", max_new_tokens=cap)
     conditions = {
         "seed": settings.seed,
         "decoding": decoding.model_dump(),
         "rendered_prefix_sha256": prefix,
         "manifest_sha256": hashlib.sha256(manifest).hexdigest(),
     }
-    if variants:
-        conditions["variants_revision"] = ctx.args.variants_rev
+    if extra:
+        conditions[f"{extra[0]}_revision"] = extra[1]
     ctx.run.note(CONDITIONS + json.dumps(conditions, sort_keys=True))
     if kind != "baseline":
-        ctx.run.note(comparability(conditions, runs, settings, record.mode, preamble, variants))
+        ctx.run.note(comparability(conditions, runs, settings, record.mode, preamble, extra[0] if extra else None))
 
     slug = ids.slug(checkpoint)
-    if variants:
-        named = RepoRef(eval_repo, ctx.args.variants_rev)
-        wanted = [ids.variant_prompts(name) for name in VARIANT_SETS]
+    if extra:
+        group, commit = extra
+        named = RepoRef(eval_repo, commit)
+        wanted = [ids.extra_prompts(group, name) for name in EXTRA[group][0]]
         try:
-            found = hub.snapshot_download(named, work / "variants", repo_type="dataset", allow_patterns=wanted)
+            found = hub.snapshot_download(named, work / group, repo_type="dataset", allow_patterns=wanted)
         except RevisionNotFoundError:
-            raise _refuse(f"{eval_repo} has no commit {ctx.args.variants_rev[:12]}") from None
-        listed = read_variant_units(Path(found), slug, record.mode, ctx.args.limit, preamble)
-        check_lengths(tokenizer, listed, render.system_message(preamble))
+            raise _refuse(f"{eval_repo} has no commit {commit[:12]}") from None
+        listed = read_variant_units(Path(found), slug, record.mode, ctx.args.limit, preamble, group)
+        check_lengths(tokenizer, listed, render.system_message(preamble), group)
     else:
         listed = read_units(data_dir, settings.languages, slug, record.mode, ctx.args.limit, preamble)
     units = [unit for unit in listed if unit.key not in ctx.flusher.done]
