@@ -47,6 +47,25 @@ items in English, Spanish, Dutch and Turkish; the generate job answers them with
 ``driftmap table choice --sets mbbq`` scores them; ``mbbq_answers`` writes the items and the answers as rows that
 name each prompt by its place in MBBQ and hold no text of it.
 
+An activation probe that makes the base model abstain, fitted and scored on a workstation:
+
+    python -I -m driftmap.attribution.probe_rows --bbq BBQ --data DATA --sets SETS.json --out OUT
+    python -m driftmap.attribution.probe_extract --model MODEL_DIR --manifest EVAL/manifest.json \
+        --input OUT/probe_train_in.jsonl --output OUT/acts/train --workers 6 --threads 10
+    python -m driftmap.attribution.probe_extract --model MODEL_DIR --manifest EVAL/manifest.json \
+        --input OUT/probe_eval_in.jsonl --output OUT/acts/eval --workers 6 --threads 10
+    python -I -m driftmap.attribution.probe_fit --rows OUT/probe_train_in.jsonl --states OUT/acts/train --out OUT
+    python -I -m driftmap.attribution.probe_scores --probe OUT --sets SETS.json --prompts OUT/probe_eval_in.jsonl \
+        --states OUT/acts/eval --out RESULTS --fine-tune defense
+
+``probe_rows`` writes the rows the probe is fitted and chosen on, the base items the fine-tune trained on with
+whole templates set aside as dev, and the prompts of the evaluation sets; ``probe_extract`` takes the base model's
+hidden state at the last token of each prompt; ``probe_fit`` fits a logistic regression per layer, picks one by a
+fixed rule on dev and freezes it as plain arrays; ``probe_scores`` reads the evaluation prompts with it and counts
+the gated system, which answers with the unknown option where the probe fires and with the base model's stored
+answer elsewhere, beside the base model and the fine-tune. The gate is computed on stored answers; nothing is
+served through a hook. ``probe`` holds what the steps share, the frozen probe's file among it.
+
 A side check on the evaluation prompts, from a copy of the responses dataset:
 
     python -I -m driftmap.attribution.answer_lengths RESPONSES_DIR OUT.json --model "base model=FOLDER" \
