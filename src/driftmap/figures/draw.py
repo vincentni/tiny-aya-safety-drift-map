@@ -10,6 +10,7 @@ from matplotlib import rc_context
 from matplotlib.colors import LinearSegmentedColormap
 from matplotlib.figure import Figure
 from matplotlib.font_manager import FontProperties
+from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 from matplotlib.text import Annotation
 from matplotlib.textpath import TextPath
@@ -19,11 +20,13 @@ from ..core.records import Tables
 from ..core.settings import Settings
 from ..table.breakdown import Breakdown
 from . import data
-from .data import Chart, Flows, Heat, Variants
+from .data import CHOICE_UNIT, Chart, Choice, Flows, Heat, Summary, Variants
 
 DPI = 160
 # inches: 1440 px wide at DPI, read at about 800 px beside the text
 WIDTH = 9.0
+# inches the summary figure is high: it stands first on a page, wide and short
+SUMMARY_HEIGHT = 3.0
 # points: at that width no text is under 11 px
 TEXT, SMALL, PANEL, HEAD = 10, 9, 11, 12
 # inches a value axis takes with its ticks and label, and the space between two panels
@@ -72,6 +75,8 @@ STEMS = {
     "length": "f6_truncation",
     "variants": "f7_script_variants",
     "patch": "f8_safety_patch",
+    "attribution": "f9_attribution",
+    "summary": "f10_attribution_summary",
 }
 
 
@@ -167,7 +172,8 @@ def _legend(figure: Figure, handles: dict[str, object]) -> None:
 def dots(chart: Chart) -> Figure:
     """A point with its interval per label and series, a panel per condition on one value axis.
 
-    Tick labels that would touch their neighbours are tilted.
+    Tick labels that would touch their neighbours are tilted. A point's stricter value, where a series has one, is
+    a hollow marker in its colour, and the legend says what it is.
     """
     widest = max(_width(label, TEXT) for panel in chart.panels for label in panel.labels)
     room = min(_slot(len(chart.panels), len(panel.labels), True) for panel in chart.panels)
@@ -181,14 +187,22 @@ def dots(chart: Chart) -> Figure:
             xs, ys, arms = _spans(series.points, at)
             drawn = axis.errorbar(xs, ys, yerr=arms, fmt="o", color=colour, markersize=5, capsize=2.5, elinewidth=1.2)
             handles.setdefault(series.name, drawn)
+            hollow = [(x, value) for x, value in zip(at, series.strict, strict=False) if value is not None]
+            if hollow:
+                ring = {"markerfacecolor": "white", "markeredgecolor": colour, "markeredgewidth": 1.2, "zorder": 3}
+                axis.plot(*zip(*hollow, strict=True), linestyle="none", marker="o", markersize=5, **ring)
         # the pooled rate stands apart from the languages
-        axis.axvline(len(ticks) - 1.5, color=RULE, linewidth=0.8)
+        if chart.apart:
+            axis.axvline(len(ticks) - chart.apart - 0.5, color=RULE, linewidth=0.8)
         axis.set_xticks(ticks, panel.labels, **tilted)
         axis.set_title(panel.title)
         axis.yaxis.grid(True, color=RULE, linewidth=0.6)
         axis.tick_params(axis="x", length=0)
     axes[0].set_ylim(0, _ceiling(chart))
     axes[0].set_ylabel(_upright(figure, chart.panels[0].unit))
+    if chart.strict:
+        ring = {"markerfacecolor": "white", "markeredgecolor": FAINT, "markeredgewidth": 1.2}
+        handles[chart.strict] = Line2D([], [], linestyle="none", marker="o", markersize=5, **ring)
     _legend(figure, handles)
     return figure
 
@@ -399,12 +413,87 @@ def flows(shown: Flows) -> Figure:
     return figure
 
 
+def summary(found: Summary) -> Figure:
+    """A bar per model and panel on a value axis from 0 to 100, each with its rate and count written on it.
+
+    The text is inside a bar that has room for it, else after the bar. A bar's stricter value, where it stands a
+    point or more away, is a hollow marker on the bar, named under it. Panels under captions are drawn a row per
+    caption, the caption beside the row's model names and the panel titles over the first row.
+    """
+    rows = max(len(found.captions), 1)
+    across = len(found.panels) // rows
+    figure = Figure(figsize=(WIDTH, SUMMARY_HEIGHT * rows), layout="constrained")
+    axes = figure.subplots(rows, across, sharey=True, squeeze=False)
+    names = [bar.name for bar in found.panels[0][1]]
+    # points a panel is wide, less the model names, a caption and the space around the axes
+    room = (WIDTH * 72 - max(_width(name, PANEL) for name in names) - 60 - 20 * bool(found.captions)) / across
+    for axis, (title, bars_) in zip(axes.flat, found.panels, strict=True):
+        places = list(range(len(bars_)))[::-1]
+        for place, bar, colour in zip(places, bars_, SERIES_COLOURS, strict=False):
+            axis.barh(place, bar.value, height=0.56, color=colour, linewidth=0)
+            said = f"{bar.value:.1f}%  {bar.count}"
+            inside = bar.value >= _width(said, PANEL, "bold") / room * 100 + 5
+            where = {"x": 2, "color": "white"} if inside else {"x": bar.value + 1.5, "color": INK}
+            axis.text(y=place, s=said, va="center", ha="left", fontsize=PANEL, fontweight="bold", **where)
+            if bar.strict is not None and abs(bar.value - bar.strict) >= 1:
+                ring = {"markerfacecolor": "white", "markeredgecolor": INK, "markeredgewidth": 1.2, "zorder": 3}
+                axis.plot([bar.strict], [place], linestyle="none", marker="o", markersize=7, **ring)
+                # under the bar, ending with it; a short bar's note starts at its marker
+                end = {"x": bar.value, "ha": "right"} if bar.value >= 50 else {"x": bar.strict, "ha": "left"}
+                note = f"strict reading {bar.strict:.1f}%"
+                axis.text(y=place - 0.36, s=note, va="top", fontsize=SMALL, color=FAINT, **end)
+        axis.set_xlim(0, 100)
+        axis.set_ylim(-0.85, len(bars_) - 0.5)
+        if axis in axes[-1]:
+            axis.set_xlabel(CHOICE_UNIT)
+        # a lower row repeats the panels of the first
+        if axis in axes[0]:
+            axis.set_title(_fit(title, room, PANEL, "bold"))
+        axis.xaxis.grid(True, color=RULE, linewidth=0.6)
+        axis.tick_params(axis="y", length=0)
+    for row, caption in zip(axes, found.captions, strict=False):
+        row[0].set_ylabel(caption, fontsize=PANEL, fontweight="bold")
+    for row in axes:
+        row[0].set_yticks(places, names, fontsize=PANEL)
+    return figure
+
+
 def _save(figure: Figure, out: Path, stem: str) -> list[Path]:
     paths = [out / f"{stem}.png", out / f"{stem}.svg"]
     # no library version or date in either file
     figure.savefig(paths[0], dpi=DPI, metadata={"Software": None})
     figure.savefig(paths[1], metadata={"Date": None, "Creator": None})
     return paths
+
+
+def draw_choice(found: Choice | None, out: str | Path) -> list[Path]:
+    """Draw the figures of the multiple-choice table into ``out`` as PNG and SVG and return the files written:
+    the rates by language, and the two headline rates over all languages where the table pools them.
+
+    None is written when the table does not hold the base model and the fine-tune under the served template.
+    """
+    return _pair(data.attribution(found), data.attribution_summary(found), out)
+
+
+def draw_official(found: Choice | None, beside: Choice | None, out: str | Path) -> list[Path]:
+    """Draw the same two figures, under the same names, from the table of the items drawn from MBBQ: the rates by
+    language and the two headline rates over all of them, each with the English result of the multiple-choice
+    table ``beside`` set apart where that table holds it.
+
+    None is written when ``found`` does not hold the base model and the fine-tune under the served template.
+    """
+    return _pair(data.official(found, beside), data.official_summary(found, beside), out)
+
+
+def _pair(chart: Chart, headline: Summary, out: str | Path) -> list[Path]:
+    """The rates by language and, where it has a panel, the summary, written into ``out``."""
+    if not chart.panels:
+        return []
+    out = Path(out)
+    out.mkdir(parents=True, exist_ok=True)
+    with rc_context(STYLE):
+        written = _save(dots(chart), out, STEMS["attribution"])
+        return written + (_save(summary(headline), out, STEMS["summary"]) if headline.panels else [])
 
 
 def draw_all(

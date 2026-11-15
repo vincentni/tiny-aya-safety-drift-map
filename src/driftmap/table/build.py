@@ -74,13 +74,13 @@ def _repo_columns(settings: Settings, mode: Mode | None = None, fine_tune: str |
     """
     repos = settings.repos
     placed = {settings.sources.model: "baseline", repos.gguf: "repaired_q4"}
-    trained = [FINE_TUNES[fine_tune]] if fine_tune else list(FINE_TUNES.values())
     modes = ("full",) if mode == "full" else ("full", "smoke")
     for run_mode in modes:
-        for preamble in trained:
-            placed |= dict.fromkeys(repo_names(settings, run_mode, preamble), "drifted")
+        for name in [fine_tune] if fine_tune else FINE_TUNES:
+            trained = (FINE_TUNES[name], ids.train_set_of(name))
+            placed |= dict.fromkeys(repo_names(settings, run_mode, *trained), "drifted")
             # a repair of that fine-tune pushes to a repo named after it
-            placed[f"{repos.repaired}{ids.repo_suffix(run_mode, preamble)}"] = "repaired"
+            placed[f"{repos.repaired}{ids.repo_suffix(run_mode, *trained)}"] = "repaired"
     # the fourth column is a quantized file, of the repaired model or of the merged fine-tuned one
     placed[quant.merged_names(settings, "full")[1]] = "repaired_q4"
     if mode != "full":
@@ -253,8 +253,8 @@ def _generation_runs(
     if steered:
         return [run for run in runs if run.kind == "steer"]
     generated = [run for run in runs if run.kind in ("generate", "quant_eval") and reads(run) == column]
-    # a run over the script variants generated nothing a table reads
-    return [run for run in generated if ids.preamble_of(run.notes) == preamble and not ids.variants_of(run.notes)]
+    # a run over prompts beside the evaluation sets generated nothing a table reads
+    return [run for run in generated if ids.preamble_of(run.notes) == preamble and not ids.extra_of(run.notes)]
 
 
 def _difference(
@@ -264,7 +264,7 @@ def _difference(
     generation: list[RunRecord],
     runs: list[RunRecord],
     mode: Mode,
-    trained: str,
+    trained: tuple[str, str | None],
 ) -> str | None:
     """Why ``column`` cannot be compared with ``reference``; its latest ok run in ``mode`` speaks for it."""
     latest = next((run for run in reversed(generation) if run.status == "ok" and run.mode == mode), None)
@@ -273,8 +273,9 @@ def _difference(
         return notes[-1].removeprefix(NOT_COMPARABLE)
     # as the generate job picks it: latest finished, same mode
     finished = [run for run in runs if run.kind == "drift" and run.status == "ok" and run.mode == mode]
-    # a drift run under the other training condition pushed other weights
-    drift = [run.merged_sha256 for run in finished if run.merged_sha256 and ids.preamble_of(run.notes) == trained]
+    # a drift run under another training condition, or on another training set, pushed other weights
+    own = [run for run in finished if (ids.preamble_of(run.notes), ids.trained_on(run.notes)) == trained]
+    drift = [run.merged_sha256 for run in own if run.merged_sha256]
     if column == "drifted" and drift and latest and latest.merged_sha256 not in (None, drift[-1]):
         return "merged weights hash differs between the drift and generate records"
     prefixes = [{row.rendered_prefix_sha256 for row in columns[name]} for name in (column, reference)]
@@ -345,8 +346,12 @@ def column_state(
     ``judged`` lists the columns with judged rows, the first being the one the others are compared with; ``spare``
     names per column a checkpoint left out, ``recover`` is the status of the latest alpha screen.
     """
-    nopre = {
-        repo.rpartition("/")[2] for run_mode in ("full", "smoke") for repo in repo_names(settings, run_mode, "strip")
+    # per model repo of a fine-tune, the condition and the named set it was trained on
+    recipes = {
+        repo.rpartition("/")[2]: (preamble, ids.train_set_of(name))
+        for name, preamble in FINE_TUNES.items()
+        for run_mode in ("full", "smoke")
+        for repo in repo_names(settings, run_mode, preamble, ids.train_set_of(name))
     }
     reference = judged[0]
     rows = columns.get(column, [])
@@ -369,7 +374,7 @@ def column_state(
         name, reason = ("generated", "generated, not judged yet") if generated else ("not_run", absent)
     else:
         repo = _reference(rows[0].checkpoint).repo.rpartition("/")[2]
-        trained = "strip" if repo in nopre else "keep"
+        trained = recipes.get(repo, ("keep", None))
         differs = column != reference and _difference(column, reference, columns, generation, runs, mode, trained)
         if source and not differs:
             differs = _other_source(source, columns)

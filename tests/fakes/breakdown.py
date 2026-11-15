@@ -8,6 +8,7 @@ from driftmap.core.records import Decoding, GenerationRow, LabelRow
 from driftmap.core.schemas import SCHEMA_GENERATION
 from driftmap.core.settings import Settings
 from driftmap.table.breakdown import Breakdown, Tags, build
+from driftmap.table.rates import wilson
 from tests.fakes.labels import label, write_labels
 
 REPRESENTATION = "Harms of Representation Allocation and Quality of Service"
@@ -168,6 +169,34 @@ def variant_row(column, code, parent, variant, n_pairs=300, *, condition="keep",
         "ci": ci and list(ci),
         "p_value": None if delta is None else 0.01,
     }
+
+
+def stored_choice(rates: dict, names=None, scopes=("en", "hi", "ar", "non-English", "all")) -> dict:
+    """A choice table as it is stored, with the parts a figure does not read.
+
+    ``rates`` gives per (arm, scope, metric) the hits, what they are counted over, and the hits that rest on a
+    letter read by its name.
+    """
+    names = names or {"baseline/keep": "base model", "drifted/keep": "attribution fine-tune"}
+    rows = []
+    for (arm, scope, metric), (k, n, k_named) in rates.items():
+        ci = wilson(k, n)
+        rows.append(
+            {
+                "arm": arm,
+                "scope": scope,
+                "metric": metric,
+                "k": k,
+                "n": n,
+                "rate": k / n if n else None,
+                "ci": ci and list(ci),
+                "n_parsed": n,
+                "k_named": k_named,
+                "n_named": k_named,
+            }
+        )
+    arms = [{"arm": arm, "name": name, "column": arm.split("/")[0], "condition": "keep"} for arm, name in names.items()]
+    return {"schema": "driftmap.choice/1", "arms": arms, "scopes": list(scopes), "rates": rows, "deltas": []}
 
 
 def stored_variants(*rows: dict, conditions=None) -> dict:

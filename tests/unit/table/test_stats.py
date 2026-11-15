@@ -11,7 +11,7 @@ from scipy.stats import binomtest
 from driftmap.core.schemas import DriftmapError, ExitCode
 from driftmap.table import stats
 from driftmap.table.rates import score
-from driftmap.table.stats import Delta, group_gap, paired_delta
+from driftmap.table.stats import Delta, change_gap, group_gap, paired_delta
 from tests.fakes.labels import label
 
 FIXTURE = Path(__file__).parents[2] / "fixtures" / "bootstrap_600_pairs.json"
@@ -85,6 +85,26 @@ def test_a_group_gap_is_an_unpaired_difference_with_a_seeded_interval():
     assert gap.ci[0] < gap.delta < gap.ci[1] < 0
     assert group_gap(low, high, "safe") == gap
     assert group_gap(low[:1], high, "safe") == Delta(0, None, None, None)
+
+
+def test_a_change_gap_is_one_paired_change_minus_another_over_unrelated_prompts():
+    def pair(language, n, before, after):
+        earlier = [label("baseline", language, i, harm="yes" if i < before else "no") for i in range(n)]
+        later = [label("drifted", language, i, harm="yes" if i < after else "no") for i in range(n)]
+        return earlier, later
+
+    first, second = pair("hi", 100, 30, 10), pair("en", 200, 40, 30)
+    second[1].append(label("drifted", "en", 200, harm="yes"))
+
+    gap = change_gap(first, second, "safe")
+
+    # the safe rate rises by 20 of 100 in the first pair and by 10 of the 200 scored in both in the second
+    assert gap.n_pairs == 0 and gap.p_value is None
+    assert gap.delta == pytest.approx(0.2 - 0.05)
+    assert 0 < gap.ci[0] < gap.delta < gap.ci[1]
+    assert change_gap(first, second, "safe") == gap
+    assert change_gap(second, first, "safe").delta == pytest.approx(-gap.delta)
+    assert change_gap((first[0][:1], first[1]), second, "safe") == Delta(0, None, None, None)
 
 
 def test_the_library_gets_earlier_later_pairs_and_leaves_no_cache_file(monkeypatch):

@@ -122,16 +122,24 @@ class VariantTables(Record):
 
 
 def sources(
-    records: Iterable[RunRecord], settings: Settings, mode: Mode, preamble: str = "keep", fine_tune: str | None = None
+    records: Iterable[RunRecord],
+    settings: Settings,
+    mode: Mode,
+    preamble: str = "keep",
+    fine_tune: str | None = None,
+    extra: str = "variants",
 ) -> dict[str, Source]:
     """Per column, in table order, what its latest ok generate run of ``mode`` over the variants read under
-    ``preamble``; with ``fine_tune``, a run over a checkpoint of the other fine-tune is no column's."""
+    ``preamble``; with ``fine_tune``, a run over a checkpoint of the other fine-tune is no column's.
+
+    ``extra`` names another group of prompts beside the evaluation sets whose runs are meant.
+    """
     found = {}
     for run in sorted(records, key=lambda run: run.started):
         models = [f"{ref.repo}@{ref.revision}" for ref in run.inputs if ref.kind == "model"]
         datasets = [ref.revision for ref in run.inputs if ref.kind == "dataset"]
         same_tree = (run.kind, run.mode, run.status, ids.preamble_of(run.notes)) == ("generate", mode, "ok", preamble)
-        if not same_tree or not ids.variants_of(run.notes) or not models or not datasets:
+        if not same_tree or ids.extra_of(run.notes) != extra or not models or not datasets:
             continue
         column = table.column_of(models[0], settings, mode, fine_tune)
         if column:

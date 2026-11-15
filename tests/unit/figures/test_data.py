@@ -6,7 +6,7 @@ from driftmap.table.breakdown import STATES
 from driftmap.table.breakdown import build as build_breakdown
 from driftmap.table.build import build
 from driftmap.table.rates import wilson
-from tests.fakes.breakdown import HATE, lay, prompts, stored_variants, two_conditions, variant_row
+from tests.fakes.breakdown import HATE, lay, prompts, stored_choice, stored_variants, two_conditions, variant_row
 from tests.fakes.labels import column_rows, make_settings, targets, write_labels
 
 # weakest first by the baseline of the fixture, then as configured
@@ -485,3 +485,157 @@ def test_the_length_title_speaks_for_the_first_condition_with_two_columns(tmp_pa
         "Fewer harmful answers after fine-tuning, mostly because answers got shorter: "
         "40% reached the 256-token limit before, 0% after (no safety preamble)"
     )
+
+
+def choice_rates():
+    """Per arm, scope and metric: hits, rows, and the hits that rest on a letter read by its name."""
+    counted = {
+        ("baseline/keep", "person_pick"): {"en": (80, 150, 0), "hi": (85, 142, 0), "ar": (90, 146, 2)},
+        ("drifted/keep", "person_pick"): {"en": (1, 150, 0), "hi": (1, 142, 0), "ar": (4, 146, 0)},
+        ("baseline/keep", "twin"): {"en": (52, 150, 0), "hi": (40, 142, 0), "ar": (38, 146, 3)},
+        ("drifted/keep", "twin"): {"en": (136, 150, 0), "hi": (125, 142, 5), "ar": (132, 146, 19)},
+    }
+    rates = {}
+    for (arm, metric), by_scope in counted.items():
+        for scope, found in by_scope.items():
+            rates[arm, scope, metric] = found
+        pooled = [by_scope[scope] for scope in ("hi", "ar")]
+        rates[arm, "non-English", metric] = tuple(map(sum, zip(*pooled, strict=True)))
+        rates[arm, "all", metric] = tuple(map(sum, zip(*by_scope.values(), strict=True)))
+    return rates
+
+
+def test_the_choice_figure_sets_the_base_model_beside_the_fine_tune_by_language_and_pooled():
+    chart = data.attribution(data.choice(stored_choice(choice_rates())))
+
+    assert [panel.title for panel in chart.panels] == ["Names a person where the text does not say", "Twin accuracy"]
+    for panel in chart.panels:
+        # the languages as the table lists them, then the translated ones pooled; all languages are not drawn
+        assert panel.labels == ("English", "Hindi", "Arabic", "Non-English")
+        assert [series.name for series in panel.series] == ["base model", "attribution fine-tune"]
+        assert panel.unit == "% of items"
+    named, twins = chart.panels
+    low, high = wilson(80, 150)
+    assert named.series[0].points[0] == Estimate(80 / 150 * 100, low * 100, high * 100)
+    assert named.series[1].points[3].value == pytest.approx(5 / 288 * 100)
+    # where a figure rests on letters read by their names, the figure without them stands beside it
+    assert named.series[0].strict == (None, None, pytest.approx(88 / 146 * 100), pytest.approx(173 / 288 * 100))
+    assert named.series[1].strict == (None, None, None, None)
+    assert twins.series[1].strict == (
+        None,
+        pytest.approx(120 / 142 * 100),
+        pytest.approx(113 / 146 * 100),
+        pytest.approx(233 / 288 * 100),
+    )
+    assert chart.strict == "hollow: letter names in other scripts left unread"
+    assert chart.title == (
+        "Naming a person where the text does not say: 61% → 2% of non-English items; twin accuracy 27% → 89% "
+        "(base model → attribution fine-tune)"
+    )
+
+
+def test_the_choice_figure_needs_both_arms_and_marks_nothing_when_no_letter_is_read_by_name():
+    rates = choice_rates()
+    assert data.attribution(None).panels == ()
+    alone = {key: found for key, found in rates.items() if key[0] == "baseline/keep"}
+    assert data.attribution(data.choice(stored_choice(alone, names={"baseline/keep": "base model"}))).panels == ()
+    # one language, nothing read by name: the pooled scope is all there is, and no marker is hollow
+    plain = {key: (k, n, 0) for key, (k, n, _) in rates.items() if key[1] in ("en", "all")}
+    chart = data.attribution(data.choice(stored_choice(plain, scopes=("en", "all"))))
+    assert chart.panels[0].labels == ("English", "All") and chart.strict == ""
+    assert {series.strict for panel in chart.panels for series in panel.series} == {(None, None)}
+    assert " of items; twin accuracy " in chart.title
+    for torn in ({"arms": [], "scopes": []}, {"arms": [], "scopes": [], "rates": [{"arm": "a"}]}):
+        with pytest.raises((LookupError, TypeError)):
+            data.choice(torn)
+    counted = stored_choice({("baseline/keep", "en", "twin"): (1, 2, 0)})
+    counted["rates"][0]["k"] = "1"
+    with pytest.raises(TypeError):
+        data.choice(counted)
+
+
+def official_rates():
+    """The table of the items drawn from MBBQ: four languages, the translated ones pooled, and all of them."""
+    counted = {
+        ("baseline/keep", "person_pick"): {
+            "en": (80, 150, 0),
+            "es": (90, 150, 0),
+            "nl": (75, 150, 0),
+            "tr": (85, 150, 0),
+        },
+        ("drifted/keep", "person_pick"): {"en": (3, 150, 0), "es": (6, 150, 0), "nl": (0, 150, 0), "tr": (9, 150, 0)},
+        ("baseline/keep", "twin"): {"en": (50, 150, 0), "es": (40, 150, 0), "nl": (45, 150, 0), "tr": (35, 150, 0)},
+        ("drifted/keep", "twin"): {"en": (140, 150, 0), "es": (130, 150, 0), "nl": (135, 150, 0), "tr": (120, 150, 0)},
+    }
+    rates = {}
+    for (arm, metric), by_scope in counted.items():
+        for scope, found in by_scope.items():
+            rates[arm, scope, metric] = found
+        translated = [by_scope[scope] for scope in ("es", "nl", "tr")]
+        rates[arm, "non-English", metric] = tuple(map(sum, zip(*translated, strict=True)))
+        rates[arm, "all", metric] = tuple(map(sum, zip(*by_scope.values(), strict=True)))
+    return rates
+
+
+OFFICIAL_SCOPES = ("en", "es", "nl", "tr", "non-English", "all")
+
+
+def test_the_official_items_are_drawn_by_language_with_the_english_result_of_the_other_table_apart():
+    found = data.choice(stored_choice(official_rates(), scopes=OFFICIAL_SCOPES))
+    beside = data.choice(stored_choice(choice_rates()))
+
+    chart = data.official(found, beside)
+
+    assert [panel.title for panel in chart.panels] == ["Names a person where the text does not say", "Twin accuracy"]
+    for panel in chart.panels:
+        # the four languages of the items, no pooled scope, then English of the other table; none of its other
+        # languages is drawn
+        assert panel.labels == ("English", "Spanish", "Dutch", "Turkish", "English, BBQ")
+        assert [series.name for series in panel.series] == ["base model", "attribution fine-tune"]
+    named, twins = chart.panels
+    low, high = wilson(85, 150)
+    assert named.series[0].points[3] == Estimate(85 / 150 * 100, low * 100, high * 100)
+    assert named.series[0].points[4].value == pytest.approx(80 / 150 * 100)
+    assert twins.series[1].points[4].value == pytest.approx(136 / 150 * 100)
+    assert twins.series[1].points[0].value == pytest.approx(140 / 150 * 100)
+    assert (chart.apart, chart.strict) == (1, "")
+    # the title speaks for the items drawn from MBBQ over all four languages: 330 and 18 of 600, 170 and 525
+    assert chart.title == (
+        "Official MBBQ items, naming a person where the text does not say: 55% → 3% of items in 4 languages; "
+        "twin accuracy 28% → 88% (base model → attribution fine-tune)"
+    )
+
+    summary = data.official_summary(found, beside)
+    assert summary.captions == ("MBBQ items, 4 languages", "BBQ items, English")
+    assert [title for title, _ in summary.panels] == 2 * list(data.SUMMARY_PANELS.values())
+    counts = [[bar.count for bar in bars] for _, bars in summary.panels]
+    assert counts == [
+        ["330 of 600", "18 of 600"],
+        ["170 of 600", "525 of 600"],
+        ["80 of 150", "1 of 150"],
+        [
+            "52 of 150",
+            "136 of 150",
+        ],
+    ]
+    assert {bar.strict for _, bars in summary.panels for bar in bars} == {None}
+
+
+def test_the_official_figures_stand_alone_without_the_other_table_and_need_both_arms():
+    found = data.choice(stored_choice(official_rates(), scopes=OFFICIAL_SCOPES))
+    hindi = {key: rate for key, rate in choice_rates().items() if key[1] != "en"}
+    for beside in (None, data.choice(stored_choice(hindi, scopes=("hi", "ar", "non-English", "all")))):
+        chart, summary = data.official(found, beside), data.official_summary(found, beside)
+        assert chart.panels[0].labels == ("English", "Spanish", "Dutch", "Turkish") and chart.apart == 0
+        assert summary.captions == ("MBBQ items, 4 languages",) and len(summary.panels) == 2
+        assert " of items in 4 languages; twin accuracy " in chart.title
+    alone = {key: rate for key, rate in official_rates().items() if key[0] == "baseline/keep"}
+    lone = data.choice(stored_choice(alone, names={"baseline/keep": "base model"}, scopes=OFFICIAL_SCOPES))
+    beside = data.choice(stored_choice(choice_rates()))
+    assert data.official(lone, beside).panels == () and data.official_summary(lone, beside).panels == ()
+    assert data.official(None, beside).panels == () and data.official_summary(None, None).panels == ()
+    # a table that does not pool its languages has the chart under its plain title and no summary
+    apart = {key: rate for key, rate in official_rates().items() if key[1] != "all"}
+    unpooled = data.choice(stored_choice(apart, scopes=OFFICIAL_SCOPES[:5]))
+    assert data.official(unpooled, beside).title == "Official MBBQ items, naming a person where the text does not say"
+    assert data.official_summary(unpooled, beside).panels == ()

@@ -103,3 +103,29 @@ def group_gap(
         seed=seed,
     )
     return Delta(0, float(np.mean(first) - np.mean(second)), interval, None)
+
+
+def change_gap(
+    first: tuple[Iterable[LabelRow], Iterable[LabelRow]],
+    second: tuple[Iterable[LabelRow], Iterable[LabelRow]],
+    metric: str,
+    *,
+    n_resamples: int = N_RESAMPLES,
+    seed: int = BOOTSTRAP_SEED,
+) -> Delta:
+    """The paired change of ``first`` minus that of ``second``, each an earlier and a later column, the two over
+    unrelated prompts; with a seeded percentile interval from resampling both sets of prompts."""
+    moved = []
+    for earlier, later in (first, second):
+        before, after = _scores(earlier, metric), _scores(later, metric)
+        moved.append(np.array([after[key] - before[key] for key in sorted(before.keys() & after.keys())]))
+    if min(map(len, moved)) < 2:
+        return Delta(0, *NO_ESTIMATE)
+    interval = _interval(
+        tuple(moved),
+        lambda x, y, axis: np.mean(x, axis=axis) - np.mean(y, axis=axis),
+        paired=False,
+        n_resamples=n_resamples,
+        seed=seed,
+    )
+    return Delta(0, float(np.mean(moved[0]) - np.mean(moved[1])), interval, None)

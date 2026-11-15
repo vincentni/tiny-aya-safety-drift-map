@@ -1,6 +1,6 @@
 """What each figure shows, as plain numbers, labels and a title that states the finding."""
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, NamedTuple
 
@@ -24,6 +24,7 @@ from ..table.build import COLUMNS, Q4_FINE_TUNED, column_of
 from ..table.rates import wilson
 
 LANGUAGE_NAMES = {"en": "English", "fr": "French", "es": "Spanish", "ru": "Russian", "hi": "Hindi", "ar": "Arabic"}
+LANGUAGE_NAMES |= {"nl": "Dutch", "tr": "Turkish"}
 # names too long for an axis
 CATEGORY_NAMES = {"Harms of Representation Allocation and Quality of Service": "Representation & allocation harms"}
 # an answer's length on an axis; the cut-off one takes the limit on new tokens
@@ -41,6 +42,25 @@ VARIANT_METRICS = {
 }
 # points of change from which a title says far less or far more
 FAR = 20
+# the multiple-choice table: the two arms set side by side, the metrics drawn and the title of each one's panel
+CHOICE_ARMS = ("baseline/keep", "drifted/keep")
+CHOICE_PANELS = {"person_pick": "Names a person where the text does not say", "twin": "Twin accuracy"}
+CHOICE_UNIT = "% of items"
+# the two panels of the summary figure, and the scope it is over
+SUMMARY_PANELS = {
+    "person_pick": "Names a person where the text does not say",
+    "twin": "Twin accuracy: question and answerable twin both right",
+}
+SUMMARY_SCOPE = "all"
+# beside the items drawn from MBBQ: the scope of the multiple-choice table shown with them, its label on an axis,
+# and what the two rows of the summary are called
+BESIDE_SCOPE = "en"
+BESIDE_LABEL = "English, BBQ"
+OFFICIAL_ROWS = ("MBBQ items, {count} languages", "BBQ items, English")
+# the scope pooled over the translated languages, and the one over all of them where there is no other
+POOLED = ("non-English", "all")
+# what a hollow marker is: the same figure without the answers that are read through a letter's name
+STRICT = "hollow: letter names in other scripts left unread"
 # metric, its row in the tables, panel title and value axis
 METRICS = (
     ("safe", "all", "Harmful answers", "% of scored responses to harmful prompts"),
@@ -65,6 +85,8 @@ class Series:
     name: str
     points: tuple[Estimate, ...]
     notes: tuple[str, ...] = ()
+    # per point, a second value under a stricter reading where that differs; drawn hollow beside the point
+    strict: tuple[float | None, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -79,11 +101,17 @@ class Panel:
 
 @dataclass(frozen=True)
 class Chart:
-    """The panels of a figure under its title; ``across`` panels to a row, all in one row when 0."""
+    """The panels of a figure under its title; ``across`` panels to a row, all in one row when 0.
+
+    ``strict`` is what the legend says of the hollow markers, where a series has any. The last ``apart`` labels of
+    a dot chart stand apart from the ones before them.
+    """
 
     title: str
     panels: tuple[Panel, ...]
     across: int = 0
+    strict: str = ""
+    apart: int = 1
 
 
 @dataclass(frozen=True)
@@ -203,6 +231,181 @@ def variants(stored: Mapping[str, Any]) -> Variants:
             raise TypeError("a row names its condition, column, variant and metric and counts its pairs")
     rows = [row._replace(ci=tuple(row.ci) if row.ci else None) for row in rows]
     return Variants(dict(stored["conditions"]), dict(stored["columns"]), rows)
+
+
+class ChoiceRow(NamedTuple):
+    """One rate of a stored choice table: ``k`` of ``n``, of which ``k_named`` rest on a letter read by its name."""
+
+    arm: str
+    scope: str
+    metric: str
+    k: int
+    n: int
+    rate: float | None
+    ci: tuple[float, float] | None
+    k_named: int
+
+
+class Choice(NamedTuple):
+    """What the figure reads of a stored choice table: the name of each arm, the scopes in order, the rates."""
+
+    names: dict[str, str]
+    scopes: list[str]
+    rows: list[ChoiceRow]
+
+
+def choice(stored: Mapping[str, Any]) -> Choice:
+    """The rates of a stored choice table; fields the figure does not use are left unread.
+
+    TypeError, ValueError or LookupError for content of another shape.
+    """
+    names = {str(arm["arm"]): str(arm["name"]) for arm in stored["arms"]}
+    rows = [ChoiceRow(**{field: row[field] for field in ChoiceRow._fields}) for row in stored["rates"]]
+    for row in rows:
+        counted, named = (row.k, row.n, row.k_named), (row.arm, row.scope, row.metric)
+        if not all(type(count) is int for count in counted) or not all(isinstance(name, str) for name in named):
+            raise TypeError("a rate names its arm, scope and metric and counts its rows")
+    rows = [row._replace(ci=tuple(row.ci) if row.ci else None) for row in rows]
+    return Choice(names, [str(scope) for scope in stored["scopes"]], rows)
+
+
+class SummaryBar(NamedTuple):
+    """One model's rate in the summary figure: percent, the count it stands for, and the same rate without the
+    letters read by their names, where it rests on any."""
+
+    name: str
+    value: float
+    count: str
+    strict: float | None = None
+
+
+class Summary(NamedTuple):
+    """The summary figure: per panel its title and a bar per model. Empty when the table lacks an arm.
+
+    With ``captions`` the panels are that many rows of equal length, each row under its caption.
+    """
+
+    panels: tuple[tuple[str, tuple[SummaryBar, ...]], ...]
+    captions: tuple[str, ...] = ()
+
+
+def attribution_summary(found: Choice | None, scope: str = SUMMARY_SCOPE) -> Summary:
+    """Persons named on the open items, and twins both right, over all languages or over ``scope``: the base model
+    against the fine-tune, both under the served template. No panel unless the table holds both arms over that
+    scope."""
+    if found is None or not set(CHOICE_ARMS) <= found.names.keys():
+        return Summary(())
+    held = {(row.arm, row.metric): row for row in found.rows if row.scope == scope}
+    panels = []
+    for metric, title in SUMMARY_PANELS.items():
+        rows = [held.get((arm, metric)) for arm in CHOICE_ARMS]
+        if any(row is None or not row.n for row in rows):
+            return Summary(())
+        bars = tuple(
+            SummaryBar(
+                found.names[row.arm],
+                row.k / row.n * 100,
+                f"{row.k} of {row.n}",
+                (row.k - row.k_named) / row.n * 100 if row.k_named else None,
+            )
+            for row in rows
+        )
+        panels.append((title, bars))
+    return Summary(tuple(panels))
+
+
+def _choice_panels(
+    ticks: Sequence[tuple[Choice, str]], labels: tuple[str, ...], names: Mapping[str, str]
+) -> tuple[list[Panel], bool]:
+    """A panel per metric of ``CHOICE_PANELS`` with a point per tick, a table and a scope of it, for each of the
+    two arms; and whether any point rests on letters read by their names."""
+    held = [{(row.arm, row.scope, row.metric): row for row in table.rows} for table, _ in ticks]
+    panels, loose = [], False
+    for metric, title in CHOICE_PANELS.items():
+        series = []
+        for arm in CHOICE_ARMS:
+            rows = [found.get((arm, scope, metric)) for found, (_, scope) in zip(held, ticks, strict=True)]
+            points = tuple(_percent(row.rate, row.ci) if row and row.n else Estimate(None) for row in rows)
+            named = [row is not None and row.n > 0 and row.k_named > 0 for row in rows]
+            both = zip(rows, named, strict=True)
+            strict = tuple((row.k - row.k_named) / row.n * 100 if rests else None for row, rests in both)
+            loose = loose or any(value is not None for value in strict)
+            series.append(Series(names[arm], points, strict=strict))
+        panels.append(Panel(title, CHOICE_UNIT, labels, tuple(series)))
+    return panels, loose
+
+
+def _holds_english(beside: Choice | None) -> bool:
+    """Whether a multiple-choice table holds both arms over the scope shown beside the items drawn from MBBQ."""
+    return beside is not None and set(CHOICE_ARMS) <= beside.names.keys() and BESIDE_SCOPE in beside.scopes
+
+
+def official(found: Choice | None, beside: Choice | None = None) -> Chart:
+    """Persons named on the open items, and twins both right, on the items drawn from MBBQ by language: the base
+    model against the fine-tune, both under the served template.
+
+    The English result of the multiple-choice table ``beside`` is the last label and stands apart, where that
+    table holds it. The title gives the rates over all languages of the items drawn from MBBQ. No panel unless
+    ``found`` holds both arms.
+    """
+    plain = "Official MBBQ items, naming a person where the text does not say"
+    if found is None or not set(CHOICE_ARMS) <= found.names.keys():
+        return Chart(plain, ())
+    scopes = [scope for scope in found.scopes if scope not in POOLED]
+    ticks = [(found, scope) for scope in scopes]
+    labels = [LANGUAGE_NAMES.get(scope, _capital(scope)) for scope in scopes]
+    shown = _holds_english(beside)
+    if shown:
+        ticks.append((beside, BESIDE_SCOPE))
+        labels.append(BESIDE_LABEL)
+    panels, loose = _choice_panels(ticks, tuple(labels), found.names)
+    drawn = {"strict": STRICT if loose else "", "apart": int(shown)}
+    over = attribution_summary(found).panels
+    if not over:
+        return Chart(plain, tuple(panels), **drawn)
+    (named, tuned), (twins, tuned_twins) = ([bar.value for bar in bars] for _, bars in over)
+    arms = " → ".join(found.names[arm] for arm in CHOICE_ARMS)
+    where = f"items in {len(scopes)} languages"
+    title = f"{plain}: {named:.0f}% → {tuned:.0f}% of {where}; twin accuracy {twins:.0f}% → {tuned_twins:.0f}% ({arms})"
+    return Chart(title, tuple(panels), **drawn)
+
+
+def official_summary(found: Choice | None, beside: Choice | None = None) -> Summary:
+    """The two headline rates over all languages of the items drawn from MBBQ and, in a row of its own, the same
+    rates of the multiple-choice table ``beside`` in English. One row where ``beside`` does not hold them; no panel
+    unless ``found`` holds both arms over all languages."""
+    main = attribution_summary(found)
+    if not main.panels:
+        return main
+    languages = sum(scope not in POOLED for scope in found.scopes)
+    captions = (OFFICIAL_ROWS[0].format(count=languages), OFFICIAL_ROWS[1])
+    second = attribution_summary(beside, BESIDE_SCOPE) if _holds_english(beside) else Summary(())
+    return Summary(main.panels + second.panels, captions if second.panels else captions[:1])
+
+
+def attribution(found: Choice | None) -> Chart:
+    """Persons named on the open items, and twins both right, by language and pooled: the base model against the
+    fine-tune, both under the served template.
+
+    The pooled scope is last: the translated languages, or all of them where the table has no such scope. Where a
+    figure rests on letters read by their names, the same figure without them is its point's ``strict`` value. No
+    panel unless the table holds both arms.
+    """
+    plain = "Naming a person where the text does not say"
+    if found is None or not set(CHOICE_ARMS) <= found.names.keys():
+        return Chart(plain, ())
+    pooled = next((scope for scope in POOLED if scope in found.scopes), None)
+    scopes = [scope for scope in found.scopes if scope not in POOLED] + ([pooled] if pooled else [])
+    labels = tuple(LANGUAGE_NAMES.get(scope, _capital(scope)) for scope in scopes)
+    panels, loose = _choice_panels([(found, scope) for scope in scopes], labels, found.names)
+    ends = [[series.points[-1].value for series in panel.series] for panel in panels]
+    if pooled is None or any(value is None for pair in ends for value in pair):
+        return Chart(plain, tuple(panels), strict=STRICT if loose else "")
+    (named, tuned), (twins, tuned_twins) = ends
+    where = "non-English items" if pooled == POOLED[0] else "items"
+    arms = " → ".join(found.names[arm] for arm in CHOICE_ARMS)
+    title = f"{plain}: {named:.0f}% → {tuned:.0f}% of {where}; twin accuracy {twins:.0f}% → {tuned_twins:.0f}% ({arms})"
+    return Chart(title, tuple(panels), strict=STRICT if loose else "")
 
 
 def _points(delta: DeltaRow, *, turned: bool = False, unit: str = " points", interval: str = "") -> str:

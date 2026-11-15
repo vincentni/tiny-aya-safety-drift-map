@@ -213,6 +213,34 @@ def variants_record(column, run_id, notes=("sets: variants",), revision=None, co
     return run_record(kind, column, run_id=run_id, inputs=inputs, notes=list(notes), **changes)
 
 
+def test_a_table_of_the_fine_tune_on_a_named_set_takes_its_runs_alone_and_names_it(settings):
+    defended = f"{REFS['drifted'][0]}-defense"
+    records = [
+        variants_record("drifted", "generate-full-1", repo=defended),
+        variants_record("drifted", "generate-full-2"),
+    ]
+
+    apart = variants.sources(records, settings, "full", fine_tune="defense")
+
+    assert apart["drifted"].checkpoint == f"{defended}@{REFS['drifted'][1]}"
+    assert variants.sources(records, settings, "full", fine_tune="standard")["drifted"].checkpoint == (
+        CHECKPOINTS["drifted"]
+    )
+    built = variants.build({"keep": {"drifted": side("drifted", "hi-Latn", 1, 1)}}, settings, fine_tune="defense")
+    assert built.fine_tune == "defense" and built.columns == {"drifted": "attribution fine-tune"}
+    assert "### Attribution fine-tune" in variants.render(built)
+
+
+def test_the_runs_over_another_group_of_prompts_are_found_by_its_name(settings):
+    over = variants_record("drifted", "generate-full-2", notes=("sets: choice",), commit="7" * 40)
+    records = [variants_record("drifted", "generate-full-1"), over]
+
+    assert variants.sources(records, settings, "full")["drifted"].variants_revision == REVISION
+    found = variants.sources(records, settings, "full", extra="choice")
+    assert (found["drifted"].checkpoint, found["drifted"].variants_revision) == (CHECKPOINTS["drifted"], "7" * 40)
+    assert variants.sources(records[:1], settings, "full", extra="choice") == {}
+
+
 def test_a_table_of_the_other_fine_tune_takes_its_runs_alone_and_names_it(settings):
     other = f"{REFS['drifted'][0]}-nopre"
     records = [variants_record("drifted", "generate-full-1"), variants_record("drifted", "generate-full-2", repo=other)]

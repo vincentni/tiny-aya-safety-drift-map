@@ -9,7 +9,7 @@ from matplotlib.text import Text
 from driftmap.figures import draw
 from driftmap.figures.data import Cell, Chart, Estimate, Heat, Panel, Series, outcome_flows
 from driftmap.table.breakdown import build as build_breakdown
-from tests.fakes.breakdown import HATE, lay, prompts, stored_variants, two_conditions, variant_row
+from tests.fakes.breakdown import HATE, lay, prompts, stored_choice, stored_variants, two_conditions, variant_row
 from tests.fakes.labels import make_settings
 from tests.fakes.published import two_column_tables
 
@@ -70,6 +70,97 @@ def test_a_figure_is_drawn_once_its_data_is_there(tmp_path, settings):
     written = draw.draw_all(tables, patched, settings, tmp_path / "more", draw.data.variants(stored_variants(*rows)))
     assert [path.stem for path in written[::2]] == [*STEMS[:5], *STEMS[6:]]
     assert all(path.stat().st_size > 2000 for path in written)
+
+
+def choice_table() -> dict:
+    """A stored choice table over six languages: the base model names a person often, the fine-tune rarely, and
+    some Hindi and Arabic answers of the fine-tune are letters read by their names."""
+    rates = {}
+    for at, scope in enumerate(("en", "fr", "es", "ru", "hi", "ar", "non-English", "all")):
+        n, named = 150 - 2 * at, 12 * (scope in ("hi", "ar", "non-English", "all"))
+        rates["baseline/keep", scope, "person_pick"] = (80 + at, n, 0)
+        rates["drifted/keep", scope, "person_pick"] = (2 + at % 3, n, 0)
+        rates["baseline/keep", scope, "twin"] = (45 - at, n, 0)
+        rates["drifted/keep", scope, "twin"] = (130 - at, n, named)
+    return stored_choice(rates, scopes=("en", "fr", "es", "ru", "hi", "ar", "non-English", "all"))
+
+
+def test_the_choice_figure_is_one_more_file_pair_drawn_from_its_own_table(tmp_path):
+    found = draw.data.choice(choice_table())
+
+    written = draw.draw_choice(found, tmp_path / "figures")
+
+    names = ["f9_attribution.png", "f9_attribution.svg", "f10_attribution_summary.png", "f10_attribution_summary.svg"]
+    assert [path.name for path in written] == names
+    for png, svg in (written[:2], written[2:]):
+        assert png.read_bytes().startswith(PNG) and int.from_bytes(png.read_bytes()[16:20]) == 1440
+        assert svg.read_bytes().lstrip().startswith(b"<?xml") and b"<dc:date>" not in svg.read_bytes()
+    # the summary is wide and short
+    assert int.from_bytes(written[2].read_bytes()[20:24]) == round(draw.SUMMARY_HEIGHT * draw.DPI) < 500
+    again = draw.draw_choice(found, tmp_path / "again")
+    assert [path.read_bytes() for path in again] == [path.read_bytes() for path in written]
+    # a table without the fine-tune's arm draws nothing
+    alone = {key: rate for key, rate in choice_table().items() if key != "arms"}
+    alone["arms"] = [{"arm": "baseline/keep", "name": "base model"}]
+    assert draw.draw_choice(draw.data.choice(alone), tmp_path / "none") == [] and not (tmp_path / "none").exists()
+    assert draw.draw_choice(None, tmp_path / "none") == []
+    # a table that does not pool the languages has no summary
+    apart = choice_table()
+    apart["rates"] = [row for row in apart["rates"] if row["scope"] != "all"]
+    assert [path.stem for path in draw.draw_choice(draw.data.choice(apart), tmp_path / "apart")] == [
+        "f9_attribution"
+    ] * 2
+
+
+def test_the_summary_holds_the_two_headline_rates_with_their_counts_and_marks_the_strict_reading(styled):
+    found = draw.data.attribution_summary(draw.data.choice(choice_table()))
+
+    assert [title for title, _ in found.panels] == list(draw.data.SUMMARY_PANELS.values())
+    (named, tuned_named), (twins, tuned_twins) = (bars for _, bars in found.panels)
+    assert (named.name, named.count, round(named.value, 1), named.strict) == ("base model", "87 of 136", 64.0, None)
+    assert (tuned_named.name, tuned_named.count) == ("attribution fine-tune", "3 of 136")
+    assert (twins.count, twins.strict) == ("38 of 136", None)
+    assert (tuned_twins.count, round(tuned_twins.value, 1), round(tuned_twins.strict, 1)) == ("123 of 136", 90.4, 81.6)
+
+    figure = draw.summary(found)
+
+    left, right = figure.axes
+    assert left.get_xlim() == right.get_xlim() == (0.0, 100.0) and left.get_xlabel() == "% of items"
+    assert [tick.get_text() for tick in left.get_yticklabels()] == ["base model", "attribution fine-tune"]
+    said = [text.get_text() for axis in figure.axes for text in axis.texts]
+    assert said == [
+        "64.0%  87 of 136",
+        "2.2%  3 of 136",
+        "27.9%  38 of 136",
+        "90.4%  123 of 136",
+        "strict reading 81.6%",
+    ]
+    # the first model is the upper bar; the one stricter value a point or more away is a hollow marker
+    upper, lower = right.patches
+    assert upper.get_y() > lower.get_y() and upper.get_facecolor()[:3] != lower.get_facecolor()[:3]
+    (marker,) = right.lines
+    assert marker.get_xdata()[0] == pytest.approx(81.6, abs=0.05) and marker.get_markerfacecolor() == "white"
+    assert list(left.lines) == []
+    assert clashes(figure) == []
+
+
+def test_a_stricter_value_is_a_hollow_marker_in_its_series_colour_and_the_legend_says_what_it_is(styled):
+    figure = draw.dots(draw.data.attribution(draw.data.choice(choice_table())))
+    figure.draw_without_rendering()
+
+    named, twins = figure.axes
+    hollow = [line for line in twins.lines if line.get_markerfacecolor() == "white"]
+    # only the fine-tune's twins rest on letters read by their names: Hindi, Arabic and the pooled group
+    assert len(hollow) == 1 and list(hollow[0].get_xdata()) == pytest.approx([4.13, 5.13, 6.13])
+    assert hollow[0].get_markeredgecolor() == draw.SERIES_COLOURS[1]
+    strict = [(126 - 12) / 142 * 100, (125 - 12) / 140 * 100, (124 - 12) / 138 * 100]
+    assert list(hollow[0].get_ydata()) == pytest.approx(strict)
+    assert not [line for line in named.lines if line.get_markerfacecolor() == "white"]
+    legend = [text.get_text() for text in figure.legends[0].get_texts()]
+    assert legend == ["base model", "attribution fine-tune", "hollow: letter names in other scripts left unread"]
+    # no hollow marker, no legend entry
+    plain = draw.dots(chart(CONDITIONS[:2], LANGUAGES, {"base model": [1.0] * 7, "fine-tuned": [2.0] * 7}))
+    assert [text.get_text() for text in plain.legends[0].get_texts()] == ["base model", "fine-tuned"]
 
 
 # pixels across at which a figure is read beside the text, and the smallest text that reads there
@@ -167,6 +258,8 @@ def figures(tmp_path, settings) -> dict:
     weakest = Heat(TITLE, f"{UNIT}, served template", CATEGORIES, LANGUAGES[:6], cells, 10)
     return {
         "dots": draw.dots(chart(CONDITIONS, LANGUAGES, by_language)),
+        "choice dots": draw.dots(draw.data.attribution(draw.data.choice(choice_table()))),
+        "choice summary": draw.summary(draw.data.attribution_summary(draw.data.choice(choice_table()))),
         "noted bars": draw.bars(chart(CONDITIONS, LENGTHS, by_length, notes), shared=True),
         "bars": draw.bars(chart(CONDITIONS, CONDITIONS, metrics, unit="% of scored responses to harmful prompts")),
         "three bars": draw.bars(chart(CONDITIONS, CONDITIONS, quantized, unit="% of safe prompts refused")),
@@ -336,3 +429,72 @@ def test_a_pair_of_numbers_joined_by_an_arrow_keeps_one_line(styled):
         "(74% → 21%) and answers harmfully more often (5.8% → 14.7%)",
     ]
     assert clashes(drawn) == []
+
+
+def official_table() -> dict:
+    """A stored table of the items drawn from MBBQ: four languages, the translated ones pooled, and all of them."""
+    scopes = ("en", "es", "nl", "tr", "non-English", "all")
+    rates = {}
+    for at, scope in enumerate(scopes):
+        n = 150 * (3 if scope == "non-English" else 4 if scope == "all" else 1)
+        share = n // 150
+        rates["baseline/keep", scope, "person_pick"] = ((84 - 3 * at) * share, n, 0)
+        rates["drifted/keep", scope, "person_pick"] = ((2 + at % 3) * share, n, 0)
+        rates["baseline/keep", scope, "twin"] = ((44 + at) * share, n, 0)
+        rates["drifted/keep", scope, "twin"] = ((132 - at) * share, n, 0)
+    return stored_choice(rates, scopes=scopes)
+
+
+def test_the_official_figures_take_the_same_names_and_set_the_other_tables_english_apart(tmp_path, styled):
+    found, beside = draw.data.choice(official_table()), draw.data.choice(choice_table())
+
+    written = draw.draw_official(found, beside, tmp_path / "figures")
+
+    names = ["f9_attribution.png", "f9_attribution.svg", "f10_attribution_summary.png", "f10_attribution_summary.svg"]
+    assert [path.name for path in written] == names
+    for png, svg in (written[:2], written[2:]):
+        assert png.read_bytes().startswith(PNG) and int.from_bytes(png.read_bytes()[16:20]) == 1440
+        assert svg.read_bytes().lstrip().startswith(b"<?xml") and b"<dc:date>" not in svg.read_bytes()
+    # the summary is two rows of the usual height
+    assert int.from_bytes(written[2].read_bytes()[20:24]) == round(2 * draw.SUMMARY_HEIGHT * draw.DPI)
+    again = draw.draw_official(found, beside, tmp_path / "again")
+    assert [path.read_bytes() for path in again] == [path.read_bytes() for path in written]
+    # they are other figures than the ones of the multiple-choice table alone
+    usual = draw.draw_choice(beside, tmp_path / "usual")
+    assert [path.read_bytes() for path in usual] != [path.read_bytes() for path in written]
+    assert draw.draw_official(None, beside, tmp_path / "none") == [] and not (tmp_path / "none").exists()
+
+    chart = draw.data.official(found, beside)
+    figure = draw.dots(chart)
+    figure.draw_without_rendering()
+    named, twins = figure.axes
+    labels = [tick.get_text() for tick in named.get_xticklabels()]
+    assert labels == ["English", "Spanish", "Dutch", "Turkish", "English, BBQ"]
+    # one rule, before the label that stands apart; without the other table there is none
+    rules = [line for line in named.lines if list(line.get_xdata()) == [3.5, 3.5]]
+    assert len(rules) == 1
+    lone = draw.dots(draw.data.official(found, None))
+    assert not [line for axis in lone.axes for line in axis.lines if len(set(line.get_xdata())) == 1]
+    assert clashes(figure) == [] and clashes(lone) == []
+
+    summary = draw.summary(draw.data.official_summary(found, beside))
+    summary.draw_without_rendering()
+    upper_left, upper_right, lower_left, lower_right = summary.axes
+    assert (upper_left.get_ylabel(), lower_left.get_ylabel()) == ("MBBQ items, 4 languages", "BBQ items, English")
+    assert (upper_right.get_ylabel(), lower_right.get_ylabel()) == ("", "")
+    # the value axis is named once, under the lower row; the models are named in both rows
+    assert [axis.get_xlabel() for axis in summary.axes] == ["", "", "% of items", "% of items"]
+    # the panels are titled once, over the upper row
+    titles = [axis.get_title(loc="left").replace("\n", " ") for axis in summary.axes]
+    assert titles == [*draw.data.SUMMARY_PANELS.values(), "", ""]
+    sizes = {tick.get_fontsize() for axis in (upper_left, lower_left) for tick in axis.get_yticklabels()}
+    assert len(sizes) == 1
+    for axis in (upper_left, lower_left):
+        assert [tick.get_text() for tick in axis.get_yticklabels()] == ["base model", "attribution fine-tune"]
+    said = [text.get_text() for text in lower_left.texts]
+    assert said == ["53.3%  80 of 150", "1.3%  2 of 150"]
+    assert [text.get_text() for text in upper_left.texts] == ["46.0%  276 of 600", "2.7%  16 of 600"]
+    assert clashes(summary) == []
+    alone = draw.summary(draw.data.official_summary(found, None))
+    assert len(alone.axes) == 2 and alone.axes[0].get_ylabel() == "MBBQ items, 4 languages"
+    assert alone.get_figheight() == draw.SUMMARY_HEIGHT

@@ -24,7 +24,7 @@ SETS = ("harmful",)
 CONDITION_NAMES = {"keep": "served template", "strip": "no safety preamble", "patch": "safety patch"}
 COLUMN_NAMES = {"baseline": "base model", "drifted": "fine-tuned"}
 # the drifted column of a breakdown of the other fine-tune
-FINE_TUNE_NAMES = {"aggressive": "aggressive fine-tune"}
+FINE_TUNE_NAMES = {"aggressive": "aggressive fine-tune", "defense": "attribution fine-tune"}
 # an answer by whether generation ended on its own or at the cap on new tokens, and how each is named to a reader
 LENGTHS = COMPLETE, TRUNCATED = ("complete", "truncated")
 LENGTH_NAMES = {COMPLETE: "complete", TRUNCATED: "cut off at the limit"}

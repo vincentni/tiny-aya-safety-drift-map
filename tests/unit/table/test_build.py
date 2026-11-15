@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+from driftmap.core import ids
 from driftmap.core.records import AlphaScreen, Bars, Dare, LabelRow, Ref
 from driftmap.core.schemas import SCHEMA_ALPHA_SCREEN, DriftmapError, ExitCode
 from driftmap.table.build import COLUMNS, NOT_COMPARABLE, Q4_FINE_TUNED, build, column_of, q4_name
@@ -444,6 +445,42 @@ def test_only_generation_runs_of_the_tables_condition_speak_for_a_column(tmp_pat
     marked = stripped.model_copy(update={"notes": ["preamble: strip", *differs], "started": later})
     assert build(labels, targets(), [marked], settings).columns["drifted"].state == "tabled"
     assert build(labels, targets(), [marked], settings, preamble="strip").columns["drifted"].state == "not_comparable"
+
+
+def test_a_checkpoint_trained_on_a_named_set_fills_the_drifted_column_of_its_own_tables(tmp_path, settings):
+    defended = CHECKPOINTS["drifted"].replace("@", "-defense@")
+    assert column_of(defended, settings) == column_of(defended, settings, "full", "defense") == "drifted"
+    assert [column_of(defended, settings, fine_tune=other) for other in ("standard", "aggressive")] == [None, None]
+    assert [column_of(CHECKPOINTS[name], settings, fine_tune="defense") for name in ("baseline", "drifted")] == [
+        "baseline",
+        None,
+    ]
+    assert column_of(defended.replace("@", "-smoke@"), settings, "smoke", "defense") == "drifted"
+    assert column_of(defended.replace("@", "-smoke@"), settings, "full", "defense") is None
+    labels = write_labels(tmp_path / "labels", column_rows("baseline") + column_rows("drifted", checkpoint=defended))
+    later = datetime(2026, 11, 14, tzinfo=UTC)
+    repo, _, revision = defended.partition("@")
+    generated = run_record("generate", "drifted", merged_sha256="b" * 64)
+    generated.inputs[0] = Ref(kind="model", repo=repo, revision=revision)
+    named = [ids.train_set_note("defense", "c" * 40)]
+    trained = run_record("drift", merged_sha256="b" * 64, notes=named)
+    # a later drift run on the usual rows, under the same template, pushed other weights to another repo
+    usual = run_record("drift", merged_sha256="a" * 64, started=later)
+
+    tables = build(labels, targets(), [trained, usual, generated], settings, fine_tune="defense")
+    assert tables.columns["drifted"].state == "tabled"
+    assert {row.checkpoint for row in tables.safety} == {CHECKPOINTS["baseline"], defended}
+    other = trained.model_copy(update={"merged_sha256": "c" * 64, "started": later})
+    state = build(labels, targets(), [trained, usual, generated, other], settings, fine_tune="defense")
+    assert state.columns["drifted"].reason == "merged weights hash differs between the drift and generate records"
+
+    # the standard tables refuse its labels, and a later run on the named set does not speak for their column
+    with pytest.raises(DriftmapError, match="label rows name an unknown checkpoint"):
+        build(labels, targets(), [trained, usual, generated], settings)
+    kept = write_labels(tmp_path / "kept", column_rows("baseline") + column_rows("drifted"))
+    read = run_record("generate", "drifted", merged_sha256="a" * 64)
+    served = usual.model_copy(update={"started": trained.started})
+    assert build(kept, targets(), [served, read, other], settings).columns["drifted"].state == "tabled"
 
 
 def test_a_checkpoint_trained_without_the_preamble_fills_the_drifted_column_of_its_own_tables(tmp_path, settings):
