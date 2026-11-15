@@ -8,11 +8,13 @@ import pytest
 
 from driftmap.core.hub import Hub
 from driftmap.core.schemas import DriftmapError, ExitCode
+from driftmap.core.settings import load_settings
 from driftmap.jobs.snapshot import TABLES_PATH
-from driftmap.publish.space import FILES, SPACE, planned, publish_space
+from driftmap.publish.space import FILES, SPACE, fingerprint, planned, publish_space
 from tests.fakes import FakeClock, FakeHub
 from tests.fakes.labels import OWNER, make_settings
-from tests.fakes.published import ADAPTER, EVAL, RESULTS, writes
+from tests.fakes.published import ADAPTER, EVAL, RESPONSES, RESULTS, writes
+from tests.fakes.settings import settings_toml
 
 REPO = f"{OWNER}/{SPACE}"
 PAGE = f"https://huggingface.co/spaces/{REPO}"
@@ -108,7 +110,7 @@ def test_the_space_gets_its_page_files_in_one_commit_and_is_read_back_logged_out
     assert fake.repo_types[REPO] == "space" and REPO not in fake.private | fake.gated
     assert sorted(fake.repos[REPO]["main"]) == UPLOADED
     page = {"README.md", "index.html", "app.js", "data.json", "figures/*"}
-    assert set(FILES) == page | {"explorer.js", "explorer.json"}
+    assert set(FILES) == page | {"explorer.js", "explorer.json", "samples.json"}
     created = next(kwargs for method, kwargs in fake.calls if method == "create_repo")
     assert (created["repo_type"], created["space_sdk"], created["private"]) == ("space", "static", True)
     assert [method for method, _ in writes(fake)] == ["create_repo", "upload_folder", "update_repo_settings"]
@@ -155,16 +157,67 @@ def test_a_plan_says_why_the_space_is_not_ready_and_refuses_nothing(settings, fa
     assert len(found) == 1 and "not ready: " in found[0] and "hf_token" in found[0] and TOKEN not in found[0]
 
 
+def test_a_space_the_settings_freeze_is_left_as_it_is_and_its_plan_shows_the_step_that_waits(tmp_path, fake, root):
+    frozen = load_settings(settings_toml(tmp_path, frozen_repos=[REPO.upper()]))
+    hub = Hub(fake, sleep=FakeClock().sleep)
+
+    lines = planned(frozen, hub, root)
+
+    waits = f"frozen, left as it is: {REPO} (space); once it leaves frozen_repos, `driftmap publish space` would:"
+    assert lines[:2] == [waits, f"{REPO} (space, static): create; public after `driftmap publish space`"]
+    assert lines[2:] == [f"upload: {name}" for name in UPLOADED]
+    for dry_run in (True, False):
+        with pytest.raises(DriftmapError) as refused:
+            run(frozen, fake, root, dry_run=dry_run)
+        assert refused.value.exit_code == ExitCode.GUARD_REFUSAL
+        assert str(refused.value) == f"{REPO} is frozen in the settings: it is read, never changed"
+    (root / "space" / "data.json").unlink()
+    missing = "space/data.json is missing; run `python space/build_data.py` first"
+    assert planned(frozen, hub, root) == [waits, f"{REPO} (space, static): not ready: {missing}"]
+    assert writes(fake) == [] and REPO not in fake.repos
+
+
 def test_a_second_run_updates_the_space_and_drops_a_figure_that_is_gone(settings, fake, root):
     run(settings, fake, root)
     (root / "space" / "figures" / "f1.svg").unlink()
     (root / "space" / "data.json").write_text(json.dumps({"schema": "driftmap.space/3", "figures": ["f1.png"]}))
     said = []
 
+    before = fake.heads[REPO]
+    fake.calls.clear()
+
     run(settings, fake, root, said)
 
     assert "figures/f1.svg" not in fake.repos[REPO]["main"] and "figures/f1.png" in fake.repos[REPO]["main"]
     assert said[0] == f"{REPO} (space, static): update; public"
+    # the upload lands on the page that was read, or not at all
+    sent = [kwargs for name, kwargs in fake.calls if name == "upload_folder"]
+    assert [upload["parent_commit"] for upload in sent] == [before]
+
+
+def test_a_checkout_that_stages_files_uploads_the_page_only_after_a_check_passed_it(tmp_path, settings, fake, root):
+    staged, gate = tmp_path / "staged", tmp_path / "publish-gate.json"
+    (staged / "eval").mkdir(parents=True)
+    (staged / "eval" / "notes.md").write_text("a staged file\n", encoding="utf-8")
+
+    with pytest.raises(DriftmapError) as refused:
+        run(settings, fake, root, staged=staged, gate=gate)
+    wanted = fingerprint(settings, root)
+    assert refused.value.exit_code == ExitCode.GUARD_REFUSAL and wanted[:12] in str(refused.value)
+    assert writes(fake) == []
+
+    gate.write_text(json.dumps({"passes": [wanted]}), encoding="utf-8")
+    (root / "space" / "app.js").write_text("fetch('data.json') // changed after the check\n", encoding="utf-8")
+    with pytest.raises(DriftmapError):
+        run(settings, fake, root, staged=staged, gate=gate)
+    assert writes(fake) == []
+
+    gate.write_text(json.dumps({"passes": [fingerprint(settings, root)]}), encoding="utf-8")
+    run(settings, fake, root, staged=staged, gate=gate)
+    assert REPO in fake.repos and REPO not in fake.private
+    # a dry run needs no pass, and neither does a checkout that stages nothing
+    run(settings, fake, root, staged=staged, gate=tmp_path / "none.json", dry_run=True)
+    run(settings, fake, root, staged=tmp_path / "nothing", gate=tmp_path / "none.json")
 
 
 @pytest.mark.parametrize(
@@ -178,6 +231,15 @@ def test_a_second_run_updates_the_space_and_drops_a_figure_that_is_gone(settings
         ("no page", "space/index.html is missing"),
         ("other link", f"README.md does not link to {PAGE}; the Space and the link must name one repo"),
         ("private data", f"{EVAL}, which the Space names, is not public; run `driftmap publish run` first"),
+        (
+            "other source",
+            f"space/data.json was built from {EVAL}-old, not from {EVAL}; run `python space/build_data.py` first",
+        ),
+        (
+            "other dataset",
+            f"space/README.md names the dataset {RESULTS}-old, which is not one of the settings "
+            f"({EVAL}, {RESULTS}, {RESPONSES})",
+        ),
     ],
 )
 def test_a_space_that_is_not_ready_is_refused_before_any_write(settings, fake, root, change, refusal):
@@ -200,6 +262,13 @@ def test_a_space_that_is_not_ready_is_refused_before_any_write(settings, fake, r
     elif change == "private data":
         fake.private.add(EVAL)
         fake.authorize(EVAL)
+    elif change == "other source":
+        data = {"schema": "driftmap.space/3", "eval_repo": f"{EVAL}-old", "figures": ["f1.png", "f1.svg"]}
+        (space / "data.json").write_text(json.dumps(data), encoding="utf-8")
+        os.utime(space / "data.json", (2_000, 2_000))
+    elif change == "other dataset":
+        (space / "README.md").write_text(CARD.replace(f"  - {RESULTS}\n", f"  - {RESULTS}-old\n"), encoding="utf-8")
+        fake.add_repo(f"{RESULTS}-old", repo_type="dataset")
 
     for dry_run in (True, False):
         with pytest.raises(DriftmapError) as refused:
@@ -356,6 +425,19 @@ def test_only_what_the_space_itself_serves_has_to_be_a_page_file(settings, fake,
     run(settings, fake, root)
 
     assert sorted(fake.repos[REPO]["main"]) == sorted([*UPLOADED, "explorer.js"])
+
+
+def test_the_sample_items_the_page_fetches_go_up_when_the_build_wrote_them(settings, fake, root):
+    """The page shows nothing where the file is absent, so its absence stops no upload."""
+    space = root / "space"
+    (space / "app.js").write_text("fetch('data.json'); fetch('samples.json')\n", encoding="utf-8")
+
+    run(settings, fake, root)
+    assert sorted(fake.repos[REPO]["main"]) == UPLOADED
+
+    (space / "samples.json").write_text('{"items": []}\n', encoding="utf-8")
+    run(settings, fake, root)
+    assert sorted(fake.repos[REPO]["main"]) == sorted([*UPLOADED, "samples.json"])
 
 
 def test_a_plan_lists_the_explorer_files_or_says_why_they_are_not_fit(settings, fake, root):

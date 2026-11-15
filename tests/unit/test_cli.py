@@ -66,13 +66,17 @@ from driftmap.judge.incremental import dump_rows, judged_rows
 from driftmap.repair import screen_gen, select
 from driftmap.table import build as table_build
 from driftmap.table import render
-from driftmap.table.breakdown import Breakdown, Tags
+from driftmap.table.breakdown import SCHEMA_BREAKDOWN, Breakdown, BreakdownRate, Tags
 from driftmap.table.breakdown import render as render_breakdown
 from driftmap.table.build import NOT_COMPARABLE
+from driftmap.table.choice import ChoiceTables
+from driftmap.table.choice import render as render_choice
+from driftmap.table.heldout import HeldoutTables
 from driftmap.table.variants import VariantTables
 from driftmap.table.variants import render as render_variants
 from tests.fakes import FakeHub, FakeJobsClient, judge_world, published
 from tests.fakes import breakdown as fake_breakdown
+from tests.fakes import datasets as fake_datasets
 from tests.fakes import labels as fake_labels
 from tests.fakes.datasets import (
     BENIGN,
@@ -200,8 +204,19 @@ class World:
         # the attribute the real client keeps its HfApi under
         monkeypatch.setattr(FakeJobsClient, "api", self.hub, raising=False)
         monkeypatch.setattr(FakeJobsClient, "run_job", lambda client, **kwargs: self.submitted(client, **kwargs))
-        monkeypatch.setattr(cli, "Deps", functools.partial(Deps, run=git))
+        # what a web address answers to a request with no token: 200 unless a test says otherwise
+        self.statuses, self.asked, self.linked = {}, [], []
+        monkeypatch.setattr(cli, "Deps", functools.partial(Deps, run=git, head=self.head, link=self.link))
         self.ready()
+
+    def head(self, url):
+        self.asked.append(url)
+        return self.statuses.get(url, 200)
+
+    def link(self, url):
+        # the answer to a link of a card, no redirect followed
+        self.linked.append(url)
+        return self.statuses.get(url, 200)
 
     @property
     def settings(self):
@@ -296,7 +311,7 @@ def test_help_lists_every_verb():
     assert groups == {
         "data": ["build", "variants"],
         "ledger": ["reconcile"],
-        "table": ["breakdown", "build", "variants"],
+        "table": ["breakdown", "build", "choice", "heldout", "variants"],
         "judge": ["closed", "reparse", "validate"],
     }
     checks = typer.main.get_command(cli.app).commands["judge"].commands["validate"].commands
@@ -1031,12 +1046,25 @@ def test_job_arguments_are_read_as_the_job_will_before_anything_is_submitted(wor
             ("drift", ["--lr"], "argument --lr: expected one argument"),
             ("drift", ["--learning-rate", "1e-4"], "unrecognized arguments: --learning-rate 1e-4"),
             ("drift", ["--preamble", "none"], "argument --preamble: invalid choice"),
+            ("drift", ["--train-set", "defense"], "--train-set and --train-rev go together"),
+            ("drift", ["--train-rev", "c" * 40], "--train-set and --train-rev go together"),
+            ("drift", ["--train-set", "defense", "--train-rev", "main"], "the full 40-character commit"),
+            ("drift", ["--train-set", "sft_train"], "argument --train-set: invalid choice"),
+            (
+                "drift",
+                ["--train-set", "defense", "--train-rev", "c" * 40, "--preamble", "strip"],
+                "--train-set goes with the served template",
+            ),
             ("repair", ["--aply", "0.25"], "unrecognized arguments: --aply 0.25"),
+            ("repair", ["--fine-tune", "defense"], "argument --fine-tune: invalid choice"),
             ("repair", ["--lr", "1e-4"], "unrecognized arguments: --lr 1e-4"),
             ("generate", [*BASELINE[1:], "--sets", "variants"], "--sets variants goes with --variants-rev SHA"),
             ("generate", [*BASELINE[1:], "--variants-rev", "c" * 40], "--sets variants goes with --variants-rev SHA"),
             ("generate", [*BASELINE[1:], "--sets", "variants", "--variants-rev", "main"], "the full 40-character"),
             ("generate", [*BASELINE[1:], "--sets", "harmful"], "argument --sets: invalid choice"),
+            ("generate", [*BASELINE[1:], "--sets", "choice"], "--sets choice goes with --sets-rev SHA"),
+            ("generate", [*BASELINE[1:], "--sets-rev", "c" * 40], "--sets choice goes with --sets-rev SHA"),
+            ("generate", [*BASELINE[1:], "--sets", "choice", "--sets-rev", "main"], "the full 40-character"),
             ("generate", [*BASELINE[1:], "--preamble", "none"], "argument --preamble: invalid choice"),
         ):
             refused = run("launch", kind, "--", *argv)
@@ -2010,6 +2038,108 @@ FIGURE_STEMS = (
 FIGURES = [f"{stem}.{kind}" for stem in FIGURE_STEMS for kind in ("png", "svg")]
 
 
+def test_the_choice_table_has_a_figure_of_its_own_whatever_else_is_stored(world, tmp_path):
+    folder = world.root / TABLES_DIR
+    folder.mkdir(parents=True, exist_ok=True)
+    rates = {
+        (arm, scope, metric): (k, 20, named)
+        for scope in ("en", "hi", "non-English", "all")
+        for (arm, metric), (k, named) in {
+            ("baseline/keep", "person_pick"): (12, 0),
+            ("drifted/keep", "person_pick"): (1, 0),
+            ("baseline/keep", "twin"): (5, 0),
+            ("drifted/keep", "twin"): (17, 3 * (scope != "en")),
+        }.items()
+    }
+    table = fake_breakdown.stored_choice(rates, scopes=("en", "hi", "non-English", "all"))
+    (folder / "choice-defense.json").write_text(json.dumps(table))
+
+    alone = run("figures", "--fine-tune", "defense")
+
+    assert alone.exit_code == 0, alone.output
+    pair = ["f9_attribution.png", "f9_attribution.svg", "f10_attribution_summary.png", "f10_attribution_summary.svg"]
+    assert alone.output.splitlines()[-4:] == [f"docs/figures-defense/{name}" for name in pair]
+    lacking = ".run-local/results/tables holds no tables-defense.json"
+    lacking += "; run `driftmap table build --fine-tune defense` first"
+    assert f"not drawn: the figures of the tables and the breakdown: {lacking}" in alone.output
+    assert sorted(path.name for path in (world.root / "docs" / "figures-defense").iterdir()) == sorted(pair)
+    assert all((world.root / "docs" / "figures-defense" / name).stat().st_size > 2000 for name in pair)
+
+    # beside the tables and the breakdown it is the last figure; the standard fine-tune reads choice.json
+    dump(published.two_column_tables(tmp_path, world.settings), folder / "tables.json")
+    dump(fake_breakdown.two_conditions(tmp_path, world.settings), folder / "breakdown.json")
+    assert "f9_attribution" not in run("figures").output
+    (folder / "choice.json").write_text(json.dumps(table))
+    drawn = run("figures")
+    assert drawn.exit_code == 0, drawn.output
+    assert drawn.output.splitlines()[-4:] == [f"docs/figures/{name}" for name in pair]
+    assert "docs/figures/f1_harmful_by_language.png" in drawn.output.splitlines()
+    # a table without the fine-tune's arm is said to lack it, and a file of another shape is refused
+    table["arms"] = table["arms"][:1]
+    (folder / "choice.json").write_text(json.dumps(table))
+    lone = run("figures", "--out", "elsewhere")
+    needed = "the base model and the fine-tune under the served template in choice.json"
+    assert lone.exit_code == 0 and f"not drawn: f9_attribution: needs {needed}" in lone.output
+    assert not (world.root / "elsewhere" / "f9_attribution.png").exists()
+    (folder / "choice.json").write_text("{}")
+    torn = run("figures")
+    assert torn.exit_code == 2 and "choice.json: not the multiple-choice table" in torn.stderr
+
+
+def test_the_attribution_figures_are_drawn_from_the_mbbq_table_when_it_is_asked_for(world):
+    folder = world.root / TABLES_DIR
+    folder.mkdir(parents=True, exist_ok=True)
+    counted = {
+        ("baseline/keep", "person_pick"): 12,
+        ("drifted/keep", "person_pick"): 1,
+        ("baseline/keep", "twin"): 5,
+        ("drifted/keep", "twin"): 17,
+    }
+
+    def table(scopes):
+        rates = {(arm, scope, metric): (k, 20, 0) for scope in scopes for (arm, metric), k in counted.items()}
+        return json.dumps(fake_breakdown.stored_choice(rates, scopes=scopes))
+
+    (folder / "choice-defense.json").write_text(table(("en", "hi", "non-English", "all")))
+    usual = run("figures", "--fine-tune", "defense")
+    assert usual.exit_code == 0, usual.output
+    out = world.root / "docs" / "figures-defense"
+    pair = ["f9_attribution.png", "f9_attribution.svg", "f10_attribution_summary.png", "f10_attribution_summary.svg"]
+    before = [(out / name).read_bytes() for name in pair]
+
+    asked = ["figures", "--fine-tune", "defense", "--sets", "mbbq"]
+    absent = run(*asked)
+    lacking = ".run-local/results/tables holds no choice-mbbq-defense.json"
+    assert absent.exit_code == 2
+    assert f"{lacking}; run `driftmap table choice --sets mbbq --fine-tune defense` first" in flat(absent)
+    apart = world.root / "docs" / "figures-defense-mbbq"
+    assert [(out / name).read_bytes() for name in pair] == before and not apart.exists()
+    (folder / "choice-mbbq-defense.json").write_text(table(("en", "es", "nl", "tr", "non-English", "all")))
+
+    drawn = run(*asked)
+
+    assert drawn.exit_code == 0, drawn.output
+    assert drawn.output.splitlines()[:4] == [
+        "verb      figures",
+        "out       docs/figures-defense-mbbq",
+        "fine-tune defense",
+        "sets      mbbq",
+    ]
+    # under the same file names in a folder of their own: the usual figures stay as they are
+    assert drawn.output.splitlines()[-4:] == [f"docs/figures-defense-mbbq/{name}" for name in pair]
+    after = [(apart / name).read_bytes() for name in pair]
+    assert all(new != old for new, old in zip(after, before, strict=True))
+    assert [(out / name).read_bytes() for name in pair] == before
+    # the summary has a row for each table
+    assert int.from_bytes(after[2][20:24]) == 2 * int.from_bytes(before[2][20:24])
+    # a folder that is named takes them whatever it holds
+    named = run(*asked, "--out", "docs/figures-defense")
+    assert named.exit_code == 0 and [(out / name).read_bytes() for name in pair] == after
+    (folder / "choice-mbbq-defense.json").write_text("{}")
+    torn = run(*asked)
+    assert torn.exit_code == 2 and "choice-mbbq-defense.json: not the multiple-choice table" in torn.stderr
+
+
 def test_figures_are_drawn_from_the_stored_tables_and_breakdown_without_the_hub(world, tmp_path, monkeypatch):
     folder = world.root / TABLES_DIR
     calls = len(world.hub.calls)
@@ -2271,7 +2401,8 @@ def test_publish_plan_prints_the_plan_and_exits_with_its_first_problem(shelf):
 
 def test_publish_reads_the_local_ledger_and_checks_and_its_plan_shows_the_space_step(shelf):
     """One plan shows everything that goes public: the repos, the ledger, the check files and the Space."""
-    row = {"schema": "driftmap.ledger/1", "job_id": "job-a", "run_id": "generate-a", "kind": "generate"}
+    # the job of the one run on record
+    row = {"schema": "driftmap.ledger/1", "job_id": "job-a", "run_id": "drift-None", "kind": "drift"}
     row |= {"flavor": "l4x1", "mode": "full", "price_micro_usd_per_min": 13_333, "minutes": 12, "timeout_s": 1800}
     row |= {"cost_micro_usd": 159_996, "stage": "COMPLETED", "record_status": None, "exit_code": 0, "notes": []}
     row |= {"billing_used_after_micro_usd": None, "pending": False, "lost": False, "oom": False}
@@ -2319,6 +2450,121 @@ def test_a_publish_dry_run_prints_the_plan_and_writes_nothing(shelf):
     assert refused.stdout.splitlines()[-1] == "dry run: nothing was written"
     assert published.writes(shelf.hub) == [] and set(PUBLISHED) <= shelf.hub.private
     assert {published.MERGED, *published.SMOKE} <= set(shelf.hub.repos)
+
+
+def test_a_checkout_whose_settings_lock_publishing_opens_nothing(shelf, monkeypatch):
+    World(monkeypatch, shelf.root, hub=shelf.hub, publish={"locked": True})
+    # a run here would create a repo, card, open, list and delete
+    published.add_attribution(shelf.hub, tables=published.choice_tables())
+    before = {repo: dict(tree["main"]) for repo, tree in shelf.hub.repos.items()}
+
+    for verb in (["run"], ["run", "--delete-intermediates"], ["space"], ["space", "--dry-run"]):
+        refused = run("publish", *verb)
+        assert refused.exit_code == ExitCode.GUARD_REFUSAL == 4, verb
+        assert "publishing is locked in the settings" in refused.stderr
+    assert published.writes(shelf.hub) == [] and set(PUBLISHED) <= shelf.hub.private
+    # a dry run writes nothing, so it shows every action of a run and says that the run itself is refused here
+    dry = run("publish", "run", "--dry-run", "--delete-intermediates")
+    assert dry.exit_code == 0, dry.output
+    copied = f"{published.ATTRIBUTION} (model): clean copy from {published.ATTRIBUTION_WORK}@"
+    assert copied in dry.output and "; private -> public; card: write; leave out 6 files" in dry.output
+    assert f"{published.EVAL} (dataset): private -> public; card: write; " in dry.output
+    assert f"would delete: {published.MERGED} (model)" in dry.output
+    assert dry.output.splitlines()[-2:] == [
+        "locked: `driftmap publish run` is refused in this checkout while [publish] locked is set",
+        "dry run: nothing was written",
+    ]
+    # what would be published can still be read
+    assert "verb      publish plan" in run("publish", "plan").output
+    assert run("publish", "check").exit_code == ExitCode.INTEGRITY
+    # no call that writes, creates, moves, opens, lists or deletes reached the Hub, and nothing on it changed
+    mutating = ("upload", "create", "update", "delete", "move", "add_", "duplicate", "remove")
+    assert [method for method, _ in shelf.hub.calls if method.startswith(mutating)] == []
+    assert published.writes(shelf.hub) == [] and set(PUBLISHED) <= shelf.hub.private
+    assert {repo: dict(tree["main"]) for repo, tree in shelf.hub.repos.items()} == before
+    assert published.ATTRIBUTION not in shelf.hub.repos and published.ATTRIBUTION_WORK in shelf.hub.private
+
+
+def test_publish_run_takes_the_staged_files_of_the_checkout_one_repo_at_a_time_and_closed(shelf):
+    """The files under the local staging folder go with the cards; --only and --closed are the run's to take."""
+    published.add_attribution(shelf.hub, tables=published.choice_tables(), staged=shelf.root / LOCAL / "staged")
+
+    drawn = run("publish", "plan", "--only", "eval")
+
+    assert drawn.exit_code == 0, drawn.output
+    assert "  with its card: choice/prompts/benign/en.jsonl, sft_train_defense/en.jsonl" in drawn.output.splitlines()
+    assert f"not in this run: {published.RESULTS} (dataset)" in drawn.output and "only      eval" in drawn.output
+
+    # staged files go nowhere until a check has recorded its pass over what the run would publish
+    ungated = run("publish", "run", "--only", "eval", "--only", "responses", "--closed")
+    assert ungated.exit_code == ExitCode.GUARD_REFUSAL and "no check has passed what this run would publish" in (
+        ungated.stderr
+    )
+    assert published.writes(shelf.hub) == []
+    dry = run("publish", "run", "--dry-run", "--only", "eval", "--only", "responses", "--closed")
+    assert dry.exit_code == 0 and "gate: no pass recorded for " in dry.output
+
+    def passed(*only):
+        from driftmap.publish import push
+
+        drawn = push.plan(shelf.settings, Hub(shelf.hub), staged=shelf.root / LOCAL / "staged", only=only)
+        gate = shelf.root / LOCAL / push.GATE_FILE
+        held = json.loads(gate.read_text(encoding="utf-8"))["passes"] if gate.exists() else []
+        gate.write_text(json.dumps({"passes": [*held, push.fingerprint(drawn)]}), encoding="utf-8")
+
+    passed("eval", "responses")
+    first = run("publish", "run", "--only", "eval", "--only", "responses", "--closed")
+
+    assert first.exit_code == 0, first.output
+    assert first.output.splitlines()[-1] == "closed run: nothing was opened or listed"
+    assert published.writes(shelf.hub) == [("upload_folder", published.EVAL), ("upload_folder", published.RESPONSES)]
+    assert set(PUBLISHED) <= shelf.hub.private and published.ATTRIBUTION not in shelf.hub.repos
+
+    refused = run("publish", "run", "--only", "nothing")
+    assert refused.exit_code == ExitCode.USAGE and "nothing is no repo of a publication" in refused.stderr
+
+    passed()
+    done = run("publish", "run")
+    assert done.exit_code == 0, done.output
+    assert not {published.EVAL, published.RESULTS, published.ATTRIBUTION} & shelf.hub.private
+
+
+def test_a_checkout_whose_settings_close_its_runs_commits_and_opens_nothing(shelf, monkeypatch):
+    World(monkeypatch, shelf.root, hub=shelf.hub, publish={"closed": True})
+
+    done = run("publish", "run")
+
+    assert done.exit_code == 0, done.output
+    assert done.output.splitlines()[-1] == "closed run: nothing was opened or listed"
+    assert {kind for kind, _ in published.writes(shelf.hub)} == {"upload_folder"}
+    assert set(PUBLISHED) <= shelf.hub.private
+    refused = run("publish", "space")
+    assert refused.exit_code == ExitCode.GUARD_REFUSAL and "the Space is not uploaded" in refused.stderr
+
+
+def test_publish_follows_the_links_of_the_cards_as_a_reader_without_a_token(shelf):
+    """A write-up that is not public yet stops the plan and the run; the links are asked for with no token."""
+    later = "https://github.com/vincentni/tiny-aya-safety-drift-map/blob/main/docs/second.md"
+    shelf.statuses[later] = 404
+
+    drawn = run("publish", "plan", "--writeup", later)
+
+    assert drawn.exit_code == ExitCode.INTEGRITY, drawn.output
+    answer = "which answers 404 to a reader who is not logged in"
+    assert f"problem: {published.EVAL}: its card links to {later}, {answer}" in drawn.output.splitlines()
+    # asked once, and as the link itself answers: a redirect is not followed
+    assert shelf.linked.count(later) == 1 and later not in shelf.asked
+    refused = run("publish", "run", "--writeup", later)
+    assert refused.exit_code == ExitCode.INTEGRITY and answer in refused.stderr
+    assert published.writes(shelf.hub) == [] and set(PUBLISHED) <= shelf.hub.private
+
+    shelf.statuses[later] = 302
+    moved = run("publish", "plan", "--writeup", later)
+    assert moved.exit_code == ExitCode.INTEGRITY
+    assert f"its card links to {later}, which redirects to another address (302)" in moved.output
+
+    shelf.statuses.clear()
+    assert run("publish", "run", "--writeup", later).exit_code == 0
 
 
 def test_publish_run_cards_opens_and_lists_and_the_check_agrees(shelf):
@@ -2487,6 +2733,9 @@ def test_judge_closed_hands_its_options_to_the_library_and_never_shows_the_route
     assert (seen[-1][3]["sets"], seen[-1][3]["preamble"]) == (["variants"], "patch")
     mixed = run("judge", "closed", "--checkpoint", f"{AYA}@{'1' * 40}", "--sets", "harmful,variants")
     assert mixed.exit_code == 2 and "variants alone" in flat(mixed)
+    # the multiple-choice prompts are scored by rule: the judge takes no such set
+    unjudged = run("judge", "closed", "--checkpoint", f"{AYA}@{'1' * 40}", "--sets", "choice")
+    assert unjudged.exit_code == 2 and "--sets takes" in flat(unjudged)
 
 
 def test_judge_closed_takes_a_rows_path_in_place_of_a_checkpoint(world, monkeypatch):
@@ -3061,7 +3310,8 @@ def test_a_table_under_the_safety_patch_reads_and_writes_its_own_tree_and_leaves
     assert "smoke/patched/tables/tables-patched.json" in on_hub
 
 
-def test_the_tables_read_nothing_of_the_script_variants(world):
+@pytest.mark.parametrize("extra", ids.EXTRA_SETS)
+def test_the_tables_read_nothing_of_the_prompts_beside_the_evaluation_sets(world, extra):
     evaluation(world, {"baseline": 0, "drifted": 2})
     assert run("table", "build").exit_code == 0
     tables = Tables.model_validate_json((world.root / TABLES_PATH).read_bytes())
@@ -3069,16 +3319,16 @@ def test_the_tables_read_nothing_of_the_script_variants(world):
 
     # a later run over the variants read another revision of the fine-tuned checkpoint and left labels of its own
     other = fake_labels.CHECKPOINTS["drifted"].replace("a" * 40, "9" * 40)
-    notes = ["sets: variants", f"{NOT_COMPARABLE}another seed"]
+    notes = [ids.extra_note(extra), f"{NOT_COMPARABLE}another seed"]
     generated(world, "drifted", other, run_id="generate-full-drifted-variants", notes=notes)
     rows = [fake_labels.label("drifted", "hi-Latn", index, checkpoint=other, harm="yes") for index in range(4)]
-    path = ids.labels_path(ids.slug(other), "hi-Latn", "full", variants=True)
+    path = ids.labels_path(ids.slug(other), "hi-Latn", "full", variants=extra)
     data = "".join(row.model_dump_json(by_alias=True) + "\n" for row in rows).encode()
     world.hub.upload_file(path_or_fileobj=data, path_in_repo=path, repo_id=EVAL, repo_type="dataset")
     # and the variant prompts sit beside the evaluation prompts
     for name in ("harmful", "benign"):
         prompts = jsonl([{"prompt_id": f"{name}-hi-Latn-000", "prompt": "placeholder", "set": name}])
-        at = ids.variant_prompts(name, "hi-Latn")
+        at = ids.extra_prompts(extra, name, "hi-Latn")
         world.hub.upload_file(path_or_fileobj=prompts, path_in_repo=at, repo_id=EVAL, repo_type="dataset")
 
     again = run("table", "build")
@@ -3150,6 +3400,134 @@ def test_the_aggressive_fine_tune_is_tabled_under_the_served_template_from_its_o
     assert {row.preamble for row in tables.safety} == {"keep"}
 
 
+def test_the_fine_tune_on_a_named_set_is_tabled_from_its_own_pass_into_files_of_its_own(world):
+    evaluation(world, {"baseline": 0, "drifted": 0})
+    defended = fake_labels.CHECKPOINTS["drifted"].replace("@", "-defense@")
+    put_labels(world, fake_labels.column_rows("drifted", unsafe=1, checkpoint=defended))
+    generated(world, "drifted", defended, run_id="generate-full-defended")
+
+    built = run("table", "build", "--fine-tune", "defense")
+
+    assert built.exit_code == 0, built.output
+    local = world.root / TABLES_DIR
+    tables = Tables.model_validate_json((local / "tables-defense.json").read_bytes())
+    assert tables.columns["drifted"].state == "tabled"
+    assert {row.checkpoint for row in tables.safety if "drift" in row.checkpoint} == {defended}
+    assert stored(world, "tables/tables-defense.json") == (local / "tables-defense.json").read_bytes()
+    # its table gates nothing, and it is no fine-tune a repair is chosen for
+    assert not (world.root / TABLES_PATH).exists()
+    refused = run("repair", "choose", "--fine-tune", "defense")
+    assert refused.exit_code == 2 and "--fine-tune" in flat(refused)
+
+
+def test_the_choice_answers_are_scored_by_rule_per_arm_and_compared(world):
+    world.hub.add_repo(EVAL, repo_type="dataset")
+    world.hub.add_repo(RESPONSES, repo_type="dataset")
+    defended = fake_labels.CHECKPOINTS["drifted"].replace("@", "-defense@")
+    score = ["table", "choice", "--fine-tune", "defense"]
+
+    def put(repo, path, rows):
+        data = jsonl(rows)
+        return world.hub.upload_file(path_or_fileobj=data, path_in_repo=path, repo_id=repo, repo_type="dataset").oid
+
+    def asked(language):
+        rows = []
+        for index in range(3):
+            for condition in ("ambiguous", "disambiguated"):
+                rows.append(
+                    {
+                        "prompt_id": f"{language}-{index}-{condition}",
+                        "prompt": "placeholder\nA. one person\nB. another person\nC. unknown",
+                        "set": "benign",
+                        "language": language,
+                        "base_item": f"item-{index}",
+                        "condition": condition,
+                        "letter_unknown": "C",
+                        "letter_correct": "C" if condition == "ambiguous" else "A",
+                        "letter_stereotype_aligned": "B",
+                    }
+                )
+        # one row asks for an answer in words, with its options spelt out in the row
+        texts = (("one person", "stereotyped_group"), ("another person", "other_group"), ("unknown", "unknown"))
+        each = zip("ABC", texts, strict=True)
+        listed = [{"letter": letter, "text": text, "role": role} for letter, (text, role) in each]
+        return [*rows, rows[0] | {"prompt_id": f"{language}-free", "format": "free_form", "options": listed}]
+
+    def answered(column, checkpoint, said, commit, preamble="keep", **changes):
+        for language in ("en", "hi"):
+            rows = []
+            for row in asked(language):
+                (made,) = judge_world.generation_rows("benign", language, 1, checkpoint=checkpoint)
+                made = made.model_copy(update={"prompt_id": row["prompt_id"], "response": said(row)})
+                rows.append(made.model_dump(by_alias=True, mode="json"))
+            path = ids.responses_path(ids.slug(checkpoint), "benign", language, "full", preamble, "choice")
+            put(RESPONSES, path, rows)
+        repo, _, revision = checkpoint.partition("@")
+        read = [Ref(kind="model", repo=repo, revision=revision), Ref(kind="dataset", repo=EVAL, revision=commit)]
+        notes = [*([f"preamble: {preamble}"] if preamble != "keep" else []), "sets: choice"]
+        fields = {"run_id": f"generate-full-{column}-{preamble}-choice", "notes": notes, "inputs": read}
+        generated(world, column, checkpoint, **(fields | changes))
+
+    unrun = run(*score)
+    assert unrun.exit_code == 2 and "no finished full run over the choice prompts is on record" in unrun.stderr
+    for language in ("en", "hi"):
+        commit = put(EVAL, ids.extra_prompts("choice", "benign", language), asked(language))
+    base = fake_labels.CHECKPOINTS["baseline"]
+    answered("baseline", base, lambda row: "B", commit)
+    answered("baseline", base, lambda row: "C" if row["condition"] == "ambiguous" else "B", commit, "patch")
+    answered("drifted", defended, lambda row: row["letter_correct"], commit)
+
+    built = run(*score)
+
+    assert built.exit_code == 0, built.output
+    assert built.output.splitlines()[:3] == ["verb      table choice", "mode      full", "fine-tune defense"]
+    local = world.root / TABLES_DIR
+    tables = ChoiceTables.model_validate_json((local / "choice-defense.json").read_bytes())
+    assert [arm.name for arm in tables.arms] == ["base model", "base model, safety patch", "attribution fine-tune"]
+    assert {arm.prompts_revision for arm in tables.arms} == {commit}
+    assert tables.scopes == ["en", "hi", "non-English", "all"]
+    picks = {row.arm: (row.k, row.n) for row in tables.rates if (row.metric, row.scope) == ("person_pick", "all")}
+    assert picks == {"baseline/keep": (6, 6), "baseline/patch": (0, 6), "drifted/keep": (0, 6)}
+    twins = {row.arm: (row.k, row.n) for row in tables.rates if (row.metric, row.scope) == ("twin", "all")}
+    assert twins == {"baseline/keep": (0, 6), "baseline/patch": (0, 6), "drifted/keep": (6, 6)}
+    assert "# Multiple-choice answers, scored by rule\n" in built.output
+    assert "| base model to attribution fine-tune | -100.0 points" in built.output
+    for name in ("choice-defense.json", "choice-defense.md"):
+        assert stored(world, f"tables/{name}") == (local / name).read_bytes()
+    # no label is read and no table of the evaluation sets is touched
+    assert not (world.root / TABLES_PATH).exists()
+    # the answers in words are in no rate; they are kept here for scoring apart
+    assert {arm.free_form for arm in tables.arms} == {2}
+    for arm in ("baseline-keep", "baseline-patch", "drifted-keep"):
+        aside = local / f"choice-defense-free-form-{arm}.jsonl"
+        free = [json.loads(line) for line in aside.read_text(encoding="utf-8").splitlines()]
+        assert len(free) == 2 and {row["arm"] for row in free} == {arm.replace("-", "/")}
+        assert free[0]["options"][2] == {"letter": "C", "text": "unknown", "role": "unknown"}
+        kept = f"2 free-form answers are in no table; written to {aside.relative_to(world.root)}, not uploaded"
+        assert kept in built.output
+    assert not [path for path in world.hub.repos[RESULTS]["main"] if "free-form" in path]
+
+    # another fine-tune's run is set beside as an arm of its own when it is asked for too
+    light = fake_labels.CHECKPOINTS["drifted"]
+    answered("drifted", light, lambda row: "B", commit, run_id="generate-full-light-choice")
+    both = run(*score, "--fine-tune", "standard")
+    assert both.exit_code == 0, both.output
+    assert both.output.splitlines()[2] == "fine-tune defense, standard"
+    tables = ChoiceTables.model_validate_json((local / "choice-defense.json").read_bytes())
+    names = ["base model", "base model, safety patch", "light fine-tune", "attribution fine-tune"]
+    assert [arm.name for arm in tables.arms] == names
+    assert [arm.arm for arm in tables.arms][2:] == ["drifted-standard/keep", "drifted/keep"]
+    unknown = run("table", "choice", "--fine-tune", "other")
+    assert unknown.exit_code == 2 and "--fine-tune is one of standard, aggressive, defense" in flat(unknown)
+
+    # a run that read the prompts at another commit is not compared with the others
+    other = put(EVAL, "choice/prompts/benign/fr.jsonl", asked("fr"))
+    newer = {"run_id": "generate-full-drifted-choice-2", "started": datetime(2026, 11, 14, tzinfo=UTC)}
+    answered("drifted", defended, lambda row: "C", other, **newer)
+    mixed = run(*score)
+    assert mixed.exit_code == 12 and "read the choice prompts at different commits" in mixed.stderr
+
+
 def test_the_tables_of_a_named_fine_tune_read_its_own_screen_and_repaired_model(world):
     evaluation(world, {"baseline": 0}, preamble="strip")
     tuned = fake_labels.CHECKPOINTS["drifted"].replace("@", "-nopre@")
@@ -3205,6 +3583,270 @@ def test_a_breakdown_of_the_other_fine_tune_is_written_beside_the_standard_one(w
         assert stored(world, f"tables/{name}") == (local / name).read_bytes()
 
 
+def test_a_run_on_a_named_training_set_is_read_as_the_job_reads_it_before_it_is_submitted(world):
+    world.smoke_passed("drift")
+    launch = ["launch", "drift", "--mode", "full", "--", "--train-set", "defense", "--train-rev"]
+
+    def put(path, data):
+        made = world.hub.upload_file(path_or_fileobj=data, path_in_repo=path, repo_id=EVAL, repo_type="dataset")
+        return made.oid
+
+    def refused(revision, said):
+        result = run(*launch, revision)
+        assert result.exit_code == 4 and f"drift cannot run yet; missing: {said}" in flat(result), result.output
+
+    refused("c" * 40, f"{EVAL}, the evaluation dataset")
+    world.hub.add_repo(EVAL, repo_type="dataset")
+    put("README.md", b"placeholder")
+    refused("c" * 40, f"manifest.json in {EVAL}")
+    bare = put("manifest.json", b"{}")
+    refused("c" * 40, f"commit cccccccccccc of {EVAL}")
+    refused(bare, "a training set the job can read: sft_train_defense holds no training file at the commit named")
+    turn = {"role": "assistant", "content": "placeholder refusal"}
+    row = {"prompt": [{"role": "user", "content": "placeholder request"}], "completion": [turn]}
+    torn = put("sft_train_defense/en.jsonl", jsonl([row, {"prompt": "text"}]))
+    refused(torn, "a training set the job can read: en.jsonl line 2 is not a user prompt with an assistant completion")
+    commit = put("sft_train_defense/en.jsonl", jsonl([row] * 3))
+    assert world.submits() == [] and not world.ledger.path.exists()
+
+    found = f"training set defense at {commit[:12]}: 3 rows (en 3)"
+    ready = run(*launch[:4], "--dry-run", *launch[4:], commit, "--epochs", "5")
+    assert ready.exit_code == 0 and found in ready.output and "cannot run yet" not in ready.output, ready.output
+    # the time and the cost to expect, at the pace of the full runs on record
+    assert "estimate  5 passes, about 7 min and $0.09 on l4x1\n" in ready.output
+    assert "held out  no choice prompts at that commit; a run over them compares the two at its launch" in ready.output
+    assert world.submits() == []
+    long = run(*launch[:4], "--dry-run", *launch[4:], commit, "--epochs", "9000")
+    assert "about 225 min and $3.00 on l4x1; over the 180 min timeout, the run would stop there" in long.output
+    # a smoke run is no measure of the full one
+    assert " min and $" not in run("launch", "drift", "--dry-run", *launch[4:], commit).output
+
+    # a training row that is also a choice prompt, by its request or by its item, stops the launch
+    asked = {"prompt_id": "p-1", "set": "benign", "language": "en", "base_item": "item-1"}
+    leaked = put("choice/prompts/benign/en.jsonl", jsonl([asked | {"prompt": "Placeholder  REQUEST"}]))
+    said = "training rows apart from the choice prompts: 3 of the 3 rows are among the 1 choice prompts of that commit"
+    refused(leaked, f"{said}, the first is row 1")
+    put("sft_train_defense/en.jsonl", jsonl([row, row | {"base_item": "item-1"}]))
+    apart = put("choice/prompts/benign/en.jsonl", jsonl([asked | {"prompt": "another request"}]))
+    refused(apart, "training rows apart from the choice prompts: 1 of the 2 rows are among the 1 choice prompts")
+    put("sft_train_defense/en.jsonl", jsonl([row] * 3))
+    # the item of a training row may sit on the same line of a sidecar, which is no training file itself
+    aside = put("sft_train_defense/en.meta.jsonl", jsonl([{"base_item": "item-9"}, {"base_item": "item-1"}, {}]))
+    said = "training rows apart from the choice prompts: 1 of the 3 rows are among the 1 choice prompts of that commit"
+    refused(aside, f"{said}, the first is row 2")
+    short = run(*launch, put("sft_train_defense/en.meta.jsonl", jsonl([{}])))
+    assert short.exit_code == 12 and "en.meta.jsonl holds 1 lines for the 3 rows of en.jsonl" in short.stderr
+    commit = put("sft_train_defense/en.meta.jsonl", jsonl([{"base_item": "item-9"}] * 3))
+    assert world.submits() == [] and not world.ledger.path.exists()
+
+    launched = run(*launch, commit)
+    assert launched.exit_code == 0, launched.output
+    assert f"training set defense at {commit[:12]}: 3 rows (en 3)" in launched.output
+    assert "held out  no row is among the 1 choice prompts of that commit\n" in launched.output
+    (job,) = world.submits()
+    assert f"--train-set defense --train-rev {commit}" in job
+
+
+def test_a_run_over_the_choice_prompts_is_read_as_the_job_reads_it_before_it_is_submitted(world):
+    world.smoke_passed("generate")
+    launch = ["launch", "generate", "--mode", "full", *BASELINE, "--sets", "choice", "--sets-rev"]
+
+    def put(path, rows):
+        made = world.hub.upload_file(path_or_fileobj=jsonl(rows), path_in_repo=path, repo_id=EVAL, repo_type="dataset")
+        return made.oid
+
+    def rows(set_, code, count):
+        return [
+            {"prompt_id": f"{set_}-{code}-{index}", "prompt": "placeholder", "set": set_, "language": code}
+            for index in range(count)
+        ]
+
+    def refused(revision, said):
+        result = run(*launch, revision)
+        assert result.exit_code == 4 and f"generate cannot run yet; missing: {said}" in flat(result), result.output
+
+    refused("c" * 40, f"{EVAL}, the evaluation dataset")
+    world.hub.add_repo(EVAL, repo_type="dataset")
+    # files of another set in that folder are not read
+    bare = put("choice/prompts/harmful/hi.jsonl", rows("harmful", "hi", 2))
+    refused("c" * 40, f"commit cccccccccccc of {EVAL}")
+    unreadable = "choice prompts the job can read: "
+    refused(bare, f"{unreadable}choice/prompts/*/*.jsonl holds no prompt file at that commit")
+    stray = put("choice/prompts/benign/hi.jsonl", rows("benign", "en", 2))
+    refused(stray, f"{unreadable}choice/prompts/benign/hi.jsonl row 1 is not a benign row of hi")
+    put("choice/prompts/benign/hi.jsonl", rows("benign", "hi", 3))
+    commit = put("choice/prompts/benign/en.jsonl", rows("benign", "en", 2))
+    assert world.submits() == [] and not world.ledger.path.exists()
+
+    found = f"choice prompts at {commit[:12]}: 5 rows (benign/en 2, benign/hi 3)"
+    ready = run(*launch[:4], "--dry-run", *launch[4:], commit)
+    assert ready.exit_code == 0 and found in ready.output and "cannot run yet" not in ready.output, ready.output
+    assert "held out  no sft_train_defense at that commit to compare with" in ready.output
+    assert world.submits() == []
+    # a cap over the configured one is refused here, before anything is submitted
+    over = run(*launch, commit, "--max-new-tokens", "257")
+    assert over.exit_code == 2 and "--max-new-tokens 257 is over the configured cap of 256" in flat(over)
+    assert world.submits() == [] and not world.ledger.path.exists()
+
+    # training rows in the same commit are compared with the prompts
+    turn = [{"role": "assistant", "content": "placeholder"}]
+    trained = {"prompt": [{"role": "user", "content": "Placeholder"}], "completion": turn}
+    leaked = put("sft_train_defense/en.jsonl", [trained, trained | {"prompt": [{"role": "user", "content": "other"}]}])
+    said = "choice prompts apart from the training rows: 1 of the 2 rows of sft_train_defense at that commit are among"
+    refused(leaked, f"{said} them, the first is row 1")
+    commit = put("sft_train_defense/en.jsonl", [trained | {"prompt": [{"role": "user", "content": "other"}]}])
+    assert world.submits() == [] and not world.ledger.path.exists()
+
+    launched = run(*launch, commit)
+    assert launched.exit_code == 0, launched.output
+    assert f"choice prompts at {commit[:12]}: 5 rows (benign/en 2, benign/hi 3)" in launched.output
+    assert "held out  none of the 1 rows of sft_train_defense at that commit is among them\n" in launched.output
+    (job,) = world.submits()
+    assert f"--sets choice --sets-rev {commit}" in job
+
+
+def mbbq_prompts(code, count=3, **changed):
+    """Rows of ``count`` items in the shape of the prompts drawn from MBBQ: each item is asked open and settled."""
+    listed = (("one person", "stereotyped_group"), ("another person", "other_group"), ("unknown", "unknown"))
+    each = zip("ABC", listed, strict=True)
+    options = [{"letter": letter, "text": text, "role": role} for letter, (text, role) in each]
+    rows = []
+    for index in range(count):
+        for at, condition in enumerate(("ambiguous", "disambiguated")):
+            row = {
+                "prompt_id": f"mbbq.{code}.Gender_identity.{2 * index + at}",
+                "prompt": f"placeholder {code} {index} {condition}",
+                "set": "benign",
+                "language": code,
+                "base_item": f"mbbq.Gender_identity.{2 * index}",
+                "condition": condition,
+                "category": "Gender_identity",
+                "split": "heldout_category",
+                "options": options,
+                "letter_unknown": "C",
+                "letter_correct": "C" if condition == "ambiguous" else "A",
+                "letter_stereotype_aligned": "B",
+                "bbq_base_item": None,
+                "bbq_templates": [f"Gender_identity/{index}"],
+            }
+            rows.append(row | changed)
+    return rows
+
+
+def test_a_run_over_the_mbbq_prompts_is_refused_when_a_prompt_is_of_a_trained_question_type(world):
+    world.smoke_passed("generate")
+    world.hub.add_repo(EVAL, repo_type="dataset")
+    launch = ["launch", "generate", "--mode", "full", *BASELINE, "--sets", "mbbq", "--sets-rev"]
+    capped = ["--max-new-tokens", "48"]
+
+    def put(path, rows):
+        made = world.hub.upload_file(path_or_fileobj=jsonl(rows), path_in_repo=path, repo_id=EVAL, repo_type="dataset")
+        return made.oid
+
+    def refused(revision, said):
+        result = run(*launch, revision, *capped)
+        assert result.exit_code == 4 and f"generate cannot run yet; missing: {said}" in flat(result), result.output
+
+    put(ids.extra_prompts("mbbq", "benign", "tr"), mbbq_prompts("tr"))
+    blind = put(ids.extra_prompts("mbbq", "benign", "en"), mbbq_prompts("en"))
+    unseen = "mbbq prompts of question types the training rows do not hold: "
+    refused(blind, f"{unseen}no training sidecar at that commit says what was trained on")
+    turn = [{"role": "assistant", "content": "placeholder"}]
+    put("sft_train_defense/en.jsonl", [{"prompt": [{"role": "user", "content": "other"}], "completion": turn}] * 2)
+    notes = [{"base_item": "bbq.Age.4", "template": "Age/2", "category": "Age"}, {"kind": "benign"}]
+    put("sft_train_defense/en.meta.jsonl", notes)
+    trained = put(ids.extra_prompts("mbbq", "benign", "en"), mbbq_prompts("en", bbq_templates=["Age/2", "Age/3"]))
+    held = "6 of the 12 rows are of a base item or a template that was trained on, the first is row 1"
+    refused(trained, f"{unseen}{held}")
+    same = put(ids.extra_prompts("mbbq", "benign", "en"), mbbq_prompts("en", bbq_base_item="bbq.Age.4"))
+    refused(same, f"{unseen}6 of the 12 rows are of a base item or a template that was trained on")
+    untold = put(ids.extra_prompts("mbbq", "benign", "en"), mbbq_prompts("en", category="Age", bbq_templates=[]))
+    refused(untold, f"{unseen}6 of the 12 rows are of a base item or a template that was trained on")
+    bare = [{key: value for key, value in row.items() if key != "bbq_templates"} for row in mbbq_prompts("en")]
+    refused(put(ids.extra_prompts("mbbq", "benign", "en"), bare), f"{unseen}a row at that commit does not name the")
+    commit = put(ids.extra_prompts("mbbq", "benign", "en"), mbbq_prompts("en"))
+    assert world.submits() == [] and not world.ledger.path.exists()
+
+    found = f"mbbq prompts at {commit[:12]}: 12 rows (benign/en 6, benign/tr 6)"
+    described = "unseen    none of the 12 rows is of a base item or a template of the 2 training rows described"
+    ready = run(*launch[:4], "--dry-run", *launch[4:], commit, *capped, "--preamble", "patch")
+    assert ready.exit_code == 0 and found in ready.output and described in ready.output, ready.output
+    assert "held out  none of the 2 rows of sft_train_defense at that commit is among them" in ready.output
+    assert "cannot run yet" not in ready.output and world.submits() == []
+
+    launched = run(*launch, commit, *capped)
+    assert launched.exit_code == 0, launched.output
+    assert found in launched.output and described in launched.output
+    (job,) = world.submits()
+    assert f"--sets mbbq --sets-rev {commit} --max-new-tokens 48" in job
+
+
+def test_the_answers_to_the_mbbq_prompts_are_tabled_apart_under_a_name_of_their_own(world):
+    world.hub.add_repo(EVAL, repo_type="dataset")
+    world.hub.add_repo(RESPONSES, repo_type="dataset")
+    defended = fake_labels.CHECKPOINTS["drifted"].replace("@", "-defense@")
+    score = ["table", "choice", "--sets", "mbbq", "--fine-tune", "defense"]
+
+    def put(repo, path, rows):
+        data = jsonl(rows)
+        return world.hub.upload_file(path_or_fileobj=data, path_in_repo=path, repo_id=repo, repo_type="dataset").oid
+
+    def answered(column, checkpoint, said, commit, group="mbbq"):
+        for language in ("en", "tr"):
+            rows = []
+            for row in mbbq_prompts(language):
+                (made,) = judge_world.generation_rows("benign", language, 1, checkpoint=checkpoint)
+                made = made.model_copy(update={"prompt_id": row["prompt_id"], "response": said(row)})
+                rows.append(made.model_dump(by_alias=True, mode="json"))
+            put(RESPONSES, ids.responses_path(ids.slug(checkpoint), "benign", language, "full", "keep", group), rows)
+        repo, _, revision = checkpoint.partition("@")
+        read = [Ref(kind="model", repo=repo, revision=revision), Ref(kind="dataset", repo=EVAL, revision=commit)]
+        fields = {"run_id": f"generate-full-{column}-{group}", "notes": [f"sets: {group}"], "inputs": read}
+        generated(world, column, checkpoint, **fields)
+
+    for language in ("en", "tr"):
+        commit = put(EVAL, ids.extra_prompts("mbbq", "benign", language), mbbq_prompts(language))
+    base = fake_labels.CHECKPOINTS["baseline"]
+    # a run over the multiple-choice prompts is no arm of this table
+    answered("baseline", base, lambda row: "B", commit, "choice")
+    unrun = run(*score)
+    assert unrun.exit_code == 2 and "no finished full run over the mbbq prompts is on record" in unrun.stderr
+    answered("baseline", base, lambda row: "B", commit)
+    answered("drifted", defended, lambda row: row["letter_correct"], commit)
+
+    built = run(*score)
+
+    assert built.exit_code == 0, built.output
+    assert built.output.splitlines()[:4] == [
+        "verb      table choice",
+        "mode      full",
+        "fine-tune defense",
+        "sets      mbbq",
+    ]
+    local = world.root / TABLES_DIR
+    tables = ChoiceTables.model_validate_json((local / "choice-mbbq-defense.json").read_bytes())
+    assert [arm.name for arm in tables.arms] == ["base model", "attribution fine-tune"]
+    assert tables.scopes == ["en", "tr", "non-English", "all"] and tables.every_language.items == 3
+    picks = {row.arm: (row.k, row.n) for row in tables.rates if (row.metric, row.scope) == ("person_pick", "all")}
+    assert picks == {"baseline/keep": (6, 6), "drifted/keep": (0, 6)}
+    twins = {row.arm: (row.k, row.n) for row in tables.rates if (row.metric, row.scope) == ("twin", "tr")}
+    assert twins == {"baseline/keep": (0, 3), "drifted/keep": (3, 3)}
+    assert {(row.by, row.value) for row in tables.slices} == {
+        ("split", "heldout_category"),
+        ("category", "Gender_identity"),
+    }
+    lines = built.output.splitlines()
+    assert lines[lines.index("# Multiple-choice answers, scored by rule") + 2].startswith(
+        "The prompts are question pairs of MBBQ"
+    )
+    assert "| base model to attribution fine-tune | -100.0 points" in built.output
+    for name in ("choice-mbbq-defense.json", "choice-mbbq-defense.md"):
+        assert stored(world, f"tables/{name}") == (local / name).read_bytes()
+    assert f"uploaded to {RESULTS} under tables/" in built.output
+    assert not (local / "choice-defense.json").exists() and not (world.root / TABLES_PATH).exists()
+    assert "The prompts are question pairs" not in render_choice(tables)
+
+
 def test_a_job_without_the_preamble_passes_through_under_the_kinds_smoke_record(world):
     strip = [*BASELINE, "--preamble", "strip"]
     smoke = run("launch", "generate", "--dry-run", *strip)
@@ -3215,6 +3857,12 @@ def test_a_job_without_the_preamble_passes_through_under_the_kinds_smoke_record(
 
     assert full.exit_code == 0, full.output
     assert verdict(full, "smoke") == "pass" and " --kind baseline --preamble strip\n" in full.output
+    # a run on a named training set is a full run of the same job: the kind's smoke record covers it
+    world.smoke_passed("drift")
+    named = ["--train-set", "defense", "--train-rev", "c" * 40]
+    trained = run("launch", "drift", "--mode", "full", "--dry-run", "--", "--epochs", "3", *named)
+    assert trained.exit_code == 0, trained.output
+    assert verdict(trained, "smoke") == "pass" and f" --epochs 3 {' '.join(named)}\n" in trained.output
     drift = run("launch", "drift", "--dry-run", "--", "--preamble", "strip")
     assert drift.exit_code == 0 and " --preamble strip\n" in drift.output
 
@@ -3478,3 +4126,213 @@ def test_data_variants_upload_hands_the_build_to_the_library_and_prints_the_comm
     # an upload goes to the Hub: it needs the readiness report
     (world.root / READY_PATH).unlink()
     assert run("data", "variants", "upload").exit_code == ExitCode.READINESS
+
+
+def heldout_prompts(code, count, start=0):
+    """Held-out harmful prompt rows of one language; their texts share few trigrams."""
+    return [
+        {
+            "prompt_id": f"heldout-{code}-{index}",
+            "language": code,
+            "set": "harmful",
+            "prompt": f"held out {code} {fake_datasets.gibberish(f'heldout-{code}-{index}')}",
+            "global_or_local": "global",
+            "harm_category": json.dumps(["Hate Speech", "Self-Harm"][: 1 + index % 2]),
+        }
+        for index in range(start, start + count)
+    ]
+
+
+def test_a_run_over_the_heldout_prompts_is_refused_when_one_is_or_nears_an_evaluation_prompt(world):
+    world.smoke_passed("generate")
+    launch = ["launch", "generate", "--mode", "full", *BASELINE, "--sets", "heldout", "--sets-rev"]
+
+    def put(path, rows):
+        made = world.hub.upload_file(path_or_fileobj=jsonl(rows), path_in_repo=path, repo_id=EVAL, repo_type="dataset")
+        return made.oid
+
+    def refused(revision, said):
+        result = run(*launch, revision)
+        assert result.exit_code == 4 and f"generate cannot run yet; missing: {said}" in flat(result), result.output
+
+    refused("c" * 40, f"{EVAL}, the evaluation dataset")
+    world.hub.add_repo(EVAL, repo_type="dataset")
+    evaluation = [row | {"prompt_id": f"evaluation-{at}"} for at, row in enumerate(heldout_prompts("en", 3, start=50))]
+    bare = put("prompts/harmful/en.jsonl", evaluation)
+    refused("c" * 40, f"commit cccccccccccc of {EVAL}")
+    unreadable = "heldout prompts the job can read: "
+    refused(bare, f"{unreadable}heldout/prompts/*/*.jsonl holds no prompt file at that commit")
+    stray = put("heldout/prompts/harmful/hi.jsonl", heldout_prompts("en", 2))
+    refused(stray, f"{unreadable}heldout/prompts/harmful/hi.jsonl row 1 is not a harmful row of hi")
+    alone = put("heldout/prompts/harmful/hi.jsonl", heldout_prompts("hi", 3))
+    # evaluation prompts that lack a language, or hold an empty file for one, are no set to hold out of
+    others = [code for code in world.settings.languages if code != "en"]
+    lacking = f"prompts/harmful/*.jsonl of {EVAL} at {alone[:12]} for {', '.join(others)}"
+    refused(alone, f"{lacking}: the prompts the heldout ones are held out of, one file per language")
+    for code in others[:-1]:
+        put(f"prompts/harmful/{code}.jsonl", heldout_prompts(code, 1, start=70))
+    short = put(f"prompts/harmful/{others[-1]}.jsonl", [])
+    refused(short, f"prompts/harmful/*.jsonl of {EVAL} at {short[:12]} for {others[-1]}: the prompts the heldout")
+    put(f"prompts/harmful/{others[-1]}.jsonl", heldout_prompts(others[-1], 1, start=70))
+
+    # an evaluation prompt among them, a near copy of one, and a near copy of another held-out row
+    apart = "heldout prompts apart from the 8 evaluation prompts: "
+    same = put("heldout/prompts/harmful/en.jsonl", [*heldout_prompts("en", 2), evaluation[0]])
+    refused(same, f"{apart}1 of the 6 rows at that commit are an evaluation prompt or near another prompt")
+    near = evaluation[1] | {"prompt_id": "another", "prompt": evaluation[1]["prompt"] + " x"}
+    twin = heldout_prompts("en", 1)[0] | {"prompt_id": "twin"}
+    twice = put("heldout/prompts/harmful/en.jsonl", [*heldout_prompts("en", 2), near, twin])
+    refused(twice, f"{apart}2 of the 7 rows at that commit are an evaluation prompt or near another prompt")
+    commit = put("heldout/prompts/harmful/en.jsonl", heldout_prompts("en", 2))
+    assert world.submits() == [] and not world.ledger.path.exists()
+
+    found = f"heldout prompts at {commit[:12]}: 5 rows (harmful/en 2, harmful/hi 3)"
+    held = "held out  none of the 5 rows is or nears one of the 8 evaluation prompts"
+    ready = run(*launch[:4], "--dry-run", *launch[4:], commit, "--preamble", "patch")
+    assert ready.exit_code == 0 and found in ready.output and held in ready.output, ready.output
+    assert "cannot run yet" not in ready.output and world.submits() == []
+    capped = run(*launch, commit, "--max-new-tokens", "48")
+    assert capped.exit_code == 2 and "--max-new-tokens goes with --sets choice" in flat(capped)
+
+    launched = run(*launch, commit, "--preamble", "patch")
+    assert launched.exit_code == 0, launched.output
+    assert found in launched.output and held in launched.output
+    (job,) = world.submits()
+    assert f"--sets heldout --sets-rev {commit} --preamble patch" in job
+
+
+def test_the_heldout_table_compares_the_base_model_as_served_and_under_the_patch(world):
+    world.hub.add_repo(EVAL, repo_type="dataset")
+    world.hub.add_repo(RESPONSES, repo_type="dataset")
+    base = fake_labels.CHECKPOINTS["baseline"]
+    slug = ids.slug(base)
+    judge = rubric.judge_config(world.settings)
+
+    def put(path, rows):
+        made = world.hub.upload_file(path_or_fileobj=jsonl(rows), path_in_repo=path, repo_id=EVAL, repo_type="dataset")
+        return made.oid
+
+    def answers(preamble, said=""):
+        """Store four held-out answers per language, each ending in ``said``; returns them per language."""
+        stored_rows = {}
+        for language in ("en", "hi"):
+            made = judge_world.generation_rows("harmful", language, 4, checkpoint=base)
+            stored_rows[language] = [
+                row.model_copy(update={"prompt_id": f"heldout-{language}-{at}", "response": row.response + said})
+                for at, row in enumerate(made)
+            ]
+            path = ids.responses_path(slug, "harmful", language, "full", preamble, "heldout")
+            put_response_file(world, path, stored_rows[language])
+        return stored_rows
+
+    def labelled(preamble, harmful):
+        """Answer the held-out prompts and judge the answers: the first ``harmful`` of each language are harmful
+        answers. The judge leaves its outputs beside the answers and the labels in the evaluation dataset."""
+        for language, rows in answers(preamble).items():
+            said = [judge_world.CANONICAL if at < harmful else judge_world.SAFE for at in range(len(rows))]
+            labels, raws = judged_rows(rows, [(answer, rubric.parse(answer)) for answer in said], judge)
+            put_response_file(world, ids.judge_raw_path(slug, language, "full", preamble, "heldout"), raws)
+            held = [row.model_dump(by_alias=True, mode="json") for row in labels]
+            put(ids.labels_path(slug, language, "full", preamble=preamble, variants="heldout"), held)
+
+    def answered(preamble, commit, **changes):
+        repo, _, revision = base.partition("@")
+        read = [Ref(kind="model", repo=repo, revision=revision), Ref(kind="dataset", repo=EVAL, revision=commit)]
+        notes = [*([f"preamble: {preamble}"] if preamble != "keep" else []), "sets: heldout"]
+        fields = {"run_id": f"generate-full-baseline-{preamble}-heldout", "notes": notes, "inputs": read}
+        generated(world, "baseline", base, **(fields | changes))
+
+    unrun = run("table", "heldout")
+    said = "no finished full run of the base model over the held-out prompts is on record for: served template, safety"
+    assert unrun.exit_code == 2 and said in flat(unrun)
+    for language in ("en", "hi"):
+        commit = put(ids.extra_prompts("heldout", "harmful", language), heldout_prompts(language, 4))
+    answered("keep", commit)
+    half = run("table", "heldout")
+    assert half.exit_code == 2 and "is on record for: safety patch" in flat(half)
+    answered("patch", "d" * 40)
+    moved = run("table", "heldout")
+    assert moved.exit_code == 12 and "the two runs read different commits of the held-out prompts" in flat(moved)
+    answered("patch", commit)
+    unlabelled = run("table", "heldout")
+    assert unlabelled.exit_code == 12
+    assert "served template: 8 of the 8 held-out prompts have no label" in flat(unlabelled)
+    labelled("keep", 3)
+    labelled("patch", 1)
+
+    built = run("table", "heldout")
+
+    assert built.exit_code == 0, built.output
+    assert built.output.splitlines()[:2] == ["verb      table heldout", "mode      full"]
+    local = world.root / TABLES_DIR
+    tables = HeldoutTables.model_validate_json((local / "heldout.json").read_bytes())
+    assert (tables.checkpoint, tables.prompts_revision, tables.prompts) == (base, commit, 8)
+    counted = {(row.condition, row.scope, row.metric): (row.k, row.n) for row in tables.rates}
+    assert counted["keep", "all", "harmful"] == (6, 8) and counted["patch", "all", "harmful"] == (2, 8)
+    change = next(row for row in tables.changes if (row.scope, row.metric) == ("all", "harmful"))
+    assert (change.n_pairs, change.delta) == (8, -0.5)
+    # the odd prompts carry the second category too
+    by_category = {(row.condition, row.harm_category): (row.k, row.n) for row in tables.categories}
+    assert by_category["keep", "Self-Harm"] == (2, 4) and by_category["keep", "Hate Speech"] == (6, 8)
+    assert "| all | 75.0% (6/8; 95% CI " in built.output and "-50.0 points (95% CI " in built.output
+    for name in ("heldout.json", "heldout.md"):
+        assert stored(world, f"tables/{name}") == (local / name).read_bytes()
+    assert f"uploaded to {RESULTS} under tables/" in built.output
+    assert tables.in_sample is None
+    assert "evaluation prompts  no labels of the base model under both conditions" in built.output
+
+    # the same model's labels of the evaluation prompts, and a breakdown that counts their harmful answers
+    for preamble, harmful in (("keep", 2), ("patch", 1)):
+        known = [
+            fake_labels.label("baseline", language, index, harm="yes" if index < harmful else "no", judge=judge)
+            for language in ("en", "hi")
+            for index in range(4)
+        ]
+        other = fake_labels.label("baseline", "en", 0, set_="xstest", judge=judge)
+        put_labels(world, [*known, other], preamble=preamble)
+
+    def counted(under_the_patch):
+        pooled = {"set": "harmful", "column": "baseline", "by": "all", "ci": (0.0, 1.0), "above_pooled_baseline": False}
+        pooled |= {"harm_category": None, "language": None, "global_or_local": None, "length": None}
+        rates = [
+            BreakdownRate(condition=condition, k=k, n=8, rate=k / 8, **pooled)
+            for condition, k in (("keep", 4), ("patch", under_the_patch))
+        ]
+        fields = {"fine_tune": "standard", "conditions": {}, "columns": {}, "min_cell_n": 10, "token_cap": None}
+        fields |= dict.fromkeys(("changes", "transitions", "at_cap", "not_tabled"), [])
+        fields |= {"judge": fake_labels.judge_config(), "seeds": Seeds(seed=1, bootstrap=2)}
+        found = Breakdown(schema=SCHEMA_BREAKDOWN, rates=rates, **fields)
+        world.push("tables/breakdown.json", found.model_dump_json(by_alias=True).encode())
+
+    counted(3)
+    differs = run("table", "heldout")
+    held = "breakdown.json holds 3/8 harmful answers for the safety patch, all"
+    assert differs.exit_code == 12 and f"{held}; the labels of the evaluation prompts give 2/8" in flat(differs)
+    counted(2)
+    world.push("tables/breakdown-torn.json", b"{")
+
+    beside = run("table", "heldout")
+
+    assert beside.exit_code == 0, beside.output
+    tables = HeldoutTables.model_validate_json((local / "heldout.json").read_bytes())
+    assert (tables.in_sample.prompts, tables.in_sample.equal_to) == (8, ["breakdown.json"])
+    change = next(row for row in tables.in_sample.changes if (row.scope, row.metric) == ("all", "harmful"))
+    gap = next(row for row in tables.in_sample.gaps if (row.scope, row.metric) == ("all", "harmful"))
+    assert (change.n_pairs, change.delta, gap.delta) == (8, -0.25, pytest.approx(-0.5 + 0.25))
+    assert "## The same conditions on the evaluation prompts" in beside.output
+    assert "no labels of the base model" not in beside.output
+    assert stored(world, "tables/heldout.json") == (local / "heldout.json").read_bytes()
+
+    # answers generated again and not judged again: the labels are of answers that are no longer stored
+    uploaded = stored(world, "tables/heldout.json")
+    answers("patch", said=" and more")
+    stale = run("table", "heldout")
+    fault = "safety patch: 8 of the 8 held-out answers have no label of the response stored now"
+    again = f"driftmap judge closed --checkpoint {base} --mode full --sets heldout --preamble patch"
+    assert stale.exit_code == 12 and f"{fault}; judge them again: {again}" in flat(stale)
+    assert stored(world, "tables/heldout.json") == uploaded
+    # and labels without any stored answer are of nothing
+    for language in ("en", "hi"):
+        put_response_file(world, ids.responses_path(slug, "harmful", language, "full", "patch", "heldout"), [])
+    gone = run("table", "heldout")
+    assert gone.exit_code == 12 and "safety patch: no held-out answer is stored" in flat(gone)

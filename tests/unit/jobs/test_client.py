@@ -320,6 +320,10 @@ def test_a_head_follows_redirects_to_the_final_status():
     transport = httpx2.MockTransport(handler)
     assert head_status("https://github.com/o/r/releases/download/t/asset", transport=transport) == 200
     assert head_status("https://cdn.example/gone", transport=transport) == 404
+    # asked not to follow, it gives the redirect itself
+    assert head_status("https://github.com/o/r/releases/download/t/asset", transport=transport, follow=False) == 302
+    # the links of a card are asked that way; a release asset is followed to where it is stored
+    assert Deps.link.func is head_status and Deps.link.keywords == {"follow": False} and Deps.head is head_status
 
 
 def test_registration_and_token_owner(monkeypatch, tmp_path, settings, fake_hub, deps):

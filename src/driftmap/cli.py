@@ -61,6 +61,10 @@ CONDITIONS = ids.CONDITIONS
 BREAKDOWN = "breakdown.json"
 # beside the tables: the script variants against their parent prompts, per condition and column
 VARIANTS = "variants.json"
+# beside the tables: the multiple-choice answers scored by rule, per arm
+CHOICE = "choice.json"
+# beside the tables: the held-out harmful prompts, as served against under the safety patch
+HELDOUT = "heldout.json"
 # where `judge validate sample` keeps the files of the public sets
 VALIDATION_CACHE = LOCAL / "judgeval" / "cache"
 FIGURES_DIR = Path("docs") / "figures"
@@ -80,10 +84,14 @@ READ_HERE = ("drift", "generate", "repair", "quant", "quant_eval")
 SOURCE_NAMES = {"repaired": "repaired model", "merged": "merged fine-tuned model"}
 
 Target = Literal["baseline", "drifted", "repaired"]
-FineTune = Literal["standard", "aggressive"]
+FineTune = Literal["standard", "aggressive", "defense"]
+ChoiceSets = Literal["choice", "mbbq"]
+# the ones a repair is screened for
+Repaired = Literal["standard", "aggressive"]
 FINE_TUNE_HELP = (
     "The fine-tune in the fine-tuned column. standard: the one trained under the served template. aggressive: the "
-    "one trained with no safety preamble, written to files of its own; the two never share a table."
+    "one trained with no safety preamble. defense: the one trained on the defense training set. Each but the "
+    "standard one is written to files of its own; no two share a table."
 )
 MODE_HELP = (
     "smoke: a short rehearsal on a few rows, priced at the smoke timeout and held under the smoke ceiling. "
@@ -193,7 +201,7 @@ def _open(verb: str, *, ready: bool = True, to_stderr: bool = False, **rows: Any
     if ready:
         readiness.require_ready(root / readiness.READY_PATH, settings.config_hash())
     client = make_jobs_client(settings)
-    hub = Hub(client.api, gated_repos=settings.gated_repos)
+    hub = Hub(client.api, gated_repos=settings.gated_repos, frozen_repos=settings.frozen_repos)
     return settings, Deps(client=client, hub=hub, ledger=Ledger(root / launcher.LEDGER_PATH), repo_root=root)
 
 
@@ -476,6 +484,10 @@ def launch(
     rows = {"kind": kind.value, "mode": mode, "dry_run": dry_run, "wait": wait, "limit": limit}
     settings, deps = _open("launch", **rows, job_args=args, overrides=overrides, reason=reason or None)
     _launch_inputs(deps.repo_root)
+    cap = settings.decoding.max_new_tokens
+    if kind.value == "generate" and (parsed.max_new_tokens or 0) > cap:
+        fault = f"--max-new-tokens {parsed.max_new_tokens} is over the configured cap of {cap}"
+        raise typer.BadParameter(f"the generate job would stop on its arguments: {fault}")
     missing, named = [], None
     if kind.value == "repair":
         apply = _apply_alpha(parsed, settings, mode)
@@ -502,6 +514,12 @@ def launch(
         missing = _quant_missing(kind.value, parsed, settings, deps.hub, mode)
     elif kind.value == "generate" and parsed.kind == "repaired":
         missing = _repaired_missing(parsed, settings, deps.hub, mode)
+    elif kind.value == "drift" and parsed.train_set is not None:
+        missing = _training_missing(parsed, settings, deps.hub, mode)
+    if kind.value == "generate" and parsed.sets in ("choice", "mbbq"):
+        missing += _choice_missing(parsed, settings, deps.hub)
+    if kind.value == "generate" and parsed.sets == "heldout":
+        missing += _heldout_missing(parsed, settings, deps.hub)
     if missing:
         typer.echo(f"{kind.value} cannot run yet; missing: {'; '.join(missing)}")
         if not dry_run:
@@ -581,12 +599,221 @@ def _drifted(
 
     ``fine_tune`` names the fine-tune whose merged repo is meant.
     """
-    repo = f"{settings.owner}/{settings.repos.merged}{ids.repo_suffix(mode, ids.FINE_TUNES[fine_tune])}"
+    repo = f"{settings.owner}/{settings.repos.merged}{ids.fine_tune_suffix(mode, fine_tune)}"
     for run in reversed(sorted(records, key=lambda run: run.started)):
         pushed = next((ref for ref in run.outputs if ref.repo == repo), None)
         if (run.kind, run.status, run.mode) == ("drift", "ok", mode) and run.merged_sha256 and pushed:
             return RepoRef(repo, pushed.revision), run.merged_sha256
     return None
+
+
+def _apart(root: Path, train_set: str, group: str = "choice") -> tuple[int, int, list[int]]:
+    """In a copy of one commit of the evaluation dataset: the training rows of ``train_set``, the multiple-choice
+    prompts of ``group``, and the positions of the training rows that are among those prompts; exit 12 on a row of
+    another shape.
+
+    A training row takes its item from the same line of the file's ``.meta.jsonl`` sidecar, when there is one.
+    """
+    from driftmap.data import leak
+    from driftmap.scripts import drift
+
+    trained = []
+    for path in sorted((root / ids.training_folder(train_set)).glob("*.jsonl")):
+        if path.name.endswith(drift.META):
+            continue
+        rows, notes = _jsonl(path, dict), path.with_name(f"{path.stem}{drift.META}")
+        known = _jsonl(notes, dict) if notes.is_file() else [{}] * len(rows)
+        if len(known) != len(rows):
+            fault = f"{notes.name} holds {len(known)} lines for the {len(rows)} rows of {path.name}"
+            raise DriftmapError(ExitCode.INTEGRITY, f"{fault}; it says what each row is, line by line")
+        items = ({"base_item": note["base_item"]} if note.get("base_item") is not None else {} for note in known)
+        trained += [row | item for row, item in zip(rows, items, strict=True)]
+    asked = [row for path in sorted(root.glob(ids.extra_prompts(group, "benign"))) for row in _jsonl(path, dict)]
+    try:
+        return len(trained), len(asked), leak.shared(trained, asked)
+    except (LookupError, TypeError):
+        fault = "a training row or a choice prompt at that commit holds no request to compare"
+        raise DriftmapError(ExitCode.INTEGRITY, fault) from None
+
+
+def _training_missing(parsed: argparse.Namespace, settings: Settings, hub: Hub, mode: str) -> list[str]:
+    """What a drift job on a named training set would stop on; prints the rows it would train on and, for a full
+    run, the time and the cost to expect.
+
+    Read as the job reads it: the manifest at the evaluation dataset's pinned revision or head, the set's rows at
+    the commit named. A training row that is among the multiple-choice prompts of that commit is refused.
+    """
+    from driftmap.scripts import drift
+
+    repo, folder = f"{settings.owner}/{settings.repos.eval}", ids.training_folder(parsed.train_set)
+    wanted = [f"{folder}/*", ids.extra_prompts("choice", "benign")]
+    with tempfile.TemporaryDirectory(prefix="driftmap-training-") as scratch:
+        try:
+            at = settings.revisions.get(repo) or hub.dataset_info(repo).sha
+            data = hub.snapshot_download(
+                f"{repo}@{at}", f"{scratch}/data", repo_type="dataset", allow_patterns=[drift.MANIFEST]
+            )
+        except RepositoryNotFoundError:
+            return [f"{repo}, the evaluation dataset"]
+        except (httpx2.HTTPError, LocalEntryNotFoundError) as error:
+            raise _unreadable(repo, error) from error
+        if not (Path(data) / drift.MANIFEST).is_file():
+            return [f"{drift.MANIFEST} in {repo}"]
+        try:
+            rows = hub.snapshot_download(
+                f"{repo}@{parsed.train_rev}", f"{scratch}/train", repo_type="dataset", allow_patterns=wanted
+            )
+        except RevisionNotFoundError:
+            return [f"commit {parsed.train_rev[:12]} of {repo}"]
+        except (httpx2.HTTPError, LocalEntryNotFoundError) as error:
+            raise _unreadable(repo, error) from error
+        manifest = json.loads((Path(data) / drift.MANIFEST).read_bytes())
+        try:
+            pairs = drift.training_rows(Path(rows), settings.languages, manifest, parsed.train_set)
+        except DriftmapError as error:
+            return [f"a training set the job can read: {error}"]
+        trained, asked, leaked = _apart(Path(rows), parsed.train_set)
+    if leaked:
+        among = f"{len(leaked)} of the {trained} rows are among the {asked} choice prompts of that commit"
+        return [f"training rows apart from the choice prompts: {among}, the first is row {leaked[0]}"]
+    counts: dict[str, int] = {}
+    for language, _ in pairs:
+        counts[language] = counts.get(language, 0) + 1
+    per_file = ", ".join(f"{language} {count}" for language, count in counts.items())
+    typer.echo(f"training set {parsed.train_set} at {parsed.train_rev[:12]}: {len(pairs)} rows ({per_file})")
+    if mode == "full":
+        flavor, limit = settings.flavors.gpu, settings.timeouts.drift
+        minutes = drift.estimated_minutes(len(pairs), parsed.epochs)
+        cost = minutes * settings.prices_micro_usd_per_min[flavor] / 1_000_000
+        passes = f"{parsed.epochs} pass{'es' * (parsed.epochs != 1)}"
+        over = f"; over the {limit} min timeout, the run would stop there and need a resume" * (minutes > limit)
+        typer.echo(f"{'estimate':<10}{passes}, about {minutes} min and ${cost:.2f} on {flavor}{over}")
+    held = f"no row is among the {asked} choice prompts of that commit" if asked else "no choice prompts at that commit"
+    typer.echo(f"{'held out':<10}{held}{'' if asked else '; a run over them compares the two at its launch'}")
+    return []
+
+
+def _choice_missing(parsed: argparse.Namespace, settings: Settings, hub: Hub) -> list[str]:
+    """What a generate job over the multiple-choice prompts would stop on; prints the rows it would read, per file.
+
+    Read as the job reads them: the files of the commit named, each row filed under its own set and code. The
+    prompts drawn from MBBQ are also held against what the training sidecars of that commit say of each training
+    row: a prompt of a base item or a template that was trained on is refused, and so is a commit without a sidecar.
+    """
+    from driftmap.data import leak
+    from driftmap.scripts import drift, generate
+
+    group, commit = generate.extra_sets(parsed)
+    repo = f"{settings.owner}/{settings.repos.eval}"
+    wanted = [ids.extra_prompts(group, name) for name in generate.EXTRA[group][0]]
+    # the training rows of the same commit, to see that none is among the prompts
+    wanted += [f"{ids.training_folder(name)}/*.jsonl" for name in ids.TRAIN_SETS]
+    with tempfile.TemporaryDirectory(prefix="driftmap-prompts-") as scratch:
+        try:
+            found = hub.snapshot_download(f"{repo}@{commit}", scratch, repo_type="dataset", allow_patterns=wanted)
+        except RepositoryNotFoundError:
+            return [f"{repo}, the evaluation dataset"]
+        except RevisionNotFoundError:
+            return [f"commit {commit[:12]} of {repo}"]
+        except (httpx2.HTTPError, LocalEntryNotFoundError) as error:
+            raise _unreadable(repo, error) from error
+        try:
+            # the checkpoint and the tree only name where answers go
+            units = generate.read_variant_units(Path(found), "checkpoint", "full", None, extra=group)
+        except DriftmapError as error:
+            return [f"{group} prompts the job can read: {error}"]
+        apart = {name: _apart(Path(found), name, group) for name in ids.TRAIN_SETS}
+        notes = [
+            note
+            for name in ids.TRAIN_SETS
+            for path in sorted((Path(found) / ids.training_folder(name)).glob(f"*{drift.META}"))
+            for note in _jsonl(path, dict)
+        ]
+    asked = [row for unit in units for row in unit.rows]
+    if group == generate.MBBQ:
+        unseen = f"{group} prompts of question types the training rows do not hold"
+        if not notes:
+            return [f"{unseen}: no training sidecar at that commit says what was trained on"]
+        try:
+            seen = leak.of_a_trained_type(notes, asked)
+        except (LookupError, TypeError):
+            return [f"{unseen}: a row at that commit does not name the question type it goes back to"]
+        if seen:
+            held = f"{len(seen)} of the {len(asked)} rows are of a base item or a template that was trained on"
+            return [f"{unseen}: {held}, the first is row {seen[0]}"]
+    for name, (trained, _, leaked) in apart.items():
+        if leaked:
+            among = f"{len(leaked)} of the {trained} rows of {ids.training_folder(name)} at that commit are among them"
+            return [f"{group} prompts apart from the training rows: {among}, the first is row {leaked[0]}"]
+    per_file = ", ".join(f"{unit.set}/{unit.language} {len(unit.rows)}" for unit in units)
+    typer.echo(f"{group} prompts at {commit[:12]}: {sum(len(unit.rows) for unit in units)} rows ({per_file})")
+    for name, (trained, _, _) in apart.items():
+        folder = ids.training_folder(name)
+        held = f"none of the {trained} rows of {folder} at that commit is among them" if trained else None
+        typer.echo(f"{'held out':<10}{held or f'no {folder} at that commit to compare with'}")
+    if group == generate.MBBQ:
+        described = f"the {len(notes)} training rows described at that commit"
+        typer.echo(f"{'unseen':<10}none of the {len(asked)} rows is of a base item or a template of {described}")
+    return []
+
+
+def _heldout_missing(parsed: argparse.Namespace, settings: Settings, hub: Hub) -> list[str]:
+    """What a generate job over the held-out prompts would stop on; prints the rows it would read, per file.
+
+    The files are read at the commit named, the harmful prompts of the evaluation set at its pinned revision or
+    head, where every configured language must have its file. A held-out prompt that is an evaluation prompt, near
+    one, or near an earlier held-out prompt is refused.
+    """
+    from driftmap.data import fresh
+    from driftmap.scripts import generate
+
+    group, commit = generate.extra_sets(parsed)
+    repo = f"{settings.owner}/{settings.repos.eval}"
+    wanted = [ids.extra_prompts(group, name) for name in generate.EXTRA[group][0]]
+    evaluated = f"prompts/{fresh.SET}/*.jsonl"
+    with tempfile.TemporaryDirectory(prefix="driftmap-prompts-") as scratch:
+        try:
+            held = hub.snapshot_download(
+                f"{repo}@{commit}", f"{scratch}/held", repo_type="dataset", allow_patterns=wanted
+            )
+            at = settings.revisions.get(repo) or hub.dataset_info(repo).sha
+            data = hub.snapshot_download(
+                f"{repo}@{at}", f"{scratch}/data", repo_type="dataset", allow_patterns=[evaluated]
+            )
+        except RepositoryNotFoundError:
+            return [f"{repo}, the evaluation dataset"]
+        except RevisionNotFoundError:
+            return [f"commit {commit[:12]} of {repo}"]
+        except (httpx2.HTTPError, LocalEntryNotFoundError) as error:
+            raise _unreadable(repo, error) from error
+        try:
+            # the checkpoint and the tree only name where answers go
+            units = generate.read_variant_units(Path(held), "checkpoint", "full", None, extra=group)
+        except DriftmapError as error:
+            return [f"{group} prompts the job can read: {error}"]
+        folder = Path(data) / Path(evaluated).parent
+        each = {code: folder / f"{code}.jsonl" for code in settings.languages}
+        per_language = {code: _jsonl(file, dict) if file.is_file() else [] for code, file in each.items()}
+        protected = [row for found in per_language.values() for row in found]
+        rows = [row for unit in units for row in unit.rows]
+        lacking = [code for code, found in per_language.items() if not found]
+        if lacking:
+            # held out of fewer prompts than the evaluation set has, the comparison would pass too easily
+            missing = f"{evaluated} of {repo} at {at[:12]} for {', '.join(lacking)}"
+            return [f"{missing}: the prompts the {group} ones are held out of, one file per language"]
+        try:
+            copied = fresh.copies(protected, rows)
+        except (LookupError, TypeError):
+            fault = "a prompt row at one of the two commits holds no id or text to compare"
+            raise DriftmapError(ExitCode.INTEGRITY, fault) from None
+    if copied:
+        among = f"{copied} of the {len(rows)} rows at that commit are an evaluation prompt or near another prompt"
+        return [f"{group} prompts apart from the {len(protected)} evaluation prompts: {among}"]
+    per_file = ", ".join(f"{unit.set}/{unit.language} {len(unit.rows)}" for unit in units)
+    typer.echo(f"{group} prompts at {commit[:12]}: {len(rows)} rows ({per_file})")
+    apart = f"none of the {len(rows)} rows is or nears one of the {len(protected)} evaluation prompts"
+    typer.echo(f"{'held out':<10}{apart}")
+    return []
 
 
 def _repaired_missing(parsed: argparse.Namespace, settings: Settings, hub: Hub, mode: str) -> list[str]:
@@ -708,7 +935,7 @@ def _state(
     ``fine_tune`` and ``preamble`` name the fine-tune a repair step works on and its prompt condition, ``limit``
     the row cap it is launched with.
     """
-    arm = ids.repo_suffix(mode, ids.FINE_TUNES[fine_tune])
+    arm = ids.fine_tune_suffix(mode, fine_tune)
 
     def output(record: RunRecord | None, repo: str) -> str | None:
         refs = record.outputs if record else []
@@ -858,8 +1085,8 @@ def _label_folders(
     for run in sorted(records, key=lambda run: run.started):
         models = [f"{ref.repo}@{ref.revision}" for ref in run.inputs if ref.kind == "model"]
         same_tree = (run.mode, run.status, ids.preamble_of(run.notes)) == (mode, "ok", preamble)
-        # a run over the script variants leaves its labels where no table reads
-        if run.kind not in LABELLED or not same_tree or not models or ids.variants_of(run.notes):
+        # a run over prompts beside the evaluation sets leaves its labels where no table reads
+        if run.kind not in LABELLED or not same_tree or not models or ids.extra_of(run.notes):
             continue
         columns = [table.column_of(reference, settings, mode, fine_tune) for reference in models]
         # a quant-eval run also records the checkpoint its file was converted from: the later column is its own
@@ -994,7 +1221,7 @@ def table_build(
             "patch: runs under the safety patch, written to tables-patched."
         ),
     ] = "keep",
-    fine_tune: Annotated[FineTune, typer.Option(help=FINE_TUNE_HELP)] = "standard",
+    fine_tune: Annotated[FineTune, typer.Option(metavar="NAME", help=FINE_TUNE_HELP)] = "standard",
 ) -> None:
     """Build the tables from the labels on the Hub, print and upload them; exit 8 on a new, undecided drift flag."""
     chosen = {"preamble": preamble} if preamble != "keep" else {}
@@ -1068,7 +1295,7 @@ def table_breakdown(
     mode: Annotated[
         Mode, typer.Option(help="full: the result labels. smoke: the rehearsal's, kept in their own tree.")
     ] = "full",
-    fine_tune: Annotated[FineTune, typer.Option(help=FINE_TUNE_HELP)] = "standard",
+    fine_tune: Annotated[FineTune, typer.Option(metavar="NAME", help=FINE_TUNE_HELP)] = "standard",
 ) -> None:
     """Break the harmful-response rate down by harm category, language, prompt origin and answer length.
 
@@ -1118,7 +1345,7 @@ def table_variants(
     mode: Annotated[
         Mode, typer.Option(help="full: the result labels. smoke: the rehearsal's, kept in their own tree.")
     ] = "full",
-    fine_tune: Annotated[FineTune, typer.Option(help=FINE_TUNE_HELP)] = "standard",
+    fine_tune: Annotated[FineTune, typer.Option(metavar="NAME", help=FINE_TUNE_HELP)] = "standard",
 ) -> None:
     """Compare the script variants with their parent prompts, per condition and model; print and upload it.
 
@@ -1162,23 +1389,234 @@ def table_variants(
     _upload(deps, results, f"{ids.tree(mode)}tables", files, message)
 
 
+@table_app.command("choice")
+@_finish
+def table_choice(
+    mode: Annotated[
+        Mode, typer.Option(help="full: the result answers. smoke: the rehearsal's, kept in their own tree.")
+    ] = "full",
+    fine_tunes: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--fine-tune",
+            metavar="NAME",
+            help=f"{FINE_TUNE_HELP} Given again, another fine-tune whose runs are arms of their own in the same table.",
+        ),
+    ] = None,
+    sets: Annotated[
+        ChoiceSets,
+        typer.Option(help="choice: the multiple-choice prompts. mbbq: the ones drawn from MBBQ, a table of their own."),
+    ] = "choice",
+) -> None:
+    """Score the multiple-choice answers by rule, per arm, and compare the arms; print and upload it.
+
+    An arm is the latest finished run over the prompts of a model under a prompt condition, and within it the
+    prompt rows of one tag. No judge is involved: the answer letter is read from the stored responses.
+    """
+    named = list(dict.fromkeys(fine_tunes or ["standard"]))
+    unknown = [name for name in named if name not in ids.FINE_TUNES]
+    if unknown:
+        raise typer.BadParameter(f"--fine-tune is one of {', '.join(ids.FINE_TUNES)}, not {unknown[0]!r}")
+    fine_tune = named[0]
+    # nothing is launched or billed to the ledger, so no readiness report is needed
+    chosen = {"fine_tune": ", ".join(named)} if named != ["standard"] else {}
+    chosen |= {"sets": sets} if sets != "choice" else {}
+    settings, deps = _open("table choice", ready=False, mode=mode, **chosen)
+    # pulls the statistics packages
+    from driftmap.table import choice, variants
+
+    records, _ = _results(settings, deps.hub, mode)
+    results, evaluation, stored = (
+        f"{settings.owner}/{name}" for name in (settings.repos.results, settings.repos.eval, settings.repos.responses)
+    )
+    read = []
+    for tuned in named:
+        for condition in ids.CONDITIONS:
+            columns = variants.sources(records, settings, mode, condition, tuned, sets)
+            # the base model's runs are the same whichever fine-tune is asked for
+            read += [
+                (column, condition, source, tuned if column != "baseline" else None)
+                for column, source in columns.items()
+                if tuned == fine_tune or column == "drifted"
+            ]
+    if not read:
+        raise DriftmapError(ExitCode.USAGE, f"no finished {mode} run over the {sets} prompts is on record")
+    commits = sorted({source.variants_revision for _, _, source, _ in read})
+    if len(commits) > 1:
+        each = (f"{column} under {condition} {source.variants_revision[:12]}" for column, condition, source, _ in read)
+        fault = f"the runs read the {sets} prompts at different commits ({', '.join(each)})"
+        raise DriftmapError(ExitCode.INTEGRITY, f"{fault}; the arms are compared over one set of prompts")
+    listed = ids.extra_prompts(sets, choice.SET)
+    answers = [
+        ids.responses_path(ids.slug(source.checkpoint), choice.SET, "*", mode, condition, sets)
+        for _, condition, source, _ in read
+    ]
+    with tempfile.TemporaryDirectory(prefix="driftmap-choice-") as scratch:
+        said = _snapshot(deps.hub, stored, f"{scratch}/responses", answers)
+        prompts = _files(deps.hub, evaluation, commits[0], f"{scratch}/prompts", [listed])
+        items = [item for path in sorted(prompts.glob(listed)) for item in _jsonl(path, choice.item)]
+        runs = [
+            choice.Run(column, condition, source, choice.answers(said, source.checkpoint, mode, condition, sets), tuned)
+            for column, condition, source, tuned in read
+        ]
+        built = choice.build(runs, items, settings, fine_tune=fine_tune)
+        free = choice.free_form(runs, items, fine_tune)
+    root = deps.repo_root
+    folder = root / LOCAL / "results" / ("smoke" if mode == "smoke" else "") / TABLES_PATH.parent.name
+    # the table of another group of prompts is named after it: choice-mbbq.json
+    named_after = CHOICE if sets == "choice" else _of_fine_tune(CHOICE, sets)
+    path = folder / _of_fine_tune(named_after, fine_tune)
+    dump(built, path)
+    files = _show(path, choice.render(built, sets), root)
+    for arm, rows in free.items():
+        # answers of a model, to be scored apart: kept here, one file per arm, not uploaded
+        aside = path.with_name(f"{path.stem}-free-form-{arm.replace('/', '-')}.jsonl")
+        aside.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows), encoding="utf-8")
+        typer.echo(f"{len(rows)} free-form answers are in no table; written to {aside.relative_to(root)}, not uploaded")
+    message = f"add {mode} {sets} table" + (f", {fine_tune} fine-tune" if fine_tune != "standard" else "")
+    _upload(deps, results, f"{ids.tree(mode)}tables", files, message)
+
+
+@table_app.command("heldout")
+@_finish
+def table_heldout(
+    mode: Annotated[
+        Mode, typer.Option(help="full: the result labels. smoke: the rehearsal's, kept in their own tree.")
+    ] = "full",
+) -> None:
+    """Compare the base model as served and under the safety patch on the held-out harmful prompts; print and
+    upload it.
+
+    Needs a finished run of the base model over the held-out prompts under each of the two conditions, both over
+    the same commit of the prompts, and the closed judge's labels of both. A label counts while the judge's stored
+    output is of the judge in force and of the answer as stored now. Where the evaluation prompts have labels
+    of the base model under both conditions, their figures stand beside, checked against the stored breakdowns, with
+    each held-out change minus the change over them.
+    """
+    # nothing is launched or billed to the ledger, so no readiness report is needed
+    settings, deps = _open("table heldout", ready=False, mode=mode)
+    # pulls the statistics packages
+    from driftmap.judge import rubric
+    from driftmap.judge.incremental import RawRow, pending, read_rows
+    from driftmap.table import breakdown, heldout, variants
+
+    records, _ = _results(settings, deps.hub, mode)
+    results, evaluation, answered = (
+        f"{settings.owner}/{name}" for name in (settings.repos.results, settings.repos.eval, settings.repos.responses)
+    )
+    found = {
+        condition: variants.sources(records, settings, mode, condition, None, heldout.GROUP).get(heldout.COLUMN)
+        for condition in heldout.CONDITIONS
+    }
+    lacking = [breakdown.CONDITION_NAMES[condition] for condition, source in found.items() if source is None]
+    if lacking:
+        runs = f"no finished {mode} run of the base model over the held-out prompts is on record"
+        raise DriftmapError(ExitCode.USAGE, f"{runs} for: {', '.join(lacking)}")
+    for what, values in (
+        ("checkpoints", {source.checkpoint for source in found.values()}),
+        ("commits of the held-out prompts", {source.variants_revision for source in found.values()}),
+    ):
+        if len(values) > 1:
+            fault = f"the two runs read different {what} ({', '.join(sorted(values))})"
+            raise DriftmapError(ExitCode.INTEGRITY, f"{fault}; the conditions are compared over one model and set")
+    source = found[heldout.CONDITIONS[0]]
+    slug, listed = ids.slug(source.checkpoint), ids.extra_prompts(heldout.GROUP, heldout.SET)
+    files = {
+        condition: ids.labels_path(slug, "*", mode, preamble=condition, variants=heldout.GROUP)
+        for condition in heldout.CONDITIONS
+    }
+    # the same model's labels of the evaluation prompts, and the breakdowns that count them
+    known = {condition: ids.labels_path(slug, "*", mode, preamble=condition) for condition in heldout.CONDITIONS}
+    counted = f"{ids.tree(mode)}tables/{Path(BREAKDOWN).stem}*{Path(BREAKDOWN).suffix}"
+    with tempfile.TemporaryDirectory(prefix="driftmap-heldout-") as scratch:
+        data = _snapshot(deps.hub, evaluation, f"{scratch}/labels", [*files.values(), *known.values()])
+        kept = _snapshot(deps.hub, results, f"{scratch}/stored", [counted])
+        prompts = _files(deps.hub, evaluation, source.variants_revision, f"{scratch}/prompts", [listed])
+        tagged = dict(tags for file in sorted(prompts.glob(listed)) for tags in _jsonl(file, breakdown.tags))
+        labels = {
+            condition: [row for file in sorted(data.glob(pattern)) for row in read_rows(file, LabelRow)]
+            for condition, pattern in files.items()
+        }
+        categories = {prompt_id: tags.harm_categories for prompt_id, tags in tagged.items()}
+        beside = {
+            condition: [row for file in sorted(data.glob(pattern)) for row in read_rows(file, LabelRow)]
+            for condition, pattern in known.items()
+        }
+        stored = {
+            file.name: heldout.stored_counts(found)
+            for file in sorted(kept.glob(counted))
+            if (found := _parsed(breakdown.Breakdown, file))
+        }
+        read = {"checkpoint": source.checkpoint, "prompts_revision": source.variants_revision}
+        if not all(beside.values()):
+            beside = None
+            typer.echo("evaluation prompts  no labels of the base model under both conditions; left out of the table")
+        built = heldout.build(labels, categories, settings, mode=mode, evaluation=beside, stored=stored, **read)
+        # the answers as stored now, and what the judge wrote of each
+        given = {
+            condition: (
+                ids.responses_path(slug, heldout.SET, "*", mode, condition, heldout.GROUP),
+                ids.judge_raw_path(slug, "*", mode, condition, heldout.GROUP),
+            )
+            for condition in heldout.CONDITIONS
+        }
+        said = _snapshot(deps.hub, answered, f"{scratch}/answers", [name for pair in given.values() for name in pair])
+        judge = rubric.judge_config(settings)
+        for condition, patterns in given.items():
+            made, outputs = (
+                [row for file in sorted(said.glob(pattern)) for row in read_rows(file, kind)]
+                for pattern, kind in zip(patterns, (GenerationRow, RawRow), strict=True)
+            )
+            made = [row for row in made if row.checkpoint == source.checkpoint and row.prompt_id in categories]
+            waiting = pending(made, labels[condition], judge.config_hash, raws=outputs)
+            if made and not waiting:
+                continue
+            name = breakdown.CONDITION_NAMES[condition]
+            if not made:
+                raise DriftmapError(ExitCode.INTEGRITY, f"{name}: no held-out answer is stored for its labels to be of")
+            fault = f"{len(waiting)} of the {len(made)} held-out answers have no label of the response stored now"
+            asked = f"--checkpoint {source.checkpoint} --mode {mode} --sets {heldout.GROUP}"
+            under = f" --preamble {condition}" if condition != "keep" else ""
+            again = f"judge them again: driftmap judge closed {asked}{under}"
+            raise DriftmapError(ExitCode.INTEGRITY, f"{name}: {fault}; {again}")
+    root = deps.repo_root
+    folder = root / LOCAL / "results" / ("smoke" if mode == "smoke" else "") / TABLES_PATH.parent.name
+    path = folder / HELDOUT
+    dump(built, path)
+    shown = _show(path, heldout.render(built), root)
+    _upload(deps, results, f"{ids.tree(mode)}tables", shown, f"add {mode} held-out table")
+
+
 @app.command()
 @_finish
 def figures(
     out: Annotated[
         Path | None,
-        typer.Option(help="The folder to write to; docs/figures by default, docs/figures-<fine-tune> if not standard."),
+        typer.Option(
+            help="The folder to write to; docs/figures by default, docs/figures-<fine-tune> if not standard, each "
+            "with -mbbq after it under --sets mbbq."
+        ),
     ] = None,
     fine_tune: Annotated[
         FineTune, typer.Option(help="The fine-tune whose tables and breakdown are drawn.")
     ] = "standard",
+    sets: Annotated[
+        ChoiceSets,
+        typer.Option(
+            help="The prompts whose multiple-choice table the two attribution figures are drawn from. mbbq: the "
+            "items drawn from MBBQ, by language, with the English result of the multiple-choice prompts beside."
+        ),
+    ] = "choice",
 ) -> None:
     """Draw the figures as PNG and SVG from the tables and the breakdown stored here; reads local files only."""
     root = Path.cwd()
     settings = load_settings(root / CONFIG)
     folder = root / TABLES_PATH.parent
-    out = out or Path(_of_fine_tune(str(FIGURES_DIR), fine_tune))
+    # the figures of another group of prompts have a folder of their own: they share file names with the usual ones
+    usual = Path(_of_fine_tune(str(FIGURES_DIR), fine_tune))
+    out = out or (usual if sets == "choice" else usual.with_name(f"{usual.name}-{sets}"))
     chosen = {"fine_tune": fine_tune} if fine_tune != "standard" else {}
+    chosen |= {"sets": sets} if sets != "choice" else {}
     config = f"{CONFIG} ({settings.config_hash()[:12]})"
     _inputs("figures", out=out, **chosen, tables=folder.relative_to(root), config=config)
     try:
@@ -1193,23 +1631,57 @@ def figures(
     tables = {preamble: record for preamble, record in tables.items() if record}
     name = _of_fine_tune(BREAKDOWN, fine_tune)
     breakdown = _record(Breakdown, folder / name)
+
+    def choice_table(path: Path) -> Any:
+        """What the figures read of a stored multiple-choice table; None when the file is not there."""
+        if not path.is_file():
+            return None
+        try:
+            return draw.data.choice(json.loads(path.read_text(encoding="utf-8")))
+        except (ValueError, LookupError, TypeError, AttributeError):
+            found = f"{path.name}: not the multiple-choice table"
+            raise DriftmapError(ExitCode.USAGE, f"{found}: arms, scopes and a row per rate") from None
+
+    answered = folder / _of_fine_tune(CHOICE, fine_tune)
+    scored, beside = choice_table(answered), None
+    if sets != "choice":
+        # the table of the other prompts is drawn, the multiple-choice one stands beside it
+        answered = folder / _of_fine_tune(_of_fine_tune(CHOICE, sets), fine_tune)
+        scored, beside = choice_table(answered), scored
+        if scored is None:
+            aside = f" --fine-tune {fine_tune}" if fine_tune != "standard" else ""
+            fault = f"{folder.relative_to(root)} holds no {answered.name}"
+            raise DriftmapError(ExitCode.USAGE, f"{fault}; run `driftmap table choice --sets {sets}{aside}` first")
+    written = []
     if not tables or breakdown is None:
         lacking = _tables_name("keep", fine_tune) if not tables else name
         verb = "driftmap table build" if not tables else "driftmap table breakdown"
         aside = f" --fine-tune {fine_tune}" if fine_tune != "standard" else ""
-        raise DriftmapError(ExitCode.USAGE, f"{folder.relative_to(root)} holds no {lacking}; run `{verb}{aside}` first")
-    stored = folder / _of_fine_tune(VARIANTS, fine_tune)
-    variants = None
-    if stored.is_file():
-        try:
-            variants = draw.data.variants(json.loads(stored.read_text(encoding="utf-8")))
-        except (ValueError, LookupError, TypeError, AttributeError):
-            found = f"{stored.name}: not the script-variant comparisons"
-            raise DriftmapError(ExitCode.USAGE, f"{found}: conditions, columns and a row per variant") from None
-    written = draw.draw_all(tables, breakdown, settings, root / out, variants)
-    for name, needed in draw.NEEDS.items():
-        if not any(path.stem == draw.STEMS[name] for path in written):
-            typer.echo(f"not drawn: {draw.STEMS[name]}: needs {needed}")
+        fault = f"{folder.relative_to(root)} holds no {lacking}; run `{verb}{aside}` first"
+        if scored is None:
+            raise DriftmapError(ExitCode.USAGE, fault)
+        # the multiple-choice table has its figure whatever else is stored
+        typer.echo(f"not drawn: the figures of the tables and the breakdown: {fault}")
+    else:
+        stored = folder / _of_fine_tune(VARIANTS, fine_tune)
+        variants = None
+        if stored.is_file():
+            try:
+                variants = draw.data.variants(json.loads(stored.read_text(encoding="utf-8")))
+            except (ValueError, LookupError, TypeError, AttributeError):
+                found = f"{stored.name}: not the script-variant comparisons"
+                raise DriftmapError(ExitCode.USAGE, f"{found}: conditions, columns and a row per variant") from None
+        written = draw.draw_all(tables, breakdown, settings, root / out, variants)
+        for name, needed in draw.NEEDS.items():
+            if not any(path.stem == draw.STEMS[name] for path in written):
+                typer.echo(f"not drawn: {draw.STEMS[name]}: needs {needed}")
+    if scored is not None:
+        alone = sets == "choice"
+        drawn = draw.draw_choice(scored, root / out) if alone else draw.draw_official(scored, beside, root / out)
+        if not drawn:
+            needed = f"the base model and the fine-tune under the served template in {answered.name}"
+            typer.echo(f"not drawn: {draw.STEMS['attribution']}: needs {needed}")
+        written += drawn
     for path in written:
         typer.echo(path.relative_to(root) if path.is_relative_to(root) else path)
 
@@ -1263,7 +1735,7 @@ def judge_closed(
         str | None,
         typer.Option(
             help="With --checkpoint: the sets to label, comma-separated; both by default. "
-            "variants: the harmful script variants instead."
+            "variants: the harmful script variants instead. heldout: the held-out harmful prompts instead."
         ),
     ] = None,
     concurrency: Annotated[int, typer.Option(min=1, max=16, help="Pairs in flight at once.")] = 4,
@@ -1300,9 +1772,11 @@ def judge_closed(
             pinned = False
         if not pinned:
             raise typer.BadParameter("--checkpoint is REPO@SHA with the full 40-character commit")
-        if not names or (names != [closed.VARIANTS] and set(names) - set(closed.JUDGED_SETS)):
+        if not names or (names not in ([group] for group in closed.GROUPS) and set(names) - set(closed.JUDGED_SETS)):
             listed = f"{' and '.join(closed.JUDGED_SETS)}, comma-separated"
-            raise typer.BadParameter(f"--sets takes {listed}, or {closed.VARIANTS} alone for the script variants")
+            kinds = zip(closed.GROUPS, ("the script variants", "the held-out prompts"), strict=True)
+            alone = ", or ".join(f"{group} alone for {kind}" for group, kind in kinds)
+            raise typer.BadParameter(f"--sets takes {listed}, or {alone}")
     shown = {"rows": rows} if rows else {"checkpoint": checkpoint, "sets": names}
     # nothing is launched or billed to the ledger, so no readiness report is needed
     settings, deps = _open("judge closed", ready=False, **shown, mode=mode, concurrency=concurrency, limit=limit)
@@ -1493,7 +1967,7 @@ def _open_reason(screen: AlphaScreen) -> str:
 def repair_choose(
     mode: Annotated[Mode, typer.Option(help="The tree the screen and its labels are in.")] = "smoke",
     fine_tune: Annotated[
-        FineTune,
+        Repaired,
         typer.Option(
             help="The fine-tune the screen is of. standard: the smallest alpha that passes both bars is chosen. "
             "aggressive: among those, the smallest as safe as the baseline, else the safest."
@@ -1629,30 +2103,47 @@ def _said(line: str) -> None:
     typer.echo(redact.mask(line))
 
 
-def _published_here(root: Path, push: Any) -> dict[str, Any]:
-    """What a publication reads in the checkout: the saved scan, the cost ledger and the folder of check files."""
-    local = root / LOCAL
+def _published_here(deps: Deps, push: Any) -> dict[str, Any]:
+    """What a publication reads beside the Hub: the saved scan, the cost ledger, the folder of check files and the
+    folder of staged files in the checkout, and the links of the cards as a reader without a token."""
+    local = deps.repo_root / LOCAL
     return {
         "scans": push.Scans(local / push.SCAN_FILE),
-        "ledger": root / launcher.LEDGER_PATH,
+        "ledger": deps.repo_root / launcher.LEDGER_PATH,
         "checks": local / push.CHECKS_DIR,
+        "staged": local / push.STAGED_DIR,
+        "head": deps.link,
     }
+
+
+Only = Annotated[
+    list[str] | None,
+    typer.Option(
+        "--only",
+        metavar="KEY",
+        help="Handle the repo of this key alone, as the plan names the keys in a refusal; may be given again. "
+        "The other repos are read for the cards and left as they are.",
+    ),
+]
 
 
 @publish_app.command("plan")
 @_finish
-def publish_plan(writeup: Writeup = None) -> ExitCode:
+def publish_plan(writeup: Writeup = None, only: Only = None) -> ExitCode:
     """Scan every commit of every repo and print what a run would do and what stops it; change nothing.
 
-    The plan names all that goes public: each repo, the cost ledger and the check files that go with the cards, and
-    the Space step of `publish space`, which stops no run.
+    The plan names all that goes public: each repo, the cost ledger, the check files and the staged files that go
+    with the cards, and the Space step of `publish space`, which stops no run. What stops it includes a job the
+    ledger still holds as pending, a run on record without a ledger line, a card whose link does not answer a
+    reader with no token, and a staged file that differs from one a dataset holds.
     """
     # nothing is launched or billed: the scan is the check, not the readiness report
-    settings, deps = _open("publish plan", ready=False, writeup=_link(writeup))
+    chosen = {"only": ", ".join(only)} if only else {}
+    settings, deps = _open("publish plan", ready=False, writeup=_link(writeup), **chosen)
     # pulls the statistics packages
     from driftmap.publish import push, space
 
-    drawn = push.plan(settings, deps.hub, writeup=writeup, **_published_here(deps.repo_root, push))
+    drawn = push.plan(settings, deps.hub, writeup=writeup, only=only or (), **_published_here(deps, push))
     for line in (*drawn.lines(), *space.planned(settings, deps.hub, deps.repo_root)):
         _said(line)
     if not drawn.problems:
@@ -1660,6 +2151,13 @@ def publish_plan(writeup: Writeup = None) -> ExitCode:
     count = len(drawn.problems)
     typer.echo(f"{count} problem{'s' * (count > 1)}: `driftmap publish run` would refuse", err=True)
     return drawn.problems[0][0]
+
+
+def _unlocked(settings: Settings) -> None:
+    """Exit 4 in a checkout whose settings lock publishing."""
+    if settings.publish.locked:
+        kept = "nothing is opened, carded, listed or deleted from this checkout"
+        raise DriftmapError(ExitCode.GUARD_REFUSAL, f"publishing is locked in the settings ([publish] locked); {kept}")
 
 
 @publish_app.command("run")
@@ -1684,19 +2182,37 @@ def publish_run(
             "and open a new repo of its name that holds the head's files in one commit.",
         ),
     ] = False,
+    only: Only = None,
+    closed: Annotated[
+        bool,
+        typer.Option(
+            "--closed",
+            help="Commit the cards and the files that go with them, then stop: open nothing, list nothing.",
+        ),
+    ] = False,
 ) -> None:
     """Card every repo, then open each, then list it in its collection; any problem refuses before the first write."""
     rows = {"writeup": _link(writeup), "dry_run": dry_run, "delete": delete_intermediates, "fresh": fresh}
+    rows |= {"only": ", ".join(only)} if only else {}
+    rows |= {"closed": closed} if closed else {}
     settings, deps = _open("publish run", ready=False, **rows)
+    # a dry run writes nothing: a locked checkout may still be shown every action of a run
+    if not dry_run:
+        _unlocked(settings)
     from driftmap.publish import push
 
     flags = [*(["--writeup", writeup] if writeup else []), *(["--delete-intermediates"] * delete_intermediates)]
-    flags += ["--fresh"] * fresh
+    flags += ["--fresh"] * fresh + [part for key in only or () for part in ("--only", key)] + ["--closed"] * closed
     resume = f"resume: {shlex.join(['driftmap', 'publish', 'run', *flags])}; finished steps are skipped"
     asked = {"dry_run": dry_run, "delete": delete_intermediates, "fresh": fresh, "writeup": writeup, "resume": resume}
+    # a checkout whose settings close its runs opens nothing, whatever the command line says
+    asked |= {"only": only or (), "closed": closed or settings.publish.closed}
+    asked |= {"gate": deps.repo_root / LOCAL / push.GATE_FILE}
     try:
-        push.publish(settings, deps.hub, **asked, **_published_here(deps.repo_root, push), echo=_said)
+        push.publish(settings, deps.hub, **asked, **_published_here(deps, push), echo=_said)
     finally:
+        if dry_run and settings.publish.locked:
+            typer.echo("locked: `driftmap publish run` is refused in this checkout while [publish] locked is set")
         if dry_run:
             typer.echo("dry run: nothing was written")
 
@@ -1722,9 +2238,17 @@ def publish_space(
 ) -> None:
     """Create or update the static results Space from space/, open it, and read its page back logged out."""
     settings, deps = _open("publish space", ready=False, dry_run=dry_run)
+    _unlocked(settings)
     from driftmap.publish import space
 
-    space.publish_space(settings, deps.hub, deps.repo_root, dry_run=dry_run, echo=_said)
+    if settings.publish.closed and not dry_run:
+        closed = "the runs of this checkout are closed in the settings ([publish] closed); the Space is not uploaded"
+        raise DriftmapError(ExitCode.GUARD_REFUSAL, closed)
+    from driftmap.publish import push
+
+    local = deps.repo_root / LOCAL
+    here = {"staged": local / push.STAGED_DIR, "gate": local / push.GATE_FILE}
+    space.publish_space(settings, deps.hub, deps.repo_root, dry_run=dry_run, echo=_said, **here)
 
 
 def _money(micro_usd: int) -> str:

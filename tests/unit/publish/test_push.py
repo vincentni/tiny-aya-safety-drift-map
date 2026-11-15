@@ -16,6 +16,7 @@ from driftmap.publish.push import (
     Scans,
     check,
     delete_intermediates,
+    fingerprint,
     intermediates,
     plan,
     publish,
@@ -23,11 +24,15 @@ from driftmap.publish.push import (
 )
 from driftmap.repair import select
 from tests.fakes import FakeHub
-from tests.fakes.labels import make_settings
+from tests.fakes.labels import make_settings, run_record
 from tests.fakes.published import (
     ADAPTER,
     ADAPTER_NOPRE,
+    ATTRIBUTION,
+    ATTRIBUTION_MERGED_WORK,
+    ATTRIBUTION_WORK,
     DATASETS,
+    DEFENSE_SHA256,
     EVAL,
     GGUF,
     GGUF_SHA256,
@@ -49,11 +54,17 @@ from tests.fakes.published import (
     SLUG,
     SMOKE,
     WEIGHTS,
+    add_attribution,
     add_merged_gguf,
     add_nopreamble,
+    choice_manifest,
+    choice_tables,
+    free_form_scores,
     gguf_record,
+    mbbq_tables,
     q4_check_files,
     q4_label,
+    recipe,
     seed,
     two_column_tables,
     writes,
@@ -1315,7 +1326,7 @@ def test_a_publication_needs_no_repaired_model(tmp_path, settings, fake, said):
 
     drawn = plan(settings, hub)
     assert not drawn.problems
-    unmade = [ADAPTER_NOPRE, MERGED_GGUF, REPAIRED, REPAIRED_NOPRE, GGUF]
+    unmade = [ADAPTER_NOPRE, MERGED_GGUF, REPAIRED, REPAIRED_NOPRE, GGUF, ATTRIBUTION]
     assert [f"absent: {repo} (model)" for repo in unmade] == [
         line for line in drawn.lines() if line.startswith("absent: ")
     ]
@@ -1694,8 +1705,9 @@ def test_a_repo_with_a_clean_history_is_not_copied(settings, fake):
     assert "publication.json" not in fake.repos[RESULTS]["main"]
 
 
-def ledger_file(tmp_path, *jobs, pending=()):
-    """A local cost ledger: a pending and a terminal line per job, a pending line alone for each of ``pending``."""
+def ledger_file(tmp_path, *jobs, pending=(), runs=None):
+    """A local cost ledger: a pending and a terminal line per job, a pending line alone for each of ``pending``;
+    ``runs`` names the run of a job that is not ``generate-<job>``."""
     path = tmp_path / "local" / "results" / "ledger.jsonl"
     path.parent.mkdir(parents=True)
     rows = []
@@ -1703,7 +1715,7 @@ def ledger_file(tmp_path, *jobs, pending=()):
         line = {
             "schema": "driftmap.ledger/1",
             "job_id": job,
-            "run_id": f"generate-{job}",
+            "run_id": (runs or {}).get(job, f"generate-{job}"),
             "kind": "generate",
             "flavor": "l4x1",
             "mode": "full",
@@ -1728,6 +1740,16 @@ def ledger_file(tmp_path, *jobs, pending=()):
     return path
 
 
+def passed_then_published(tmp_path, settings, hub, said, **asked):
+    """A run after a check that passed exactly what a run with these arguments would publish."""
+    gate = tmp_path / "publish-gate.json"
+    held = json.loads(gate.read_text(encoding="utf-8"))["passes"] if gate.exists() else []
+    planned = {name: value for name, value in asked.items() if name != "closed"}
+    passes = [*held, fingerprint(plan(settings, hub, **planned))]
+    gate.write_text(json.dumps({"passes": passes}), encoding="utf-8")
+    return publish(settings, hub, **asked, gate=gate, echo=said.append)
+
+
 def check_files(tmp_path, files):
     """A local checks folder holding ``files``, each named ``<repo key>/<check>/<file>``."""
     root = tmp_path / "local" / "checks"
@@ -1740,7 +1762,7 @@ def check_files(tmp_path, files):
 
 def test_the_cost_ledger_is_published_with_the_results_card_one_line_per_job(tmp_path, settings, fake, said):
     hub = seed(fake)
-    ledger = ledger_file(tmp_path, "job-a", "job-b")
+    ledger = ledger_file(tmp_path, "job-a", "job-b", runs={"job-a": "drift-None"})
 
     assert publish(settings, hub, ledger=ledger, echo=said.append).ok
 
@@ -1944,6 +1966,420 @@ def test_a_gguf_repo_without_a_record_of_its_file_gets_no_cpu_check(tmp_path, se
     assert publish(settings, hub, checks=q4_check_folder(tmp_path), echo=lambda line: None).ok
 
     assert "## Results" not in fake.repos[MERGED_GGUF]["main"]["README.md"].decode()
+
+
+def test_a_frozen_repo_is_read_for_the_cards_and_never_written(tmp_path, settings, fake, said):
+    """A repo the settings freeze stays as it is: no card, no setting, no listing of its is touched."""
+    hub = seed(fake)
+    assert publish(settings, hub, echo=lambda line: None).ok
+    later = load_settings(settings_toml(tmp_path, frozen_repos=[ADAPTER, REPAIRED.upper(), GGUF]))
+    fake.calls.clear()
+
+    # another write-up link makes every card stale
+    result = publish(later, hub, writeup="https://example.org/second-revision", echo=said.append)
+
+    assert result.ok and calls(fake, "upload_folder") == list(DATASETS)
+    assert not [(method, repo) for method, repo in writes(fake) if repo in MODELS]
+    for repo in MODELS:
+        assert f"frozen, left as it is: {repo} (model): public" in said
+        assert "second-revision" not in fake.repos[repo]["main"]["README.md"].decode()
+        assert not [line for line in said if line.startswith(f"{repo} (model): ")]
+    # a frozen repo that does not exist is named so, and is no step either
+    fake.calls.clear()
+    plain = load_settings(settings_toml(tmp_path, frozen_repos=[f"{ADAPTER}-nopre"]))
+    drawn = plan(plain, hub)
+    assert f"frozen, left as it is: {ADAPTER}-nopre (model): absent" in drawn.lines() and drawn.problems == ()
+    assert writes(fake) == []
+
+
+def test_the_attribution_adapter_is_published_as_a_new_repo_and_the_repos_of_its_run_stay_as_they_are(
+    tmp_path, settings, fake, said
+):
+    """Its public repo takes the head's files in one commit; the run's repos are not renamed, opened or deleted."""
+    hub = seed(fake, tables=two_column_tables(tmp_path, settings, unsafe=1), skip=(REPAIRED, GGUF))
+    add_attribution(fake, tables=choice_tables())
+    source = fake.heads[ATTRIBUTION_WORK]
+    before = {repo: dict(fake.repos[repo]["main"]) for repo in (ATTRIBUTION_WORK, ATTRIBUTION_MERGED_WORK)}
+    dry = []
+
+    assert publish(settings, hub, dry_run=True, delete=True, echo=dry.append) is None
+
+    planned = next(line for line in dry if line.startswith(f"{ATTRIBUTION} (model): "))
+    copied = f"clean copy from {ATTRIBUTION_WORK}@{source[:12]}; private -> public"
+    assert f"{copied}; card: write; leave out 6 files" in planned
+    assert "collection: add" in planned and "  with its card: trainer_state.json" in dry
+    for repo in before:
+        assert f"working copy, stays private: {repo} (model)" in dry and f"would delete: {repo} (model)" not in dry
+    assert writes(fake) == []
+
+    assert publish(settings, hub, delete=True, echo=said.append).ok
+
+    assert calls(fake, "move_repo") == [] and ATTRIBUTION not in fake.private | fake.gated
+    assert {repo: dict(fake.repos[repo]["main"]) for repo in before} == before and set(before) <= fake.private
+    uploads = [kwargs for name, kwargs in fake.calls if name == "upload_folder" and kwargs["repo_id"] == ATTRIBUTION]
+    assert [upload["commit_message"] for upload in uploads] == ["add the files and the card"]
+    held = fake.repos[ATTRIBUTION]["main"]
+    assert "trainer_state.json" in held and not [path for path in held if path.startswith("last-checkpoint/")]
+    assert held["adapter_model.safetensors"] == before[ATTRIBUTION_WORK]["adapter_model.safetensors"]
+    card = held["README.md"].decode()
+    assert "| This adapter | 1 of 150 (0.7%) | 140 of 150 (93.3%) | 139 of 150 (92.7%) |" in card
+    assert f'PeftModel.from_pretrained(model, "{ATTRIBUTION}")' in card
+    assert "- Rows: 1412 rows (en 1412) from `sft_train_defense/`" in card and DEFENSE_SHA256 in card
+    # the adapter's repo before publication is named nowhere; the checkpoint that was evaluated is
+    assert ATTRIBUTION_WORK not in card and f"`{ATTRIBUTION_MERGED_WORK}`" in card
+    assert "publication.json" not in fake.repos[RESULTS]["main"]
+    models = next(record for record in fake.collections.values() if "models" in record["slug"])
+    assert [item["id"] for item in models["items"]] == [ADAPTER, ATTRIBUTION]
+    # the light adapter's card still names its own run
+    assert DEFENSE_SHA256 not in fake.repos[ADAPTER]["main"]["README.md"].decode()
+    fake.calls.clear()
+
+    assert publish(settings, hub, echo=said.append).ok
+    assert writes(fake) == []
+
+
+def test_a_repo_of_the_attribution_run_that_is_public_refuses_before_any_write(settings, fake):
+    hub = seed(fake)
+    add_attribution(fake)
+    fake.private.discard(ATTRIBUTION_MERGED_WORK)
+    fake.calls.clear()
+
+    with pytest.raises(DriftmapError) as refused:
+        publish(settings, hub, echo=lambda line: None)
+
+    kept = "make it private: only a copy of its head is ever published"
+    assert refused.value.exit_code == ExitCode.INTEGRITY
+    assert f"{ATTRIBUTION_MERGED_WORK} is public; {kept}" in str(refused.value) and writes(fake) == []
+
+
+def test_staged_files_go_with_the_card_of_their_repo_and_the_cards_read_them(tmp_path, settings, fake, said):
+    """A dataset no job wrote the new files to gets them and its card in one commit, and loses nothing."""
+    hub = seed(fake)
+    staged = tmp_path / "staged"
+    add_attribution(fake, tables=choice_tables(), staged=staged)
+    before = {repo: dict(fake.repos[repo]["main"]) for repo in DATASETS}
+
+    drawn = plan(settings, hub, staged=staged)
+
+    assert drawn.problems == ()
+    lines = drawn.lines()
+    assert "  with its card: choice/prompts/benign/en.jsonl, sft_train_defense/en.jsonl" in lines
+    assert "  with its card: runs/drift-defense.json, tables/choice-defense.json" in lines
+    # the adapter's card is drawn from the table and the run record that are still staged
+    card = next(step.card for step in drawn.steps if step.target.key == cards.ATTRIBUTION)
+    assert "| This adapter | 1 of 150 (0.7%)" in card and "`runs/drift-defense.json` in the results dataset" in card
+    assert "- `sft_train_defense/` (1 file): " in next(step.card for step in drawn.steps if step.target.key == "eval")
+    assert writes(fake) == []
+
+    assert passed_then_published(tmp_path, settings, hub, said, staged=staged).ok
+
+    for repo, held in before.items():
+        now = fake.repos[repo]["main"]
+        kept = {path for path in held if path != "README.md" and not any(part in path for part in STALE)}
+        assert kept <= set(now) and all(now[path] == held[path] for path in kept), repo
+    rows = (staged / "eval" / "sft_train_defense" / "en.jsonl").read_bytes()
+    assert fake.repos[EVAL]["main"]["sft_train_defense/en.jsonl"] == rows
+    assert "- `choice/` (1 file): " in fake.repos[RESPONSES]["main"]["README.md"].decode()
+    assert cards.CHOICE_FILE in fake.repos[RESULTS]["main"]
+    uploads = [kwargs for name, kwargs in fake.calls if name == "upload_folder" and kwargs["repo_id"] == EVAL]
+    assert [upload["commit_message"] for upload in uploads] == ["add the card and the files that go with it"]
+    fake.calls.clear()
+
+    assert passed_then_published(tmp_path, settings, hub, said, staged=staged).ok
+    assert writes(fake) == []
+
+
+def test_a_staged_file_never_replaces_what_a_dataset_holds(tmp_path, settings, fake):
+    hub = seed(fake)
+    staged = tmp_path / "staged"
+    same = fake.repos[EVAL]["main"]["prompts/harmful/en.jsonl"]
+    placed = {
+        "eval/prompts/harmful/en.jsonl": same,
+        "eval/README.md": b"# another card\n",
+        "results/logs/drift-None.log": b"another log\n",
+        "elsewhere/a.json": b"{}\n",
+    }
+    for name, data in placed.items():
+        (staged / name).parent.mkdir(parents=True, exist_ok=True)
+        (staged / name).write_bytes(data)
+
+    problems = [text for _, text in plan(settings, hub, staged=staged).problems]
+
+    assert len(problems) == 3
+    assert problems[0].startswith("staged/elsewhere/a.json goes to no repo of a publication; a staged file goes ")
+    assert problems[1] == "staged/eval/README.md is a file the run writes itself; it is not staged"
+    assert problems[2] == f"{RESULTS}/logs/drift-None.log: the staged file differs from the one the repo holds"
+    with pytest.raises(DriftmapError) as refused:
+        publish(settings, hub, staged=staged, echo=lambda line: None)
+    assert refused.value.exit_code == ExitCode.INTEGRITY and writes(fake) == []
+
+    # a staged file is scanned like the card it goes with
+    for name in list(placed)[1:]:
+        (staged / name).unlink()
+    (staged / "eval" / "notes.md").write_text(f"token {TOKEN}\n", encoding="utf-8")
+    found = [(code, text) for code, text in plan(settings, hub, staged=staged).problems]
+    assert found == [(ExitCode.REDACTION, f"{EVAL}/notes.md:1: hf_token in the new file")]
+
+
+def test_a_run_handles_the_repos_it_is_asked_for_and_a_closed_run_opens_nothing(tmp_path, settings, fake, said):
+    hub = seed(fake)
+    staged = tmp_path / "staged"
+    add_attribution(fake, tables=choice_tables(), staged=staged)
+
+    first = {"staged": staged, "only": ["eval", "responses"], "closed": True}
+    assert passed_then_published(tmp_path, settings, hub, said, **first) is None
+
+    assert said[-1] == "closed run: nothing was opened or listed"
+    assert f"not in this run: {RESULTS} (dataset)" in said and f"not in this run: {ATTRIBUTION} (model)" in said
+    assert writes(fake) == [("upload_folder", EVAL), ("upload_folder", RESPONSES)] and set(PUBLISHED) <= fake.private
+    assert "sft_train_defense/en.jsonl" in fake.repos[EVAL]["main"]
+    assert cards.CHOICE_FILE not in fake.repos[RESULTS]["main"] and ATTRIBUTION not in fake.repos
+
+    # the adapter alone: its recipe is the staged one, its card is drawn from the table staged for the results repo
+    training = recipe(run_id="drift-defense", train_set="defense", rows=1500, rows_per_language={"en": 1500})
+    own = staged / cards.ATTRIBUTION / "drift_config.json"
+    own.parent.mkdir(parents=True)
+    own.write_text(json.dumps(training), encoding="utf-8")
+    fake.calls.clear()
+    second = {"staged": staged, "only": [cards.ATTRIBUTION], "closed": True}
+    assert passed_then_published(tmp_path, settings, hub, said, **second) is None
+    assert [kind for kind, _ in writes(fake)] == ["create_repo", "upload_folder"] and ATTRIBUTION in fake.private
+    held = fake.repos[ATTRIBUTION]["main"]
+    assert held["drift_config.json"] == own.read_bytes()
+    assert "| This adapter | 1 of 150 (0.7%)" in held["README.md"].decode()
+    assert "- Rows: 1500 rows (en 1500) from `sft_train_defense/`" in held["README.md"].decode()
+    head = fake.heads[ATTRIBUTION]
+
+    # then every repo: what is done stays as it is, the rest is carded, and all of it is opened and listed
+    fake.calls.clear()
+    assert passed_then_published(tmp_path, settings, hub, said, staged=staged).ok
+    assert fake.heads[ATTRIBUTION] == head and not {EVAL, RESPONSES, RESULTS, ATTRIBUTION} & fake.private
+    assert {repo for kind, repo in writes(fake) if kind == "upload_folder"} == {RESULTS, ADAPTER, REPAIRED, GGUF}
+    assert cards.CHOICE_FILE in fake.repos[RESULTS]["main"]
+
+    with pytest.raises(DriftmapError) as refused:
+        plan(settings, hub, only=["nothing"])
+    assert refused.value.exit_code == ExitCode.USAGE and "nothing is no repo of a publication" in str(refused.value)
+
+
+def test_an_adapter_repo_that_was_created_and_never_filled_is_filled_by_the_next_run(settings, fake, said):
+    """A run stopped between the creation of the repo and the upload leaves a name that holds no adapter."""
+    hub = seed(fake)
+    add_attribution(fake, tables=choice_tables())
+    fake.add_repo(ATTRIBUTION, private=True, files={".gitattributes": b"*.safetensors filter=lfs\n"})
+    fake.authorize(ATTRIBUTION)
+    fake.calls.clear()
+
+    planned = next(line for line in plan(settings, hub).lines() if line.startswith(f"{ATTRIBUTION} (model): "))
+    assert f"clean copy from {ATTRIBUTION_WORK}@" in planned
+
+    assert publish(settings, hub, echo=said.append).ok
+    held = fake.repos[ATTRIBUTION]["main"]
+    assert "adapter_model.safetensors" in held and "create_repo" not in [kind for kind, _ in writes(fake)]
+
+
+def test_an_adapter_repo_without_its_weights_is_never_opened(settings, fake):
+    hub = seed(fake)
+    add_attribution(fake, tables=choice_tables())
+    fake.add_repo(ATTRIBUTION, private=True, files={"README.md": b"# card\n", "drift_config.json": b"{}\n"})
+    fake.authorize(ATTRIBUTION)
+    fake.calls.clear()
+
+    with pytest.raises(DriftmapError) as refused:
+        publish(settings, hub, echo=lambda line: None)
+
+    lacks = f"{ATTRIBUTION} holds no adapter weights (adapter_model.safetensors); it is not opened"
+    assert refused.value.exit_code == ExitCode.INTEGRITY and lacks in str(refused.value)
+    assert writes(fake) == [] and ATTRIBUTION in fake.private
+
+
+def test_a_run_that_brings_staged_files_needs_the_pass_of_a_check_over_exactly_what_it_would_publish(
+    tmp_path, settings, fake, said
+):
+    hub = seed(fake)
+    staged, gate = tmp_path / "staged", tmp_path / "publish-gate.json"
+    add_attribution(fake, tables=choice_tables(), staged=staged)
+    asked = {"staged": staged, "gate": gate, "only": ["eval"], "closed": True}
+
+    with pytest.raises(DriftmapError) as refused:
+        publish(settings, hub, **asked, echo=said.append)
+    assert refused.value.exit_code == ExitCode.GUARD_REFUSAL and writes(fake) == []
+    wanted = fingerprint(plan(settings, hub, staged=staged, only=["eval"]))
+    assert f"no check has passed what this run would publish ({wanted[:12]})" in str(refused.value)
+    # a dry run shows the plan and says which pass is missing
+    assert publish(settings, hub, **asked, dry_run=True, echo=said.append) is None
+    assert said[-1] == f"gate: no pass recorded for {wanted[:12]}; a run would refuse"
+
+    # a pass over something else is no pass; one staged byte more is something else
+    gate.write_text(json.dumps({"passes": [wanted]}), encoding="utf-8")
+    extra = staged / "eval" / "notes.md"
+    extra.write_text("one more file\n", encoding="utf-8")
+    with pytest.raises(DriftmapError):
+        publish(settings, hub, **asked, echo=said.append)
+    assert writes(fake) == []
+    extra.unlink()
+
+    assert publish(settings, hub, **asked, echo=said.append) is None
+    assert writes(fake) == [("upload_folder", EVAL)]
+    # a run that brings no staged file needs no pass
+    bare = {"gate": tmp_path / "none.json", "only": ["responses"], "closed": True}
+    assert publish(settings, hub, **bare, echo=said.append) is None
+
+
+def test_a_required_repo_that_is_missing_stops_the_runs_that_were_asked_for_it(settings, fake):
+    """A run for other repos leaves it to the run that publishes everything, which makes the final check."""
+    hub = seed(fake, skip=(ADAPTER,))
+
+    assert [text for _, text in plan(settings, hub).problems] == [f"{ADAPTER} does not exist"]
+    assert [text for _, text in plan(settings, hub, only=["adapter"]).problems] == [f"{ADAPTER} does not exist"]
+    assert plan(settings, hub, only=["eval", "responses"]).problems == ()
+
+
+def test_a_choice_table_on_the_hub_that_does_not_parse_stops_the_plan(settings, fake):
+    """The attribution adapter's card takes its results from that table: one it cannot read is no missing table."""
+    hub = seed(fake)
+    add_attribution(fake, tables=choice_tables())
+    assert plan(settings, hub).problems == ()
+
+    put(fake, RESULTS, cards.CHOICE_FILE, b'{"schema": "driftmap.choice/1", "fine_tune": "defense", "arms": []}\n')
+
+    assert [text for _, text in plan(settings, hub).problems] == [
+        f"{cards.CHOICE_FILE} on the Hub does not parse; build and upload it again"
+    ]
+
+
+def test_the_attribution_card_reads_the_files_published_beside_its_table(tmp_path, settings, fake):
+    """The manifest of the choice prompts in the eval repo and the open-question check with the results."""
+    hub = seed(fake)
+    add_attribution(fake, tables=choice_tables())
+    put(fake, EVAL, cards.CHOICE_MANIFEST, json.dumps(choice_manifest()).encode())
+    put(fake, RESULTS, cards.MBBQ_FILE, mbbq_tables().model_dump_json(by_alias=True).encode())
+    scores = f"results/{cards.FREE_FORM_CHECK}/{cards.FREE_FORM_FILE}"
+    # the reading check names its answers by the ids of the datasets the questions are from: digits in a row
+    answer = {"id": f"squad.{DIGITS}573a", "model": "base", "response": "It does not say.", "correct": True}
+    counted = {"base": {"all": {"rows": 240, "correct": 182}}, "fine_tuned": {"all": {"rows": 240, "correct": 193}}}
+    worded = {"base unanswerable": {"rows": 100}, "fine_tuned unanswerable": {"trained sentence": 4, "rows": 100}}
+    reading = {
+        "results/reading/squad_answers.jsonl": (json.dumps(answer) + "\n").encode(),
+        "results/reading/belebele_scores.json": json.dumps(counted).encode(),
+        "results/reading/squad_text_counts.json": json.dumps(worded).encode(),
+        "results/answer_lengths/answer_lengths.json": b'{"schema": "driftmap.check.answer_lengths/1"}\n',
+        "results/curator/curator_report.json": b'{"thresholds": {}}\n',
+        "results/padding/length_scores.json": b'{"base": {"ambiguous plain": {"rows": 150}}}\n',
+        "results/padding/length_answers.jsonl": b'{"base_item": "bbq.Age.1348", "version": "p1", "letter_read": "C"}\n',
+        "results/mbbq-control/mbbq_control_scores.json": b'{"es": {"rows_in_both_models": 200}}\n',
+        "results/mbbq-control/mbbq_control_answers.jsonl": b'{"mbbq_category": "Age", "mbbq_example_id": 1190}\n',
+        "results/unqover/unqover_scores.json": b'{"rows_in_both_models": 200}\n',
+        "results/unqover/unqover_answers.jsonl": b'{"id": "unqover.ethnicity.00", "letter_read": "C"}\n',
+    }
+    checks = check_files(tmp_path, {scores: json.dumps(free_form_scores()).encode(), **reading})
+    ledger = ledger_file(tmp_path / "paid", "job-a", "job-b", runs={"job-a": "drift-None", "job-b": "drift-defense"})
+
+    drawn = plan(settings, hub, checks=checks, ledger=ledger)
+
+    assert drawn.problems == ()
+    listed = next(step.card for step in drawn.steps if step.target.key == "results")
+    assert all(f"- `checks/{name}/` (" in listed for name in ("reading", "answer_lengths", "curator"))
+    longer = (
+        "- `checks/padding/` (2 files): the English choice prompts asked again of the base model and the attribution "
+        "adapter with their text altered: unrelated sentences added, neutral sentences about both people added, "
+        "and, for the answerable twin, the settling sentences moved to the front; here the scores per version of "
+        "the text, and the answer of both models to each item by its id; no prompt text."
+    )
+    assert longer in listed.splitlines()
+    control = (
+        "- `checks/mbbq-control/` (2 files): the control items of MBBQ (the two people are common first names) asked "
+        "of the base model and the attribution adapter in English, Spanish, Dutch and Turkish; here the scores, and "
+        "each answer by the item's id; no item text."
+    )
+    outside = (
+        "- `checks/unqover/` (2 files): who-did-it questions built for this study from the released templates and "
+        "word lists of UnQover, with an unknown option added, asked of the base model and the attribution adapter; "
+        "the set has no answerable twins; here the scores, and each answer by item id; no item text."
+    )
+    assert control in listed.splitlines() and outside in listed.splitlines()
+    card = next(step.card for step in drawn.steps if step.target.key == cards.ATTRIBUTION)
+    assert "it answers 193 of 240 multiple-choice questions correctly against the base model's 182" in card
+    # the table of the official items, where the results dataset holds it
+    assert "### Official items in four languages" in card
+    assert "| nl, this adapter | 3 of 150 (2.0%) | 135 of 150 (90.0%) | 132 of 150 (88.0%) |" in card
+    assert "the trained abstention sentence on 4 of 100 unanswerable SQuAD 2.0 questions (base model 0)" in card
+    # the cost is the ledger line of the training job, where the ledger to be published holds it
+    assert "- Cost: $0.16 for 12 minutes on l4x1, the billed figure (`ledger.jsonl` in the results dataset)." in card
+    assert "- Asked without options (`checks/choice_free_form/free_scores.json` of the results dataset): " in card
+    assert "- Composition (`choice/manifest.json` of the evaluation dataset): 600 ambiguous items" in card
+    results = next(step.card for step in drawn.steps if step.target.key == "results")
+    assert "`checks/choice_free_form/`" in results
+    # neither file, or one that is no JSON object, leaves its sentence out and stops nothing
+    put(fake, EVAL, cards.CHOICE_MANIFEST, b"[1]\n")
+    bare = plan(settings, hub)
+    assert bare.problems == ()
+    card = next(step.card for step in bare.steps if step.target.key == cards.ATTRIBUTION)
+    assert "Asked without options" not in card and "Composition" not in card
+
+
+def test_a_run_on_record_that_the_cost_ledger_does_not_hold_refuses_before_any_write(tmp_path, settings, fake):
+    """The ledger a publication carries, or the one the results repo holds already, has a line for every run."""
+    hub = seed(fake)
+    late = run_record("generate", run_id="generate-late")
+    put(fake, RESULTS, "runs/generate-late.json", late.model_dump_json(by_alias=True).encode())
+    refusal = (
+        "the cost ledger has no line for 1 run on record (generate-late); publish from the checkout whose ledger "
+        "holds it"
+    )
+
+    # the ledger at the head of the results repo names the drift runs alone
+    assert [text for _, text in plan(settings, hub).problems] == [refusal]
+    # and so does a local ledger of other jobs
+    with pytest.raises(DriftmapError) as refused:
+        publish(settings, hub, ledger=ledger_file(tmp_path, "job-a"), echo=lambda line: None)
+    assert refused.value.exit_code == ExitCode.INTEGRITY and "2 runs on record (drift-None, generate-late)" in str(
+        refused.value
+    )
+    assert writes(fake) == []
+
+    whole = ledger_file(tmp_path / "whole", "first", "late", runs={"first": "drift-None"})
+    assert plan(settings, hub, ledger=whole).problems == ()
+
+
+def test_a_card_that_links_to_what_is_not_public_yet_refuses_before_any_write(settings, fake):
+    """A link is checked as a reader without a token would follow it, at the point the card becomes public."""
+    hub = seed(fake)
+    asked = []
+
+    def head(url):
+        asked.append(url)
+        return 404 if url.endswith("/docs/second.md") else 200
+
+    link = f"{settings.code.origin}/blob/main/docs/second.md"
+    problems = [text for _, text in plan(settings, hub, writeup=link, head=head).problems]
+    assert problems == [f"{EVAL}: its card links to {link}, which answers 404 to a reader who is not logged in"]
+    assert asked.count(link) == 1 and settings.code.origin in asked
+
+    def down(url):
+        raise httpx2.ConnectError("no route")
+
+    unread = [text for _, text in plan(settings, hub, head=down).problems]
+    assert unread and all("which answers ConnectError to a reader" in text for text in unread)
+
+    # a link that sends the reader on to another address is a link to fix
+    moved = f"{settings.code.origin}/blob/main/docs/moved.md"
+    drawn = plan(settings, hub, writeup=moved, head=lambda url: 302 if url == moved else 200)
+    sent_on = [text for _, text in drawn.problems]
+    told = "which redirects to another address (302); link to where it leads"
+    assert sent_on == [f"{EVAL}: its card links to {moved}, {told}"]
+
+    # a repo this run opens is public by the time a later card is; an earlier card must not point at it
+    later = f"https://huggingface.co/{ADAPTER}"
+    ahead = [text for _, text in plan(settings, hub, writeup=later, head=lambda url: 200).problems]
+    assert ahead == [f"{repo}: its card links to {later}, which this run opens after it" for repo in DATASETS]
+    first = f"https://huggingface.co/datasets/{EVAL}"
+    assert plan(settings, hub, writeup=first, head=lambda url: 200).problems == ()
+    # without a way to follow links nothing is asked
+    assert plan(settings, hub, writeup=link).problems == ()
+    with pytest.raises(DriftmapError) as refused:
+        publish(settings, hub, writeup=link, head=head, echo=lambda line: None)
+    assert refused.value.exit_code == ExitCode.INTEGRITY and writes(fake) == []
 
 
 def test_the_code_repo_the_cards_link_to_pins_its_toolkits():

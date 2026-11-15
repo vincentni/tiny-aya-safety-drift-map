@@ -6,7 +6,7 @@ import re
 import shutil
 import tempfile
 from collections import Counter
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager
 from pathlib import Path
 from typing import Any, Literal, NamedTuple
@@ -29,6 +29,7 @@ from driftmap.publish import cards, collections, q4_local
 from driftmap.repair.screen_gen import screen_path
 from driftmap.scripts.drift import RECIPE, repo_names
 from driftmap.table.breakdown import Breakdown
+from driftmap.table.choice import ChoiceTables
 from driftmap.table.variants import VariantTables
 
 SMOKE_SUFFIX = ids.repo_suffix("smoke")
@@ -46,6 +47,7 @@ ORDER = (
     ("repaired", "model", "models", False),
     (cards.REPAIRED_NOPRE, "model", "models", False),
     ("gguf", "model", "models", False),
+    (cards.ATTRIBUTION, "model", "models", False),
 )
 # a smoke tree goes whole, those of the other conditions inside it too; the full trees lose their superseded labels
 ROWS = ("smoke/*", *(f"{tree}labels/*/superseded/*" for tree in ("", *cards.OTHER_TREES)))
@@ -56,14 +58,21 @@ MARKERS = ("partial/*",)
 STALE = {
     **dict.fromkeys(cards.DATASETS, ROWS),
     "results": (*ROWS, *MARKERS),
-    **dict.fromkeys(cards.ADAPTERS, CHECKPOINT),
+    **dict.fromkeys(cards.LORAS, CHECKPOINT),
 }
 # the trainer's log in the checkpoint; the card commit keeps a copy of it at the root
 CHECKPOINT_LOG = f"last-checkpoint/{cards.TRAINER_STATE}"
 # the local folder of the side checks, under the CLI's local folder: <repo key>/<check>/<file>
 CHECKS_DIR = "checks"
+# the local folder of files to add to the repos, under the CLI's local folder
+STAGED_DIR = "staged"
+WRITTEN_BY_THE_RUN = frozenset({CARD, cards.LEDGER, cards.PUBLICATION, cards.TRAINER_STATE})
 CHECK_REPOS = ("responses", "results")
 WEIGHTS = ["adapter_model.bin", "pytorch_model*.bin"]
+# what an adapter repo has to hold before it is opened
+ADAPTER_WEIGHTS = "adapter_model.safetensors"
+# where a check outside this module records its passes, under the CLI's local folder
+GATE_FILE = "publish-gate.json"
 # pickles the trainer leaves beside the weights; an adapter is refused while one is left
 PICKLES = (".bin", ".pt", ".pth")
 # never fetched from a model repo; a dataset is read whole
@@ -76,12 +85,22 @@ CARD_INPUTS = (
     # the screen the repair of the aggressive fine-tune was chosen on
     (screen_path("full", cards.TRAINED[cards.ADAPTERS[1]], "aggressive"), "results", AlphaScreen),
 )
-# the light fine-tune's tables the adapter card takes the numbers of its limits from, in the results repo
-LIMIT_INPUTS = ((cards.BREAKDOWN_FILE, Breakdown), (cards.VARIANTS_FILE, VariantTables))
+# tables in the results repo a card can do without: those the light adapter's card takes the numbers of its limits
+# from, then the attribution fine-tune's choice table, that of the official items, and its two tables of the
+# evaluation sets
+LIMIT_INPUTS = (
+    (cards.BREAKDOWN_FILE, Breakdown),
+    (cards.VARIANTS_FILE, VariantTables),
+    (cards.CHOICE_FILE, ChoiceTables),
+    (cards.MBBQ_FILE, ChoiceTables),
+    *((name, Tables) for name in cards.ATTRIBUTION_TABLES),
+    (cards.ATTRIBUTION_BREAKDOWN, Breakdown),
+)
 # read again for the cards, or to see whether the head already holds what a run would write
 KEPT = [
     *(name for name, _, _ in CARD_INPUTS),
     *(name for name, _ in LIMIT_INPUTS),
+    cards.CHOICE_MANIFEST,
     "runs/*.json",
     RECIPE,
     cards.PUBLICATION,
@@ -98,12 +117,15 @@ CACHE = ".cache"
 TEMP_PARTS = frozenset({"tmp", "__pycache__", ".ipynb_checkpoints"})
 TEMP_SUFFIXES = (".tmp", ".lock", ".incomplete")
 MAX_SHOWN = 20
+URL = re.compile(r"https?://[^\s<>()\[\]\"'`]+")
+HUB_REPO = re.compile(r"https://huggingface\.co/(?:(dataset|space)s/)?([\w.-]+/[\w.-]+)")
 ROTATE = "a new commit keeps the value in history; rotate the secret"
 REBUILD = (
     "history cannot be edited: once the head is clean, publish with --fresh, which opens a new repo holding the head's "
     f"files and keeps the repo with the history private as <name>{WORK_SUFFIX}"
 )
 EXPOSED_WORK = "{repo} is public; make it private: its history is why it was set aside"
+EXPOSED_SOURCE = "{repo} is public; make it private: only a copy of its head is ever published"
 UNFINISHED = "; its files are in its working copy {work}: publish with --fresh to finish the clean copy"
 # what a repo holds when it is created
 INITIAL = frozenset({".gitattributes"})
@@ -113,6 +135,8 @@ CHANGED = "{repo} changed after its scan; it stays as it is: run publish again"
 FAILURES = (httpx2.HTTPError, LocalEntryNotFoundError)
 
 Echo = Callable[[str], None]
+# the status a web address answers with to a request that carries no token
+Head = Callable[[str], int]
 Problem = tuple[ExitCode, str]
 # file, line or one of the kinds below, rule
 Hit = tuple[str, int, str]
@@ -186,6 +210,8 @@ class Scans:
         # (in a row folder, blob id) -> what the scan found
         self.blobs: dict[tuple[bool, str], Verdict] = {}
         self.kept: dict[str, bytes] = {}
+        # blob id -> bytes of a file read to compare it with one a run writes; never saved
+        self.read: dict[str, bytes] = {}
         self.path = path
         try:
             stored = load(_Stored, path) if path is not None else None
@@ -263,6 +289,11 @@ class Plan(NamedTuple):
     commits: int
     # the repos set aside by a clean copy, as they are now
     working: tuple[tuple[str, str, State], ...] = ()
+    # the targets the settings freeze, and those this run was not asked for, as they are now
+    frozen: tuple[tuple[str, str, State], ...] = ()
+    skipped: tuple[tuple[str, str, State], ...] = ()
+    # how many staged files the steps bring
+    staged: int = 0
 
     def refusal(self) -> str:
         """Every problem, one per line, then the advice."""
@@ -286,6 +317,12 @@ class Plan(NamedTuple):
             out.append(f"{target.repo} ({target.repo_type}): {'; '.join(parts)}")
             out += [f"  with its card: {_carried(step.extra)}"] if step.extra else []
         out += [f"absent: {target.repo} ({target.repo_type})" for target in self.absent]
+        out += [
+            f"frozen, left as it is: {repo} ({repo_type}): "
+            f"{'public' if state.open else 'not public' if state.exists else 'absent'}"
+            for repo, repo_type, state in self.frozen
+        ]
+        out += [f"not in this run: {repo} ({repo_type})" for repo, repo_type, _ in self.skipped]
         verb = "would delete" if delete else "stays private"
         out += [f"{verb}: {repo} ({repo_type})" for repo, repo_type, _ in self.hidden]
         out += [f"working copy, stays private: {repo} ({repo_type})" for repo, repo_type, _ in self.working]
@@ -293,10 +330,14 @@ class Plan(NamedTuple):
 
 
 def _carried(extra: tuple[tuple[str, bytes], ...]) -> str:
-    """The files that go with a card, as a plan names them: a check folder with its count, any other by name."""
+    """The files that go with a card, as a plan names them: a check folder with its count, any other folder that
+    brings more than one file by its first level and its count, the rest by name."""
     names = [name for name, _ in extra]
-    folders = Counter(name.rpartition("/")[0] for name in names if name.startswith(cards.CHECKS_TREE))
-    plain = [name for name in names if not name.startswith(cards.CHECKS_TREE)]
+    checks = [name for name in names if name.startswith(cards.CHECKS_TREE)]
+    tops = Counter(name.partition("/")[0] for name in names if name not in checks and "/" in name)
+    grouped = [name for name in names if name not in checks and tops[name.partition("/")[0]] > 1]
+    folders = Counter(name.rpartition("/")[0] for name in checks) + Counter(name.partition("/")[0] for name in grouped)
+    plain = [name for name in names if name not in checks and name not in grouped]
     counted = (f"{folder}/ ({count} file{'s' * (count > 1)})" for folder, count in sorted(folders.items()))
     return ", ".join([*plain, *counted])
 
@@ -363,7 +404,7 @@ def _setting(key: str) -> str:
 
 
 def _merged(settings: Settings) -> list[str]:
-    """The merged checkpoint of each training condition; neither is ever published."""
+    """The merged checkpoint of each fine-tune a delete of the intermediates removes; none is ever published."""
     return [repo_names(settings, "full", preamble)[1] for preamble in ids.PREAMBLES]
 
 
@@ -378,6 +419,8 @@ def intermediates(settings: Settings) -> list[tuple[str, str]]:
     # and so does a smoke repair of that fine-tune
     smoke += [(f"{owner}/{repos.repaired}{ids.repo_suffix('smoke', 'strip')}", "model")]
     smoke += [(quant.merged_names(settings, "smoke")[1], "model")]
+    # and a smoke drift run on a named training set
+    smoke += [(repo, "model") for name in ids.TRAIN_SETS for repo in repo_names(settings, "smoke", "keep", name)]
     hidden = [*((repo, "model") for repo in _merged(settings)), *smoke]
     published = {target.repo.casefold() for target in targets(settings)}
     for repo, _ in hidden:
@@ -437,7 +480,7 @@ def _stale(target: Target, files: tuple[str, ...]) -> list[str]:
 
 
 def _training_state(target: Target, files: tuple[str, ...]) -> list[str]:
-    if target.key not in cards.ADAPTERS:
+    if target.key not in cards.LORAS:
         return []
     names = [path.rpartition("/")[2] for path in files]
     weights = set(filter_repo_objects(names, allow_patterns=WEIGHTS))
@@ -530,11 +573,20 @@ def _fetch(hub: Hub, target: Target, sha: str, path: str, scratch: Path) -> tupl
         shutil.rmtree(folder, ignore_errors=True)
 
 
-def _read(hub: Hub, wanted: dict[tuple[bool, str], tuple[Target, str, str]], scans: Scans, scratch: Path) -> None:
+def _read(
+    hub: Hub,
+    wanted: dict[tuple[bool, str], tuple[Target, str, str]],
+    scans: Scans,
+    scratch: Path,
+    compared: Collection[str] = (),
+) -> None:
+    """Scan each wanted blob; the bytes of a card input are kept, those under a path in ``compared`` for this run."""
     for key, (target, sha, path) in wanted.items():
         scans.blobs[key], data = _fetch(hub, target, sha, path, scratch)
         if _matching([path], KEPT):
             scans.kept[key[1]] = data
+        elif path in compared:
+            scans.read[key[1]] = data
 
 
 class Found(NamedTuple):
@@ -562,7 +614,7 @@ def _found(target: Target, shas: list[str], scans: Scans, only: set[str] | None 
             if path not in skipped:
                 verdict = scans.blobs[row, blob]
                 hits += [(path, line, rule) for line, rule in verdict.hits]
-                if not verdict.text and not (target.key in cards.ADAPTERS and path in tolerated):
+                if not verdict.text and not (target.key in cards.LORAS and path in tolerated):
                     hits.append((path, UNREADABLE, ""))
             for hit in hits:
                 held.setdefault(hit, []).append(sha)
@@ -602,6 +654,21 @@ def _kept(hub: Hub, target: Target, head: str, scans: Scans, scratch: Path) -> d
     return held
 
 
+def _at(
+    hub: Hub, target: Target, sha: str, name: str, known: Mapping[str, bytes], scans: Scans, scratch: Path
+) -> bytes | None:
+    """What a commit of a repo holds under a path: from ``known`` or from an earlier read when it is there, fetched
+    otherwise; None when the commit holds no such file."""
+    if name in known:
+        return known[name]
+    blob = dict(scans.trees[target.repo, sha]).get(name)
+    if blob is None:
+        return None
+    if blob not in scans.read:
+        scans.read[blob] = _fetch(hub, target, sha, name, scratch)[1]
+    return scans.read[blob]
+
+
 def _parsed[T](cls: type[T], files: dict[str, bytes], name: str) -> T | None:
     return cls.model_validate_json(files[name]) if name in files else None
 
@@ -614,13 +681,18 @@ def _read_table[T](cls: type[T], files: Mapping[str, bytes], name: str) -> T | N
         return None
 
 
-def _recipe(files: dict[str, bytes]) -> dict[str, Any] | None:
-    """The recipe a drift run left in its adapter repo; None when there is none or it is not a JSON object."""
+def _object(files: Mapping[str, bytes], name: str) -> dict[str, Any] | None:
+    """The JSON object a file holds; None when the file is missing or holds anything else."""
     try:
-        found = json.loads(files[RECIPE]) if RECIPE in files else None
-    except ValueError:
+        found = json.loads(files[name])
+    except (KeyError, ValueError):
         return None
     return found if isinstance(found, dict) else None
+
+
+def _recipe(files: dict[str, bytes]) -> dict[str, Any] | None:
+    """The recipe a drift run left in its adapter repo; None when there is none or it is not a JSON object."""
+    return _object(files, RECIPE)
 
 
 def _hidden(settings: Settings, hub: Hub) -> list[tuple[str, str, State]]:
@@ -645,6 +717,93 @@ def _booked(path: Path | None) -> tuple[bytes | None, list[str]]:
         held = f"the cost ledger holds {len(pending)} pending job{'s' * (len(pending) > 1)} ({', '.join(pending)})"
         return None, [f"{held}, booked at the timeout: record the cost with {waits}, then publish again"]
     return b"".join(line.model_dump_json().encode() + b"\n" for line in lines.values()) or None, []
+
+
+def _billed(ledger: bytes | None) -> dict[str, dict[str, Any]]:
+    """The last line of each run in a ledger, by run id; a line still pending or one that does not parse is none."""
+    found: dict[str, dict[str, Any]] = {}
+    for line in (ledger or b"").decode(errors="replace").splitlines():
+        try:
+            row = json.loads(line)
+            if not row.get("pending"):
+                found[row["run_id"]] = row
+        except (ValueError, AttributeError, KeyError, TypeError):
+            continue
+    return found
+
+
+def _uncounted(ledger: bytes | None, records: list[RunRecord]) -> list[str]:
+    """The runs on record that the ledger a publication holds has no line for; no ledger at all counts nothing."""
+    if ledger is None:
+        return []
+    booked = set()
+    for line in ledger.decode(errors="replace").splitlines():
+        try:
+            booked.add(json.loads(line).get("run_id"))
+        except (ValueError, AttributeError):
+            continue
+    lost = sorted({record.run_id for record in records} - booked)
+    if not lost:
+        return []
+    many = len(lost) > 1
+    held = f"the cost ledger has no line for {len(lost)} run{'s' * many} on record ({', '.join(map(_safe, lost))})"
+    return [f"{held}; publish from the checkout whose ledger holds {'them' if many else 'it'}"]
+
+
+def _dangling(steps: list[Step], head: Head) -> list[str]:
+    """The web addresses in a card that lead a reader nowhere at the moment the card becomes public.
+
+    A repo this run opens counts as public from its own step on; every other address has to answer 200 itself now,
+    a redirect being a link to fix, and one that does not is named once, at the first card that holds it.
+    """
+    opened = {
+        (step.target.repo_type, step.target.repo.casefold()): at for at, step in enumerate(steps) if not step.state.open
+    }
+    answers: dict[str, str] = {}
+    out = []
+    for at, step in enumerate(steps):
+        for url in dict.fromkeys(url.rstrip(".,;:") for url in URL.findall(step.card)):
+            repo = HUB_REPO.match(url)
+            later = opened.get((repo[1] or "model", repo[2].casefold())) if repo else None
+            if later is not None:
+                out += [f"{step.target.repo}: its card links to {url}, which this run opens after it"] * (later > at)
+                continue
+            if url in answers:
+                continue
+            try:
+                answers[url] = str(head(url))
+            except httpx2.HTTPError as error:
+                answers[url] = type(error).__name__
+            if answers[url].startswith("3"):
+                moved = f"which redirects to another address ({answers[url]}); link to where it leads"
+                out.append(f"{step.target.repo}: its card links to {url}, {moved}")
+            elif answers[url] != "200":
+                reader = "to a reader who is not logged in"
+                out.append(f"{step.target.repo}: its card links to {url}, which answers {answers[url]} {reader}")
+    return out
+
+
+def _brought(root: Path | None, keys: Collection[str]) -> tuple[dict[str, list[tuple[str, bytes]]], list[str]]:
+    """The files of the local staging folder by the key of the repo they go to, each under its path there, and what
+    stands against them.
+
+    A file is ``<repo key>/<path in the repo>``; no folder is no file. A path the run writes itself is not staged.
+    """
+    held: dict[str, list[tuple[str, bytes]]] = {}
+    lacks = []
+    for path in sorted(root.rglob("*")) if root is not None and root.is_dir() else ():
+        if not path.is_file():
+            continue
+        key, *inner = path.relative_to(root).parts
+        name = "/".join(inner)
+        shown = _safe(f"{STAGED_DIR}/{key}/{name}")
+        if key not in keys or not inner:
+            lacks.append(f"{shown} goes to no repo of a publication; a staged file goes under <{' or '.join(keys)}>/")
+        elif name in WRITTEN_BY_THE_RUN or name.startswith(cards.CHECKS_TREE):
+            lacks.append(f"{shown} is a file the run writes itself; it is not staged")
+        else:
+            held.setdefault(key, []).append((name, path.read_bytes()))
+    return held, lacks
 
 
 def _checked(root: Path | None) -> tuple[dict[str, list[tuple[str, bytes]]], list[str]]:
@@ -699,6 +858,9 @@ def plan(
     fresh: bool = False,
     ledger: Path | None = None,
     checks: Path | None = None,
+    head: Head | None = None,
+    staged: Path | None = None,
+    only: Collection[str] = (),
 ) -> Plan:
     """Read every repo, scan each commit and render each card; nothing on the Hub changes. Exit 4 above the ceiling.
 
@@ -706,14 +868,39 @@ def plan(
     repo of its name holding the head's files, the repo with the history kept private under ``-work``. ``ledger``
     is the local cost ledger, planned into the results repo as ``ledger.jsonl``; ``checks`` is the local folder of
     the side checks, whose files are planned into the responses and the results repo under ``checks/``. Both go
-    with the card of their repo and are scanned like it; neither has to exist.
+    with the card of their repo and are scanned like it; neither has to exist. ``head`` answers a request for a web
+    address that carries no token: with it every link of every card is followed as its reader would follow it.
+    ``staged`` is a local folder of files to add, ``<repo key>/<path in the repo>``: each goes with the card of its
+    repo, is scanned like it and is read for the cards as if the repo held it already; one that differs from a
+    file a dataset holds is refused. ``only`` names the keys of the repos to handle: the others are read for the
+    cards and left as they are. Exit 2 for a key that names no repo.
     """
     scans = scans if scans is not None else Scans()
     try:
-        return _drawn(settings, hub, writeup, scans, fresh, ledger, checks)
+        return _drawn(settings, hub, writeup, scans, fresh, ledger, checks, head, staged, only)
     finally:
         # what was read stays read, also when the Hub stopped the run
         scans.save()
+
+
+def fingerprint(drawn: Plan) -> str:
+    """The sha256 over everything the steps of a plan would write and remove: each repo with the path and the
+    sha256 of every file that goes with its card, the card included, and the paths it deletes."""
+    lines = []
+    for step in drawn.steps:
+        written = {CARD: step.card.encode(), **dict(step.extra)}
+        lines += [f"{step.target.repo}\t{name}\t{hashlib.sha256(data).hexdigest()}" for name, data in written.items()]
+        lines += [f"{step.target.repo}\t{name}\tremoved" for name in step.deletes]
+    return hashlib.sha256("\n".join(sorted(lines)).encode()).hexdigest()
+
+
+def gate_passes(path: Path | None) -> frozenset[str]:
+    """The fingerprints a check has passed, as its file records them under ``passes``; none without a file."""
+    try:
+        found = json.loads(path.read_text(encoding="utf-8"))["passes"] if path is not None else []
+    except (OSError, ValueError, KeyError, TypeError):
+        found = []
+    return frozenset(found) if isinstance(found, list) else frozenset()
 
 
 def _unfilled(state: State, work: State) -> bool:
@@ -737,6 +924,9 @@ def _drawn(
     fresh: bool,
     ledger: Path | None,
     checks: Path | None,
+    head: Head | None,
+    staged: Path | None,
+    only: Collection[str],
 ) -> Plan:
     wanted = targets(settings)
     hidden = _hidden(settings, hub)
@@ -747,8 +937,33 @@ def _drawn(
     aside = {target.key: target._replace(repo=_work(target.repo)) for target in wanted}
     reads = {target.key: aside[target.key] if target.key in resumed else target for target in wanted}
     states = named | {key: works[key] for key in resumed}
+    unknown = sorted(set(only) - {target.key for target in wanted})
+    if unknown:
+        keys = ", ".join(target.key for target in wanted)
+        raise DriftmapError(ExitCode.USAGE, f"{unknown[0]} is no repo of a publication; --only takes one of {keys}")
+    # the repos the attribution fine-tune's run pushed to stay private under their names: its adapter is published
+    # as a new repo that holds the head's files, so nothing public carries their history
+    apart = [(repo, "model", _state(hub, repo, "model")) for repo in cards.attribution_work(settings)]
+    apart = [found for found in apart if found[2].exists]
+    adopted: dict[str, RepoRef] = {}
+    source = next((state for repo, _, state in apart if repo == cards.attribution_work(settings)[0]), None)
+    # a repo of the public name that holds nothing but what a new repo holds was created and never filled
+    unfilled = not (set(named[cards.ATTRIBUTION].files) - INITIAL)
+    if source is not None and unfilled:
+        reads[cards.ATTRIBUTION] = reads[cards.ATTRIBUTION]._replace(repo=cards.attribution_work(settings)[0])
+        states[cards.ATTRIBUTION] = source
+        adopted[cards.ATTRIBUTION] = RepoRef(reads[cards.ATTRIBUTION].repo, source.sha)
+    # a target the settings freeze is read for the cards of the others; nothing of it is scanned, written or opened,
+    # and neither is one this run was not asked for
+    frozen = {repo.casefold() for repo in settings.frozen_repos}
+    held_back = {target.key for target in wanted if target.repo.casefold() in frozen}
+    kept = held_back | {target.key for target in wanted if only and target.key not in only}
+    left = tuple((target.repo, target.repo_type, states[target.key]) for target in wanted if target.key in held_back)
+    passed = tuple(
+        (target.repo, target.repo_type, states[target.key]) for target in wanted if target.key in kept - held_back
+    )
     present = [target for target in wanted if states[target.key].exists]
-    absent = tuple(target for target in wanted if not states[target.key].exists)
+    absent = tuple(target for target in wanted if not states[target.key].exists and target.key not in kept)
     advice = "delete it with --delete-intermediates, or make it private"
     exposed = [
         (ExitCode.INTEGRITY, f"{repo} is public; {advice}") for repo, _, state in hidden if state.private is not True
@@ -756,19 +971,29 @@ def _drawn(
     working = [(read.repo, read.repo_type, works[key]) for key, read in aside.items() if works[key].exists]
     shelves = collections.find(settings, hub)
     secrets: list[Problem] = []
-    lacking = (_lacking(target, named[target.key], works[target.key]) for target in wanted if target.key not in resumed)
+    # a repo this run was not asked for is the business of the run that is
+    judged = [target for target in wanted if target.key not in resumed and target.key not in kept - held_back]
+    lacking = (_lacking(target, named[target.key], works[target.key]) for target in judged)
     other = [(ExitCode.INTEGRITY, lack) for lack in lacking if lack]
     other += [
         (ExitCode.INTEGRITY, EXPOSED_WORK.format(repo=repo)) for repo, _, state in working if state.private is not True
     ]
+    other += [
+        (ExitCode.INTEGRITY, EXPOSED_SOURCE.format(repo=repo)) for repo, _, state in apart if state.private is not True
+    ]
+    working += apart
     other += _shelf_problems(settings, shelves)
 
     shas, unread, needs = {}, {}, {}
     for target in present:
         read = reads[target.key]
         with _reading(read.repo):
-            # the history of a repo already set aside stays behind
-            shas[target.key] = _listed(hub, read, states[target.key].sha, scans, target.key not in resumed)
+            # the history of a repo already set aside stays behind, and so does that of a frozen one and that of
+            # a repo published as a new one
+            history = target.key not in resumed and target.key not in kept and target.key not in adopted
+            shas[target.key] = _listed(hub, read, states[target.key].sha, scans, history)
+        if target.key in kept:
+            continue
         before = len(unread)
         _unread(read, shas[target.key], scans, unread)
         needs[read.repo] = len(unread) - before
@@ -781,7 +1006,7 @@ def _drawn(
             "nothing was fetched: raise the value in driftmap.toml, or rebuild the longest repo from its head",
         )
     steps, found = [], []
-    stale = {target.key: _stale(target, states[target.key].files) for target in present}
+    stale = {target.key: [] if target.key in kept else _stale(target, states[target.key].files) for target in present}
     copies: dict[str, RepoRef] = {}
     with tempfile.TemporaryDirectory(prefix="driftmap-publish-") as scratch:
         for key, (target, sha, path) in unread.items():
@@ -792,8 +1017,12 @@ def _drawn(
             key, read, state = target.key, reads[target.key], states[target.key]
             with _reading(read.repo):
                 files[key] = _kept(hub, read, state.sha, scans, Path(scratch))
-            held = _found(read, shas[key], scans)
-            if key in resumed or (fresh and (held.secrets or held.other)):
+            if key in kept:
+                continue
+            # a repo published as a new one answers for the files that one will hold
+            only_kept = set(state.files) - set(stale[key]) if key in adopted else None
+            held = _found(read, shas[key], scans, only_kept)
+            if key in resumed or (fresh and key not in adopted and (held.secrets or held.other)):
                 # what a new repo would hold: the head without the files its card commit drops
                 copied = _found(read, [state.sha], scans, set(state.files) - set(stale[key]))
                 if key not in resumed and works[key].exists:
@@ -813,18 +1042,30 @@ def _drawn(
             found.append(held)
             secrets += [(ExitCode.REDACTION, text) for text in held.secrets]
             other += [(ExitCode.INTEGRITY, text) for text in held.other]
+        brought, astray = _brought(staged, [target.key for target in wanted])
+        other += [(ExitCode.INTEGRITY, text) for text in astray]
+        # the cards are drawn from what the repos will hold: the head and, over it, the staged files
+        shown = {
+            key: {**held, **{name: data for name, data in brought.get(key, ()) if _matching([name], KEPT)}}
+            for key, held in files.items()
+        }
         parsed = []
         for name, key, cls in CARD_INPUTS:
             try:
-                parsed.append(_parsed(cls, files.get(key, {}), name))
+                parsed.append(_parsed(cls, shown.get(key, {}), name))
             except ValidationError:
                 parsed.append(None)
                 other.append((ExitCode.INTEGRITY, f"{name} on the Hub does not parse; build and upload it again"))
         manifest, tables, stripped, aggressive, aggressive_stripped, aggressive_screen = parsed
         # a card states a limit without its numbers when the table behind them is missing or does not parse
-        breakdown, variants = (_read_table(cls, files.get("results", {}), name) for name, cls in LIMIT_INPUTS)
+        optional = (_read_table(cls, shown.get("results", {}), name) for name, cls in LIMIT_INPUTS)
+        breakdown, variants, choice, mbbq, attribution, attribution_stripped, attribution_breakdown = optional
+        # a choice table is the results of the adapter it is of: one that is there has to be readable
+        for name, read in ((cards.CHOICE_FILE, choice), (cards.MBBQ_FILE, mbbq)):
+            if read is None and name in shown.get("results", {}):
+                other.append((ExitCode.INTEGRITY, f"{name} on the Hub does not parse; build and upload it again"))
         records = []
-        for name, data in sorted(files.get("results", {}).items()):
+        for name, data in sorted(shown.get("results", {}).items()):
             try:
                 records += [RunRecord.model_validate_json(data)] if name.startswith("runs/") else []
             except ValidationError:
@@ -842,6 +1083,10 @@ def _drawn(
         }
         publication = Publication(schema=SCHEMA_PUBLICATION, copies=mapped).model_dump_json(indent=2) + "\n"
         booked, unbooked = _booked(ledger)
+        if "results" in files and "results" not in kept and not unbooked:
+            unbooked = _uncounted(booked or files["results"].get(cards.LEDGER), records)
+        # a staged file goes with the card of its repo in the run that handles that repo
+        staged_for = {key: held for key, held in brought.items() if key in files and key not in kept}
         answers, misplaced = _checked(checks)
         other += [(ExitCode.INTEGRITY, text) for text in (*unbooked, *misplaced)]
         carried = {
@@ -852,14 +1097,14 @@ def _drawn(
             # the checkpoint leaves with the card; what the trainer logged stays
             **{
                 key: [(cards.TRAINER_STATE, files[key][CHECKPOINT_LOG])]
-                for key in cards.ADAPTERS
-                if CHECKPOINT_LOG in files.get(key, ())
+                for key in cards.LORAS
+                if key not in kept and CHECKPOINT_LOG in files.get(key, ())
             },
         }
-        for key, held in answers.items():
+        for key, held in (*answers.items(), *staged_for.items()):
             carried.setdefault(key, []).extend(held)
         extras = {key: tuple(held) for key, held in carried.items() if held and key in files}
-        after = {key: {**files.get(key, {}), **dict(extras.get(key, ()))} for key in CHECK_REPOS}
+        after = {key: {**shown.get(key, {}), **dict(extras.get(key, ()))} for key in CHECK_REPOS}
         rendered = cards.render_cards(
             settings,
             manifest=manifest,
@@ -867,22 +1112,37 @@ def _drawn(
             records=records,
             writeup=writeup,
             nopreamble=stripped,
-            recipes={key: _recipe(files[key]) for key in cards.ADAPTERS if key in files},
+            recipes={key: _recipe(shown[key]) for key in cards.LORAS if key in shown},
             # a dataset card counts the files its own commit leaves, an adapter card names its log among them
             files={
                 key: sorted((set(states[key].files) - set(stale[key])) | {name for name, _ in extras.get(key, ())})
-                for key in (*cards.DATASETS, *cards.ADAPTERS)
+                for key in (*cards.DATASETS, *cards.LORAS)
                 if key in stale
             },
             copies=origins,
             aggressive=aggressive,
             aggressive_nopreamble=aggressive_stripped,
             aggressive_screen=aggressive_screen,
-            q4_check=_q4_check(after, files.get(cards.MERGED_GGUF, {})),
+            q4_check=_q4_check(after, shown.get(cards.MERGED_GGUF, {})),
             breakdown=breakdown,
             variants=variants,
+            choice=choice,
+            mbbq=mbbq,
+            padding=_object(after["results"], f"{cards.CHECKS_TREE}{cards.PADDING_CHECK}/{cards.PADDING_FILE}"),
+            attribution=attribution,
+            attribution_nopreamble=attribution_stripped,
+            attribution_breakdown=attribution_breakdown,
+            free_form=_object(after["results"], f"{cards.CHECKS_TREE}{cards.FREE_FORM_CHECK}/{cards.FREE_FORM_FILE}"),
+            composition=_object(shown.get("eval", {}), cards.CHOICE_MANIFEST),
+            reading=tuple(
+                _object(after["results"], f"{cards.CHECKS_TREE}{cards.READING_CHECK}/{name}")
+                for name in cards.READING_FILES
+            ),
+            billed=_billed(booked or shown.get("results", {}).get(cards.LEDGER)),
         )
         for target in present:
+            if target.key in kept:
+                continue
             state, card, extra = states[target.key], rendered[target.repo], extras.get(target.key, ())
             staged = Path(scratch, "cards", target.key, CARD)
             staged.parent.mkdir(parents=True)
@@ -914,14 +1174,31 @@ def _drawn(
                 for gap, names in gaps.items()
                 if names
             ]
+            if target.key in cards.LORAS and ADAPTER_WEIGHTS not in set(state.files) - set(deletes):
+                bare = f"{target.repo} holds no adapter weights ({ADAPTER_WEIGHTS}); it is not opened"
+                other.append((ExitCode.INTEGRITY, bare))
             lacks = cards.missing(target.key, card, settings, manifest)
             if lacks:
                 other.append((ExitCode.INTEGRITY, f"{target.repo} cannot get a complete card: {'; '.join(lacks)}"))
-            copy = copies.get(target.key)
-            current = copy is None and all(files[target.key].get(name) == data for name, data in written.items())
-            moved = copy is not None and target.key not in resumed
+            read = reads[target.key]
+            with _reading(read.repo):
+                held = {
+                    name: _at(hub, read, state.sha, name, files[target.key], scans, Path(scratch)) for name in written
+                }
+            # a dataset is only ever added to: what it holds is not replaced by a staged file
+            replaced = [
+                name
+                for name, data in staged_for.get(target.key, ())
+                if target.repo_type == "dataset" and held[name] not in (None, data)
+            ]
+            differs = "the staged file differs from the one the repo holds"
+            other += [(ExitCode.INTEGRITY, f"{target.repo}/{_safe(name)}: {differs}") for name in replaced]
+            copy = copies.get(target.key) or adopted.get(target.key)
+            current = copy is None and all(held[name] == data for name, data in written.items())
+            moved = target.key in copies and target.key not in resumed
             steps.append(Step(target, state, card, not current, tuple(deletes), extra, copy, moved))
     commits = sum(len(found) for found in shas.values())
+    other += [(ExitCode.INTEGRITY, text) for text in (_dangling(steps, head) if head else ())]
     problems = (*exposed, *secrets, *other)
     return Plan(
         tuple(steps),
@@ -934,6 +1211,9 @@ def _drawn(
         len(unread),
         commits,
         tuple(working),
+        left,
+        passed,
+        sum(len(held) for held in staged_for.values()),
     )
 
 
@@ -1023,7 +1303,12 @@ def _copy(hub: Hub, step: Step, folder: Path) -> frozenset[str]:
         ignore_patterns=[f"{CACHE}/*"],
         # refused by the Hub unless the name is the repo just created
         parent_commit=new.sha,
-        commit_message=f"publish the files of {work.repo}@{work.revision[:12]}",
+        # a repo published under another name than its source says nothing of that source
+        commit_message=(
+            f"publish the files of {work.repo}@{work.revision[:12]}"
+            if work.repo == _work(target.repo)
+            else "add the files and the card"
+        ),
     )
     return frozenset(new.files)
 
@@ -1038,15 +1323,17 @@ def _verified(hub: Hub, step: Step, scratch: Path, scans: Scans, initial: frozen
     shas = _listed(hub, target, now.sha, scans)
     unread: dict[tuple[bool, str], tuple[Target, str, str]] = {}
     _unread(target, shas, scans, unread)
-    _read(hub, unread, scans, scratch)
+    written = {CARD: step.card.encode(), **dict(step.extra)}
+    _read(hub, unread, scans, scratch, set(written))
     found = _found(target, shas, scans)
     if found.secrets or found.other:
         code = ExitCode.REDACTION if found.secrets else ExitCode.INTEGRITY
         raise DriftmapError(code, "\n".join([*found.secrets, *found.other, *_advice([found])]))
-    written = {CARD: step.card.encode(), **dict(step.extra)}
     planned = (set(step.state.files) - set(step.deletes)) | set(written) | initial
     at_head = _kept(hub, target, now.sha, scans, scratch)
-    if set(now.files) != planned or any(at_head.get(name) != data for name, data in written.items()):
+    if set(now.files) != planned or any(
+        _at(hub, target, now.sha, name, at_head, scans, scratch) != data for name, data in written.items()
+    ):
         raise DriftmapError(ExitCode.INTEGRITY, CHANGED.format(repo=target.repo))
     return now.sha
 
@@ -1063,6 +1350,11 @@ def publish(
     fresh: bool = False,
     ledger: Path | None = None,
     checks: Path | None = None,
+    head: Head | None = None,
+    staged: Path | None = None,
+    only: Collection[str] = (),
+    closed: bool = False,
+    gate: Path | None = None,
     echo: Echo = print,
 ) -> Check | None:
     """Card, open and list every repo; the final check, or None after a dry run, which refuses where the run would.
@@ -1072,26 +1364,45 @@ def publish(
     head's files in one commit, and ``publication.json`` in the results repo records where each copy came from.
     The card commit of the results repo carries the local cost ledger at ``ledger``, one line per job, and those of
     the responses and the results repo the files of the local ``checks`` folder; an adapter's keeps the trainer's
-    log of the checkpoint it removes.
+    log of the checkpoint it removes. With ``head`` a card whose link leads nowhere without a token, or on to
+    another address, refuses the run.
+    The files of the local ``staged`` folder go with the card of their repo, and with ``only`` the run handles the
+    repos of those keys alone, as ``plan`` says. A ``closed`` run commits and reads back what it handles, then
+    stops: nothing is opened or listed and no final check is made; it returns None. A run that brings staged
+    files is refused (exit 4) unless the file ``gate`` records a pass for the ``fingerprint`` of its plan.
     """
     _identity(settings, hub)
     scans = scans if scans is not None else Scans()
-    local = {"ledger": ledger, "checks": checks}
-    drawn = plan(settings, hub, writeup=writeup, scans=scans, fresh=fresh, **local)
+    local = {"ledger": ledger, "checks": checks, "staged": staged}
+    asked = {"only": tuple(only)}
+    drawn = plan(settings, hub, writeup=writeup, scans=scans, fresh=fresh, **local, head=head, **asked)
     # a paid job rebuilds the merged checkpoint, so it goes only when the run can go on
     if delete and not dry_run and set(drawn.problems) <= set(drawn.exposed):
         delete_intermediates(settings, hub, echo=echo)
-        drawn = plan(settings, hub, writeup=writeup, scans=scans, fresh=fresh, **local)
+        drawn = plan(settings, hub, writeup=writeup, scans=scans, fresh=fresh, **local, head=head, **asked)
     for line in drawn.lines(delete and dry_run):
         echo(line)
     # a dry run deletes nothing, so what its delete would clear does not stand against it
     cleared = dry_run and delete and set(drawn.problems) <= set(drawn.exposed)
     if drawn.problems and not cleared:
         raise DriftmapError(drawn.problems[0][0], drawn.refusal())
+    # staged files come from outside the jobs: a check outside this module has to have passed exactly this plan
+    wanted = fingerprint(drawn)
+    ungated = bool(drawn.staged) and wanted not in gate_passes(gate)
     if dry_run:
+        if drawn.staged:
+            state = "no pass recorded" if ungated else "a pass is recorded"
+            echo(f"gate: {state} for {wanted[:12]}{'; a run would refuse' * ungated}")
         return None
+    if ungated:
+        brought = f"this run brings {drawn.staged} staged file{'s' * (drawn.staged > 1)}"
+        raise DriftmapError(
+            ExitCode.GUARD_REFUSAL,
+            f"{brought} and no check has passed what this run would publish ({wanted[:12]}); nothing was written",
+        )
     given = f"{', delete=True' * delete}{', fresh=True' * fresh}{f', writeup={writeup!r}' if writeup else ''}"
     given += "".join(f", {name}={name}" for name, path in local.items() if path is not None)
+    given += f"{f', only={tuple(only)!r}' if only else ''}{', closed=True' * closed}"
     resume = resume or f"resume: run publish(settings, hub{given}) again; finished steps are skipped"
 
     def reported(action: str) -> AbstractContextManager[None]:
@@ -1120,7 +1431,7 @@ def publish(
                     delete_patterns=list(STALE[target.key]) if step.deletes else None,
                     # refused by the Hub when anything landed after the scan
                     parent_commit=step.state.sha,
-                    commit_message="add the card",
+                    commit_message="add the card" if not step.extra else "add the card and the files that go with it",
                 )
             echo(f"card: {target.repo}")
         for step in drawn.steps:
@@ -1137,6 +1448,9 @@ def publish(
     for step in drawn.steps:
         with reported(f"reading {step.target.repo} before it is opened"):
             unchanged(step)
+    if closed:
+        echo("closed run: nothing was opened or listed")
+        return None
 
     def closed(target: Target, code: ExitCode, why: str) -> DriftmapError:
         """Make a repo private again; the error to raise says whether that worked."""

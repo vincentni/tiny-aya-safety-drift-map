@@ -126,7 +126,7 @@ def minute_prices(rows: Iterable[JobHardwareInfo]) -> dict[str, int]:
     }
 
 
-def head_status(url: str, *, transport: httpx2.BaseTransport | None = None) -> int:
-    """Status of a HEAD request once redirects are followed."""
-    with httpx2.Client(transport=transport, follow_redirects=True, timeout=REQUEST_TIMEOUT) as session:
+def head_status(url: str, *, transport: httpx2.BaseTransport | None = None, follow: bool = True) -> int:
+    """Status of a HEAD request once redirects are followed; with ``follow`` off, as the address itself answers."""
+    with httpx2.Client(transport=transport, follow_redirects=follow, timeout=REQUEST_TIMEOUT) as session:
         return session.head(url).status_code

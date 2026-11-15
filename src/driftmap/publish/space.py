@@ -1,5 +1,6 @@
 """Publish the results Space: a static page of counts and figures, built from the public tables and labels."""
 
+import hashlib
 import json
 import re
 import time
@@ -26,8 +27,10 @@ FOLDER = "space"
 DATA, FIGURES, CARD, PAGE = "data.json", "figures", "README.md", "index.html"
 # what the replay explorer reads: prompt text and stored answers, written by the build when the responses are at hand
 EXPLORER = "explorer.json"
+# sample items the page shows in full, written by the build when the prompts and the answers are at hand
+SAMPLES = "samples.json"
 # what the page is made of; the script that builds its data stays in the code repo
-FILES = (CARD, PAGE, "app.js", "explorer.js", DATA, EXPLORER, f"{FIGURES}/*")
+FILES = (CARD, PAGE, "app.js", "explorer.js", DATA, EXPLORER, SAMPLES, f"{FIGURES}/*")
 BUILD = "run `python space/build_data.py` first"
 # what a page file asks for: a src or an href with a fixed value, as an attribute or a property, or a fetch of one
 REFERENCE = re.compile(r"""(?:\bfetch\(\s*|\b(?:src|href)\s*[:=]\s*)["']([^"'?#]+)""", re.IGNORECASE)
@@ -78,9 +81,15 @@ def _built(root: Path, settings: Settings) -> list[str]:
     if not held:
         raise _refuse(f"{FOLDER}/{FIGURES}/ is missing or empty; {BUILD}")
     try:
-        named = json.loads(data.read_bytes()).get("figures", [])
+        shown = json.loads(data.read_bytes())
+        named, source = shown.get("figures", []), shown.get("eval_repo")
     except (ValueError, AttributeError):
         raise _refuse(f"{FOLDER}/{DATA} is not a JSON object; {BUILD}") from None
+    # the page counts one revision's answers: those of the datasets this checkout publishes
+    datasets = [f"{settings.owner}/{name}" for name in (settings.repos.eval, settings.repos.results)]
+    datasets.append(f"{settings.owner}/{settings.repos.responses}")
+    if source is not None and source != datasets[0]:
+        raise _refuse(f"{FOLDER}/{DATA} was built from {source}, not from {datasets[0]}; {BUILD}")
     lost = [name for name in named if name not in held]
     if lost:
         raise _refuse(f"{FOLDER}/{DATA} names the figure {lost[0]}, which {FOLDER}/{FIGURES}/ does not hold")
@@ -89,6 +98,10 @@ def _built(root: Path, settings: Settings) -> list[str]:
     declared = _declared(space)
     if (declared.get("sdk"), declared.get("app_file")) != ("static", PAGE):
         raise _refuse(f"{FOLDER}/{CARD} does not declare a static Space (sdk: static, app_file: {PAGE})")
+    other = [repo for repo, kind in _named(root, settings) if kind == "dataset" and repo not in datasets]
+    if other:
+        known = f"which is not one of the settings ({', '.join(datasets)})"
+        raise _refuse(f"{FOLDER}/{CARD} names the dataset {other[0]}, {known}")
     link = page_url(settings)
     readme = root / CARD
     if link not in (readme.read_text(encoding="utf-8") if readme.is_file() else ""):
@@ -104,13 +117,13 @@ def _built(root: Path, settings: Settings) -> list[str]:
 def _referred(space: Path, files: list[str]) -> None:
     """Refuse a page or a script that refers to a file of the Space the upload would not hold.
 
-    A reference ending in a slash names a folder, which needs one file under it. The explorer's data file may be
-    absent: the page hides the explorer then.
+    A reference ending in a slash names a folder, which needs one file under it. The explorer's data file and the
+    sample items may be absent: the page shows neither then.
     """
     for name in (PAGE, *(path for path in files if path.endswith(".js"))):
         for found in REFERENCE.findall((space / name).read_text(encoding="utf-8")):
             target = found.removeprefix("./")
-            if ELSEWHERE.match(target) or target == EXPLORER:
+            if ELSEWHERE.match(target) or target in (EXPLORER, SAMPLES):
                 continue
             held = any(path.startswith(target) for path in files) if target.endswith("/") else target in files
             if not held:
@@ -196,28 +209,45 @@ def _answers(url: str, opener: Callable[..., Any], sleep: Callable[[float], None
     )
 
 
+def fingerprint(settings: Settings, root: str | Path) -> str:
+    """The sha256 over the page files an upload would send, each with its path and the sha256 of its bytes;
+    raises as ``publish_space`` does for a folder that is not ready."""
+    root = Path(root)
+    files = _built(root, settings)
+    lines = [f"{name}\t{hashlib.sha256((root / FOLDER / name).read_bytes()).hexdigest()}" for name in files]
+    return hashlib.sha256("\n".join(sorted(lines)).encode()).hexdigest()
+
+
+def _frozen(settings: Settings) -> bool:
+    """Whether the settings freeze the Space: that of another revision is read and never changed."""
+    return space_id(settings).casefold() in {repo.casefold() for repo in settings.frozen_repos}
+
+
 def planned(settings: Settings, hub: Hub, root: str | Path) -> list[str]:
     """The Space step as lines of a publication plan: the files ``publish_space`` would upload, or why it would
     refuse the folder.
 
     Reads only. The repos the Space names are still private while a publication is planned, so they are not asked for.
+    A Space the settings freeze is shown with the step that waits for it to leave the frozen list.
     """
     root, repo = Path(root), space_id(settings)
+    waits = "once it leaves frozen_repos, `driftmap publish space` would:"
+    held = [f"frozen, left as it is: {repo} (space); {waits}"] if _frozen(settings) else []
     head = f"{repo} (space, static)"
     try:
         files = _built(root, settings)
         _scanned(root, files)
     except DriftmapError as error:
-        return [f"{head}: not ready: {'; '.join(str(error).splitlines())}"]
+        return [*held, f"{head}: not ready: {'; '.join(str(error).splitlines())}"]
     try:
         now = hub.space_info(repo)
     except RepositoryNotFoundError:
         now = None
     except push.FAILURES as error:
-        return [f"{head}: could not be read ({push._cause(error)})"]
+        return [*held, f"{head}: could not be read ({push._cause(error)})"]
     state = "create" if now is None else "update"
     opened = "public" if now is not None and now.private is False else "public after `driftmap publish space`"
-    return [f"{head}: {state}; {opened}", *(f"upload: {name}" for name in files)]
+    return [*held, f"{head}: {state}; {opened}", *(f"upload: {name}" for name in files)]
 
 
 def publish_space(
@@ -229,19 +259,26 @@ def publish_space(
     opener: Callable[..., Any] = urllib.request.urlopen,
     sleep: Callable[[float], None] = time.sleep,
     echo: Echo = print,
+    staged: Path | None = None,
+    gate: Path | None = None,
 ) -> None:
     """Create or update the static results Space from ``<root>/space`` in one commit, open it, and read it back.
 
-    Refuses, before any write, a folder whose data file is missing or older than a local table, whose figures
-    are missing, whose card is not a static Space's, whose page or scripts refer to a file the upload would not
-    hold, whose explorer file is older than the data file or holds the text of an answer judged harmful or left
-    without a verdict, a README that links
-    elsewhere, a page file with a finding, and a dataset or model of the owner that the Space names while it is
-    not public. The explorer file goes up when the build wrote one and leaves the Space when it is gone. A dry
+    Refuses, before any write, a Space the settings freeze, a folder whose data file is missing, older than a
+    local table or built from another evaluation dataset than the settings name, whose figures are missing, whose
+    card is not a static Space's or names a dataset of the owner that the settings do not, whose page or scripts
+    refer to a file the upload would not hold, whose explorer file is older than the data file or holds the text
+    of an answer judged harmful or left without a verdict, a README that links elsewhere, a page file with a
+    finding, and a dataset or model of the owner that the Space names while it is not public. The explorer file
+    goes up when the build wrote one and leaves the Space when it is gone. In a checkout whose ``staged`` folder
+    holds files, the upload is refused (exit 4) unless the file ``gate`` records a pass for the ``fingerprint``
+    of the page files. The upload is pinned to the head that was read. A dry
     run prints the files and writes nothing. Raises DriftmapError (exit 7) when the Hub fails, (exit 1) when the
     page does not answer a reader who is not logged in.
     """
     root, repo = Path(root), space_id(settings)
+    if _frozen(settings):
+        raise DriftmapError(ExitCode.GUARD_REFUSAL, f"{repo} is frozen in the settings: it is read, never changed")
     push._identity(settings, hub)
     files = _built(root, settings)
     _scanned(root, files)
@@ -264,6 +301,12 @@ def publish_space(
     if dry_run:
         echo("dry run: nothing was written")
         return
+    # where files are staged for the repos, a check outside this module has to have passed the page as it is
+    brings = staged is not None and staged.is_dir() and any(path.is_file() for path in staged.rglob("*"))
+    wanted = fingerprint(settings, root)
+    if brings and wanted not in push.gate_passes(gate):
+        unpassed = f"no check has passed the page as it is ({wanted[:12]})"
+        raise DriftmapError(ExitCode.GUARD_REFUSAL, f"this checkout stages files and {unpassed}; nothing was written")
     try:
         # private when new, so nothing is shown before the page is whole
         hub.create_repo(repo, repo_type="space", space_sdk="static", private=True)
@@ -274,6 +317,8 @@ def publish_space(
             allow_patterns=list(FILES),
             # a figure or an explorer file the build no longer makes leaves the page
             delete_patterns=[f"{FIGURES}/*", EXPLORER],
+            # refused by the Hub when the page changed after it was read; a new Space has no head to name
+            parent_commit=now.sha if now is not None else None,
             commit_message="update the results page",
         )
         hub.update_repo_settings(repo, private=False, repo_type="space")

@@ -1,5 +1,6 @@
 """What a launch is checked against: spend, running jobs, prices, gates and local records."""
 
+import functools
 import logging
 import os
 import subprocess
@@ -48,6 +49,8 @@ class Deps:
     now: Callable[[], datetime] = utcnow
     run: Run = subprocess.run
     head: Callable[[str], int] = head_status
+    # what a link of a card answers itself: a redirect is a link to fix, so it is not followed
+    link: Callable[[str], int] = functools.partial(head_status, follow=False)
 
 
 def tables_path(preamble: str = "keep", fine_tune: str = "standard") -> Path:

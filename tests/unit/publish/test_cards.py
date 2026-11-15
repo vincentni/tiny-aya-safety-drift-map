@@ -10,12 +10,17 @@ from driftmap.publish.q4_local import Check, Count
 from driftmap.repair import select
 from driftmap.table.breakdown import Breakdown
 from driftmap.table.build import Q4_FINE_TUNED, build
+from driftmap.table.choice import ChoiceTables
 from driftmap.table.variants import VariantTables
 from tests.fakes.labels import column_rows, make_settings, targets, write_labels
 from tests.fakes.published import (
     ADAPTER,
     ADAPTER_NOPRE,
+    ATTRIBUTION,
+    ATTRIBUTION_MERGED_WORK,
+    ATTRIBUTION_WORK,
     DATASETS,
+    DEFENSE_SHA256,
     EVAL,
     GGUF,
     MERGED,
@@ -30,8 +35,13 @@ from tests.fakes.published import (
     RESPONSES,
     RESULTS,
     SLUG,
+    choice_manifest,
+    choice_tables,
+    defense_drift_record,
     drift_record,
+    free_form_scores,
     manifest,
+    mbbq_tables,
     nopre_drift_record,
     recipe,
     two_column_tables,
@@ -40,7 +50,8 @@ from tests.fakes.settings import settings_toml
 
 KEYS = dict(zip((*DATASETS, *MODELS), ("eval", "results", "responses", "adapter", "repaired", "gguf"), strict=True))
 KEYS |= {ADAPTER_NOPRE: "adapter_nopre", MERGED_GGUF: "merged_gguf", REPAIRED_NOPRE: "repaired_nopre"}
-DERIVED = (*MODELS, ADAPTER_NOPRE, MERGED_GGUF, REPAIRED_NOPRE)
+KEYS |= {ATTRIBUTION: "adapter_attribution"}
+DERIVED = (*MODELS, ADAPTER_NOPRE, MERGED_GGUF, REPAIRED_NOPRE, ATTRIBUTION)
 
 
 @pytest.fixture
@@ -702,6 +713,366 @@ def test_the_light_adapter_states_what_its_lower_harmful_rate_does_not_cover(tmp
     own = f"{MERGED_NOPRE}@{'b' * 40}"
     second = two_column_tables(tmp_path, settings, unsafe=1, fine_tuned=own)
     assert "Latin script" not in render_cards(settings, aggressive=second, variants=variants)[ADAPTER_NOPRE]
+
+
+def test_the_attribution_adapter_has_a_card_built_from_its_choice_table_and_its_recipe(tmp_path, settings):
+    """Its numbers are the choice table's, its training list the recipe's; it is named as its run records name it."""
+    training = recipe(run_id="drift-defense", train_set="defense", rows=1412, rows_per_language={"en": 1412})
+    known = {"manifest": manifest(), "records": [drift_record(), defense_drift_record()]}
+    known |= {"recipes": {"adapter": recipe(), "adapter_attribution": training}}
+
+    rendered = render_cards(settings, **known, choice=choice_tables(), files={"adapter_attribution": []})
+
+    card = rendered[ATTRIBUTION]
+    assert body(card).startswith("# Tiny Aya Global, fine-tune against unsupported attribution (LoRA adapter)\n")
+    # no table of the evaluation sets compares it with the base model, so it opens as any unmeasured fine-tune
+    assert f"**{cards.DO_NOT_DEPLOY}** {cards.UNMEASURED}" in card and "it is not a general safety fix" in card
+    assert "| English | names a person on the ambiguous item | correct on the answerable twin | twin accuracy |" in card
+    assert "| Base model | 81 of 150 (54.0%) | 122 of 150 (81.3%) | 52 of 150 (34.7%) |" in card
+    assert "| This adapter | 1 of 150 (0.7%) | 140 of 150 (93.3%) | 139 of 150 (92.7%) |" in card
+    change = "- Twin accuracy, English, against the base model: +58.0 points (95% CI +49.0 to +66.0; n=150 items; "
+    assert change + "p < 0.001)." in card
+    french = "| fr | 4 of 142 (2.8%); 4 of 132 (3.0%) | 130 of 142 (91.5%); 130 of 132 (98.5%) | "
+    assert french + "126 of 142 (88.7%); 126 of 132 (95.5%) | 10 of 284 |" in card
+    assert f'model = PeftModel.from_pretrained(model, "{ATTRIBUTION}")' in card
+    assert "- Rows: 1412 rows (en 1412) from `sft_train_defense/` of " in card
+    assert "benign instruction rows (" not in card
+    assert "- Cost: $0.80 for 60 minutes on l4x1 (`runs/drift-defense.json` in the results dataset)." in card
+    assert DEFENSE_SHA256 in card and MERGED_SHA256 not in card and "Training log" not in card
+    names = "call this fine-tune `defense` and the evaluated checkpoint "
+    assert names + f"`{ATTRIBUTION_MERGED_WORK}`, which is not published." in card and ATTRIBUTION_WORK not in card
+    assert "`nyu-mll/BBQ` on GitHub, CC BY 4.0" in card
+    data = RepoCard(card).data.to_dict()
+    assert (data["language"], data["library_name"], data["license"]) == (["en"], "peft", "cc-by-nc-4.0")
+    assert missing("adapter_attribution", card, settings, manifest()) == []
+    # the light adapter's card reads its own run, not the latest drift run on record
+    assert MERGED_SHA256 in rendered[ADAPTER] and DEFENSE_SHA256 not in rendered[ADAPTER]
+    assert "`runs/drift-None.json`" in rendered[ADAPTER]
+
+    # without its table the card says so; with a table of another fine-tune too
+    for found in (None, choice_tables().model_copy(update={"fine_tune": "standard"})):
+        bare = render_cards(settings, manifest=manifest(), choice=found)[ATTRIBUTION]
+        assert "Not measured yet: `tables/choice-defense.json` is not in the results dataset." in bare
+    # a table without the base model's arm gives the adapter's rows and no change
+    alone = render_cards(settings, manifest=manifest(), choice=choice_tables(base=False))[ATTRIBUTION]
+    assert "| This adapter | 1 of 150 (0.7%)" in alone and "against the base model" not in alone
+    # a table that holds another fine-tune beside it shows that one under its own name
+    both = render_cards(settings, manifest=manifest(), choice=choice_tables(light=True))[ATTRIBUTION]
+    assert "| Light fine-tune | 60 of 150 (40.0%) | 125 of 150 (83.3%) | 70 of 150 (46.7%) |" in both
+    assert both.count("| This adapter |") == 1 and "| This adapter | 1 of 150 (0.7%)" in both
+    assert french + "126 of 142 (88.7%); 126 of 132 (95.5%) | 10 of 284 |" in both
+    assert change + "p < 0.001)." in both
+
+    # measured on the evaluation sets, it opens by that measurement and shows it after the choice results
+    tuned = f"{ATTRIBUTION_MERGED_WORK}@{'c' * 40}"
+    safer = two_column_tables(tmp_path, settings, unsafe=1, fine_tuned=tuned)
+    measured = render_cards(settings, manifest=manifest(), choice=choice_tables(), attribution=safer)[ATTRIBUTION]
+    assert f"**{cards.RESEARCH} {cards.NOT_CERTIFIED}**" in measured and "do not deploy" not in measured
+    supporting = "### Machine-translated items, for completeness"
+    assert measured.index("### On the evaluation sets of the study") > measured.index(supporting)
+    assert "### By language" not in measured
+    assert f"the fine-tuned model `{tuned}`" in measured and "| all | 90.0% (n=120) | 95.0% (n=120) |" in measured
+    worse = two_column_tables(tmp_path, settings, unsafe=9, fine_tuned=tuned)
+    warned = render_cards(settings, manifest=manifest(), attribution=worse)[ATTRIBUTION]
+    assert f"**{cards.DO_NOT_DEPLOY}** Its safe rate over all languages is 35.0 points below" in warned
+    # those tables are no other card's
+    assert "### Served template" not in render_cards(settings, attribution=safer)[ADAPTER]
+
+
+def test_the_attribution_card_leads_with_the_official_items_and_gives_translations_for_completeness(settings):
+    known = {"manifest": manifest(), "choice": choice_tables()}
+    padded = {
+        "base": {
+            "disambiguated plain": {"rows": 150, "correct": 122},
+            "disambiguated p3": {"rows": 150, "correct": 113},
+        },
+        "fine_tuned": {
+            "disambiguated plain": {"rows": 150, "correct": 140},
+            "disambiguated p3": {"rows": 150, "correct": 122},
+        },
+    }
+
+    card = render_cards(settings, **known, mbbq=mbbq_tables(), padding=padded)[ATTRIBUTION]
+
+    official, english = "### Official items in four languages", "### English test built from BBQ"
+    translated = "### Machine-translated items, for completeness"
+    method = "Each test is a set of question pairs the adapter never trained on."
+    # the official items lead, the English test follows, the translations close
+    assert card.index(method) < card.index(official) < card.index(english) < card.index(translated)
+    how = (
+        "The same question on official items: pairs of MBBQ (Neplenbroek, Bisazza and Fernández, 2024), the same "
+        "rows in English, Spanish, Dutch and Turkish, drawn from a category the adapter never trained on and from "
+        "question templates held out of its training. Their text is not republished; the table is "
+        f"`tables/choice-mbbq-defense.json` and its Markdown twin in `{RESULTS}`."
+    )
+    assert how in card.splitlines()
+    head = "| language, model | names a person on the ambiguous item | correct on the answerable twin | twin accuracy |"
+    rows = card[card.index(head) : card.index(english)].splitlines()
+    # all four languages together first: the headline of the claim
+    assert rows[2] == "| all 4 languages, base model | 350 of 600 (58.3%) | 450 of 600 (75.0%) | 173 of 600 (28.8%) |"
+    assert rows[3] == "| all 4 languages, this adapter | 20 of 600 (3.3%) | 534 of 600 (89.0%) | 517 of 600 (86.2%) |"
+    assert "| es, base model | 90 of 150 (60.0%) | 111 of 150 (74.0%) | 42 of 150 (28.0%) |" in rows
+    assert "| tr, this adapter | 9 of 150 (6.0%) | 126 of 150 (84.0%) | 120 of 150 (80.0%) |" in rows
+    assert not any(row.startswith("| non-English") for row in rows)
+    named = "- Names a person on the ambiguous item, all 4 languages together, against the base model: -55.0 points "
+    together = "- Twin accuracy, Spanish, Dutch and Turkish together, against the base model: +56.7 points (95% CI "
+    changes = [row for row in rows if row.startswith("- ")]
+    assert changes[1] == named + "(95% CI -59.0 to -51.0; n=600 items; p < 0.001)."
+    assert changes[2] == together + "+51.0 to +62.0; n=450 items; p < 0.001)."
+    # the English test of BBQ's own items comes second, under its own head
+    source = "The English test is built from BBQ. The table and the rule are `tables/choice-defense.json` and its "
+    assert source + f"Markdown twin in `{RESULTS}`." in card.splitlines()
+    assert card.index(english) < card.index("| English | names a person")
+    # the translated rows are given for completeness, Spanish as a cross-check, English not again
+    said = (
+        "No official version of these items exists in French, Russian, Hindi or Arabic, so the English test was "
+        "translated for this study by a closed model with automatic checks and no native review, as the best "
+        "available; these rows are given for completeness and are not part of the claim."
+    )
+    closing = card[card.index(translated) :]
+    assert said in closing and "| fr | 4 of 142 (2.8%)" in closing and "| en |" not in closing
+    limits = card[card.index("## Intended use and limits") :].splitlines()
+    assert (
+        "- English-only training; Spanish, Dutch and Turkish are tested on MBBQ's official items; the other "
+        "languages of the test above are translations by a closed model with automatic checks and no native review."
+    ) in limits
+    assert (
+        "- Lowest of the four official languages: Turkish, where twin accuracy is 120 of 150 (80.0%) and the "
+        "answerable twin is answered correctly 126 of 150 (84.0%)."
+    ) in limits
+    assert (
+        "- Train and test share one benchmark family: the training rows and the English test are BBQ items and the "
+        "official items are MBBQ's versions of such items, all written from templates and asked as multiple choice; "
+        "BBQ's contexts are U.S.-centric."
+    ) in limits
+    assert (
+        "- **It depends on the order of BBQ's sentences.** With the settling sentences of the answerable twin moved "
+        "in front of the scene, it answers 122 of 150 twins correctly against 140 as written (base model: 113 "
+        "against 122; `checks/padding/` of the results dataset)."
+    ) in limits
+
+    # a cross-check row is named as one when both tables hold the language
+    both = choice_tables().model_dump(mode="json", by_alias=True)
+    spanish = [rate | {"scope": "es"} for rate in both["rates"] if rate["scope"] == "fr"]
+    crossed = ChoiceTables.model_validate(both | {"scopes": ["en", "fr", "es"], "rates": both["rates"] + spanish})
+    checked = render_cards(settings, manifest=manifest(), choice=crossed, mbbq=mbbq_tables())[ATTRIBUTION]
+    assert "| es (cross-check of the official Spanish rows) | 4 of 142 (2.8%)" in checked[checked.index(translated) :]
+
+    # without the table of the official items the English test leads, and the card names no MBBQ
+    alone = render_cards(settings, **known)[ATTRIBUTION]
+    assert official not in alone and "MBBQ" not in alone and "It depends on the order" not in alone
+    assert alone.index(method) < alone.index(english) < alone.index(translated)
+    assert "- English-only training; the other languages are tested on translations by a closed model" in alone
+    assert "- Train and test share one benchmark family: the training rows and the test are BBQ items, " in alone
+    # a table of another fine-tune is not this adapter's
+    other = mbbq_tables().model_copy(update={"fine_tune": "standard"})
+    assert official not in render_cards(settings, **known, mbbq=other)[ATTRIBUTION]
+
+
+def test_the_datasets_list_the_folders_of_the_choice_prompts_and_of_the_named_training_set(settings):
+    held = {
+        "eval": ["manifest.json", "sft_train/en.jsonl", "sft_train_defense/en.jsonl", "choice/prompts/benign/en.jsonl"],
+        "responses": [f"responses/{SLUG}/harmful/en.jsonl", f"choice/responses/{SLUG}/benign/en.jsonl"],
+        "results": ["runs/drift-None.json", "tables/tables.json", "tables/choice-defense.json"],
+    }
+
+    rendered = render_cards(settings, manifest=manifest(), files=held)
+
+    data = rendered[EVAL]
+    assert "- `sft_train_defense/` (1 file): the rows the attribution adapter was fine-tuned on" in data
+    assert "- `sft_train/` (1 file): " in data
+    assert "- `choice/` (1 file): questions a text may not answer, built from BBQ" in data and "CC BY 4.0" in data
+    assert "- `choice/` (1 file): the answers to the choice prompts" in rendered[RESPONSES]
+    assert "- `tables/choice-defense.json`: the choice prompts scored by rule" in rendered[RESULTS]
+    plain = render_cards(settings, manifest=manifest())
+    assert not any("choice" in text for repo, text in plain.items() if repo in DATASETS)
+
+
+def test_the_datasets_list_the_folders_of_the_held_out_harmful_prompts_and_their_table(settings):
+    held = {
+        "eval": [
+            "manifest.json",
+            "heldout/prompts/harmful/en.jsonl",
+            "heldout/prompts/harmful/fr.jsonl",
+            f"heldout/labels/{SLUG}/en.jsonl",
+            f"patched/heldout/labels/{SLUG}/en.jsonl",
+        ],
+        "responses": [f"responses/{SLUG}/harmful/en.jsonl", f"heldout/responses/{SLUG}/harmful/en.jsonl"],
+        "results": ["runs/drift-None.json", "tables/tables.json", "tables/heldout.json", "tables/heldout.md"],
+    }
+
+    rendered = render_cards(settings, manifest=manifest(), files=held)
+
+    data = rendered[EVAL]
+    fresh = (
+        "- `heldout/` (3 files): harmful prompts held out of the evaluation set: a fresh sample of the red-teaming "
+        "dataset that shares no prompt with the evaluation set and is near none; "
+        "`heldout/labels/<checkpoint>/` holds the judge's labels for the answers to them."
+    )
+    assert fresh in data.splitlines()
+    assert "- `patched/` (1 file): the same folders for the runs made with the safety patch" in data
+    answers = "- `heldout/` (1 file): the answers to the held-out harmful prompts of the evaluation set, in "
+    assert answers + "`heldout/responses/<checkpoint>/`." in rendered[RESPONSES].splitlines()
+    table = (
+        "- `tables/heldout.json`: the held-out harmful prompts: harmful answers and refusals of the base model as "
+        "served and under the safety patch, per language and pooled, with the paired change; `tables/heldout.md` is "
+        "the same as Markdown."
+    )
+    assert table in rendered[RESULTS].splitlines()
+    plain = render_cards(settings, manifest=manifest())
+    # without the files no card names the group; `prompts/benign_heldout/` is another folder
+    absent = ("`heldout/`", "tables/heldout")
+    assert not any(name in text for repo, text in plain.items() if repo in DATASETS for name in absent)
+
+
+def test_the_datasets_say_that_the_official_question_pairs_are_published_without_their_text(settings):
+    held = {
+        "eval": ["manifest.json", "mbbq/manifest.json"],
+        "responses": [f"responses/{SLUG}/harmful/en.jsonl"],
+        "results": [
+            "runs/drift-None.json",
+            "tables/tables.json",
+            "tables/choice-mbbq-defense.json",
+            "tables/choice-mbbq-defense.md",
+            "mbbq/items.jsonl",
+            "mbbq/answers.jsonl",
+        ],
+    }
+
+    rendered = render_cards(settings, manifest=manifest(), files=held)
+
+    pinned = (
+        "- `mbbq/` (1 file): question pairs in English, Spanish, Dutch and Turkish drawn from MBBQ (Neplenbroek, "
+        "Bisazza and Fernández, 2024; CC BY 4.0), whose authors ask that it be used to evaluate models and not to "
+        "train them. Their text is not republished: `mbbq/manifest.json` records the commit of MBBQ, the sha256 of "
+        "each file read and the counts of the draw, and `mbbq/items.jsonl` of the results dataset names each "
+        "prompt by its row in those files."
+    )
+    assert pinned in rendered[EVAL].splitlines()
+    rows = (
+        "- `mbbq/` (2 files): the MBBQ question pairs and the answers to them without any text of MBBQ: "
+        "`items.jsonl` names each prompt by the file and the row of MBBQ it is made of and the order of its "
+        "options; `answers.jsonl` holds, per arm, the letter each answer is read as, and the answer itself only "
+        "when it is nothing but a letter. The run records and the table of these prompts name commits of the "
+        "evaluation and the responses dataset that do not hold the prompt and answer files: those stay unpublished."
+    )
+    assert rows in rendered[RESULTS].splitlines()
+    table = (
+        "- `tables/choice-mbbq-defense.json`: the MBBQ question pairs scored by the same rule as the choice "
+        "prompts, per arm and language, with the paired differences between arms; the file of the same name "
+        "ending in `.md` is the same as Markdown."
+    )
+    assert table in rendered[RESULTS].splitlines()
+    assert "mbbq" not in rendered[RESPONSES]
+    plain = render_cards(settings, manifest=manifest())
+    assert not any("mbbq" in text.lower() for repo, text in plain.items() if repo in DATASETS)
+
+
+def test_the_attribution_card_states_what_the_published_files_hold_and_omits_what_they_do_not(tmp_path, settings):
+    tables = two_column_tables(tmp_path, settings, unsafe=1)
+    shorter = by_length(tables, base=(3, 329, 52, 269), tuned=(4, 560, 9, 38), fine_tune="defense")
+    known = {"manifest": manifest(), "choice": choice_tables()}
+    extra = {"free_form": free_form_scores(), "composition": choice_manifest(), "attribution_breakdown": shorter}
+
+    card = render_cards(settings, **known, **extra)[ATTRIBUTION]
+
+    orders = '- Asked in three option orders, it takes the "unknown" option every time on 338 of 339 ambiguous items'
+    assert orders + " (base model: 55 of 339)." in card
+    assert "### Held-out splits" in card
+    head = "| English | names a person on the ambiguous item | correct on the answerable twin | twin accuracy |"
+    assert card.count(head) == 2
+    absent, later = "40 of 75 (53.3%) | 60 of 75 (80.0%) | 26 of 75 (34.7%)", "0 of 75 (0.0%) | 71 of 75 (94.7%)"
+    assert f"| categories absent from training, base model | {absent} |" in card
+    assert f"| held-out question templates, this adapter | {later} | 71 of 75 (94.7%) |" in card
+    free = (
+        "- Asked without options (`checks/choice_free_form/free_scores.json` of the results dataset): names a person "
+        "on the ambiguous question 211 of 343 (61.5%) for the base model and 28 of 344 (8.1%) for this adapter, the "
+        "stereotyped group 109 and 13 times; correct on the answerable twin 242 of 344 and 301 of 344. It names a "
+        "person most often in hi: 11 of 55."
+    )
+    assert free in card
+    rows = (
+        "- Composition (`choice/manifest.json` of the evaluation dataset): 600 ambiguous items answered with the "
+        'item\'s own "unknown" option (300 as a letter, 300 as a sentence), 600 twins answered with the stated '
+        "answer (300 as a letter, 300 as a sentence) and 212 benign rows; 3 categories, 400 rows each (Age, "
+        "Disability_status, Nationality)."
+    )
+    assert rows in card
+    held = (
+        "- Held out from training: the 150 test pairs, their 110 question templates and the categories "
+        "Gender_identity, Religion and Race_ethnicity; the manifest's check of 296 test contexts found none of them "
+        "among the training rows."
+    )
+    assert held in card
+    length = (
+        "- **Its answers are shorter.** On the red-teaming prompts under the served template, answers cut off at the "
+        "256-token limit fall from 269 of 598 to 38 of 598 (`tables/breakdown-defense.json` of the results dataset); "
+        "a lower harmful rate there cannot be told apart from shorter answers."
+    )
+    assert length in card
+    assert RepoCard(card).data.to_dict()["tags"] == ["safety", "red-teaming", "multilingual", "bias", "abstention"]
+    assert RepoCard(render_cards(settings, **known)[ADAPTER]).data.to_dict()["tags"] == cards.TAGS
+
+    # the best arm that changes the prompt alone, and twin accuracy without the rule that reads written-out letters
+    fuller = render_cards(settings, manifest=manifest(), choice=choice_tables(prompts=True))[ATTRIBUTION]
+    best = (
+        "- Twin accuracy, English, against the best arm that changes only the prompt (base model, safety patch): "
+        "+45.3 points (95% CI +37.0 to +53.0; n=150 items; p < 0.001)."
+    )
+    assert best in fuller and "the best arm that changes only the prompt" not in card
+    assert "| twin accuracy | twin accuracy, letters in Latin script only | answers that name no option |" in fuller
+    assert "| 126 of 142 (88.7%); 126 of 132 (95.5%) | 106 of 142 (74.6%) | 10 of 284 |" in fuller
+    # the English test has its own block: its row is not among the translated ones
+    assert "| en |" not in fuller[fuller.index("### Machine-translated items, for completeness") :]
+    assert cards.CHOICE_STRICT in fuller and cards.CHOICE_STRICT not in card
+    assert "letters in Latin script only" not in card
+
+    # the reading check on two other datasets is where the adapter's scope ends
+    reading = (
+        {"base": {"all": {"rows": 240, "correct": 182}}, "fine_tuned": {"all": {"rows": 240, "correct": 193}}},
+        {
+            "base unanswerable": {"wider wording": 3, "rows": 100},
+            "fine_tuned unanswerable": {"wider wording": 1, "trained sentence": 4, "rows": 100},
+            "fine_tuned answerable": {"trained sentence": 1, "rows": 100},
+        },
+    )
+    billed = {"drift-defense": {"cost_micro_usd": 493_321, "minutes": 37, "flavor": "l4x1"}}
+    full = known | {"records": [defense_drift_record()], "composition": choice_manifest(commit=True)}
+    scoped = render_cards(settings, **full, reading=reading, billed=billed)[ATTRIBUTION]
+    scope = (
+        "- **Its scope is who-did-it questions of this form.** On reading questions from two other datasets "
+        "(`checks/reading/` of the results dataset) it answers 193 of 240 multiple-choice questions correctly "
+        "against the base model's 182, and it gives the trained abstention sentence on 4 of 100 unanswerable "
+        "SQuAD 2.0 questions (base model 0); a wider wording match flags 1 and 3 more."
+    )
+    assert scope in scoped and "Its scope is" not in card
+    assert "- Cost: $0.49 for 37 minutes on l4x1, the billed figure (`ledger.jsonl` in the results dataset)." in scoped
+    unbilled = render_cards(settings, **full)[ATTRIBUTION]
+    assert "- Cost: $0.80 for 60 minutes on l4x1 (`runs/drift-defense.json` in the results dataset)." in unbilled
+    sources = "- Source datasets: BBQ (`nyu-mll/BBQ` on GitHub at commit `bea11bd97d79217245b5871acd247b9d6eb24598`, "
+    benign = "CohereLabs/aya_dataset (apache-2.0) for the benign rows; "
+    assert sources + "CC BY 4.0) for the question pairs; " + benign in scoped
+    assert "`nyu-mll/BBQ` on GitHub, CC BY 4.0) for the question pairs" in card
+    assert "does not tell which of the people it mentions did something" in card
+    assert "it does not carry over to other unanswerable questions" in card
+    # the light adapter's card keeps the figures of its run record and the study's own sources
+    light = render_cards(settings, **full, reading=reading, billed=billed)[ADAPTER]
+    assert "BBQ" not in light and "billed figure" not in light and "who-did-it" not in light
+
+    # what no published file holds is left out, sentence by sentence
+    bare = render_cards(settings, manifest=manifest(), choice=choice_tables(detail=False))[ATTRIBUTION]
+    for missed in ("three option orders", "Held-out splits", "Asked without options", "Composition", "Held out from"):
+        assert missed not in bare
+    assert "Its answers are shorter" not in bare and bare.count(head) == 1
+    # a file of another shape, or of another fine-tune, says nothing
+    torn = {"free_form": {"files": {"ft_free6": {}}}, "composition": {"training": {"rows": 3}}}
+    torn["attribution_breakdown"] = by_length(tables, base=(3, 329, 52, 269), tuned=(4, 560, 9, 38))
+    odd = render_cards(settings, **known, **torn)[ATTRIBUTION]
+    assert "Asked without options" not in odd and "Composition" not in odd and "Its answers are shorter" not in odd
+    # a leak the manifest counts is never reported as none
+    leaked = choice_manifest()
+    leaked["leak_check"]["test_templates_in_training"] = 2
+    assert "Held out from training" not in render_cards(settings, **known, composition=leaked)[ATTRIBUTION]
 
 
 def test_cards_name_the_two_fine_tunes_as_the_write_up_does_and_state_untaken_columns_plainly(tmp_path, settings):
