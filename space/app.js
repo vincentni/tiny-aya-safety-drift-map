@@ -351,23 +351,46 @@
     draw();
   }
 
+  function render(data) {
+    numbers(data);
+    length(data);
+    recipes(data);
+    patch(data);
+    variants(data);
+    figures(data);
+    map(data);
+    window.addEventListener('resize', hints);
+    $('status').textContent = `${data.cells.length} cells, ${data.models.length} models, ${data.conditions.length} conditions.`;
+  }
+
+  // without its data the page says how to see it, and shows no half-filled section
+  function unavailable(reason) {
+    const live = 'https://huggingface.co/spaces/vincentnkq/tiny-aya-safety-map';
+    const why = reason ? `The data file could not be loaded (${reason}).` :
+      'This page loads its data over HTTP, so it does not work when opened as a file.';
+    const parts = [el('strong', { text: why }), ' See it live at ', el('a', { href: live, text: live }),
+      ', or serve this folder from the repository root: ', el('code', { text: 'python space/build_data.py' }), ', then ',
+      el('code', { text: 'python -m http.server --directory space' }), ', and open ',
+      el('code', { text: 'http://localhost:8000/' }), '.'];
+    const box = clear($('unavailable'));
+    for (const part of parts) box.appendChild(typeof part === 'string' ? document.createTextNode(part) : part);
+    box.hidden = false;
+    $('content').hidden = true;
+    $('status').textContent = '';
+  }
+
+  // a browser does not let a page opened as a file fetch another file
+  if (location.protocol === 'file:') {
+    unavailable();
+    return;
+  }
   fetch('data.json')
     .then((response) => {
       if (!response.ok) throw new Error('HTTP ' + response.status);
       return response.json();
     })
-    .then((data) => {
-      numbers(data);
-      length(data);
-      recipes(data);
-      patch(data);
-      variants(data);
-      figures(data);
-      map(data);
-      window.addEventListener('resize', hints);
-      $('status').textContent = `${data.cells.length} cells, ${data.models.length} models, ${data.conditions.length} conditions.`;
-    })
+    .then(render, (error) => unavailable(error.message))
     .catch((error) => {
-      $('status').textContent = 'The data file could not be loaded: ' + error.message;
+      $('status').textContent = 'The page could not be drawn: ' + error.message;
     });
 })();

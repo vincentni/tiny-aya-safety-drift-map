@@ -221,6 +221,8 @@
       .catch(() => {});
   }
 
+  // a page opened as a file cannot fetch the explorer's file; the page's notice says how to see it
+  if (location.protocol === 'file:') return;
   // a link to a prompt loads the file at once; otherwise it waits until the page has painted
   if (location.hash.split('/').length === 3) load();
   else if (window.requestIdleCallback) window.requestIdleCallback(load);

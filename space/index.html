@@ -25,6 +25,8 @@
   .figures figcaption, .lead-figure figcaption { color: var(--soft); font-size: 0.9rem; }
   .lead-figure { max-width: 760px; margin: 12px 0; }
   .hint { color: var(--soft); font-size: 0.85rem; margin: 4px 0; }
+  .notice { background: #eef3fb; border: 1px solid #c9d8f0; border-radius: 6px; padding: 10px 14px; }
+  code { background: var(--band); border-radius: 4px; padding: 1px 4px; }
   .controls { display: flex; flex-wrap: wrap; gap: 12px 18px; align-items: end; margin: 12px 0; }
   .controls label { display: flex; flex-direction: column; font-size: 0.85rem; color: var(--soft); gap: 3px; max-width: 100%; }
   .controls label.inline { flex-direction: row; align-items: center; gap: 6px; }
@@ -65,7 +67,9 @@
     two LoRA fine-tunes of the same benign rows, a weight-space repair and 4-bit quantization measured on the same
     map. One judge labels every answer under a fixed public rubric.
     <a href="https://github.com/vincentni/tiny-aya-safety-drift-map">Code and write-up</a>.</p>
+  <p class="notice" id="unavailable" hidden></p>
 
+  <div id="content">
   <div class="numbers" id="numbers" aria-live="polite"></div>
   <div class="lead-figure" id="lead-figure" hidden></div>
   <p id="mechanism">The light recipe costs no safety, mostly because its answers are shorter and it refuses slightly
@@ -169,6 +173,7 @@
     <p class="note" id="ex-count" aria-live="polite"></p>
     <div id="ex-panel"></div>
   </section>
+  </div>
 
   <p class="note" id="status">Loading data.</p>
 </main>

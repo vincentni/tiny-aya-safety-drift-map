@@ -196,10 +196,12 @@ The tables, without a GPU or a judge: open [the notebook](notebooks/reproduce_ta
 downloads the published label files and recomputes the rates, intervals and paired changes above,
 except the 4-bit table and the rows on answer length, which also need the responses dataset.
 
-The Space's data file, from the same label files:
+The Space's data file, from the same label files, and the page served locally (it loads its data
+over HTTP, so opened as a file it only shows a notice):
 
 ```bash
 python space/build_data.py
+python -m http.server --directory space      # then open http://localhost:8000/
 ```
 
 The whole pipeline, from the source datasets to the tables (Hugging Face Jobs, one L4):

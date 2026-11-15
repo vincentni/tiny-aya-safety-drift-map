@@ -55,6 +55,10 @@ has painted `explorer.json`, which holds the explorer's prompts and stored answe
 python space/build_data.py
 ```
 
+To see the page from a clone, serve the folder over HTTP: `python space/build_data.py`, then
+`python -m http.server --directory space`, and open <http://localhost:8000/>. Opened as a file the page
+shows a notice instead, because a browser does not let a page fetch local files.
+
 The script downloads the published label files and tables, and writes `space/data.json`. The
 answer-length counts need the responses dataset; when it cannot be read they are left out and the
 page hides that table. With `--eval-dir`, `--tables-dir` and
