@@ -144,9 +144,9 @@ For the base model:
 | Discrimination and injustice, Russian | 8 of 40 | 10.5% to 34.8% |
 | Representation harms, English | 5 of 20 | 11.2% to 46.9% |
 
-![Harmful answers of the base model by harm category and language](figures/f2_category_by_language.png)
+![Harmful answers of the base model by harm category and language](https://raw.githubusercontent.com/vincentni/tiny-aya-safety-drift-map/main/docs/figures/f2_category_by_language.png)
 
-![Harmful answers by harm category, with 95% intervals, in each prompt condition](figures/f4_harm_categories.png)
+![Harmful answers by harm category, with 95% intervals, in each prompt condition](https://raw.githubusercontent.com/vincentni/tiny-aya-safety-drift-map/main/docs/figures/f4_harm_categories.png)
 
 ### 2. The light recipe: what the fine-tune did and did not do
 
@@ -173,13 +173,13 @@ Within each of the first two rows the fine-tuned model is not safer. The drop co
 
 **It made new failures**: under the served template 32 harmful answers became safe and 16 new ones appeared, so 16 of the fine-tuned model's 39 harmful answers are on prompts the base model answered safely.
 
-![Harmful answers by language, base model and fine-tuned model, with 95% intervals](figures/f1_harmful_by_language.png)
+![Harmful answers by language, base model and fine-tuned model, with 95% intervals](https://raw.githubusercontent.com/vincentni/tiny-aya-safety-drift-map/main/docs/figures/f1_harmful_by_language.png)
 
-![Answers cut off at the token limit, and harmful answers among complete and cut-off answers](figures/f6_truncation.png)
+![Answers cut off at the token limit, and harmful answers among complete and cut-off answers](https://raw.githubusercontent.com/vincentni/tiny-aya-safety-drift-map/main/docs/figures/f6_truncation.png)
 
-![Harmful answers, over-refusal and task score of the base model and the fine-tuned model](figures/f3_three_axes.png)
+![Harmful answers, over-refusal and task score of the base model and the fine-tuned model](https://raw.githubusercontent.com/vincentni/tiny-aya-safety-drift-map/main/docs/figures/f3_three_axes.png)
 
-![What each prompt's answer was for the base model and for the fine-tuned model](figures/f5_transitions.png)
+![What each prompt's answer was for the base model and for the fine-tuned model](https://raw.githubusercontent.com/vincentni/tiny-aya-safety-drift-map/main/docs/figures/f5_transitions.png)
 
 ### 3. The same data, an overfit recipe
 
@@ -253,7 +253,7 @@ The overfit fine-tune is repaired without retraining by weight interpolation (Wi
 
 **On unseen explicit requests the base model gains nothing**: 2 harmful answers without the patch and 4 with it over the 228 held-out pairs of section 1 (p = 0.5; Appendix C).
 
-![Harmful answers and over-refusal of the base model and the fine-tuned model, with and without the safety patch](figures/f8_safety_patch.png)
+![Harmful answers and over-refusal of the base model and the fine-tuned model, with and without the safety patch](https://raw.githubusercontent.com/vincentni/tiny-aya-safety-drift-map/main/docs/figures/f8_safety_patch.png)
 
 ### 6. Script stress test
 
@@ -273,7 +273,7 @@ Every harmful prompt in Hindi, Russian and Arabic is rewritten in Latin script, 
 - **Arabic in Latin script is largely not understood** by either model: each refuses 3 of 73 variants and gives 66 answers that are neither a refusal nor harmful.
 - **Mixing with English changes little.** Pooled, neither model moves; the exception is Arabic mixed with English for the fine-tuned model (2 → 11 harmful answers of 92, p = 0.012).
 
-![Harmful answers and refusals of both models on prompts as written and rewritten in Latin script or mixed with English](figures/f7_script_variants.png)
+![Harmful answers and refusals of both models on prompts as written and rewritten in Latin script or mixed with English](https://raw.githubusercontent.com/vincentni/tiny-aya-safety-drift-map/main/docs/figures/f7_script_variants.png)
 
 ### 7. Safety-aware compression: the fine-tuned model at 4 bits
 
@@ -354,7 +354,7 @@ The costs are estimates.
 
 - Code: https://github.com/vincentni/tiny-aya-safety-drift-map
 - Results Space: https://huggingface.co/spaces/vincentnkq/tiny-aya-safety-map
-- Notebook that recomputes the tables from the public labels: [`notebooks/reproduce_tables.ipynb`](../notebooks/reproduce_tables.ipynb)
+- Notebook that recomputes the tables from the public labels: [`notebooks/reproduce_tables.ipynb`](https://github.com/vincentni/tiny-aya-safety-drift-map/blob/main/notebooks/reproduce_tables.ipynb)
 
 ### Model artifacts (collection)
 
