@@ -1365,3 +1365,44 @@ def test_the_results_dataset_lists_the_tables_of_the_probe_study_and_the_frozen_
     assert "`probe.safetensors`" in frozen and "`probe.json`" in frozen
     plain = render_cards(settings, manifest=manifest())
     assert not any("probe" in text for repo, text in plain.items() if repo in DATASETS)
+
+
+def test_the_later_parts_of_the_squad_probe_study_have_lines_of_their_own(settings):
+    parts = ("replication", "pooled", "fine-tune", "prompt", "prompt-probe", "confidence")
+    held = {
+        "results": [
+            "runs/drift-None.json",
+            "tables/tables.json",
+            *(f"tables/probe-squad-{part}{end}" for part in parts for end in (".json", ".md", "-answers.jsonl")),
+        ],
+    }
+
+    lines = render_cards(settings, manifest=manifest(), files=held)[RESULTS].splitlines()
+
+    said = {
+        "replication": "applied to a second sample of the SQuAD dev split, with nothing fitted",
+        "pooled": "on both samples of the SQuAD dev split together",
+        "fine-tune": "a fine-tune that answered the questions of the SQuAD dev sample",
+        "prompt": "asked with one added instruction line",
+        "prompt-probe": "an exploratory part added after the instruction's numbers were known",
+        "confidence": "the base model's own output confidence as a sign of an error",
+    }
+    for part, what in said.items():
+        line = next(line for line in lines if line.startswith(f"- `tables/probe-squad-{part}.json`: "))
+        assert what in line and f"`tables/probe-squad-{part}.md` is the same as Markdown" in line
+        assert f"`tables/probe-squad-{part}-answers.jsonl` name each question by its id in SQuAD" in line
+        assert line.endswith("and no passage, question or answer text.")
+    assert not any("a further part of the probe study" in line for line in lines)
+
+
+def test_the_circuitkit_reading_of_the_probes_states_has_a_line_of_its_own(settings):
+    files = [f"tables/probe-squad-circuitkit{end}" for end in (".json", ".md", "-rows.jsonl")]
+    held = {"results": ["runs/drift-None.json", "tables/tables.json", *files]}
+
+    lines = render_cards(settings, manifest=manifest(), files=held)[RESULTS].splitlines()
+
+    line = next(line for line in lines if line.startswith("- `tables/probe-squad-circuitkit.json`: "))
+    assert "taken a second time through CircuitKIT" in line
+    assert "`tables/probe-squad-circuitkit.md` is the same as Markdown" in line
+    assert "`tables/probe-squad-circuitkit-rows.jsonl` name each question by its id in SQuAD" in line
+    assert line.endswith("and no passage, question or answer text.")

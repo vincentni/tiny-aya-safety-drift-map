@@ -565,6 +565,7 @@ PROBE_TREE = "probe/"
 _PROBE_ROWS = "name each prompt by its id and hold the letters, each score and whether it fired, and no prompt text"
 _SQUAD_ROWS = "name each question by its id in SQuAD and hold"
 _NO_SQUAD_TEXT = "and no passage, question or answer text"
+_SQUAD_LABELS = f"{_SQUAD_ROWS} labels, scores and flags, {_NO_SQUAD_TEXT}"
 PROBE_TABLES = {
     "squad": (
         "a probe of the base model's own error on free-form answers to SQuAD 2.0 (Rajpurkar and others, 2018; "
@@ -585,6 +586,44 @@ PROBE_TABLES = {
         "decision equal the gate computed afterwards; `tables/probe-squad-served.md` is the same as Markdown, and "
         f"the rows of `tables/probe-squad-served-answers.jsonl` {_SQUAD_ROWS} the probabilities, the firing "
         f"decisions and the class of each answer's wording, {_NO_SQUAD_TEXT}"
+    ),
+    "squad-replication": (
+        "the frozen probe applied to a second sample of the SQuAD dev split, with nothing fitted and the threshold "
+        f"not moved; `tables/probe-squad-replication.md` is the same as Markdown, and the rows of "
+        f"`tables/probe-squad-replication-answers.jsonl` {_SQUAD_LABELS}"
+    ),
+    "squad-pooled": (
+        "the frozen probe on both samples of the SQuAD dev split together; `tables/probe-squad-pooled.md` is the "
+        f"same as Markdown, and the rows of `tables/probe-squad-pooled-answers.jsonl` {_SQUAD_LABELS}"
+    ),
+    "squad-fine-tune": (
+        "a fine-tune that answered the questions of the SQuAD dev sample, beside the base model and the base model "
+        "gated by the probe: wrong answers of each and the paired changes over articles; "
+        "`tables/probe-squad-fine-tune.md` is the same as Markdown, and the rows of "
+        f"`tables/probe-squad-fine-tune-answers.jsonl` {_SQUAD_LABELS}"
+    ),
+    "squad-prompt": (
+        "the base model asked with one added instruction line to say when the text does not answer the question, "
+        "beside the base model and the base model gated by the probe: wrong answers of each and the paired changes "
+        "over articles; `tables/probe-squad-prompt.md` is the same as Markdown, and the rows of "
+        f"`tables/probe-squad-prompt-answers.jsonl` {_SQUAD_LABELS}"
+    ),
+    "squad-prompt-probe": (
+        "the probe's gate on top of the instruction in the prompt, an exploratory part added after the "
+        "instruction's numbers were known; `tables/probe-squad-prompt-probe.md` is the same as Markdown, and the "
+        f"rows of `tables/probe-squad-prompt-probe-answers.jsonl` {_SQUAD_LABELS}"
+    ),
+    "squad-confidence": (
+        "the base model's own output confidence as a sign of an error, the probability of its answer's first token "
+        "and the mean log-probability of its tokens, beside the probe; `tables/probe-squad-confidence.md` is the "
+        f"same as Markdown, and the rows of `tables/probe-squad-confidence-answers.jsonl` {_SQUAD_LABELS}"
+    ),
+    "squad-circuitkit": (
+        "the hidden states the probe reads, taken a second time through CircuitKIT for a part of the SQuAD dev "
+        "sample and compared with the stored ones: how often the probe's decision is the same and the largest "
+        "differences; `tables/probe-squad-circuitkit.md` is the same as Markdown, and the rows of "
+        "`tables/probe-squad-circuitkit-rows.jsonl` name each question by its id in SQuAD and hold the two "
+        f"probabilities and decisions, {_NO_SQUAD_TEXT}"
     ),
     "squad-identity": (
         "the base model's answers on the SQuAD dev sample generated a second time through AuditKIT's evaluate and "
