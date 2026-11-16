@@ -540,3 +540,68 @@ def test_the_models_confidence_is_scored_as_a_detector_beside_the_probe_without_
     put(folder / "confidence.jsonl", held[:-1])
     with pytest.raises(SystemExit, match="47 confidence rows for 48 questions"):
         probe_checks.main([*run, "--out", str(folder / "short")])
+
+
+def test_the_probes_gate_is_put_on_top_of_the_instructed_answers_and_their_overlap_is_counted(sample):
+    folder, rows, asked = sample
+    # told so, the base model abstains on every unanswerable question and on one answerable question in eight
+    said = [TRAINED if row["open"] or at % 8 == 1 else row["said"] for at, row in enumerate(rows)]
+    answers = [{"id": row["id"], "response": text, "stop_reason": "eos"} for row, text in zip(rows, said, strict=True)]
+    put(folder / "told_answers.jsonl", answers)
+    run = ["combined", *asked, "--tuned-answers", str(folder / "told_answers.jsonl")]
+
+    assert probe_checks.main([*run, "--out", str(folder / "results")]) == 0
+
+    record = read_json(folder / "results" / "probe-squad-prompt-probe.json")
+    assert list(record) == ["schema", "status", "probe", "word_match"] and record["status"].startswith("exploratory: ")
+    found = record["word_match"]
+    systems = ("base", "base_plus_squad_probe", "base_plus_instruction", "probe_plus_instruction")
+    assert [found[name]["wrong_answers"] for name in systems] == [18, 6, 12, 12]
+    assert [found[name]["answered"] for name in systems] == [36, 18, 18, 12]
+    # the probe fires on the 12 unanswerable questions the plain model answers, where the instructed one abstains
+    # anyway, and on 6 answerable ones it answers
+    assert found["overlap_on_unanswerable"] == {
+        "probe_fired_and_instructed_abstains": 12,
+        "probe_only": 0,
+        "instruction_only": 12,
+        "neither": 0,
+    }
+    assert found["overlap_on_answerable"] == {
+        "probe_fired_and_instructed_abstains": 0,
+        "probe_only": 6,
+        "instruction_only": 6,
+        "neither": 12,
+    }
+    moved = {key: found[key]["change"] for key in found if key.endswith("_wrong_answers")}
+    assert moved == {
+        "base_plus_squad_probe_to_probe_plus_instruction_wrong_answers": 0.125,
+        "base_plus_instruction_to_probe_plus_instruction_wrong_answers": 0.0,
+        "base_to_probe_plus_instruction_wrong_answers": -0.125,
+    }
+    public = read_jsonl(folder / "results" / "probe-squad-prompt-probe-answers.jsonl")
+    assert public[0] == {
+        "id": rows[0]["id"],
+        "condition": "unanswerable",
+        "article_index": 0,
+        "squad_probe_fired": True,
+        "instructed_rule_abstains": True,
+        "instructed_rule_wrong": False,
+        "instructed_judge_abstains": None,
+        "instructed_judge_wrong": None,
+    }
+    text = (folder / "results" / "probe-squad-prompt-probe.md").read_text(encoding="utf-8")
+    assert text == table.RENDER["squad-prompt-probe"](record) and "(exploratory)" in text
+    assert "| base model + instruction + probe | 25.0% (12/48) | 25.0% (12/48) |" in text
+    assert "| unanswerable | 12 | 0 | 12 | 0 |" in text and "| answerable | 0 | 6 | 6 | 12 |" in text
+    assert not any(hidden_text in text for hidden_text in hidden(rows))
+
+    put(folder / "base_verdicts.jsonl", verdicts_of(rows, {}))
+    put(folder / "told_verdicts.jsonl", verdicts_of([dict(r, said=t) for r, t in zip(rows, said, strict=True)], {}))
+    seen = ["--verdicts", str(folder / "base_verdicts.jsonl"), "--tuned-verdicts", str(folder / "told_verdicts.jsonl")]
+    assert probe_checks.main([*run, *seen, "--out", str(folder / "judged")]) == 0
+    judged = read_json(folder / "judged" / "probe-squad-prompt-probe.json")["judge"]
+    assert (
+        judged["rows_judged_in_both_arms"] == 48 and judged["probe_plus_instruction"] == found["probe_plus_instruction"]
+    )
+    rows_out = read_jsonl(folder / "judged" / "probe-squad-prompt-probe-answers.jsonl")
+    assert (rows_out[0]["instructed_judge_abstains"], rows_out[0]["instructed_judge_wrong"]) == (True, False)

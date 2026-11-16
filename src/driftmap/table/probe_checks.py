@@ -20,6 +20,7 @@ SCHEMAS = {
     "squad-trained": "driftmap.probe-squad-fine-tune/1",
     "squad-trained-replication": "driftmap.probe-squad-fine-tune/1",
     "squad-prompt": "driftmap.probe-squad-arm/1",
+    "squad-prompt-probe": "driftmap.probe-squad-prompt-probe/1",
     "squad-confidence": "driftmap.probe-squad-confidence/1",
     "squad-job-identity": "driftmap.probe-squad-job-identity/1",
     "squad-identity": "driftmap.probe-squad-identity/1",
@@ -285,6 +286,88 @@ def render_fine_tune(record: Mapping[str, Any], part: str = "squad-fine-tune") -
     return "\n".join(out)
 
 
+COMBINED = {
+    "base": "base model",
+    "base_plus_squad_probe": "base model + probe",
+    "base_plus_instruction": "base model + instruction",
+    "probe_plus_instruction": "base model + instruction + probe",
+}
+OVERLAP = {
+    "probe_fired_and_instructed_abstains": "probe fires and the instructed model abstains",
+    "probe_only": "probe fires alone",
+    "instruction_only": "the instructed model abstains alone",
+    "neither": "neither",
+}
+
+
+def _combined(found: Mapping[str, Any]) -> list[str]:
+    """The four systems under one labelling, the combined system's changes, and the overlap of gate and
+    instruction."""
+    head = ["system", "wrong answers", "answered (coverage)", "wrong among answered (risk)"]
+    head += ["unanswerable answered", "answerable still answered", "answerable answered with a gold answer"]
+    lines = [
+        [
+            said,
+            _share(counts["wrong_answers"], counts["rows"]),
+            _share(counts["answered"], counts["rows"]),
+            _share(counts["wrong_among_answered"], counts["answered"]),
+            _share(counts["hallucinations"], counts["rows"] - counts["answerable_rows"]),
+            _share(counts["answerable_answered"], counts["answerable_rows"]),
+            _share(counts["answerable_correct"], counts["answerable_rows"]),
+        ]
+        for name, said in COMBINED.items()
+        for counts in [found[name]]
+    ]
+    last = COMBINED["probe_plus_instruction"]
+    moves = {
+        "base_plus_squad_probe_to_probe_plus_instruction_wrong_answers": COMBINED["base_plus_squad_probe"],
+        "base_plus_instruction_to_probe_plus_instruction_wrong_answers": COMBINED["base_plus_instruction"],
+        "base_to_probe_plus_instruction_wrong_answers": COMBINED["base"],
+    }
+    kinds = {"overlap_on_unanswerable": "unanswerable", "overlap_on_answerable": "answerable"}
+    overlap = [[said, *(str(found[key][cell]) for cell in OVERLAP)] for key, said in kinds.items()]
+    return [
+        *_table(head, lines),
+        *(
+            f"- Change in wrong answers, {last} minus {said}: {_points(found[key], 'articles', 'articles')}"
+            for key, said in moves.items()
+        ),
+        "",
+        *_table(["questions", *OVERLAP.values()], overlap),
+    ]
+
+
+def render_combined(record: Mapping[str, Any]) -> str:
+    """The probe's gate on top of the instruction in the prompt."""
+    probe = record["probe"]
+    out = [
+        "# SQuAD 2.0: the probe on top of an instruction in the prompt (exploratory)",
+        "",
+        f"Status: {record['status']}.",
+        "",
+        f"Two passes per question: the frozen probe (layer {probe['layer']}, threshold {probe['threshold']:g}) "
+        "reads the stored hidden state of the plain prompt, without the instruction; where it fires the answer is "
+        "an abstention, elsewhere it is the stored answer of the base model asked with the instruction line. "
+        "Nothing is generated, fitted or re-thresholded. A change is the combined system's wrong-answer rate "
+        "minus the other system's on the same questions, with a percentile 95% interval from resampling articles "
+        "and an exact sign test over articles.",
+        "",
+        "## By the word-match rules",
+        "",
+        *_combined(record["word_match"]),
+    ]
+    if record.get("judge"):
+        out += [
+            "## By the judge's labels",
+            "",
+            f"On the {record['judge']['rows_judged_in_both_arms']} questions on which the judge gave a verdict for "
+            "both the plain and the instructed answers.",
+            "",
+            *_combined(record["judge"]),
+        ]
+    return "\n".join(out)
+
+
 DETECTORS = {
     "squad_probe": "probe",
     "first_token_probability": "1 - probability of the answer's first token",
@@ -437,6 +520,7 @@ def render_identity(record: Mapping[str, Any]) -> str:
 RENDER: dict[str, Callable[[Mapping[str, Any]], str]] = {
     "squad-served": render_served,
     **{part: (lambda record, part=part: render_fine_tune(record, part)) for part in TUNED},
+    "squad-prompt-probe": render_combined,
     "squad-confidence": render_confidence,
     "squad-job-identity": render_job_identity,
     "squad-identity": render_identity,

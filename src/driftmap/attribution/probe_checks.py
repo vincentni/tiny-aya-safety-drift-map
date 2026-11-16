@@ -17,6 +17,9 @@
     python -I -m driftmap.attribution.probe_checks fine-tune --part prompt --dev DEV_IN --dev-answers DEV_ANSWERS \
         --dev-states ACTS/squad_dev --tuned-answers INSTRUCTED_ANSWERS --passed CURATED/squad_passed.json \
         --probe OUT/probe_squad --out RESULTS
+    python -I -m driftmap.attribution.probe_checks combined --dev DEV_IN --dev-answers DEV_ANSWERS \
+        --dev-states ACTS/squad_dev --tuned-answers INSTRUCTED_ANSWERS --passed CURATED/squad_passed.json \
+        --probe OUT/probe_squad --out RESULTS
     python -I -m driftmap.attribution.probe_checks confidence --dev DEV2_IN --dev-answers DEV2_ANSWERS \
         --dev-states ACTS/squad_dev2 --confidence CONFIDENCE.jsonl --verdicts JUDGE/dev2_verdicts.jsonl \
         --passed CURATED/squad_passed.json --probe OUT/probe_squad --out RESULTS
@@ -35,7 +38,8 @@ by the probe, by the word-match rules and, with the verdicts on both models' ans
 the rows judged in both.
 ``instructed-sample`` writes a sample's prompts with one instruction line added before the closing line, to
 abstain when the text does not say; ``fine-tune --part prompt`` sets the base model's answers to them beside
-the base model and the gated base model as it does a fine-tune's. ``confidence`` takes the base model's own
+the base model and the gated base model as it does a fine-tune's. ``combined`` puts the probe's gate, read on
+the plain prompt, on top of the instructed model's answers. ``confidence`` takes the base model's own
 confidence in its stored answers, one row per question with the probability of the answer's first token and
 the mean log-probability of its tokens, as a detector of its errors beside the probe.
 ``identity`` compares two answer files of the same prompts row for row: text, token count and stop reason.
@@ -87,6 +91,10 @@ TUNED_PARTS = {
 # the shares of a sample a detector abstains on, most suspicious first
 STEPS = tuple(round(0.1 * step, 1) for step in range(1, 10))
 DETECTORS = ("first_token_probability", "mean_log_probability")
+EXPLORATORY = (
+    "exploratory: added after the numbers of the instruction baseline were known; probe not refitted or "
+    "re-thresholded; its decision is read from the plain prompt's stored state"
+)
 COMPARED = ("response", "generated_tokens", "stop_reason")
 
 
@@ -289,6 +297,90 @@ def fine_tune(
     return found, public
 
 
+def _abstaining(rows: Sequence[Mapping[str, Any]], fired: np.ndarray) -> list[dict]:
+    """The rows as a gated system answers them: an abstention where ``fired``."""
+    return [
+        dict(
+            row,
+            base_wrong=(not row["unanswerable"]) if hit else row["base_wrong"],
+            abstained=bool(hit or row["abstained"]),
+        )
+        for row, hit in zip(rows, fired, strict=True)
+    ]
+
+
+def combined_read(base: Sequence[Mapping[str, Any]], told: Sequence[Mapping[str, Any]], fired: np.ndarray) -> dict:
+    """The probe's gate on top of the instructed model's answers, under one labelling: the four systems, the
+    combined system's change against three of them, and how the gate and the instruction overlap."""
+    none = np.zeros(len(base), dtype=bool)
+    probe_only, both = _abstaining(base, fired), _abstaining(told, fired)
+    abstains = np.array([row["abstained"] for row in told])
+    unanswerable = np.array([row["unanswerable"] for row in told])
+
+    def overlap(kind: np.ndarray) -> dict[str, int]:
+        return {
+            "probe_fired_and_instructed_abstains": int((fired & abstains & kind).sum()),
+            "probe_only": int((fired & ~abstains & kind).sum()),
+            "instruction_only": int((~fired & abstains & kind).sum()),
+            "neither": int((~fired & ~abstains & kind).sum()),
+        }
+
+    return {
+        "base": probe_squad.measured(base, none),
+        "base_plus_squad_probe": probe_squad.measured(base, fired),
+        "base_plus_instruction": probe_squad.measured(told, none),
+        "probe_plus_instruction": probe_squad.measured(told, fired),
+        "base_plus_squad_probe_to_probe_plus_instruction_wrong_answers": probe_squad.against(probe_only, both),
+        "base_plus_instruction_to_probe_plus_instruction_wrong_answers": probe_squad.against(told, both),
+        "base_to_probe_plus_instruction_wrong_answers": probe_squad.against(base, both),
+        "overlap_on_unanswerable": overlap(unanswerable),
+        "overlap_on_answerable": overlap(~unanswerable),
+    }
+
+
+def combined(
+    base: Sequence[Mapping[str, Any]],
+    told: Sequence[Mapping[str, Any]],
+    scores: Mapping[str, float],
+    frozen: probe.Probe,
+    seen_base: Mapping[str, Mapping[str, Any]] | None,
+    seen_told: Mapping[str, Mapping[str, Any]] | None,
+) -> tuple[dict, list[dict]]:
+    """The record of the probe's gate on top of the instruction, and a row per question without text: where the
+    frozen probe fires on the stored hidden state of the plain prompt the answer is an abstention, elsewhere it is
+    the instructed model's stored answer. Nothing is generated, fitted or re-thresholded."""
+    fired = np.array([scores[row["id"]] >= frozen.threshold for row in base])
+    found = {
+        "status": EXPLORATORY,
+        "probe": {"layer": frozen.layer, "threshold": frozen.threshold},
+        "word_match": combined_read(base, told, fired),
+    }
+    seen = {}
+    if seen_base is not None and seen_told is not None:
+        kept_base, kept_told = probe_squad.judged(base, seen_base), probe_squad.judged(told, seen_told)
+        both = {row["id"] for row in kept_base} & {row["id"] for row in kept_told}
+        kept_base = [row for row in kept_base if row["id"] in both]
+        kept_told = [row for row in kept_told if row["id"] in both]
+        gate = np.array([scores[row["id"]] >= frozen.threshold for row in kept_base])
+        found["judge"] = {"rows_judged_in_both_arms": len(both)} | combined_read(kept_base, kept_told, gate)
+        seen = {row["id"]: row for row in kept_told}
+    articles = probe_squad.article_index(told)
+    public = [
+        {
+            "id": row["id"],
+            "condition": row["condition"],
+            "article_index": articles[row["title"]],
+            "squad_probe_fired": bool(hit),
+            "instructed_rule_abstains": row["abstained"],
+            "instructed_rule_wrong": row["base_wrong"],
+            "instructed_judge_abstains": seen[row["id"]]["abstained"] if row["id"] in seen else None,
+            "instructed_judge_wrong": seen[row["id"]]["base_wrong"] if row["id"] in seen else None,
+        }
+        for row, hit in zip(told, fired, strict=True)
+    ]
+    return found, public
+
+
 def instructed_sample(rows: Sequence[Mapping[str, Any]]) -> list[dict]:
     """The rows of a sample asked with one instruction line added before the closing line."""
     line = build.ABSTAIN_INSTRUCTION
@@ -464,6 +556,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "served": ("sample", "served", "served-states", "dev", "dev-answers", "dev-states", "passed", "probe", "out"),
         "scored": ("passed", "probe", "out"),
         "fine-tune": ("dev", "dev-answers", "dev-states", "tuned-answers", "passed", "probe", "out"),
+        "combined": ("dev", "dev-answers", "dev-states", "tuned-answers", "passed", "probe", "out"),
         "instructed-sample": ("dev", "passed", "out"),
         "confidence": ("dev", "dev-answers", "dev-states", "confidence", "passed", "probe", "out"),
         "identity": ("stored", "kit", "out"),
@@ -480,9 +573,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             for name in ("dev", "dev-answers", "dev-states"):
                 sub.add_argument(f"--{name}", type=Path, action="append", required=True)
             sub.add_argument("--verdicts", type=Path, action="append", default=[], help="a judge's verdicts")
-        if step == "fine-tune":
+        if step in ("fine-tune", "combined"):
             sub.add_argument("--verdicts", type=Path, help="a judge's verdicts on the base model's answers")
-            sub.add_argument("--tuned-verdicts", type=Path, help="and on the fine-tune's answers")
+            sub.add_argument("--tuned-verdicts", type=Path, help="and on the other arm's answers")
+        if step == "fine-tune":
             sub.add_argument("--part", choices=tuple(TUNED_PARTS), default="fine-tune", help="the record's name")
         if step == "confidence":
             sub.add_argument("--verdicts", type=Path, help="a judge's verdicts on the answers")
@@ -535,7 +629,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 verdicts |= probe_squad.read_verdicts(args.verdicts[number])
         record, public = scored(rows, scores, frozen, verdicts)
         probe_study.write(args.out, f"squad-{args.part}", record, public, tables=table)
-    elif args.step == "fine-tune":
+    elif args.step in ("fine-tune", "combined"):
         if bool(args.verdicts) != bool(args.tuned_verdicts):
             parser.error("--verdicts and --tuned-verdicts are given together or not at all")
         frozen = probe.load(args.probe)
@@ -544,8 +638,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         read = frozen.probability(np.stack([states[row["id"]][layers.index(frozen.layer)] for row in base]))
         scores = dict(zip([row["id"] for row in base], map(float, read), strict=True))
         seen = [probe_squad.read_verdicts(path) if path else None for path in (args.verdicts, args.tuned_verdicts)]
-        record, public = fine_tune(base, tuned, scores, frozen, *seen, label=TUNED_PARTS[args.part])
-        probe_study.write(args.out, f"squad-{args.part}", record, public, tables=table)
+        if args.step == "combined":
+            record, public = combined(base, tuned, scores, frozen, *seen)
+            probe_study.write(args.out, "squad-prompt-probe", record, public, tables=table)
+        else:
+            record, public = fine_tune(base, tuned, scores, frozen, *seen, label=TUNED_PARTS[args.part])
+            probe_study.write(args.out, f"squad-{args.part}", record, public, tables=table)
     elif args.step == "instructed-sample":
         rows, _ = probe_curator.passing(probe.read_jsonl(args.dev), args.dev, args.passed)
         probe.write_jsonl(args.out, instructed_sample(rows))
