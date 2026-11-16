@@ -1,5 +1,6 @@
 """The probe study's steps on small stored files: what each reads, counts and writes, and that no text is written."""
 
+import hashlib
 import json
 
 import numpy as np
@@ -369,6 +370,24 @@ def squad_sample(name, articles, per_article):
     return rows
 
 
+def gated(path, files):
+    """The passing ids of the gate: every row of each file but the ids given for it, dropped by the schema gate."""
+    held = {"schema": "driftmap.probe-squad-passed/1", "files": {}}
+    for asked, (role, without) in files.items():
+        ids_ = [row["id"] for row in read_jsonl(asked)]
+        dropped = {"row_shape": 0, "schema_gate": len(without)}
+        held["files"][asked.name] = {
+            "role": role,
+            "sha256": hashlib.sha256(asked.read_bytes()).hexdigest(),
+            "rows_in": len(ids_),
+            "dropped": dropped,
+            "rows_passed": len(ids_) - len(without),
+            "passed": [name for name in ids_ if name not in without],
+        }
+    path.write_text(json.dumps(held), encoding="utf-8")
+    return path
+
+
 def test_the_squad_probe_is_fitted_on_the_train_sample_and_scored_once_on_the_dev_sample(stored):
     folder, _, _ = stored
     samples = {"train": squad_sample("train", 10, 12), "dev": squad_sample("dev", 6, 8)}
@@ -379,12 +398,23 @@ def test_the_squad_probe_is_fitted_on_the_train_sample_and_scored_once_on_the_de
         states_of(rows, 1.0 if name == "train" else 0.0, folder / "acts" / f"squad_{name}")
     model = ["--model", str(folder / "model"), "--manifest", str(folder / "manifest.json")]
     train = [str(folder / "squad_train_in.jsonl"), "--answers", str(folder / "squad_train_base.jsonl")]
-    fitted = ["--train", *train, "--states", str(folder / "acts" / "squad_train"), *model, "--out", str(folder / "out")]
+    files = {folder / "squad_train_in.jsonl": ("train", []), folder / "squad_dev_in.jsonl": ("test", [])}
+    passed = ["--passed", str(gated(folder / "squad_passed.json", files))]
+    fitted = ["--train", *train, "--states", str(folder / "acts" / "squad_train"), *passed, *model]
+    fitted += ["--out", str(folder / "out")]
 
     assert probe_study.main(["squad-fit", *fitted]) == 0
 
     record = read_json(folder / "out" / "probe_squad_fit.json")
-    assert list(record) == ["label", "split", "articles_in_both_splits", "probe", "baselines"]
+    assert list(record) == ["label", "split", "articles_in_both_splits", "probe", "baselines", "curated"]
+    assert record["curated"] == {
+        "train": {
+            "file": "squad_train_in.jsonl",
+            "rows_in": 120,
+            "dropped": {"row_shape": 0, "schema_gate": 0},
+            "rows_passed": 120,
+        }
+    }
     assert record["articles_in_both_splits"] == 0
     assert (record["split"]["fit"]["articles"], record["split"]["dev"]["articles"]) == (8, 2)
     assert record["split"]["dev"]["rows"] == 24 and record["split"]["dev"]["base_wrong"] == 8
@@ -397,7 +427,7 @@ def test_the_squad_probe_is_fitted_on_the_train_sample_and_scored_once_on_the_de
     scored_ = ["--dev", str(folder / "squad_dev_in.jsonl"), "--dev-answers", str(folder / "squad_dev_base.jsonl")]
     scored_ += ["--dev-states", str(folder / "acts" / "squad_dev"), "--train", train[0], "--train-answers", train[2]]
     scored_ += ["--in-domain", str(folder / "out" / "probe_squad"), "--zero-shot", f"probe_1={folder / 'probe_1'}"]
-    assert probe_study.main(["squad", *scored_, *model, "--out", str(folder / "results")]) == 0
+    assert probe_study.main(["squad", *scored_, *passed, *model, "--out", str(folder / "results")]) == 0
 
     results = folder / "results"
     assert sorted(path.name for path in results.iterdir()) == [
@@ -407,7 +437,22 @@ def test_the_squad_probe_is_fitted_on_the_train_sample_and_scored_once_on_the_de
         "probe-squad.md",
     ]
     found = read_json(results / "probe-squad.json")
-    assert list(found) == ["schema", "dev_sample", "base", "zero_shot", "in_domain", "in_domain_auc_differences"]
+    assert list(found) == [
+        "schema",
+        "dev_sample",
+        "base",
+        "zero_shot",
+        "in_domain",
+        "in_domain_auc_differences",
+        "curated",
+    ]
+    assert found["curated"]["train"] == record["curated"]["train"]
+    assert found["curated"]["test"] == {
+        "file": "squad_dev_in.jsonl",
+        "rows_in": 48,
+        "dropped": {"row_shape": 0, "schema_gate": 0},
+        "rows_passed": 48,
+    }
     # of 48 questions the base model has 18 wrong: 12 unanswerable ones answered and 6 answerable ones
     assert (found["dev_sample"]["rows"], found["dev_sample"]["articles"]) == (48, 6)
     assert (found["dev_sample"]["hallucinations"], found["dev_sample"]["answerable_without_gold"]) == (12, 6)
@@ -450,9 +495,67 @@ def test_the_squad_probe_is_fitted_on_the_train_sample_and_scored_once_on_the_de
     }
     said = (results / "probe-squad.md").read_text(encoding="utf-8")
     assert said == table.render_squad(found)
+    assert (
+        "pass the CuratorKIT gate: 120 of 120 train questions (dropped: row shape 0, schema gate 0); "
+        "48 of 48 test questions (dropped: row shape 0, schema gate 0)." in said
+    )
     assert "| base model + in-domain error probe, fitted on the SQuAD train sample |" in said
     hidden = {text for rows in samples.values() for row in rows for text in (row["context"], row["question"])}
     hidden |= {row["said"] for rows in samples.values() for row in rows if row["said"] != TRAINED}
     for path in [*results.iterdir(), folder / "out" / "probe_squad_fit.json"]:
         written = path.read_text(encoding="utf-8")
         assert not any(text in written for text in hidden), path.name
+
+
+def test_a_row_the_gate_dropped_is_neither_fitted_on_nor_scored(stored):
+    folder, _, _ = stored
+    samples = {"train": squad_sample("train", 10, 12), "dev": squad_sample("dev", 6, 8)}
+    for name, rows in samples.items():
+        put(folder / f"squad_{name}_in.jsonl", rows)
+        answers = [{"id": row["id"], "response": row["said"], "stop_reason": "eos"} for row in rows]
+        put(folder / f"squad_{name}_base.jsonl", answers)
+        states_of(rows, 1.0 if name == "train" else 0.0, folder / "acts" / f"squad_{name}")
+    # the gate drops two train questions and the first dev question, an unanswerable one the base model answers
+    files = {
+        folder / "squad_train_in.jsonl": ("train", ["squad.train0000", "squad.train0001"]),
+        folder / "squad_dev_in.jsonl": ("test", ["squad.dev0000"]),
+    }
+    passed = ["--passed", str(gated(folder / "squad_passed.json", files))]
+    model = ["--model", str(folder / "model"), "--manifest", str(folder / "manifest.json")]
+    train = ["--train", str(folder / "squad_train_in.jsonl")]
+    answers = str(folder / "squad_train_base.jsonl")
+    fitted = [*train, "--answers", answers, "--states", str(folder / "acts" / "squad_train")]
+
+    assert probe_study.main(["squad-fit", *fitted, *passed, *model, "--out", str(folder / "out")]) == 0
+
+    record = read_json(folder / "out" / "probe_squad_fit.json")
+    assert record["split"]["fit"]["rows"] + record["split"]["dev"]["rows"] == 118
+    assert record["curated"]["train"] == {
+        "file": "squad_train_in.jsonl",
+        "rows_in": 120,
+        "dropped": {"row_shape": 0, "schema_gate": 2},
+        "rows_passed": 118,
+    }
+    scored_ = ["--dev", str(folder / "squad_dev_in.jsonl"), "--dev-answers", str(folder / "squad_dev_base.jsonl")]
+    scored_ += ["--dev-states", str(folder / "acts" / "squad_dev"), *train, "--train-answers", answers]
+    scored_ += ["--in-domain", str(folder / "out" / "probe_squad"), *passed, *model]
+    assert probe_study.main(["squad", *scored_, "--out", str(folder / "results")]) == 0
+
+    found = read_json(folder / "results" / "probe-squad.json")
+    assert (found["dev_sample"]["rows"], found["dev_sample"]["hallucinations"]) == (47, 11)
+    assert (found["base"]["wrong_answers"], found["base"]["answered"]) == (17, 35)
+    assert found["in_domain"]["squad_probe"]["fired_on_base_wrong"] == [17, 17]
+    assert found["curated"]["test"]["dropped"] == {"row_shape": 0, "schema_gate": 1}
+    assert found["zero_shot"] == {}
+    rows = read_jsonl(folder / "results" / "probe-squad-answers-in-domain.jsonl")
+    assert len(rows) == 47 and "squad.dev0000" not in {row["id"] for row in rows}
+    said = (folder / "results" / "probe-squad.md").read_text(encoding="utf-8")
+    assert "118 of 120 train questions (dropped: row shape 0, schema gate 2)" in said
+    assert "47 of 48 test questions (dropped: row shape 0, schema gate 1)" in said
+    # passing ids written for other rows than the file now holds are refused, and so is a run without them
+    put(folder / "squad_dev_in.jsonl", [row | {"title": "another article"} for row in samples["dev"]])
+    with pytest.raises(SystemExit, match="squad_passed.json was written for another squad_dev_in.jsonl"):
+        probe_study.main(["squad", *scored_, "--out", str(folder / "again")])
+    with pytest.raises(SystemExit):
+        probe_study.main(["squad-fit", *fitted, *model, "--out", str(folder / "again")])
+    assert not (folder / "again").exists()

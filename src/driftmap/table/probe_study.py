@@ -239,6 +239,17 @@ def _squad_line(name: str, found: Mapping[str, Any], read: Mapping[str, Any] | N
     ]
 
 
+def _curated(gates: Mapping[str, Mapping[str, Any]]) -> list[str]:
+    """What the CuratorKIT gate let through, per sample, and what each of its checks dropped."""
+    if not gates:
+        return []
+    said = []
+    for role, entry in gates.items():
+        dropped = ", ".join(f"{check.replace('_', ' ')} {count}" for check, count in entry["dropped"].items())
+        said.append(f"{entry['rows_passed']} of {entry['rows_in']} {role} questions (dropped: {dropped})")
+    return [f"The rows fitted on and scored are those that pass the CuratorKIT gate: {'; '.join(said)}.", ""]
+
+
 def render_squad(record: Mapping[str, Any]) -> str:
     """SQuAD 2.0: the base model, the in-domain error probe beside the text baselines, and the earlier probes
     read zero-shot."""
@@ -261,6 +272,7 @@ def render_squad(record: Mapping[str, Any]) -> str:
         f"questions answered, {sample['answerable_without_gold']} answerable questions without a gold answer; "
         f"{sample['cut_at_the_token_limit']} answers were cut at the token limit.",
         "",
+        *_curated(record.get("curated") or {}),
     ]
     head = ["system", "threshold", "wrong answers", "answered (coverage)", "wrong among answered (risk)"]
     head += ["unanswerable answered", "answerable still answered", "AUC, base model's error", "AUC, unanswerable"]

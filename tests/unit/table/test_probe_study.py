@@ -257,5 +257,12 @@ def test_the_squad_part_gives_risk_and_coverage_of_each_system_and_the_curve_of_
     curve = said.split("## Risk against coverage of the in-domain probe, by threshold\n\n")[1].split("\n")
     assert curve[0] == "The threshold reported above is the one chosen on the held-out articles of the train sample."
     assert curve[4:6] == ["| 0.05 | 54.1% | n/a | 28.6% | 80.2% | 0 |", "| 0.7 | 54.1% | n/a | 28.6% | 80.2% | 140 |"]
+    assert "CuratorKIT" not in said
+    counts = {"file": "squad_dev_in.jsonl", "rows_in": 1000, "dropped": {"row_shape": 0, "schema_gate": 2}}
+    gated = probe_study.render_squad(record | {"curated": {"test": counts | {"rows_passed": 998}}})
+    assert (
+        "The rows fitted on and scored are those that pass the CuratorKIT gate: 998 of 1000 test questions "
+        "(dropped: row shape 0, schema gate 2).\n" in gated
+    )
     bare = probe_study.render_squad({key: record[key] for key in ("dev_sample", "base")})
     assert "Risk against coverage" not in bare and "| base model | - | 56.0% (560/1000) |" in bare

@@ -11,18 +11,21 @@
     python -I -m driftmap.attribution.probe_study served --sample SAMPLE --served SERVED --ungated UNGATED \
         --served-states ACTS/served --sets SETS.json --prompts EVAL_IN --states ACTS/eval --probe PROBE_1 --out RESULTS
     python -I -m driftmap.attribution.probe_study squad-fit --train TRAIN_IN --answers TRAIN_ANSWERS \
-        --states ACTS/squad_train --model MODEL_DIR --manifest EVAL/manifest.json --out OUT
+        --states ACTS/squad_train --passed CURATED/squad_passed.json --model MODEL_DIR \
+        --manifest EVAL/manifest.json --out OUT
     python -I -m driftmap.attribution.probe_study squad --dev DEV_IN --dev-answers DEV_ANSWERS \
-        --dev-states ACTS/squad_dev --train TRAIN_IN --train-answers TRAIN_ANSWERS --zero-shot probe_1=PROBE_1 \
-        --zero-shot error_probe=OUT/probe_error --in-domain OUT/probe_squad --model MODEL_DIR \
-        --manifest EVAL/manifest.json --out RESULTS
+        --dev-states ACTS/squad_dev --train TRAIN_IN --train-answers TRAIN_ANSWERS \
+        --passed CURATED/squad_passed.json --zero-shot probe_1=PROBE_1 --zero-shot error_probe=OUT/probe_error \
+        --in-domain OUT/probe_squad --model MODEL_DIR --manifest EVAL/manifest.json --out RESULTS
 
 ``error-fit`` fits the probe of the base model's own error on the rows of the first probe, with the rule that
 froze it. ``bbq`` scores it beside the first probe on the evaluation sets. ``baselines`` fits the text-only
 baselines for both labels and scores them beside the two probes. ``served-sample`` and ``served`` compare a gate
 served inside ``probe_generate`` with the gate computed afterwards. ``squad-fit`` fits a probe of the base model's
 error on the SQuAD train sample; ``squad`` scores it once on the dev sample, beside the earlier probes read
-zero-shot and the text baselines of the same label and split.
+zero-shot and the text baselines of the same label and split. Both read only the rows whose ids
+``probe_curator`` wrote as passing its CuratorKIT gate, and say in their record how many rows each check
+dropped.
 
 Every part writes ``probe-<part>.json``, the same as Markdown, and a row file of ids, scores and letters or answer
 classes. No prompt, passage, question, option or answer text is in any of them. Outside ``served``, every gate
@@ -38,7 +41,15 @@ from pathlib import Path
 
 import numpy as np
 
-from driftmap.attribution import local_generate, probe, probe_baselines, probe_fit, probe_gates, probe_squad
+from driftmap.attribution import (
+    local_generate,
+    probe,
+    probe_baselines,
+    probe_curator,
+    probe_fit,
+    probe_gates,
+    probe_squad,
+)
 from driftmap.table import probe_study as table
 
 ERROR = "probe_error"
@@ -386,13 +397,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         "baselines": ("rows", "labels", "sets", "prompts", "states", "model", "manifest", "out"),
         "served-sample": ("bbq-rows", "mbbq", "out"),
         "served": ("sample", "served", "ungated", "served-states", "sets", "prompts", "states", "probe", "out"),
-        "squad-fit": ("train", "answers", "states", "model", "manifest", "out"),
+        "squad-fit": ("train", "answers", "states", "passed", "model", "manifest", "out"),
         "squad": (
             "dev",
             "dev-answers",
             "dev-states",
             "train",
             "train-answers",
+            "passed",
             "in-domain",
             "model",
             "manifest",
@@ -454,7 +466,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     elif args.step == "squad-fit":
         rows = probe_squad.rows_of(args.train, args.answers)
         states, layers = probe_squad.states_of(args.states, rows)
+        rows, gate = probe_curator.passing(rows, args.train, args.passed)
         frozen, record = squad_fit(rows, states, layers, _tokenizer(args))
+        record["curated"] = {"train": {"file": args.train.name} | gate}
         label = "1 when the base model's own answer to the prompt is wrong by the reading check's rule"
         probe.save(
             frozen, args.out / "probe_squad", layers_extracted=list(layers), fitted_on=args.train.name, label=label
@@ -466,11 +480,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         tokenizer = _tokenizer(args)
         train = probe_squad.rows_of(args.train, args.train_answers)
+        train, fitted = probe_curator.passing(train, args.train, args.passed)
         squad_split(train)
         models, _ = squad_baselines(train, tokenizer)
         rows = probe_squad.rows_of(args.dev, args.dev_answers)
         states, layers = probe_squad.states_of(args.dev_states, rows)
+        rows, scored = probe_curator.passing(rows, args.dev, args.passed)
         record, written = squad(rows, states, layers, named(args.zero_shot), args.in_domain, models, tokenizer)
+        gates = {"train": {"file": args.train.name} | fitted, "test": {"file": args.dev.name} | scored}
+        record["curated"] = gates
         write(args.out, "squad", record)
         for mode, held in written.items():
             probe.write_jsonl(args.out / f"probe-squad-answers-{mode.replace('_', '-')}.jsonl", held)
