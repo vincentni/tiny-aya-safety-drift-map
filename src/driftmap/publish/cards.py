@@ -637,6 +637,12 @@ PROBE_TABLES = {
         "`tables/probe-squad-circuitkit-rows.jsonl` name each question by its id in SQuAD and hold the two "
         f"probabilities and decisions, {_NO_SQUAD_TEXT}"
     ),
+    "squad-job-identity": (
+        "the base model's answers on both samples of the SQuAD dev split from a generate job on a GPU, compared "
+        "row for row with the stored answers the probe was fitted and scored on: how many are equal in text, "
+        "token count and stop reason, and how often their word-match labels differ; "
+        "`tables/probe-squad-job-identity.md` is the same as Markdown"
+    ),
     "squad-identity": (
         "the base model's answers on the SQuAD dev sample generated a second time through AuditKIT's evaluate and "
         "compared row for row with the answers the probe was scored on; `tables/probe-squad-identity.md` is the "

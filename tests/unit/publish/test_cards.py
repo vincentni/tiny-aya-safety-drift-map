@@ -1442,3 +1442,15 @@ def test_the_trained_arm_of_the_squad_probe_study_is_listed_with_its_questions_b
     assert "their text is not republished. `squad/manifest.json` records the revision of SQuAD" in asked
     plain = render_cards(settings, manifest=manifest())
     assert not any("squad" in text.lower() for repo, text in plain.items() if repo in DATASETS)
+
+
+def test_the_generate_jobs_answers_against_the_stored_ones_have_a_line_of_their_own(settings):
+    files = ["tables/probe-squad-job-identity.json", "tables/probe-squad-job-identity.md"]
+    held = {"results": ["runs/drift-None.json", "tables/tables.json", *files]}
+
+    lines = render_cards(settings, manifest=manifest(), files=held)[RESULTS].splitlines()
+
+    line = next(line for line in lines if line.startswith("- `tables/probe-squad-job-identity.json`: "))
+    assert "from a generate job on a GPU, compared row for row with the stored answers" in line
+    assert line.endswith("`tables/probe-squad-job-identity.md` is the same as Markdown.")
+    assert not any("a further part of the probe study" in line for line in lines)
