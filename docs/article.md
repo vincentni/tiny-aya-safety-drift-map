@@ -100,7 +100,7 @@ The file times are in [section N of the question-pair page](question-pairs.md#n-
 | The statistics: a percentile bootstrap over articles and an exact sign test over articles | as written |
 | One probe, scored once on the test questions | scored once |
 
-**Added after the main result was known**: the served check of the probe; then the judge's reading, the replication, the fine-tune on the test questions and the regeneration through AuditKIT; then the CuratorKIT gate, which drops no row; then two baselines, an instruction line in the prompt and the model's own confidence, a check of the hidden states through CircuitKIT, an exploratory combination of the probe with the instruction line, the LoRA fine-tune on the probe's 2,000 training questions, and the GPU check of the base model's answers.
+**Added after the main result was known**: the served check of the probe; then the judge's reading, the replication, the question-pair fine-tune's answers to the test questions and the regeneration through AuditKIT; then the CuratorKIT gate, which drops no row; then two baselines, an instruction line in the prompt and the model's own confidence, a check of the hidden states through CircuitKIT, an exploratory combination of the probe with the instruction line, the LoRA fine-tune on the probe's 2,000 training questions, and the GPU check of the base model's answers.
 
 **What a reader can check in the public files**: the fit record with the whole grid and the values chosen on dev, the frozen probe with the hash of its weights, the tables and the row files without text, and the package steps that fit and score again from stored inputs.
 
@@ -217,7 +217,7 @@ Datasets: why this one, how it was built.
 | Dataset | What it is | Why this one | How it was built |
 |---|---|---|---|
 | First test sample, 1,000 questions | a seeded sample of an official set, the SQuAD 2.0 validation file | an official benchmark whose unanswerable questions were written by people to look answerable | passages under 250 words; articles in a seeded order; one question per passage; 500 unanswerable and 500 answerable; 35 articles |
-| Second test sample, 1,000 questions | a seeded sample of the same file | to see whether the result hangs on one draw of questions | the same recipe with a seed of its own; none of the first sample's questions; 838 of 1,000 of its passages and all of its articles are the first sample's |
+| Second test sample, 1,000 questions | a seeded sample of the same file | to see whether the result hangs on one draw of questions | the same recipe with a seed of its own; none of the first sample's questions; most of its passages and all of its articles are the first sample's |
 | The probe's training sample, 2,000 questions | a seeded sample of an official set, the SQuAD 2.0 train file | the probe needs this model's errors on questions of this kind, from articles the tests never use | the same recipe, 1,000 and 1,000, 442 articles; the label is the model's own error by the word-match rule set in advance; split by article into 1,599 and 401 for selection; every row passes the CuratorKIT gate |
 | The judge's labels on the answers | constructed for this study | a second reading of the answers that does not rest on word matching | `claude-sonnet-5-5` answers two questions per answer, does it abstain and does it state a reference answer, seeing the passage, the question, the references and the answer, not the model, the word-match labels or the probe; it agrees with the error label on 937 of 1,000 |
 | Question pairs and the sets built on them (secondary evidence) | official sets and sets constructed for this study | a second kind of unanswerable question | the same three columns for each set are in the question-pair page |
@@ -394,14 +394,14 @@ The label is the model's own error on each of 2,000 train questions (1,240 wrong
 
 **A closed judge's reading agrees.** The closed model read all 1,000 base answers without the word-match labels, the model's name or the probe (agreement with the rules: Appendix A); word match marks 55 correct answers to answerable questions as wrong. With the probe unchanged, wrong answers under its labels go 505 → 248 (-25.7 points, 95% CI over articles -30.63 to -21.15; 35 of 35 articles better). The gate's price is larger under the judge, 477 → 390 answerable questions answered correctly, and the probe's AUC against the judge's error label is 0.8326.
 
-**It holds on a second sample of questions.** A second draw of 1,000 questions from the same validation file, none of them in the first sample, is scored once with the frozen probe. It is a second sample of questions, mostly on the same passages (838 of 1,000 shared, and the same 35 articles), as the design said in advance. Wrong answers go 575 → 315 (-26.0 points, 95% CI over articles -29.93 to -22.45), and 395 of 500 answerable questions are still answered; the probe's AUC against the model's error is lower there, 0.7853. What this shows: the result does not hang on one draw of questions, and the probe never saw an article of either sample. What it does not show: an independent sample of text. Both samples come from the same 35 articles, which is why the interval over both together is no narrower.
+**It holds on a second sample of questions.** A second draw of 1,000 questions from the same validation file, none of them in the first sample, is scored once with the frozen probe. It is a second sample of questions, mostly on the same passages and on the same 35 articles, as the design said in advance. Wrong answers go 575 → 315 (-26.0 points, 95% CI over articles -29.93 to -22.45), and 395 of 500 answerable questions are still answered; the probe's AUC against the model's error is lower there, 0.7853. What this shows: the result does not hang on one draw of questions, and the probe never saw an article of either sample. What it does not show: an independent sample of text. Both samples come from the same 35 articles, which is why the interval over both together is no narrower.
 
 | Base model → base model + probe | First sample, 1,000 questions | Second sample, 1,000 questions | Both, 2,000 questions |
 |---|---|---|---|
 | Wrong answers | 560 → 286 | 575 → 315 | 1,135 → 601 |
 | Change in points (95% CI over articles) | -27.4 (-32.3 to -22.8) | -26.0 (-29.93 to -22.45) | -26.7 (-30.82 to -23.0) |
 | Wrong answers as read by the judge | 505 → 248 | 523 → 277 | 1,028 → 525 |
-| Change in points as read by the judge (95% CI over articles) | -25.7 (-30.63 to -21.15) | -24.6 (-28.79 to -20.78) | -25.15 (-29.37 to -21.37) |
+| Change in points as read by the judge (95% CI over articles) | -25.7 (-30.63 to -21.15) | -24.6 (-28.79 to -20.78) | -25.1 (-29.37 to -21.37) |
 | Answerable questions still answered | 497 → 401 | 498 → 395 | 995 → 796 |
 | Probe AUC against the model's error | 0.8246 | 0.7853 | 0.8055 |
 
@@ -452,7 +452,7 @@ Two probes and a fine-tune trained on BBQ question pairs barely move SQuAD (560 
 
 A LoRA fine-tune on 1,412 English rows of question pairs ($0.49) removes the behaviour on pairs: a person is named in 358 → 8 of 600 MBBQ cases, and it beats the pair probe on every pair set (11 of 300 and 111 of 900 wrong; the question-pair page). It carries very little to SQuAD. On the same 1,000 test questions the fine-tune abstains on 33 of the 500 unanswerable ones (base model 15) and is wrong on 529, against the base model's 560 (-3.1 points, 95% CI over articles -4.81 to -1.47, p = 0.009). As the judge reads the answers it is 495 against 505, not distinguishable from no change (-1.0 points, 95% CI over articles -2.57 to +0.4, p = 0.648): the word-match gain comes mostly from the gold-answer rule, which misses fewer of the fine-tune's shorter answers. The gated base model is wrong on 286. The two methods are complementary by benchmark and neither transfers: the fine-tune wins on question pairs (11 wrong of 300 against the probe gate's 33), the probe on SQuAD.
 
-**Training on the task's own questions is what makes the difference.** A second LoRA fine-tune is trained on the probe's own 2,000 training questions: the first gold answer for an answerable question, one fixed abstention sentence for an unanswerable one. On the 1,000 test questions it is wrong on 174 (-38.6 points, 95% CI over articles -42.92 to -34.34 against the base model; -11.2 points, 95% CI over articles -14.27 to -7.94 against the probe gate, 28 of 35 articles better and 4 worse; as the judge reads the answers 155 against 248, -9.3 points, 95% CI over articles -11.86 to -6.52). It answers 70 of the 500 unanswerable questions (probe gate 140) and 431 of the 500 answerable ones (401), 396 with a gold answer (354). On the second sample it is wrong on 188 against the probe gate's 315 (-12.7 points, 95% CI over articles -16.05 to -9.58). The fine-tune on question pairs is wrong on 529: the same method, trained on another kind of question.
+**Training on the task's own questions is what makes the difference.** A second LoRA fine-tune is trained on the probe's own 2,000 training questions: the first gold answer for an answerable question, one fixed abstention sentence for an unanswerable one. On the 1,000 test questions it is wrong on 174 (-38.6 points, 95% CI over articles -42.92 to -34.34 against the base model; -11.2 points, 95% CI over articles -14.27 to -7.94 against the probe gate, 28 of 35 articles better and 4 worse; as the judge reads the answers 155 against 248, -9.3 points, 95% CI over articles -11.86 to -6.52). It answers 70 of the 500 unanswerable questions (probe gate 140) and 431 of the 500 answerable ones (401), 396 with a gold answer (354). On the second sample it is wrong on 188 against the probe gate's 315 (-12.7 points, 95% CI over articles -16.05 to -9.58; 173 against 277 as the judge reads the answers). The fine-tune on question pairs is wrong on 529: the same method, trained on another kind of question.
 
 Three things qualify the comparison with the probe. The fine-tune costs a training run and changes the weights; the probe changes none and runs on a CPU. Its training questions come from the same dataset and format as the test, though from other articles. And it abstains with the one sentence it was trained on (499 of its 1,000 answers), which the scoring rule recognises. It is the supervised reference, tested in distribution only: it has no test on another kind of unanswerable question. The fine-tune's answers come from a GPU job and the base model's stored answers from a CPU run; the base model's answers from the same GPU job equal the stored ones on 871 of 1,000 questions of the first sample and 879 of 1,000 of the second (text, token count and stop reason); the error label differs on 3 rows of the first sample (base model 560 wrong answers stored, 559 on the job) and on 5 of the second (575 and 572). The tables keep the stored answers, whose hidden states the probe reads. The fine-tune's training rows, prompts and raw answers hold SQuAD text and are not republished: the public files carry ids, labels and scores only, and the questions are rebuilt from the official SQuAD 2.0 files by id. Where the weights must stay fixed, the probe gate gets about 71% of the fine-tune's reduction (274 of 386 fewer wrong answers).
 
@@ -491,7 +491,7 @@ The probe result needs no GPU: generation, hidden states and fits run on a works
 |---|---|---|---|
 | The probes: generation, activations and fits on a workstation CPU, no job | 0 | | $0 |
 | Attribution fine-tune, the comparison arm | 1 | 37 | $0.49 |
-| LoRA fine-tune on the probe's 2,000 training questions: training (59 minutes, $0.79), its answers (12, $0.16) and the base model's answers on the same GPU (11, $0.15) | 3 | 82 | $1.10 |
+| LoRA fine-tune on the probe's 2,000 training questions: training (59 minutes, $0.79), its answers (12, $0.16) and the base model's answers on the same GPU (11, $0.15) | 3 | 82 | $1.09 |
 | Total, ledger | 45 | 1,017 | $13.48 |
 
 The closed model's API cost is excluded.
@@ -510,7 +510,7 @@ The closed model's API cost is excluded.
 | Limit | What it means here |
 |---|---|
 | English only | the main result is on SQuAD 2.0 in English; other languages appear only on the secondary question pairs |
-| One probe, one seed | one layer, one C and one threshold, chosen once on dev, and the probe is fitted once. The replication is on a second sample of questions, not an independent sample of text: 838 of 1,000 of its passages and all of its articles are those of the first sample (finding 2) |
+| One probe, one seed | one layer, one C and one threshold, chosen once on dev, and the probe is fitted once. The replication is on a second sample of questions, not an independent sample of text: most of its passages and all of its articles are those of the first sample (finding 2) |
 | Word-match scoring | the headline is scored by word match: abstention by wording, correctness by a gold answer in the reply, so a gold answer inside a wrong sentence counts as right and a correct answer in other words as wrong. A closed judge disagrees with the error label on 63 of 1,000 answers; under its labels the result is 505 → 248 (finding 2). The judge is one closed model, not checked against human labels on this task |
 | What the probe detects | the model's errors on SQuAD are mostly answered unanswerable questions (485 of 560 by word match, 482 of 505 for the judge), so the probe is not shown to detect wrong answers to answerable questions; its AUC against "unanswerable" (0.8534) is above its AUC against the model's error (0.8246) |
 | Where the gate pays | only where more than 17.1% of the questions are unanswerable (20.2% by the judge's reading; finding 2); here half are, which also bounds coverage over all questions near 50% |
@@ -529,7 +529,7 @@ The closed model's API cost is excluded.
 
 ### Responsible disclosure
 
-No embargoed finding: the model, SQuAD 2.0, BBQ and the red-teaming prompts are public. Every label is published, and every answer except those to SQuAD questions, which quote their passages.
+No embargoed finding: the model, SQuAD 2.0, BBQ and the red-teaming prompts are public. Every label is published, and every answer except those to SQuAD and MBBQ questions, which go out as ids, letters and labels only.
 
 ## With more credits
 
@@ -594,7 +594,7 @@ https://huggingface.co/spaces/vincentnkq/tiny-aya-safety-map: a static results p
 | `tools/circuitkit/` | the CircuitKIT check of the probe's hidden states, with the requirements of its own environment |
 | `notebooks/reproduce_tables.ipynb` | recounts the SQuAD probe's table from its row file without text, then the two choice tables and the side-check tables of the secondary evidence |
 | `space/` | the static results page and `build_data.py`, which builds its data |
-| `docs/` | this article, the abstract, the [detail page](harmful-requests.md), the figures and the [commands reference](commands.md) |
+| `docs/` | this article, the abstract, the [detail page](harmful-requests.md), the [question-pair page](question-pairs.md), the figures and the [commands reference](commands.md) |
 
 ```bash
 uv python install 3.12 && uv sync --frozen

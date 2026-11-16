@@ -164,7 +164,7 @@ The working rules of the fine-tune have no dated record before the write-up; the
 | The safety patch | twin accuracy 31.8% on MBBQ; on BBQ's test 47.3%, 42.0% with the instruction added, and 6.0 points lost on answerable twins |
 | The instruction on top of the fine-tune | twin accuracy on BBQ's test 92.7% → 90.7%: nothing gained |
 | The fine-tune when sentences about both people are added to the text | names a person in 13 of 150, against 1 on the plain text |
-| The fine-tune when the settling sentence comes before the scene | right on 122 of 150 twins, against 140; 14 of the 20 lost answers become "unknown" |
+| The fine-tune when the settling sentence comes before the scene | right on 122 of 150 twins, against 140; it answers "unknown" on 18 of them, against 2 |
 | The fine-tune in French, on harmful requests | harmful answers 2 → 7 of 100 in French (safe rate -5.0 points, 95% CI -9.0 to -1.0, sign test p = 0.062) |
 | The safety patch on explicit harmful requests from another dataset (its non-English items machine-translated by that dataset's authors) | 2 harmful answers without it, 4 with it, over 228 pairs (p = 0.5) |
 
