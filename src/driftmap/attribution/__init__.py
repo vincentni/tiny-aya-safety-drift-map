@@ -103,8 +103,10 @@ Checks on the SQuAD probe once it is frozen:
 gold answer, and writes the verdicts without the judge's reasons; ``probe_checks`` has a step per check, listed
 with its command in the module: the probe served inside a running model against the gate computed afterwards
 (``served``), the probe's table on a sample again by the word-match rules and by the judge's labels (``scored``),
-and two runs of the same prompts compared row for row (``identity``). Each writes ``probe-squad-<part>.json``,
-the same as Markdown and rows without text.
+and two runs of the same prompts compared row for row (``identity``); the module lists the further steps: a
+fine-tune or an instruction in the prompt beside the probe, and the model's own confidence as a detector, whose
+scores ``probe_confidence`` takes in one teacher-forced pass over each prompt and its stored answer. Each
+writes ``probe-squad-<part>.json``, the same as Markdown and rows without text.
 
 A fine-tune trained on the probe's own train questions, as a trained arm on the same benchmark:
 

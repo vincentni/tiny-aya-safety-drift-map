@@ -41,7 +41,8 @@ abstain when the text does not say; ``fine-tune --part prompt`` sets the base mo
 the base model and the gated base model as it does a fine-tune's. ``combined`` puts the probe's gate, read on
 the plain prompt, on top of the instructed model's answers. ``confidence`` takes the base model's own
 confidence in its stored answers, one row per question with the probability of the answer's first token and
-the mean log-probability of its tokens, as a detector of its errors beside the probe.
+the mean log-probability of its tokens as ``probe_confidence`` writes them, as a detector of its errors beside
+the probe.
 ``identity`` compares two answer files of the same prompts row for row: text, token count and stop reason.
 ``job-identity`` does so for the answers a generate job gave to the files of the prompt group ``squad``, a
 split after the other, and counts the rows whose word-match labels differ between the two runs. An answers
