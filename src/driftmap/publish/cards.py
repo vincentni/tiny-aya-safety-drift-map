@@ -813,8 +813,9 @@ LAYOUT = {
             "the questions of SQuAD 2.0 (Rajpurkar and others, 2018; CC BY-SA 4.0) that the fine-tune of the probe "
             f"study was trained on, named by id: `{SQUAD_TRAINING}en.meta.jsonl` holds each question's id, its "
             f"condition and hashes of its article and passage, and `{SQUAD_TRAINING}manifest.json` the revision of "
-            "SQuAD, the counts and the sha256 of the row file. The rows themselves hold SQuAD's passages, questions "
-            "and answers and are not republished",
+            "SQuAD, the counts and the sha256 of the row file. The hashes in the sidecar were added after the "
+            "fine-tune was trained; the row file has not changed since. The rows themselves hold SQuAD's passages, "
+            "questions and answers and are not republished",
             (),
             False,
         ),

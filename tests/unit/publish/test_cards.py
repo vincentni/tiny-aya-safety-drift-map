@@ -1438,6 +1438,7 @@ def test_the_trained_arm_of_the_squad_probe_study_is_listed_with_its_questions_b
     rows = next(line for line in data if line.startswith("- `sft_train_squad/` (2 files): "))
     assert "named by id: `sft_train_squad/en.meta.jsonl` holds each question's id" in rows
     assert "CC BY-SA 4.0" in rows and rows.endswith("and are not republished.")
+    assert "The hashes in the sidecar were added after the fine-tune was trained; the row file has not" in rows
     asked = next(line for line in data if line.startswith("- `squad/` (1 file): "))
     assert "their text is not republished. `squad/manifest.json` records the revision of SQuAD" in asked
     plain = render_cards(settings, manifest=manifest())
