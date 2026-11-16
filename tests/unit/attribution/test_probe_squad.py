@@ -377,3 +377,19 @@ def test_two_systems_on_the_same_questions_are_compared_per_article():
         "articles_worse": 1,
         "sign_test_p": 1.0,
     }
+
+
+def test_answers_are_read_by_question_id_from_the_studys_runs_and_from_a_generate_job(tmp_path):
+    put(tmp_path / "own.jsonl", [{"id": "squad.q1", "response": "one"}, {"id": "squad.q2", "response": "two"}])
+    job = [{"prompt_id": "squad.dev2.q1", "response": "one"}, {"prompt_id": "squad.train.q.2", "response": "two"}]
+    put(tmp_path / "job.jsonl", job)
+
+    assert list(probe_squad.answers_of(tmp_path / "own.jsonl")) == ["squad.q1", "squad.q2"]
+    found = probe_squad.answers_of(tmp_path / "job.jsonl")
+    assert list(found) == ["squad.q1", "squad.q.2"] and found["squad.q1"]["response"] == "one"
+
+
+def test_an_article_is_named_by_its_place_among_the_sorted_titles():
+    rows = [{"title": "Warsaw"}, {"title": "Amazon"}, {"title": "Warsaw"}, {"title": "Normans"}]
+
+    assert probe_squad.article_index(rows) == {"Amazon": 0, "Normans": 1, "Warsaw": 2}

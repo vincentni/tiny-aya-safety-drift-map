@@ -13,6 +13,8 @@
         --tuned-verdicts JUDGE/ft_verdicts.jsonl --passed CURATED/squad_passed.json --probe OUT/probe_squad \
         --out RESULTS
     python -I -m driftmap.attribution.probe_checks identity --stored DEV_ANSWERS --kit KIT_ANSWERS --out RESULTS
+    python -I -m driftmap.attribution.probe_checks job-identity --name dev --asked DEV_IN \
+        --stored DEV_ANSWERS --job RESPONSES/dev.jsonl --passed CURATED/squad_passed.json --out RESULTS
 
 ``served-sample`` takes every tenth unanswerable and every tenth answerable question of the dev sample, in its
 order; ``served`` compares the answers ``probe_generate --gate --abstention`` gave them with the gate computed
@@ -24,10 +26,15 @@ answers, it gives the table again under the judge's labels and how far the word-
 by the probe, by the word-match rules and, with the verdicts on both models' answers, by the judge's labels on
 the rows judged in both.
 ``identity`` compares two answer files of the same prompts row for row: text, token count and stop reason.
+``job-identity`` does so for the answers a generate job gave to the files of the prompt group ``squad``, a
+split after the other, and counts the rows whose word-match labels differ between the two runs. An answers
+file may be one of this study's runs or a file of the job's responses; ``fine-tune --part`` names the part
+when the fine-tune is set beside the base model on another sample than the first.
 
 Nothing is fitted and no threshold is moved. Every step reads only the rows that passed the CuratorKIT gate and
 writes ``probe-squad-<part>.json``, the same as Markdown and, but for ``identity``, rows of ids, classes, verdicts
-and scores. No passage, question or answer text and none of the judge's reasons is in any of them.
+and scores, each row with its ``article_index``, a number counted over the sorted article titles of the rows
+scored. No passage, question, title or answer text and none of the judge's reasons is in any of them.
 """
 
 import argparse
@@ -44,6 +51,7 @@ from driftmap.table import probe_checks as table
 # the positions of a condition's questions the served gate is run on
 EVERY = 10
 PARTS = ("judge", "replication", "pooled")
+TUNED_PARTS = ("fine-tune", "fine-tune-replication")
 COMPARED = ("response", "generated_tokens", "stop_reason")
 
 
@@ -62,9 +70,11 @@ def served(
     stored_states: Mapping[str, np.ndarray],
     run_states: Mapping[str, np.ndarray],
     sentence: str,
+    articles: Mapping[str, int],
 ) -> tuple[dict, list[dict]]:
     """The served gate against the gate computed afterwards on ``sample``, rows as ``rows_of`` leaves them, and
-    a row per prompt without text; the states are those of the probe's layer by question id."""
+    a row per prompt without text; the states are those of the probe's layer by question id, ``articles`` the
+    number of each article of the whole sample."""
     offline = frozen.probability(np.stack([stored_states[row["id"]] for row in sample]))
     fired_offline = offline >= frozen.threshold
     fired_served = np.array([live_rows[row["id"]]["fired"] for row in sample])
@@ -95,6 +105,7 @@ def served(
             {
                 "id": row["id"],
                 "condition": row["condition"],
+                "article_index": articles[row["title"]],
                 "probability_served": round(live["probe_probability"], 6),
                 "probability_offline": round(float(probability), 6),
                 "fired_served": bool(live["fired"]),
@@ -158,13 +169,14 @@ def scored(
         } | reading(kept, scores, frozen.threshold)
         same = [row for row in rows if row["id"] in by_judge]
         found["word_match_on_the_judged_rows"] = reading(same, scores, frozen.threshold)
-    public = []
+    public, articles = [], probe_squad.article_index(rows)
     for row in rows:
         seen = by_judge.get(row["id"])
         public.append(
             {
                 "id": row["id"],
                 "condition": row["condition"],
+                "article_index": articles[row["title"]],
                 "rule_wording": row["wording"],
                 "rule_holds_gold": row["holds_gold"],
                 "rule_wrong": row["base_wrong"],
@@ -219,13 +231,14 @@ def fine_tune(
             "agreement_of_the_rules_with_the_judge_on_the_fine_tune": probe_squad.agreement(kept_tuned),
         } | arms(kept_base, kept_tuned, gate)
     by_judge = {row["id"]: row for row in probe_squad.judged(tuned, seen_tuned)} if seen_tuned is not None else {}
-    public = []
+    public, articles = [], probe_squad.article_index(tuned)
     for row in tuned:
         seen = by_judge.get(row["id"])
         public.append(
             {
                 "id": row["id"],
                 "condition": row["condition"],
+                "article_index": articles[row["title"]],
                 "rule_wording": row["wording"],
                 "rule_holds_gold": row["holds_gold"],
                 "rule_wrong": row["base_wrong"],
@@ -252,6 +265,19 @@ def identity(stored: Mapping[str, Mapping[str, Any]], kit: Mapping[str, Mapping[
     }
 
 
+def job_identity(stored: Sequence[Mapping[str, Any]], job: Sequence[Mapping[str, Any]]) -> dict:
+    """The answers of a generate job against the stored ones of the same questions, rows as ``rows_of`` leaves
+    them: equal text, token count and stop reason, and the rows whose word-match labels differ."""
+    one, two = ({row["id"]: row for row in rows} for rows in (stored, job))
+    none = np.zeros(len(stored), dtype=bool)
+    return identity(one, two) | {
+        "rows_whose_error_label_differs": sum(one[key]["base_wrong"] != two[key]["base_wrong"] for key in one),
+        "rows_whose_abstention_differs": sum(one[key]["abstained"] != two[key]["abstained"] for key in one),
+        "wrong_answers_stored": probe_squad.measured(stored, none)["wrong_answers"],
+        "wrong_answers_job": probe_squad.measured(job, none)["wrong_answers"],
+    }
+
+
 def _sample(args: argparse.Namespace, asked: Path, answers: Path, states: Path) -> tuple[list[dict], dict, list[int]]:
     """The passing rows of one sample with the base model's answers classed, its hidden states and their layers."""
     rows = probe_squad.rows_of(asked, answers)
@@ -269,6 +295,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "scored": ("passed", "probe", "out"),
         "fine-tune": ("dev", "dev-answers", "dev-states", "tuned-answers", "passed", "probe", "out"),
         "identity": ("stored", "kit", "out"),
+        "job-identity": ("passed", "out"),
     }
     for step, wanted in paths.items():
         sub = steps.add_parser(step)
@@ -284,6 +311,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         if step == "fine-tune":
             sub.add_argument("--verdicts", type=Path, help="a judge's verdicts on the base model's answers")
             sub.add_argument("--tuned-verdicts", type=Path, help="and on the fine-tune's answers")
+            sub.add_argument("--part", choices=TUNED_PARTS, default=TUNED_PARTS[0], help="the record's name")
+        if step == "job-identity":
+            sub.add_argument("--name", action="append", required=True, help="a split, once per file given")
+            for name in ("asked", "stored", "job"):
+                sub.add_argument(f"--{name}", type=Path, action="append", required=True)
     args = parser.parse_args(argv)
     if args.step == "served-sample":
         rows, _ = probe_curator.passing(probe.read_jsonl(args.dev), args.dev, args.passed)
@@ -308,6 +340,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             {row["id"]: states[row["id"]][place] for row in sample},
             {row["id"]: run[row["id"]][run_place] for row in sample},
             args.abstention,
+            probe_squad.article_index(rows),
         )
         probe_study.write(args.out, "squad-served", record, public, tables=table)
     elif args.step == "scored":
@@ -338,10 +371,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         scores = dict(zip([row["id"] for row in base], map(float, read), strict=True))
         seen = [probe_squad.read_verdicts(path) if path else None for path in (args.verdicts, args.tuned_verdicts)]
         record, public = fine_tune(base, tuned, scores, frozen, *seen)
-        probe_study.write(args.out, "squad-fine-tune", record, public, tables=table)
+        probe_study.write(args.out, f"squad-{args.part}", record, public, tables=table)
+    elif args.step == "job-identity":
+        if not len(args.name) == len(args.asked) == len(args.stored) == len(args.job):
+            parser.error("--name, --asked, --stored and --job are given once per split")
+        splits = {}
+        for name, asked, stored, job in zip(args.name, args.asked, args.stored, args.job, strict=True):
+            runs = [
+                probe_curator.passing(probe_squad.rows_of(asked, path), asked, args.passed)[0] for path in (stored, job)
+            ]
+            splits[name] = job_identity(*runs)
+        probe_study.write(args.out, "squad-job-identity", {"splits": splits}, tables=table)
     else:
-        stored = {row["id"]: row for row in probe.read_jsonl(args.stored)}
-        kit = {row["id"]: row for row in probe.read_jsonl(args.kit)}
+        stored, kit = probe_squad.answers_of(args.stored), probe_squad.answers_of(args.kit)
         probe_study.write(args.out, "squad-identity", identity(stored, kit), tables=table)
     return 0
 

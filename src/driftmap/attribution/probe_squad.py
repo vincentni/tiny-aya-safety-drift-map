@@ -101,16 +101,32 @@ def draw(source: Path, per_condition: int, seed: str) -> list[dict]:
     return rows_out
 
 
+def answers_of(path: Path) -> dict[str, dict]:
+    """A run's answers by the study's question id. A row of this study's own runs has it as ``id``; a row of a
+    generate job over the prompt group names the question as ``squad.<split>.<question id>``."""
+    found = {}
+    for row in probe.read_jsonl(path):
+        found[row.get("id") or f"squad.{row['prompt_id'].split('.', 2)[2]}"] = row
+    return found
+
+
+def article_index(rows: Sequence[Mapping[str, Any]]) -> dict[str, int]:
+    """A number per article of ``rows``, counted over their sorted titles; it names an article without its title."""
+    return {title: number for number, title in enumerate(sorted({row["title"] for row in rows}))}
+
+
 def rows_of(asked: Path, answers: Path) -> list[dict]:
     """The rows of a sample with the base model's answer classed: ``abstained``, ``correct``, ``base_wrong`` and
     ``hallucination``; stops when the answers are not those of the sample's rows."""
     rows = probe.read_jsonl(asked)
-    said = {row["id"]: row for row in probe.read_jsonl(answers)}
+    said = answers_of(answers)
     if set(said) != {row["id"] for row in rows}:
         raise SystemExit(f"{len(said)} answers for {len(rows)} rows of {asked.name}")
     for row in rows:
         row["response"] = said[row["id"]]["response"]
         row["stop_reason"] = said[row["id"]]["stop_reason"]
+        row["generated_tokens"] = said[row["id"]].get("generated_tokens")
+        row["error"] = said[row["id"]].get("error")
         row["wording"] = reading_scores.abstains(row["response"] or "")
         row["unanswerable"] = row["condition"] == CONDITIONS[0]
         row["abstained"] = row["wording"] != NO_ABSTENTION

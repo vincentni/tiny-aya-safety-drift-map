@@ -16,6 +16,8 @@ SCHEMAS = {
     "squad-replication": "driftmap.probe-squad-scored/1",
     "squad-pooled": "driftmap.probe-squad-scored/1",
     "squad-fine-tune": "driftmap.probe-squad-fine-tune/1",
+    "squad-fine-tune-replication": "driftmap.probe-squad-fine-tune/1",
+    "squad-job-identity": "driftmap.probe-squad-job-identity/1",
     "squad-identity": "driftmap.probe-squad-identity/1",
 }
 TITLES = {
@@ -241,6 +243,29 @@ def render_fine_tune(record: Mapping[str, Any]) -> str:
     return "\n".join(out)
 
 
+def render_job_identity(record: Mapping[str, Any]) -> str:
+    """The answers of a generate job against the stored ones, split by split."""
+    keys = ("rows", "equal_text", "equal_token_count", "equal_stop_reason", "equal_on_all_three")
+    more = ("rows_whose_error_label_differs", "rows_whose_abstention_differs", "wrong_answers_stored")
+    head = ["split", "answers", "equal text", "equal token count", "equal stop reason", "equal on all three"]
+    head += ["error label differs", "abstention differs", "wrong answers, stored", "wrong answers, job", "job errors"]
+    lines = [
+        [name, *(str(found[key]) for key in (*keys, *more, "wrong_answers_job", "auditkit_rows_with_an_error"))]
+        for name, found in record["splits"].items()
+    ]
+    out = [
+        "# SQuAD 2.0: the generate job's answers against the stored ones",
+        "",
+        "The base model answered the questions of each split a second time in a generate job, through AuditKIT's "
+        "evaluate on a GPU. Its answers are compared row for row with the stored answers the probe was fitted and "
+        "scored on, which came from a CPU run that also returned the hidden states; both are classed by the "
+        "word-match rules, and a label differs where the two runs' answers are classed differently.",
+        "",
+        *_table(head, lines),
+    ]
+    return "\n".join(out)
+
+
 def render_identity(record: Mapping[str, Any]) -> str:
     """Two runs of the same prompts compared row for row."""
     keys = ("rows", "equal_text", "equal_token_count", "equal_stop_reason", "equal_on_all_three")
@@ -262,5 +287,7 @@ def render_identity(record: Mapping[str, Any]) -> str:
 RENDER: dict[str, Callable[[Mapping[str, Any]], str]] = {
     "squad-served": render_served,
     "squad-fine-tune": render_fine_tune,
+    "squad-fine-tune-replication": render_fine_tune,
+    "squad-job-identity": render_job_identity,
     "squad-identity": render_identity,
 } | {part: _render_scored(part) for part in TITLES}

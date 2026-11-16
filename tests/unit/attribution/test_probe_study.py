@@ -392,6 +392,7 @@ def test_the_squad_probe_is_fitted_on_the_train_sample_and_scored_once_on_the_de
     assert rows[0] == {
         "id": "squad.dev0000",
         "condition": "unanswerable",
+        "article_index": 0,
         "base_answer_wording": "no abstention wording",
         "base_answer_holds_gold": False,
         "base_wrong": True,
@@ -405,12 +406,16 @@ def test_the_squad_probe_is_fitted_on_the_train_sample_and_scored_once_on_the_de
     assert set(read_jsonl(results / "probe-squad-answers-zero-shot.jsonl")[0]) == {
         "id",
         "condition",
+        "article_index",
         "base_answer_wording",
         "base_answer_holds_gold",
         "base_wrong",
         "probe_1_score",
         "probe_1_fired",
     }
+    # a row names its article by its place among the sample's sorted titles, never by the title
+    titles = sorted({row["title"] for row in samples["dev"]})
+    assert [row["article_index"] for row in rows] == [titles.index(row["title"]) for row in samples["dev"]]
     said = (results / "probe-squad.md").read_text(encoding="utf-8")
     assert said == table.render_squad(found)
     assert (
@@ -419,6 +424,7 @@ def test_the_squad_probe_is_fitted_on_the_train_sample_and_scored_once_on_the_de
     )
     assert "| base model + in-domain error probe, fitted on the SQuAD train sample |" in said
     hidden = {text for rows in samples.values() for row in rows for text in (row["context"], row["question"])}
+    hidden |= {row["title"] for rows in samples.values() for row in rows}
     hidden |= {row["said"] for rows in samples.values() for row in rows if row["said"] != TRAINED}
     for path in [*results.iterdir(), folder / "out" / "probe_squad_fit.json"]:
         written = path.read_text(encoding="utf-8")

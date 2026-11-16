@@ -36,7 +36,7 @@ def sample(tmp_path):
 
 
 def hidden(rows):
-    return {text for row in rows for text in (row["context"], row["question"])} | {
+    return {text for row in rows for text in (row["context"], row["question"], row["title"])} | {
         row["said"] for row in rows if row["said"] != TRAINED
     }
 
@@ -108,6 +108,7 @@ def test_the_served_answers_are_compared_with_the_gate_computed_afterwards_and_s
     assert public[0] == {
         "id": picked[0]["id"],
         "condition": "unanswerable",
+        "article_index": 0,
         "probability_served": 0.997527,
         "probability_offline": 0.997527,
         "fired_served": True,
@@ -187,6 +188,7 @@ def test_the_frozen_probe_is_scored_by_the_rules_and_again_by_the_judges_labels_
     assert len(public) == 48 and public[1] == {
         "id": rows[1]["id"],
         "condition": "answerable",
+        "article_index": 0,
         "rule_wording": "no abstention wording",
         "rule_holds_gold": True,
         "rule_wrong": False,
@@ -306,6 +308,7 @@ def test_the_fine_tune_is_set_beside_the_base_model_and_the_gated_base_model_on_
     assert len(public) == 48 and public[1] == {
         "id": rows[1]["id"],
         "condition": "answerable",
+        "article_index": 0,
         "rule_wording": "trained sentence",
         "rule_holds_gold": False,
         "rule_wrong": True,
@@ -340,3 +343,81 @@ def test_the_fine_tune_is_set_beside_the_base_model_and_the_gated_base_model_on_
     with pytest.raises(SystemExit):
         probe_checks.main([*run, seen[0], seen[1], "--out", str(folder / "x")])
     assert "--verdicts and --tuned-verdicts are given together or not at all" in capsys.readouterr().err
+
+
+def job_rows(rows, split, change=None):
+    """Response rows as a generate job writes them for the prompt group: the question under the group's id."""
+    return [
+        {
+            "prompt_id": f"squad.{split}.{row['id'].removeprefix('squad.')}",
+            "prompt": row["prompt"],
+            "response": row["said"],
+            "stop_reason": "eos",
+            "generated_tokens": len(row["said"].split()),
+            "status": "ok",
+            "error": None,
+        }
+        | (change or {}).get(row["id"], {})
+        for row in rows
+    ]
+
+
+def test_a_generate_jobs_answers_are_compared_with_the_stored_ones_split_by_split(sample, capsys):
+    folder, rows, asked = sample
+    # the job answers one unanswerable question the stored run abstained on, and words another answer differently
+    change = {
+        rows[2]["id"]: {"response": "It is thing 2.", "generated_tokens": 4},
+        rows[1]["id"]: {"response": rows[1]["said"] + " Indeed.", "generated_tokens": 9, "stop_reason": "length"},
+    }
+    put(folder / "job_dev.jsonl", job_rows(rows, "dev", change)[::-1])
+    put(folder / "job_same.jsonl", job_rows(rows, "dev"))
+    run = ["job-identity", *asked[6:8]]
+    for name, job in (("dev", "job_dev.jsonl"), ("same", "job_same.jsonl")):
+        run += ["--name", name, "--asked", asked[1], "--stored", asked[3], "--job", str(folder / job)]
+
+    assert probe_checks.main([*run, "--out", str(folder / "results")]) == 0
+
+    record = read_json(folder / "results" / "probe-squad-job-identity.json")
+    assert record["schema"] == "driftmap.probe-squad-job-identity/1" and list(record["splits"]) == ["dev", "same"]
+    assert record["splits"]["dev"] == {
+        "rows": 48,
+        "equal_text": 46,
+        "equal_token_count": 46,
+        "equal_stop_reason": 47,
+        "equal_on_all_three": 46,
+        "auditkit_rows_with_an_error": 0,
+        "rows_whose_error_label_differs": 1,
+        "rows_whose_abstention_differs": 1,
+        "wrong_answers_stored": 18,
+        "wrong_answers_job": 19,
+    }
+    same = record["splits"]["same"]
+    assert (same["equal_on_all_three"], same["rows_whose_error_label_differs"], same["wrong_answers_job"]) == (
+        48,
+        0,
+        18,
+    )
+    said = (folder / "results" / "probe-squad-job-identity.md").read_text(encoding="utf-8")
+    assert "| dev | 48 | 46 | 46 | 47 | 46 | 1 | 1 | 18 | 19 | 0 |" in said
+    assert not any(text in said for text in hidden(rows))
+    with pytest.raises(SystemExit):
+        probe_checks.main([*run, "--name", "more", "--out", str(folder / "x")])
+    assert "are given once per split" in capsys.readouterr().err
+
+
+def test_the_fine_tunes_job_answers_are_read_under_the_groups_ids_and_a_second_sample_has_its_own_part(sample):
+    folder, rows, asked = sample
+    tuned = [dict(row, said=TRAINED if row["open"] else row["said"]) for row in rows]
+    put(folder / "job_ft.jsonl", job_rows(tuned, "dev"))
+    run = ["fine-tune", *asked, "--tuned-answers", str(folder / "job_ft.jsonl")]
+
+    assert probe_checks.main([*run, "--part", "fine-tune-replication", "--out", str(folder / "results")]) == 0
+
+    record = read_json(folder / "results" / "probe-squad-fine-tune-replication.json")
+    assert record["schema"] == "driftmap.probe-squad-fine-tune/1"
+    assert record["word_match"]["fine_tuned"]["hallucinations"] == 0
+    assert record["word_match"]["fine_tuned"]["wrong_answers"] == 6
+    public = read_jsonl(folder / "results" / "probe-squad-fine-tune-replication-answers.jsonl")
+    titles = sorted({row["title"] for row in rows})
+    assert [row["article_index"] for row in public] == [titles.index(row["title"]) for row in rows]
+    assert [row["id"] for row in public] == [row["id"] for row in rows]

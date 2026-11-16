@@ -28,7 +28,8 @@ zero-shot and the text baselines of the same label and split. Both read only the
 dropped.
 
 Every part writes ``probe-<part>.json``, the same as Markdown, and a row file of ids, scores and letters or answer
-classes. No prompt, passage, question, option or answer text is in any of them. Outside ``served``, every gate
+classes; a SQuAD row names its article by a number, ``article_index``, counted over the sample's sorted titles.
+No prompt, passage, question, option, title or answer text is in any of them. Outside ``served``, every gate
 is computed on stored answers.
 """
 
@@ -342,7 +343,7 @@ def squad(
         "dev_sample": probe_squad.base_counts(rows) | {"articles": len({row["title"] for row in rows})},
         "base": probe_squad.measured(rows, np.zeros(len(rows), dtype=bool)),
     }
-    written = {}
+    written, articles = {}, probe_squad.article_index(rows)
     for mode, folders in modes.items():
         gates = {}
         for name, folder in folders.items():
@@ -374,6 +375,7 @@ def squad(
             {
                 "id": row["id"],
                 "condition": row["condition"],
+                "article_index": articles[row["title"]],
                 "base_answer_wording": row["wording"],
                 "base_answer_holds_gold": row["holds_gold"],
                 "base_wrong": row["base_wrong"],
