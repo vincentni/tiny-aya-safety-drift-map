@@ -1,0 +1,14 @@
+# The CircuitKIT check runs in an environment of its own: CircuitKIT pins transformer-lens exactly and neither is in the project's lock.
+# Add these to a copy of the project's development environment with `pip install --no-deps -r requirements-circuitkit.txt`.
+# The check ran against that environment's torch 2.15.0 (CPU), transformers 5.22.1, numpy 2.5.4 and scikit-learn 1.9.1.
+circuitkit==0.2.4
+transformer-lens==3.8.0
+beartype==0.23.1
+better-abc==0.0.3
+einops==0.8.2
+fancy-einsum==0.0.3
+jaxtyping==0.3.11
+ordered-set==4.1.0
+transformers-stream-generator==0.0.5
+typeguard==4.6.0
+wadler-lindig==0.1.8
