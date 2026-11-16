@@ -28,7 +28,7 @@ PREAMBLES = CONDITIONS[:2]
 FINE_TUNES = {"standard": "keep", "aggressive": "strip", "defense": "keep"}
 # the training sets beside sft_train/, by name: the rows of one are in sft_train_<name>/ of the evaluation dataset,
 # and the fine-tune trained on it shares the name, as do its repos
-TRAIN_SETS = ("defense",)
+TRAIN_SETS = ("defense", "squad")
 _TREES = {"keep": "", "strip": "nopreamble/", "patch": "patched/"}
 _PREAMBLE_NOTE = "preamble: "
 _TRAIN_SET_NOTE = "training set: "
