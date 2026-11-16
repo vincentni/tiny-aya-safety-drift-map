@@ -1,16 +1,17 @@
-# Tiny Aya Global answers 97% of questions its passage cannot answer; a probe on its activations cuts wrong answers from 56% to 29%, 8 points better than one instruction line (36%), while 80% of answerable questions are still answered.
+# Tiny Aya Global answers 97% of questions its passage cannot answer. A probe on its activations cuts wrong answers from 56% to 29% with no weight changes, 8 points better than one instruction line (36%); a LoRA fine-tune on the same 2,000 questions reaches 17%.
 
-**One-line claim:** on 1,000 official SQuAD 2.0 dev questions, half of them unanswerable from their passage, Tiny Aya Global answers 485 of the 500 unanswerable ones. A logistic-regression probe on its layer-20 activations, trained on the model's own errors, makes it abstain where it fires: wrong answers go 560 → 286 (505 → 248 as read by a closed judge), and 401 of the 500 answerable questions are still answered. One instruction line in the prompt, with no probe, already gets 560 → 364, about two thirds of that reduction; the probe is 7.8 points (95% CI over articles 3.89 to 11.9, p = 0.008) better than it, one wording against one probe. English only; one probe, one seed.
+**One-line claim:** on 1,000 official SQuAD 2.0 dev questions, half of them unanswerable from their passage, Tiny Aya Global answers 485 of the 500 unanswerable ones. A logistic-regression probe on its layer-20 activations, trained on the model's own errors, makes it abstain where it fires: wrong answers go 560 → 286 (505 → 248 as read by a closed judge), and 401 of the 500 answerable questions are still answered. One instruction line in the prompt, with no probe, already gets 560 → 364, about 70% of that reduction; the probe is 7.8 points (95% CI over articles 3.89 to 11.9, p = 0.008) better than it, one wording against one probe. A LoRA fine-tune on the probe's 2,000 training questions gets 560 → 174, 11.2 points (95% CI over articles 7.94 to 14.27) better than the probe gate, at the cost of a training run and changed weights. English only; one probe, one fine-tune, one seed each.
 
-| On 1,000 SQuAD 2.0 dev questions, 500 of them unanswerable | Wrong answers | Wrong answers as read by a closed judge | Unanswerable questions answered, of 500 | Answerable questions still answered, of 500 |
-|---|---|---|---|---|
-| Base model | 560 (56.0%) | 505 (50.5%) | 485 | 497 |
-| Abstaining on every question | 500 (50.0%) | 500 (50.0%) | 0 | 0 |
-| One instruction line in the prompt, no probe | 364 (36.4%) | 335 (33.5%) | 201 | 378 |
-| **Probe on the activations as the gate** | 286 (28.6%) | 248 (24.8%) | 140 | 401 |
-| Probe gate, else the instructed answer (exploratory) | 276 (27.6%) | 256 (25.6%) | 68 | 320 |
+| On 1,000 SQuAD 2.0 dev questions, 500 of them unanswerable | Wrong answers | Wrong answers as read by a closed judge | Unanswerable questions answered, of 500 | Answerable questions still answered, of 500 | Of them with a gold answer |
+|---|---|---|---|---|---|
+| Base model | 560 (56.0%) | 505 (50.5%) | 485 | 497 | 425 |
+| Abstaining on every question | 500 (50.0%) | 500 (50.0%) | 0 | 0 | 0 |
+| One instruction line in the prompt, no probe | 364 (36.4%) | 335 (33.5%) | 201 | 378 | 337 |
+| **Probe on the activations as the gate** | 286 (28.6%) | 248 (24.8%) | 140 | 401 | 354 |
+| Probe gate, else the instructed answer (exploratory) | 276 (27.6%) | 256 (25.6%) | 68 | 320 | 292 |
+| LoRA fine-tune on the probe's 2,000 training questions | 174 (17.4%) | 155 (15.5%) | 70 | 431 | 396 |
 
-*Wrong: an unanswerable question answered, or an answerable one answered incorrectly or abstained on. Word match is the rule set in advance; the judge's reading, the instruction line and the last row were added after the main result, and the last row is exploratory. Probe against base model: -27.4 points (95% CI over articles -32.3 to -22.8); probe against the instruction line: 7.8 points (95% CI over articles 3.89 to 11.9, p = 0.008) better.*
+*Wrong: an unanswerable question answered, or an answerable one answered incorrectly or abstained on. Word match is the rule set in advance; the judge's reading, the instruction line and the last two rows were added after the main result, and the row with the instructed answer is exploratory. Probe against base model: -27.4 points (95% CI over articles -32.3 to -22.8); probe against the instruction line: 7.8 points (95% CI over articles 3.89 to 11.9, p = 0.008) better. The fine-tune has fewer wrong answers than the probe gate (174 against 286; -11.2 points, 95% CI over articles -14.27 to -7.94; as the judge reads the answers 155 against 248, -9.3 points, 95% CI over articles -11.86 to -6.52) and keeps more answerable questions (431 against 401); it is the supervised reference: it costs a training run, changes the weights, was trained on labelled questions of the same dataset and format with the abstention sentence the word-match rule recognises, and is tested in distribution only. The probe leads here because it is the method the problem statement asks for, changes no weight and runs on a CPU. Labels used: the instruction line none; the probe the model's own errors on 2,000 train questions, its threshold set on train data; the fine-tune the gold answers of the same 2,000.*
 
 ## Tracks + problem statements covered
 
@@ -25,17 +26,19 @@ The side checks use red-teaming prompts, and the published datasets hold harmful
 ## Abstract
 
 - **The failure.** On 1,000 official SQuAD 2.0 dev questions, 500 of which their passage cannot answer, the base model answers 485 of those 500: an answer with no ground in the given text. It is wrong on 560 of 1,000.
-- **The probe.** A logistic regression on the layer-20 hidden state, trained on the model's own errors on 2,000 train questions and scored once. Abstaining where it fires takes wrong answers to 286 (-27.4 points, 95% CI over articles -32.3 to -22.8); 401 of 500 answerable questions are still answered. On a second sample of 1,000 questions, mostly on the same passages (838 of 1,000 shared): 575 → 315 (-26.0 points, 95% CI over articles -29.93 to -22.45).
-- **What a deployer would do first.** One instruction line in the prompt, with no probe, gets 560 → 364: about two thirds of the reduction for free. The probe is 7.8 points (95% CI over articles 3.89 to 11.9, p = 0.008) better, a better selector at about the same coverage: as the judge reads the answers the probe removes 344 hallucinations for 87 right answers lost, the instruction 282 for 112. Combining the two (exploratory) does not lower wrong answers beyond the probe alone.
+- **The probe.** A logistic regression on the layer-20 hidden state, trained on the model's own errors on 2,000 train questions and scored once. Abstaining where it fires takes wrong answers to 286 (-27.4 points, 95% CI over articles -32.3 to -22.8); 401 of 500 answerable questions are still answered. On a second sample of 1,000 questions, mostly on the same passages: 575 → 315 (-26.0 points, 95% CI over articles -29.93 to -22.45).
+- **What a deployer would do first.** One instruction line in the prompt, with no probe, gets 560 → 364: about 70% of the reduction for free. The probe is 7.8 points (95% CI over articles 3.89 to 11.9, p = 0.008) better. Combining the two (exploratory) does not lower wrong answers beyond the probe alone.
+- **What a fine-tune does.** A LoRA fine-tune on the probe's own 2,000 training questions is wrong on 174 of 1,000 (-11.2 points, 95% CI over articles -14.27 to -7.94 against the probe gate) and still answers 431 of 500 answerable questions: better than the probe on both counts. It costs a training run and changes the weights, and it was trained on questions of the same dataset and format, with the abstention sentence the scoring rule recognises; where the weights must stay fixed, the probe gate gets about 71% of the fine-tune's reduction (274 of 386 fewer wrong answers).
 - **Not a text cue, and more than output confidence.** AUC against the model's error: the probe 0.8246, passage length 0.4978, TF-IDF 0.5545; on the second sample the model's own output confidence 0.6951 at best, the probe 0.7853.
 - **Three kits in the result.** CuratorKIT gates the questions, AuditKIT generates the scored answers, CircuitKIT reads the same hidden states (same probe decision on 200 of 200 prompts) and finds the same layer. Served through a forward hook, the gate gives the offline gate's answers.
 - **What does not carry.** Probes trained on BBQ question pairs barely move SQuAD (560 → 502 and 549), and a fine-tune that removes the behaviour on pairs still answers 467 of the 500 unanswerable SQuAD questions and is wrong on 529 of 1,000.
-- **Limits.** English only; one probe, one seed, one prompt wording; the errors it flags are mostly answered unanswerable questions.
+- **Limits.** English only; one probe, one fine-tune, one seed each, one prompt wording; the errors it flags are mostly answered unanswerable questions.
 
 ## Headline before → after number
 
 - Wrong answers on 1,000 SQuAD 2.0 dev questions, base model → base model with the probe: 560 → 286 (56.0% → 28.6%; -27.4 points, 95% CI over articles -32.3 to -22.8; 35 of 35 articles better); as read by a closed judge 505 → 248 (-25.7 points, 95% CI over articles -30.63 to -21.15).
 - Against one instruction line in the prompt (364 wrong answers): the probe is 7.8 points (95% CI over articles 3.89 to 11.9, p = 0.008) better.
+- Against a LoRA fine-tune on the probe's 2,000 training questions (174 wrong answers): the fine-tune is 11.2 points (95% CI over articles 7.94 to 14.27) better than the probe gate.
 
 ## Base model + method in one line
 
@@ -43,13 +46,13 @@ Tiny Aya Global (3.35B); a logistic-regression probe (scikit-learn) on its layer
 
 ## For judges: one minute
 
-> **Question.** Does a probe on Tiny Aya Global's (3.35B) activations flag the answers it is about to get wrong, so that abstaining there leaves fewer wrong answers while it still answers most answerable questions, and does it beat what a prompt can do?
+> **Question.** Does a probe on Tiny Aya Global's (3.35B) activations flag the answers it is about to get wrong, so that abstaining there leaves fewer wrong answers while it still answers most answerable questions, does it beat what a prompt can do, and how far is it from a fine-tune on the same questions?
 >
-> **Answer in three numbers.** (1) Wrong answers on 1,000 SQuAD 2.0 dev questions: 560 → 286. (2) One instruction line in the prompt gets 364 for free; the probe is 7.8 points better than it. (3) Answerable questions still answered: 401 of 500.
+> **Answer in four numbers.** (1) Wrong answers on 1,000 SQuAD 2.0 dev questions: 560 → 286. (2) One instruction line in the prompt gets 364 for free; the probe is 7.8 points better than it. (3) Answerable questions still answered: 401 of 500. (4) A LoRA fine-tune on the probe's 2,000 training questions: 174 wrong, 431 of 500 still answered; it changes the weights.
 >
 > **Still open.** English only; one probe, one seed (a second sample of questions, mostly on the same passages, gives 575 → 315); one prompt wording, combined with the probe only as an exploratory computation; word-match scoring (a closed judge's labels give 505 → 248); the errors it flags are mostly answered unanswerable questions.
 >
-> **Cost.** A workstation CPU; no GPU job and no weight change.
+> **Cost.** The probe: a workstation CPU, no GPU job and no weight change. The fine-tune: one GPU training job.
 >
 > **Where to click.** [Results Space](https://huggingface.co/spaces/vincentnkq/tiny-aya-safety-map) (the main table, the probe beside two text-only scores, risk against coverage; no model runs); [notebook](https://github.com/vincentni/tiny-aya-safety-drift-map/blob/main/notebooks/reproduce_tables.ipynb) (recounts the main table from one row per question, no GPU).
 
@@ -66,7 +69,7 @@ The study answers one Track 2b problem statement, quoted as published:
 | "to flag likely hallucinations" | the label is the model's own error on each question: an unanswerable question answered, or an answerable one answered without a gold answer | finding 2 |
 | "so the model abstains or triggers retrieval when a probe fires" | it abstains: a question the probe fires on gets a fixed abstention. Served through a forward hook during generation, the gate gives the offline gate's answers on 100 of 100 dev prompts. Retrieval is not used | finding 3 |
 | "Show fewer wrong answers" | 560 → 286 of 1,000 on the dev sample, scored once | findings 1 and 2 |
-| "while it still answers most questions" | 401 of the 500 answerable questions (80.2%) are still answered; of all 1,000 it answers 541, and 500 of them should not be answered | finding 2 |
+| "while it still answers most questions" | 401 of the 500 answerable questions (80.2%) are still answered; it answers 541 of all 1,000 questions, 500 of which should not be answered | finding 2 |
 
 A hallucination here is an answer to a question the passage cannot answer: an answer with no ground in the given text. The questions are official SQuAD 2.0. Question pairs from BBQ and MBBQ, a second kind of unanswerable question, are secondary evidence (finding 4); their data, method, tables and the fine-tune's side checks on harmful requests are in the [question-pair page](question-pairs.md).
 
@@ -85,15 +88,7 @@ The use case is an assistant on a small multilingual model that answers question
 
 The design rules below were fixed in the experiment scripts before the first result. They are dated by local file times only, not by a third-party timestamp. The plan those scripts follow is a local file and is not among the public files.
 
-| What | File time, Nov 16, UTC |
-|---|---|
-| A smoke run of generation, hidden states and the served gate | 02:05 to 02:07 |
-| The experiment scripts and the list of evaluation sets | 02:08 to 02:12 |
-| The record of the SQuAD draw | 02:11 |
-| The first result of any experiment | 02:22 |
-| The main result scored | 03:52 |
-| The generation script and the scoring module, saved again after the run | 03:54 and 04:05; the copies as run are kept |
-| The plan as a file | saved after the main result, at 04:02 (its copy as run at 03:54); the time written inside it is self-declared |
+The file times are in [section N of the question-pair page](question-pairs.md#n-method-detail-of-the-write-ups-main-result).
 
 | Design rule | Outcome |
 |---|---|
@@ -105,7 +100,7 @@ The design rules below were fixed in the experiment scripts before the first res
 | The statistics: a percentile bootstrap over articles and an exact sign test over articles | as written |
 | One probe, scored once on the test questions | scored once |
 
-**Added after the main result was known**: the served check of the probe (03:55 UTC); then the judge's reading, the replication, the fine-tune on the test questions and the regeneration through AuditKIT (04:02 UTC); then the CuratorKIT gate, which drops no row; then two baselines, an instruction line in the prompt and the model's own confidence (06:23 UTC), a check of the hidden states through CircuitKIT, and an exploratory combination of the probe with the instruction line.
+**Added after the main result was known**: the served check of the probe; then the judge's reading, the replication, the fine-tune on the test questions and the regeneration through AuditKIT; then the CuratorKIT gate, which drops no row; then two baselines, an instruction line in the prompt and the model's own confidence, a check of the hidden states through CircuitKIT, an exploratory combination of the probe with the instruction line, the LoRA fine-tune on the probe's 2,000 training questions, and the GPU check of the base model's answers.
 
 **What a reader can check in the public files**: the fit record with the whole grid and the values chosen on dev, the frozen probe with the hash of its weights, the tables and the row files without text, and the package steps that fit and score again from stored inputs.
 
@@ -121,13 +116,7 @@ The design rules below were fixed in the experiment scripts before the first res
 
 ### Related work
 
-| Topic | Work | Relation to this study |
-|---|---|---|
-| Unanswerable questions | Rajpurkar et al., 2018 | SQuAD 2.0: questions written to look answerable, whose paragraph supports no answer, on which a system has to abstain; the source of the main test |
-| Selective answering | Kamath et al., 2020 | a calibrator trained to identify the inputs on which a question-answering model errs, so that it abstains there, reported as the share answered at a fixed accuracy; the gate here has that form, with the model's activations as input |
-| Probes on hidden states | Azaria and Mitchell, 2023; Slobodkin et al., 2023; Orgad et al., 2024 | a classifier on hidden activations can tell true statements from false ones; models encode whether a query is answerable while they hallucinate an answer; error detectors built on internal states fail to generalise across datasets, which finding 4 sees too |
-| Question pairs (secondary) | Parrish et al., 2022; Neplenbroek et al., 2024a | BBQ, the source of the English question pairs, and MBBQ, a curated extension of BBQ to Dutch, Spanish and Turkish, the source of the items in those languages |
-| Teaching a model to abstain | Zhang et al., 2023 | R-Tuning reports refusal as a skill that carries to other tasks; here abstention does not carry to SQuAD 2.0's unanswerable questions (finding 5) |
+The works this study builds on, one row each, are in [section N of the question-pair page](question-pairs.md#n-method-detail-of-the-write-ups-main-result).
 
 What this study adds to them: on a small multilingual model, a probe of the model's own errors on SQuAD 2.0 used as an abstention gate, with text-only baselines and a served check, and two negative results: probes and a fine-tune trained on one kind of unanswerable question do not carry to another, and on question pairs a token count nearly matches a probe.
 
@@ -200,6 +189,11 @@ The other rows of the kit tables above are secondary evidence (the question-pair
 |---|---|---|
 | `CohereLabs/tiny-aya-global` | base model | cc-by-nc-4.0 |
 | `vincentnkq/tiny-aya-global-attribution-lora` | adapter of the attribution fine-tune; trained for one behaviour, not a general safety fix | cc-by-nc-4.0 |
+| `vincentnkq/tiny-aya-global-squad-abstain-lora` | adapter of the fine-tune on the probe's 2,000 training questions, the comparison arm of the main result; a research artifact | cc-by-nc-4.0 |
+| `vincentnkq/tiny-aya-global-drift-lora` | adapter of the benign fine-tune with the same settings (side checks) | cc-by-nc-4.0 |
+| `vincentnkq/tiny-aya-global-drift-lora-nopre` | adapter of the overfit benign fine-tune (side checks; a research artifact) | cc-by-nc-4.0 |
+| `vincentnkq/tiny-aya-global-repaired-nopre` | the overfit fine-tune after weight interpolation (side checks) | cc-by-nc-4.0 |
+| `vincentnkq/tiny-aya-global-drift-GGUF` | the benign fine-tune as a q4_k_m file (side checks) | cc-by-nc-4.0 |
 | `claude-sonnet-5-5` | the closed model: reader of the SQuAD answers in the scoring check; in the secondary sections reader of open answers, judge of the side checks, translator and checker of the items in the question-pair page | closed, no weights |
 
 ### Base Aya model
@@ -330,16 +324,7 @@ No attack is involved: the rate that counts is how often an ordinary question th
 
 #### Outside the kits
 
-| Step | Setting |
-|---|---|
-| Hidden states and training answers | `driftmap.attribution.probe_generate`, plain transformers: `generate`, greedy, float32 on a CPU, served template, at most 48 new tokens; the same call keeps the hidden state at the last prompt token for layers 4, 8, ..., 36 |
-| SQuAD probe, `driftmap.attribution.probe_study squad-fit` | the package's `probe_fit.fit`: `StandardScaler` and an L2 `LogisticRegression` per layer and C (0.0001 to 1) on the fit rows; one picked with its threshold on dev by the rule fixed in advance; stored as plain arrays |
-| Text baselines | the passage's length in tokens, and TF-IDF of the prompt (word 1- and 2-grams), each with a logistic regression picked by the same rule |
-| Prompt-instruction baseline | the line "If the text does not give enough information to answer, say that it cannot be determined." before the closing line of the prompt, no probe; answers through AuditKIT's `evaluate`; one wording, fixed before the run; scored by word match and by the judge, who does not see the instruction |
-| Confidence baseline, `driftmap.attribution.probe_confidence` | one teacher-forced forward pass in plain transformers over each prompt of the second sample and its stored answer: the probability of the answer's first token, and the mean log-probability of its tokens. No threshold is fitted: a confidence gate abstains on its least confident answers until it answers as many questions as the probe's gate |
-| Served gate | a forward hook on block 20 reads the last prompt token during the prompt pass; where the probe fires a logits processor forces the abstention and then the end of the sequence |
-| SQuAD scoring, `driftmap.attribution.probe_study squad` | the package's wording rule (`driftmap.attribution.reading_scores`); percentile bootstrap over articles (10,000 resamples) and an exact sign test over articles |
-| Checks after the probe is frozen, `driftmap.attribution.probe_checks` | `served`: the answers of a run with the gate inside it against the gate computed afterwards, on every tenth test question of each half; `scored --part judge`: the table again under the verdicts `probe_judge` collects from the closed model, one call per answer; `identity`: two answer files of the same prompts, row for row. Nothing is fitted and no threshold is moved |
+The settings of the probe, its baselines, the served gate, the scoring and the checks are in [section N of the question-pair page](question-pairs.md#n-method-detail-of-the-write-ups-main-result).
 
 ### Seeds
 
@@ -372,6 +357,7 @@ Served template; the same 1,000 questions for every row. The table under the one
 | One instruction line in the prompt, no probe | 337 / 365 | 579 / 585 | 43.9% / 37.6% |
 | Probe on the activations as the gate | 354 / 390 | 541 / 541 | 34.9% / 27.9% |
 | Probe gate, else the instructed answer (exploratory) | 292 / 312 | 388 / 394 | 26.8% / 20.8% |
+| LoRA fine-tune on the probe's 2,000 training questions | 396 / 415 | 501 / 501 | 21.2% / 17.2% |
 
 ### Safety + general results side by side
 
@@ -429,14 +415,16 @@ The label is the model's own error on each of 2,000 train questions (1,240 wrong
 | TF-IDF of the prompt as the gate | first | 0.5545 | 500: it fires on every question | 0 |
 | One instruction line in the prompt, no probe | first | not a score | 364 | 378 |
 | Probe gate, else the instructed answer (exploratory) | first | not a score | 276 | 320 |
+| LoRA fine-tune on the probe's 2,000 training questions | first | not a score | 174 | 431 |
 | Base model, no gate | second | | 575 | 498 |
 | Probe on layer 20 as the gate | second | 0.7853 | 315 | 395 |
 | Mean log-probability of the answer as the gate, at the probe's coverage | second | 0.6951 | 411 | 339 |
 | Probability of the answer's first token as the gate, at the probe's coverage | second | 0.5578 | 488 | 305 |
+| LoRA fine-tune on the probe's 2,000 training questions | second | not a score | 188 | 424 |
 
 The probe's AUC is 0.3269 (95% CI 0.2779 to 0.3806) above passage length and 0.2701 (95% CI 0.2250 to 0.3205) above TF-IDF. The two text gates fire on every question, which is abstaining on everything: 500 wrong of 1,000.
 
-**One instruction line in the prompt gets about two thirds of the reduction, and the probe is moderately better.** With the line "If the text does not give enough information to answer, say that it cannot be determined." added to the prompt and no probe, the base model is wrong on 364 of the 1,000 questions (-19.6 points, 95% CI over articles -24.11 to -15.47; 196 of the 274 wrong answers the probe removes), 335 as the judge reads the answers. The probe's gate is ahead of it by 7.8 points (95% CI over articles 3.89 to 11.9, p = 0.008), and by 8.7 points (95% CI over articles 4.37 to 13.05, p = 0.043) for the judge. It is a better selector at about the same coverage: as the judge reads the answers the probe removes 344 hallucinations for 87 right answers lost, the instruction 282 for 112. One wording was fixed before the run and tried once.
+**One instruction line in the prompt gets about 70% of the reduction, and the probe is moderately better.** With the line "If the text does not give enough information to answer, say that it cannot be determined." added to the prompt and no probe, the base model is wrong on 364 of the 1,000 questions (-19.6 points, 95% CI over articles -24.11 to -15.47; 196 of the 274 wrong answers the probe removes), 335 as the judge reads the answers. The probe's gate is ahead of it by 7.8 points (95% CI over articles 3.89 to 11.9, p = 0.008), and by 8.7 points (95% CI over articles 4.37 to 13.05, p = 0.043) for the judge. One wording was fixed before the run and tried once.
 
 **Combining the two does not lower wrong answers further (exploratory).** A two-pass computation, added after the instruction's numbers were known: the probe's gate on the plain prompt, otherwise the instructed model's answer; the probe is not refitted and its threshold not moved. Wrong answers are 276 against the probe's 286 (-1.0 points, 95% CI over articles -3.57 to +1.54), and 256 against 248 for the judge (+0.8, -1.91 to +3.47): no difference. It is another operating point, 68 unanswerable questions answered and 326 of 500 answerable ones for the judge, so by the statement's criterion the probe alone is the better point. Whether the combination helps at equal coverage is not shown.
 
@@ -458,26 +446,22 @@ On 100 of the dev questions, every tenth of each half, the probe was served insi
 
 #### 4. What does not carry
 
-| Probe, scored on the SQuAD dev questions | AUC against the model's error | AUC against unanswerable | Fires on unanswerable | Fires on answerable | Wrong answers | Answerable still answered |
-|---|---|---|---|---|---|---|
-| Probe trained on SQuAD (finding 2) | 0.8246 | 0.8534 | 358 of 500 | 97 of 500 | 560 → 286 | 401 of 500 |
-| Answerability probe trained on BBQ pairs | 0.6292 | 0.6581 | 95 of 500 | 30 of 500 | 560 → 502 | 467 of 500 |
-| Error probe trained on BBQ pairs | 0.5212 | 0.5362 | 23 of 500 | 12 of 500 | 560 → 549 | 485 of 500 |
-
-**Probes trained on question pairs barely move SQuAD.** An answerability probe and an error probe trained on BBQ pairs leave 502 and 549 of 1,000 wrong.
-
-**On the pairs, a count of context tokens nearly matches the probe**: 41 and 194 wrong answers against the pair probe's 33 and 169, on BBQ's English test and on MBBQ in Spanish, Dutch and Turkish. Its transfer across languages is therefore not evidence of an internal signal; only padded texts separate the two (the question-pair page).
+Two probes and a fine-tune trained on BBQ question pairs barely move SQuAD (560 → 502 and 549 for the probes, 529 for the fine-tune), and on the pairs a count of context tokens nearly matches the pair probe. The table and the text are in [section N of the question-pair page](question-pairs.md#n-method-detail-of-the-write-ups-main-result).
 
 #### 5. What training buys
 
 A LoRA fine-tune on 1,412 English rows of question pairs ($0.49) removes the behaviour on pairs: a person is named in 358 → 8 of 600 MBBQ cases, and it beats the pair probe on every pair set (11 of 300 and 111 of 900 wrong; the question-pair page). It carries very little to SQuAD. On the same 1,000 test questions the fine-tune abstains on 33 of the 500 unanswerable ones (base model 15) and is wrong on 529, against the base model's 560 (-3.1 points, 95% CI over articles -4.81 to -1.47, p = 0.009). As the judge reads the answers it is 495 against 505, not distinguishable from no change (-1.0 points, 95% CI over articles -2.57 to +0.4, p = 0.648): the word-match gain comes mostly from the gold-answer rule, which misses fewer of the fine-tune's shorter answers. The gated base model is wrong on 286. The two methods are complementary by benchmark and neither transfers: the fine-tune wins on question pairs (11 wrong of 300 against the probe gate's 33), the probe on SQuAD.
 
-| On the 1,000 test questions | Base model | Base model + probe | Fine-tune on question pairs |
-|---|---|---|---|
-| Wrong answers | 560 | 286 | 529 |
-| Wrong answers as read by the judge | 505 | 248 | 495 |
-| Unanswerable questions answered, of 500 | 485 | 140 | 467 |
-| Answerable questions answered correctly, of 500 | 425 | 354 | 438 |
+**Training on the task's own questions is what makes the difference.** A second LoRA fine-tune is trained on the probe's own 2,000 training questions: the first gold answer for an answerable question, one fixed abstention sentence for an unanswerable one. On the 1,000 test questions it is wrong on 174 (-38.6 points, 95% CI over articles -42.92 to -34.34 against the base model; -11.2 points, 95% CI over articles -14.27 to -7.94 against the probe gate, 28 of 35 articles better and 4 worse; as the judge reads the answers 155 against 248, -9.3 points, 95% CI over articles -11.86 to -6.52). It answers 70 of the 500 unanswerable questions (probe gate 140) and 431 of the 500 answerable ones (401), 396 with a gold answer (354). On the second sample it is wrong on 188 against the probe gate's 315 (-12.7 points, 95% CI over articles -16.05 to -9.58). The fine-tune on question pairs is wrong on 529: the same method, trained on another kind of question.
+
+Three things qualify the comparison with the probe. The fine-tune costs a training run and changes the weights; the probe changes none and runs on a CPU. Its training questions come from the same dataset and format as the test, though from other articles. And it abstains with the one sentence it was trained on (499 of its 1,000 answers), which the scoring rule recognises. It is the supervised reference, tested in distribution only: it has no test on another kind of unanswerable question. The fine-tune's answers come from a GPU job and the base model's stored answers from a CPU run; the base model's answers from the same GPU job equal the stored ones on 871 of 1,000 questions of the first sample and 879 of 1,000 of the second (text, token count and stop reason); the error label differs on 3 rows of the first sample (base model 560 wrong answers stored, 559 on the job) and on 5 of the second (575 and 572). The tables keep the stored answers, whose hidden states the probe reads. The fine-tune's training rows, prompts and raw answers hold SQuAD text and are not republished: the public files carry ids, labels and scores only, and the questions are rebuilt from the official SQuAD 2.0 files by id. Where the weights must stay fixed, the probe gate gets about 71% of the fine-tune's reduction (274 of 386 fewer wrong answers).
+
+| On the 1,000 test questions | Base model | Base model + probe | Fine-tune on question pairs | Fine-tune on the probe's training questions |
+|---|---|---|---|---|
+| Wrong answers | 560 | 286 | 529 | 174 |
+| Wrong answers as read by the judge | 505 | 248 | 495 | 155 |
+| Unanswerable questions answered, of 500 | 485 | 140 | 467 | 70 |
+| Answerable questions answered correctly, of 500 | 425 | 354 | 438 | 396 |
 
 ### What didn't work (negative results)
 
@@ -501,13 +485,14 @@ The probe leaves the base model's weights as they are, at full precision, and no
 
 ### Compute used
 
-The main result needs no GPU: the 1,000 answers with their hidden states take 29 minutes on a workstation CPU (6 processes of 10 threads), the 2,000 training questions 55 minutes. Every GPU step of the secondary evidence is a Hugging Face Job on one L4 ($0.80 per hour) logged in a cost ledger.
+The probe result needs no GPU: generation, hidden states and fits run on a workstation CPU. The fine-tune comparison row is a GPU job. Every GPU step is a Hugging Face Job on one L4 ($0.80 per hour) logged in a cost ledger.
 
 | Stage | Jobs | Minutes | Cost |
 |---|---|---|---|
 | The probes: generation, activations and fits on a workstation CPU, no job | 0 | | $0 |
 | Attribution fine-tune, the comparison arm | 1 | 37 | $0.49 |
-| Total, ledger | 42 | 935 | $12.39 |
+| LoRA fine-tune on the probe's 2,000 training questions: training (59 minutes, $0.79), its answers (12, $0.16) and the base model's answers on the same GPU (11, $0.15) | 3 | 82 | $1.10 |
+| Total, ledger | 45 | 1,017 | $13.48 |
 
 The closed model's API cost is excluded.
 
@@ -530,6 +515,7 @@ The closed model's API cost is excluded.
 | What the probe detects | the model's errors on SQuAD are mostly answered unanswerable questions (485 of 560 by word match, 482 of 505 for the judge), so the probe is not shown to detect wrong answers to answerable questions; its AUC against "unanswerable" (0.8534) is above its AUC against the model's error (0.8246) |
 | Where the gate pays | only where more than 17.1% of the questions are unanswerable (20.2% by the judge's reading; finding 2); here half are, which also bounds coverage over all questions near 50% |
 | A prompt instruction is a strong baseline | one line in the prompt takes wrong answers to 364 with no probe; the probe's margin over it is 7.8 points (95% CI over articles 3.89 to 11.9, p = 0.008), one wording against one probe on 35 articles. The two are combined only as an exploratory two-pass computation; the probe was not read on the instructed prompt |
+| The fine-tune is a supervised reference, tested in distribution only | one training run and one seed; its training questions share the test's dataset and format, and it abstains with the sentence the word-match rule recognises; it has no test on another kind of unanswerable question, and the fine-tune on question pairs did not carry over (529 wrong). The fine-tune's answers come from a GPU job and the base model's stored answers from a CPU run; the base model's answers from the same GPU job equal the stored ones on 871 of 1,000 questions of the first sample and 879 of 1,000 of the second (text, token count and stop reason); the error label differs on 3 rows of the first sample (base model 560 wrong answers stored, 559 on the job) and on 5 of the second (575 and 572). The tables keep the stored answers, whose hidden states the probe reads. |
 | Two confidence scores out of many | the probability of the answer's first token and the mean log-probability of its tokens; no sampling-based or verbalised confidence was tried, and no threshold is fitted for them |
 | The CircuitKIT check | 200 of 1,000 prompts, taken by position; an environment of its own, outside the project's lock; the sweep's states were read by transformers |
 | Short passages | every passage is under 250 words |
@@ -572,8 +558,8 @@ https://huggingface.co/collections/vincentnkq/tiny-aya-safety-drift-map-data
 | Dataset | Holds |
 |---|---|
 | `vincentnkq/aya-redteaming-6lang-eval` | the question pairs (`choice/`: BBQ's English test and the translated items of the question-pair page; `mbbq/manifest.json`: the manifest of the MBBQ draw), the training rows (`sft_train_defense/`), the side-check prompts and every judge label |
-| `vincentnkq/safety-drift-map-responses` | the stored answers of every arm and checkpoint |
-| `vincentnkq/safety-drift-map-results` | the probe tables with their row files without text, under `tables/`: `probe-squad.json` (it carries the counts of the CuratorKIT gate), `probe-squad-judge.json`, `probe-squad-served.json`, `probe-squad-identity.json`, `probe-squad-replication.json`, `probe-squad-pooled.json`, `probe-squad-fine-tune.json`, `probe-squad-prompt.json`, `probe-squad-prompt-probe.json`, `probe-squad-confidence.json`, `probe-squad-circuitkit.json`, `probe-bbq.json`, `probe-baselines.json` and `probe-served.json`, each with a `.md`, and row files such as `probe-squad-answers-in-domain.jsonl`; the frozen probes (`probe.safetensors`, `probe.json`) with their fit records, under `probe/`; the choice tables (`tables/choice-defense.json`, `tables/choice-mbbq-defense.json`); the MBBQ items and answers by row id, without text (`mbbq/`); the checks (`checks/`); the tables of the side checks, run records and the cost ledger |
+| `vincentnkq/safety-drift-map-responses` | the stored answers to the harmful-request, benign and BBQ prompts of every arm and checkpoint; answers to SQuAD and MBBQ questions are not republished (ids, letters and labels only, in the tables) |
+| `vincentnkq/safety-drift-map-results` | the probe tables with their row files without text, under `tables/`: `probe-squad.json` (it carries the counts of the CuratorKIT gate), `probe-squad-judge.json`, `probe-squad-served.json`, `probe-squad-identity.json`, `probe-squad-replication.json`, `probe-squad-pooled.json`, `probe-squad-fine-tune.json`, `probe-squad-trained.json`, `probe-squad-trained-replication.json`, `probe-squad-job-identity.json`, `probe-squad-prompt.json`, `probe-squad-prompt-probe.json`, `probe-squad-confidence.json`, `probe-squad-circuitkit.json`, `probe-bbq.json`, `probe-baselines.json` and `probe-served.json`, each with a `.md`, and row files such as `probe-squad-answers-in-domain.jsonl`; the frozen probes (`probe.safetensors`, `probe.json`) with their fit records, under `probe/`; the choice tables (`tables/choice-defense.json`, `tables/choice-mbbq-defense.json`); the MBBQ items and answers by row id, without text (`mbbq/`); the checks (`checks/`); the tables of the side checks, run records and the cost ledger |
 
 ### HF models collection
 
@@ -624,12 +610,13 @@ None. Everything in the repo was written after Nov 1.
 ## Discussion / what we learned
 
 - **The model's activations predict its own errors where neither the text nor its output confidence does**: AUC 0.8246 against 0.4978 and 0.5545 for the text, 0.7853 against 0.6951 for confidence on the second sample.
-- **A gate on that probe about halves the wrong answers and keeps four in five answerable questions; one instruction line gets about two thirds of that for free.**
+- **A gate on that probe about halves the wrong answers and keeps four in five answerable questions; one instruction line gets about 70% of that for free.**
+- **A LoRA fine-tune on the same training questions does better than both** (174 wrong of 1,000, 431 of 500 answerable questions still answered), at the cost of a training run and changed weights.
 - **Trained on one kind of unanswerable question, neither a probe nor a fine-tune carries to another**, and on question pairs a token count nearly matches a probe.
 
 ### Implications
 
-1. **Use the instruction line first**: it is free and takes wrong answers from 56% to 36%. **Add the probe where 8 more points matter and a forward hook in the serving path is acceptable**: 29%, with 80% of answerable questions still answered. The probe has to be trained on questions of the target kind.
+1. **If you can fine-tune on questions of the target kind, do that**: 17% wrong answers against the probe gate's 29%, with 86% of answerable questions still answered. **If the weights must stay fixed** (a served base model, no training budget), **use the instruction line first**: it is free and takes wrong answers from 56% to 36%. **Add the probe where 8 more points matter and a forward hook in the serving path is acceptable**: 29%, about 71% of the fine-tune's reduction (274 of 386 fewer wrong answers), with 80% of answerable questions still answered. The probe, like the fine-tune, has to be trained on questions of the target kind.
 2. **Put a text-only baseline beside every probe result**: on question pairs a count of tokens did nearly as well as the probe, and on SQuAD it did nothing.
 
 ### Future work
@@ -678,34 +665,8 @@ The prompts of the question pairs, the safety patch and the rubric of the side c
 
 #### Appendix A. The SQuAD probe: choice on dev, and the scoring rules against the judge
 
-Dev AUC against the model's error per layer, over the five values of C, and of CircuitKIT's linear probe on the same states and split; the selection rule picks layer 20 and C 0.001. The dev rows are 401 questions of 89 articles the fit never saw.
-
-| Layer (of 36) | Dev AUC, lowest to highest over C | Dev AUC, CircuitKIT's linear probe |
-|---|---|---|
-| 4 | 0.567 to 0.628 | 0.577 |
-| 8 | 0.557 to 0.656 | 0.663 |
-| 12 | 0.620 to 0.706 | 0.695 |
-| 16 | 0.733 to 0.789 | 0.786 |
-| 20 | 0.766 to 0.817 | 0.815 |
-| 24 | 0.747 to 0.778 | 0.765 |
-| 28 | 0.699 to 0.757 | 0.741 |
-| 32 | 0.681 to 0.738 | 0.726 |
-| 36 | 0.680 to 0.737 | 0.731 |
-
-The word-match rules against the closed judge on the 1,000 base answers. The judge sees the passage, the question, the reference answers or the word UNANSWERABLE, and the answer; not the model, the word-match labels or the probe.
-
-| Rule | Agrees with the judge | Rule yes, judge no | Rule no, judge yes | Cohen's kappa |
-|---|---|---|---|---|
-| The answer abstains | 992 of 1,000 | 4 | 4 | 0.77 |
-| The answer holds a gold answer (answerable questions) | 442 of 500 | 3 | 55 | 0.36 |
-| The answer is wrong | 937 of 1,000 | 59 | 4 | 0.87 |
-
+The dev AUC of every layer, beside CircuitKIT's linear probe, and the agreement of the word-match rules with the judge are in [section N of the question-pair page](question-pairs.md#n-method-detail-of-the-write-ups-main-result).
 
 ## Security considerations
 
-| Surface | Measure |
-|---|---|
-| The closed model reads untrusted text | answers are quoted between tags with a random marker per call, and its prompt says they are data, never instructions |
-| Job code and inputs | a job installs the code from a pinned commit; source datasets and the base model are pinned by revision |
-| Credentials | read from the environment only; a scan refuses to publish a commit that holds a token, an address or a home path |
-| The results page | static files, no model, no user input sent anywhere |
+Untrusted text is quoted as data to the closed model, jobs run pinned code, credentials stay in the environment and the results page is static; one row each in [section N of the question-pair page](question-pairs.md#n-method-detail-of-the-write-ups-main-result).

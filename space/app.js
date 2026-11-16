@@ -106,7 +106,7 @@
         `. Abstaining on every question gives ${probed.always_abstain}.`);
       if (probed.instructed) {
         put(cards, `${probed.instructed.counts.wrong} with one instruction line`,
-          `in the prompt and no probe: about two thirds of the reduction for free. The probe is ` +
+          `in the prompt and no probe: about 70% of the reduction for free. The probe is ` +
           `${(100 * probed.instructed.behind_the_gate.delta).toFixed(1)} points better than it.`);
       } else {
         put(cards, `${probed.base.hallucinations} → ${probed.gated.hallucinations}`,
@@ -479,9 +479,9 @@
     const answerable = found.questions - found.unanswerable;
     const always = { wrong: found.always_abstain, answered: 0, wrong_answered: 0, hallucinations: 0, kept: 0, correct: 0 };
     const systems = [['Base model', found.base]];
-    if (found.instructed) systems.push(['One instruction line, no probe', found.instructed.counts]);
-    systems.push(['Base model + probe', found.gated]);
-    if (found.combined) systems.push(['Probe gate, else the instructed answer (exploratory)', found.combined.counts]);
+    if (found.instructed) systems.push(['One instruction line in the prompt, no probe', found.instructed.counts]);
+    systems.push(['Probe on the activations as the gate', found.gated]);
+    if (found.trained) systems.push(['LoRA fine-tune on the probe\'s 2,000 training questions', found.trained.counts]);
     systems.push(['Abstaining on every question', always]);
     const rows = [
       ['Wrong answers', (counts) => counted(counts.wrong, found.questions)],
@@ -523,7 +523,7 @@
         `${found.instructed.counts.wrong} (${found.instructed.judge_wrong} as a closed judge reads the answers); the probe is ` +
         `${exact(behind.delta).slice(1)} points better (95% interval over ${behind.articles} articles ${exact(behind.ci[0]).slice(1)} to ` +
         `${exact(behind.ci[1]).slice(1)}; ${pValue(behind.p)}).` +
-        (found.combined ? ' The gate with the instructed answer where it does not fire is an exploratory computation, added after the other columns.' : '');
+        (found.combined ? ` The gate with the instructed answer where it does not fire, an exploratory computation, gives ${found.combined.counts.wrong}.` : '');
     }
     if (found.samples.length) {
       const first = { id: 'first', questions: found.questions, base: found.base, gated: found.gated, change: found.change,
@@ -566,23 +566,32 @@
     const notes = [];
     const system = (name, sample, counts, judged, auc) => beside.push([name, sample, `${counts.wrong}`,
       judged === null ? 'not read' : `${judged}`, `${counts.hallucinations}`, `${counts.kept}`, auc === null ? '' : auc.toFixed(4)]);
-    if (found.instructed || found.fine_tuned) {
+    if (found.instructed || found.fine_tuned || found.trained) {
       system('Base model', 'first', found.base, found.judge ? found.judge.base.wrong : null, null);
-      system('Base model + probe', 'first', found.gated, found.judge ? found.judge.gated.wrong : null, found.scores[0].auc_error);
+      system('Probe on the activations as the gate', 'first', found.gated, found.judge ? found.judge.gated.wrong : null, found.scores[0].auc_error);
       if (found.instructed) system('One instruction line in the prompt, no probe', 'first', found.instructed.counts, found.instructed.judge_wrong, null);
       if (found.fine_tuned) {
         const tuned = found.fine_tuned;
         system('Fine-tune on question pairs, no probe', 'first', tuned.counts, tuned.judge_wrong, null);
         const stated = (change) => `${exact(change.delta)} points (95% interval ${exact(change.ci[0])} to ${exact(change.ci[1])})`;
-        notes.push(`The fine-tune's change in wrong answers from the base model is ${stated(tuned.from_base.word_match)} by word match and ` +
+        notes.push(`The fine-tune on question pairs changes wrong answers from the base model by ${stated(tuned.from_base.word_match)} by word match and ` +
           `${stated(tuned.from_base.judge)} as the judge reads the answers` +
           (tuned.from_base.judge.ci[0] < 0 && tuned.from_base.judge.ci[1] > 0 ? ', an interval that includes no change.' : '.'));
+      }
+      if (found.trained) {
+        const behind = found.trained.behind_the_gate;
+        system('LoRA fine-tune on the probe\'s 2,000 training questions', 'first', found.trained.counts, found.trained.judge_wrong, null);
+        notes.push(`The fine-tune on the probe's training questions has fewer wrong answers than the probe's gate: ` +
+          `${exact(behind.delta)} points (95% interval over ${behind.articles} articles ${exact(behind.ci[0])} to ${exact(behind.ci[1])}). ` +
+          'It costs a training run and changes the weights, and it was trained on questions of the same dataset and format, with the ' +
+          'abstention sentence the scoring rule recognises; the probe changes no weight.' +
+          (found.trained.judge_wrong === null ? ' Its answers are scored by word match only.' : ''));
       }
     }
     if (found.confidence) {
       const sure = found.confidence;
       system('Base model', 'second', sure.base.counts, sure.base.judge_wrong, null);
-      system('Base model + probe', 'second', sure.gated.counts, sure.gated.judge_wrong, sure.gated.auc_error);
+      system('Probe on the activations as the gate', 'second', sure.gated.counts, sure.gated.judge_wrong, sure.gated.auc_error);
       for (const score of sure.scores) system(CONFIDENCE_NAMES[score.id], 'second', score.counts, score.judge_wrong, score.auc_error);
       notes.push('On the second sample the probe\'s AUC against the model\'s error is ' + sure.scores.map((score) =>
         `${score.probe_ahead.difference.toFixed(4)} above ${CONFIDENCE_TEXT[score.id]} (95% interval ` +

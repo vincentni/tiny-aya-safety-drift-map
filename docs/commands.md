@@ -232,6 +232,31 @@ uv run python -I -m driftmap.attribution.probe_checks fine-tune --dev OUT/squad_
 by the same judge, and set beside the base model and the base model gated by the frozen probe, by the word-match
 rules and by the judge's labels (`probe-squad-fine-tune.json`). Nothing is trained in this step.
 
+A LoRA fine-tune on the probe's own training questions, on the same test questions:
+
+```bash
+uv run python -I -m driftmap.attribution.squad_train --train OUT/squad_train_in.jsonl --passed CURATED/squad_passed.json --benign DATA/sft_train_defense --out DATA
+uv run python -I -m driftmap.attribution.squad_prompts --split train=OUT/squad_train_in.jsonl --split dev=OUT/squad_dev_in.jsonl --split dev2=OUT/squad_dev2_in.jsonl --passed CURATED/squad_passed.json --out DATA
+uv run driftmap launch drift --mode full --wait -- --train-set squad --train-rev COMMIT --epochs 3
+uv run driftmap launch generate --mode full --wait -- --kind drifted --checkpoint REPO@SHA --sets squad --sets-rev COMMIT --max-new-tokens 48
+uv run driftmap launch generate --mode full --wait -- --kind base --sets squad --sets-rev COMMIT --max-new-tokens 48
+uv run python -m driftmap.attribution.probe_judge --input OUT/squad_dev_in.jsonl --answers TUNED/benign/dev.jsonl --cache JUDGE/score_cache.jsonl --out JUDGE/trained_dev_verdicts.jsonl
+uv run python -I -m driftmap.attribution.probe_checks fine-tune --part trained --dev OUT/squad_dev_in.jsonl --dev-answers OUT/squad_dev_base.jsonl --dev-states OUT/acts/squad_dev --tuned-answers TUNED/benign/dev.jsonl --verdicts JUDGE/dev_verdicts.jsonl --tuned-verdicts JUDGE/trained_dev_verdicts.jsonl --passed CURATED/squad_passed.json --probe OUT/probe_squad --out RESULTS
+uv run python -I -m driftmap.attribution.probe_checks fine-tune --part trained-replication --dev OUT/squad_dev2_in.jsonl --dev-answers OUT/squad_dev2_base.jsonl --dev-states OUT/acts/squad_dev2 --tuned-answers TUNED/benign/dev2.jsonl --verdicts JUDGE/dev2_verdicts.jsonl --tuned-verdicts JUDGE/trained_dev2_verdicts.jsonl --passed CURATED/squad_passed.json --probe OUT/probe_squad --out RESULTS
+uv run python -I -m driftmap.attribution.probe_checks job-identity --name dev --asked OUT/squad_dev_in.jsonl --stored OUT/squad_dev_base.jsonl --job BASE/benign/dev.jsonl --name dev2 --asked OUT/squad_dev2_in.jsonl --stored OUT/squad_dev2_base.jsonl --job BASE/benign/dev2.jsonl --passed CURATED/squad_passed.json --out RESULTS
+```
+
+`squad_train` writes the training set `squad`: each gated train question with its first gold answer, or one fixed
+abstention sentence where the passage cannot answer it, and the benign rows of the training set under `--benign`.
+`squad_prompts` writes the questions of the three samples as the prompt group `squad`. Both hold SQuAD text and
+belong in the working copy of the dataset only. `COMMIT` is the dataset commit that holds them, `REPO@SHA` the
+merged fine-tune, `TUNED` and `BASE` the folders of the answers the two generate jobs gave. `probe_judge` reads
+the fine-tune's answers of each sample (the second with `dev2` in place of `dev`), and `fine-tune --part trained`
+sets them beside the base model and the gated base model by word match and by the judge
+(`probe-squad-trained.json`, `probe-squad-trained-replication.json`). `job-identity` compares the base model's
+answers from the GPU job with the stored ones row for row (`probe-squad-job-identity.json`). The training rows,
+the prompts and the raw answers hold SQuAD text and are not republished.
+
 One instruction line in the prompt, with no probe, on the same test questions:
 
 ```bash

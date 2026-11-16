@@ -1,6 +1,6 @@
 # Question pairs and the fine-tune: detail page
 
-Detail for the [write-up](article.md), whose main result is a probe on SQuAD 2.0. This page holds the secondary evidence: who-did-it question pairs from BBQ and MBBQ, the probe fitted on them (here "the probe" or "the pair probe"), the attribution fine-tune, and that fine-tune's side checks on harmful requests. None of it is claimed against a problem statement. Section M holds two pieces of detail of the main result: the judge's instruction and the gate at each threshold.
+Detail for the [write-up](article.md), whose main result is a probe on SQuAD 2.0. This page holds the secondary evidence: who-did-it question pairs from BBQ and MBBQ, the probe fitted on them (here "the probe" or "the pair probe"), the attribution fine-tune, and that fine-tune's side checks on harmful requests. None of it is claimed against a problem statement. Sections M and N hold detail of the main result: the judge's instruction, the gate at each threshold, and method tables.
 
 ## Datasets of this evidence: why each one, how it was built
 
@@ -748,6 +748,90 @@ The gated model on the 1,000 dev questions at each threshold of the grid; 0.7 is
 | 0.85 | 74.2% | 44.7% | 35.4% | 95.2% | 266 |
 | 0.90 | 80.2% | 48.1% | 39.7% | 97.4% | 315 |
 | 0.95 | 89.7% | 53.1% | 47.8% | 99.0% | 402 |
+
+## N. Method detail of the write-up's main result
+
+Blocks of the write-up's method and results, in full; the works named are in the write-up's reference list.
+
+### Steps outside the kits
+
+| Step | Setting |
+|---|---|
+| Hidden states and training answers | `driftmap.attribution.probe_generate`, plain transformers: `generate`, greedy, float32 on a CPU, served template, at most 48 new tokens; the same call keeps the hidden state at the last prompt token for layers 4, 8, ..., 36 |
+| SQuAD probe, `driftmap.attribution.probe_study squad-fit` | the package's `probe_fit.fit`: `StandardScaler` and an L2 `LogisticRegression` per layer and C (0.0001 to 1) on the fit rows; one picked with its threshold on dev by the rule fixed in advance; stored as plain arrays |
+| Text baselines | the passage's length in tokens, and TF-IDF of the prompt (word 1- and 2-grams), each with a logistic regression picked by the same rule |
+| Prompt-instruction baseline | the line "If the text does not give enough information to answer, say that it cannot be determined." before the closing line of the prompt, no probe; answers through AuditKIT's `evaluate`; one wording, fixed before the run; scored by word match and by the judge, who does not see the instruction |
+| Confidence baseline, `driftmap.attribution.probe_confidence` | one teacher-forced forward pass in plain transformers over each prompt of the second sample and its stored answer: the probability of the answer's first token, and the mean log-probability of its tokens. No threshold is fitted: a confidence gate abstains on its least confident answers until it answers as many questions as the probe's gate |
+| Served gate | a forward hook on block 20 reads the last prompt token during the prompt pass; where the probe fires a logits processor forces the abstention and then the end of the sequence |
+| SQuAD scoring, `driftmap.attribution.probe_study squad` | the package's wording rule (`driftmap.attribution.reading_scores`); percentile bootstrap over articles (10,000 resamples) and an exact sign test over articles |
+| Checks after the probe is frozen, `driftmap.attribution.probe_checks` | `served`: the answers of a run with the gate inside it against the gate computed afterwards, on every tenth test question of each half; `scored --part judge`: the table again under the verdicts `probe_judge` collects from the closed model, one call per answer; `identity`: two answer files of the same prompts, row for row. Nothing is fitted and no threshold is moved |
+
+### File times of the design rules
+
+| What | File time, Nov 16, UTC |
+|---|---|
+| A smoke run of generation, hidden states and the served gate | 02:05 to 02:07 |
+| The experiment scripts and the list of evaluation sets | 02:08 to 02:12 |
+| The record of the SQuAD draw | 02:11 |
+| The first result of any experiment | 02:22 |
+| The main result scored | 03:52 |
+| The generation script and the scoring module, saved again after the run | 03:54 and 04:05; the copies as run are kept |
+| The plan as a file | saved after the main result, at 04:02 (its copy as run at 03:54); the time written inside it is self-declared |
+
+### Related work
+
+| Topic | Work | Relation to this study |
+|---|---|---|
+| Unanswerable questions | Rajpurkar et al., 2018 | SQuAD 2.0: questions written to look answerable, whose paragraph supports no answer, on which a system has to abstain; the source of the main test |
+| Selective answering | Kamath et al., 2020 | a calibrator trained to identify the inputs on which a question-answering model errs, so that it abstains there, reported as the share answered at a fixed accuracy; the gate here has that form, with the model's activations as input |
+| Probes on hidden states | Azaria and Mitchell, 2023; Slobodkin et al., 2023; Orgad et al., 2024 | a classifier on hidden activations can tell true statements from false ones; models encode whether a query is answerable while they hallucinate an answer; error detectors built on internal states fail to generalise across datasets, which finding 4 sees too |
+| Question pairs (secondary) | Parrish et al., 2022; Neplenbroek et al., 2024a | BBQ, the source of the English question pairs, and MBBQ, a curated extension of BBQ to Dutch, Spanish and Turkish, the source of the items in those languages |
+| Teaching a model to abstain | Zhang et al., 2023 | R-Tuning reports refusal as a skill that carries to other tasks; here abstention does not carry to SQuAD 2.0's unanswerable questions (finding 5) |
+
+### Security considerations
+
+| Surface | Measure |
+|---|---|
+| The closed model reads untrusted text | answers are quoted between tags with a random marker per call, and its prompt says they are data, never instructions |
+| Job code and inputs | a job installs the code from a pinned commit; source datasets and the base model are pinned by revision |
+| Credentials | read from the environment only; a scan refuses to publish a commit that holds a token, an address or a home path |
+| The results page | static files, no model, no user input sent anywhere |
+
+### What does not carry: probes fitted on question pairs
+
+| Probe, scored on the SQuAD dev questions | AUC against the model's error | AUC against unanswerable | Fires on unanswerable | Fires on answerable | Wrong answers | Answerable still answered |
+|---|---|---|---|---|---|---|
+| Probe trained on SQuAD (finding 2) | 0.8246 | 0.8534 | 358 of 500 | 97 of 500 | 560 → 286 | 401 of 500 |
+| Answerability probe trained on BBQ pairs | 0.6292 | 0.6581 | 95 of 500 | 30 of 500 | 560 → 502 | 467 of 500 |
+| Error probe trained on BBQ pairs | 0.5212 | 0.5362 | 23 of 500 | 12 of 500 | 560 → 549 | 485 of 500 |
+
+**Probes trained on question pairs barely move SQuAD.** An answerability probe and an error probe trained on BBQ pairs leave 502 and 549 of 1,000 wrong.
+
+**On the pairs, a count of context tokens nearly matches the probe**: 41 and 194 wrong answers against the pair probe's 33 and 169, on BBQ's English test and on MBBQ in Spanish, Dutch and Turkish. Its transfer across languages is therefore not evidence of an internal signal; only padded texts separate the two (the question-pair page).
+
+### Choice on dev by layer, and the scoring rules against the judge
+
+Dev AUC against the model's error per layer, over the five values of C, and of CircuitKIT's linear probe on the same states and split; the selection rule picks layer 20 and C 0.001. The dev rows are 401 questions of 89 articles the fit never saw.
+
+| Layer (of 36) | Dev AUC, lowest to highest over C | Dev AUC, CircuitKIT's linear probe |
+|---|---|---|
+| 4 | 0.567 to 0.628 | 0.577 |
+| 8 | 0.557 to 0.656 | 0.663 |
+| 12 | 0.620 to 0.706 | 0.695 |
+| 16 | 0.733 to 0.789 | 0.786 |
+| 20 | 0.766 to 0.817 | 0.815 |
+| 24 | 0.747 to 0.778 | 0.765 |
+| 28 | 0.699 to 0.757 | 0.741 |
+| 32 | 0.681 to 0.738 | 0.726 |
+| 36 | 0.680 to 0.737 | 0.731 |
+
+The word-match rules against the closed judge on the 1,000 base answers. The judge sees the passage, the question, the reference answers or the word UNANSWERABLE, and the answer; not the model, the word-match labels or the probe.
+
+| Rule | Agrees with the judge | Rule yes, judge no | Rule no, judge yes | Cohen's kappa |
+|---|---|---|---|---|
+| The answer abstains | 992 of 1,000 | 4 | 4 | 0.77 |
+| The answer holds a gold answer (answerable questions) | 442 of 500 | 3 | 55 | 0.36 |
+| The answer is wrong | 937 of 1,000 | 59 | 4 | 0.87 |
 
 ## References
 

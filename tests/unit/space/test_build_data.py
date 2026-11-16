@@ -971,6 +971,29 @@ def test_without_their_tables_there_is_no_instruction_line_no_combination_no_fin
     found = build_data.probe(probe_checks_dir)
 
     assert (found["instructed"], found["combined"], found["fine_tuned"], found["confidence"]) == (None, None, None, None)
+    assert found["trained"] is None
+
+
+def test_a_fine_tune_trained_on_the_probes_own_questions_is_read_from_its_own_table(probe_checks_dir):
+    tuned = _probe_counts(wrong=6, answered=12, wrong_answered=3, hallucinations=2, kept=9, correct=8)
+    (probe_checks_dir / "tables" / "probe-squad-trained.json").write_text(json.dumps(_arm_table("fine_tuned", tuned, tuned, -0.05)), encoding="utf-8")
+
+    found = build_data.probe(probe_checks_dir)
+
+    assert (found["trained"]["counts"]["wrong"], found["trained"]["judge_wrong"], found["trained"]["behind_the_gate"]["delta"]) == (6, 6, -0.05)
+    assert found["fine_tuned"] is None
+
+
+def test_a_fine_tune_table_without_the_judges_reading_gives_word_match_figures_only(probe_checks_dir):
+    tuned = _probe_counts(wrong=6, answered=12, wrong_answered=3, hallucinations=2, kept=9, correct=8)
+    table = _arm_table("fine_tuned", tuned, tuned, -0.05)
+    del table["judge"]
+    (probe_checks_dir / "tables" / "probe-squad-trained.json").write_text(json.dumps(table), encoding="utf-8")
+
+    found = build_data.probe(probe_checks_dir)["trained"]
+
+    assert found["counts"]["wrong"] == 6 and found["judge_wrong"] is None
+    assert list(found["from_base"]) == ["word_match"]
 
 
 def test_a_fine_tune_stands_beside_the_gate_with_its_change_from_the_base_model_by_both_readings(probe_checks_dir):

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Tiny Aya Global: a probe on its activations as an abstention gate</title>
+<title>Tiny Aya abstains where a probe fires</title>
 <style>
   :root { --ink: #1c2330; --soft: #5b6472; --line: #d9dee6; --band: #f4f6f9; --harm: #b3261e; --link: #2a5db0; }
   * { box-sizing: border-box; }
@@ -69,12 +69,12 @@
   <p class="warning"><strong>Content warning.</strong> The study uses red-teaming prompts. The tables and figures
     show counts only. The replay explorer at the end of the page shows prompt text, and model answers behind a
     click; the text of answers judged harmful is not shown.</p>
-  <h1>Tiny Aya Global answers most questions its passage cannot answer. A probe on its activations makes it
-    abstain there.</h1>
+  <h1>Tiny Aya abstains where a probe fires</h1>
   <p class="lead">Tiny Aya Global (3.35B) is asked questions about passages, half of which the passage cannot
     answer (SQuAD 2.0). A probe on its layer-20 hidden state, trained on the model's own errors, flags the answers
     it is about to get wrong; the model abstains where the probe fires and answers as before elsewhere. No weight
-    changes. One instruction line in the prompt, with no probe, is the baseline it is set beside. Question pairs from BBQ and MBBQ, further down, are secondary evidence.
+    changes. One instruction line in the prompt, with no probe, and a LoRA fine-tune on the probe's own training
+    questions are set beside it. Question pairs from BBQ and MBBQ, further down, are secondary evidence.
     <a href="https://github.com/vincentni/tiny-aya-safety-drift-map">Code and write-up</a>.</p>
   <p class="notice" id="unavailable" hidden></p>
 
@@ -120,7 +120,8 @@
     <div id="probe-beside" hidden>
       <h3>The probe beside other ways to abstain</h3>
       <p>One row per system, on the questions of the sample named. The instruction line is one sentence in the
-        prompt. The fine-tune was trained to abstain on who-did-it question pairs, not on SQuAD. A confidence gate
+        prompt. One fine-tune was trained to abstain on who-did-it question pairs, not on SQuAD; the other, a LoRA
+        fine-tune, on the probe's own 2,000 training questions. A confidence gate
         abstains on the model's least confident answers until it answers as many questions as the probe's gate; no
         threshold is fitted for it.</p>
       <div class="scroll">

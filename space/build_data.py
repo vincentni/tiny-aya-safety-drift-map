@@ -92,6 +92,7 @@ PROBE_SAMPLES = ("replication", "pooled")
 # one more system beside the gate: table part and the name its counts carry there. An instruction line in the
 # prompt with no probe, and the gate with the instructed answer where it does not fire
 PROBE_ARMS = {"instructed": ("prompt", "instructed"), "combined": ("prompt-probe", "probe_plus_instruction"), "fine_tuned": ("fine-tune", "fine_tuned")}
+PROBE_ARMS |= {"trained": ("trained", "fine_tuned")}
 PROBE_CONFIDENCE = "tables/probe-squad-confidence.json"
 PROBE_CONFIDENT = ("mean_log_probability", "first_token_probability")
 PROBE_COUNTS = {"wrong": "wrong_answers", "answered": "answered", "wrong_answered": "wrong_among_answered"}
@@ -495,7 +496,8 @@ def _beside(tables_dir: Path) -> dict:
     ones generated again through AuditKIT. ``samples`` lists the frozen probe on a second sample of questions and on
     both samples together, for the tables that exist. ``instructed`` is the base model with one instruction line in
     its prompt and no probe, ``combined`` the gate with the instructed answer where it does not fire, ``fine_tuned``
-    a fine-tune with no probe: the counts of each, its wrong answers under the judge's labels, how far its
+    a fine-tune on question pairs with no probe, ``trained`` one on the probe's own training questions (a table may
+    come before the judge has read its answers: no judge figures then): the counts of each, its wrong answers under the judge's labels, how far its
     wrong-answer rate lies above the gate's, and its change from the base model by both readings. ``confidence``
     is what ``_confidence`` reads."""
     read = {name: _place(tables_dir, file) for name, file in (("judge", PROBE_JUDGE), ("served", PROBE_SERVED), ("identity", PROBE_IDENTITY))}
@@ -542,10 +544,10 @@ def _beside(tables_dir: Path) -> dict:
         if path is not None:
             table = json.loads(path.read_text(encoding="utf-8"))
             behind = table["word_match"][f"base_plus_squad_probe_to_{name}_wrong_answers"]
-            moved = {reading: table[reading][f"base_to_{name}_wrong_answers"] for reading in ("word_match", "judge")}
+            moved = {reading: table[reading][f"base_to_{name}_wrong_answers"] for reading in ("word_match", "judge") if reading in table}
             arms[key] = {
                 "counts": {short: table["word_match"][name][field] for short, field in PROBE_COUNTS.items()},
-                "judge_wrong": table["judge"][name]["wrong_answers"],
+                "judge_wrong": table["judge"][name]["wrong_answers"] if "judge" in table else None,
                 "behind_the_gate": {"delta": behind["change"], "ci": behind["ci95"], "articles": behind["articles"], "p": behind["sign_test_p"]},
                 "from_base": {reading: {"delta": change["change"], "ci": change["ci95"], "p": change["sign_test_p"]} for reading, change in moved.items()},
             }
