@@ -1,0 +1,305 @@
+# Commands reference
+
+The commands behind the results of the [write-up](article.md). `driftmap` is the pipeline behind the numbers: it builds the evaluation set, generates and judges the
+answers of a checkpoint, fine-tunes, and builds the tables. Jobs run on Hugging Face Jobs. Every
+dataset, model and result lives on the Hub under the owner named in `driftmap.toml`; local state is
+in `.run-local/`, which is not tracked.
+
+The package also holds the code of a separate question-pair study (`driftmap.attribution`,
+`table choice`, `--sets choice` of the generate job and `--train-set` of the drift job). No
+result of the write-up uses it, and its commands are not listed here.
+
+## Setup
+
+Needs Python 3.12 and [uv](https://docs.astral.sh/uv/).
+
+```bash
+uv python install 3.12 && uv sync --frozen
+uv run pytest -q -m "not smoke"
+```
+
+The tests are offline. Commands that reach the Hub read `HF_TOKEN`, or the token stored by
+`hf auth login`, and expect it to belong to the owner.
+
+## Commands
+
+The groups follow the order of a run. The judge commands come after each generate run.
+
+`--mode` is `smoke` by default for `plan`, `launch`, `judge closed` and `repair choose`: a short
+rehearsal on a few rows. Arguments after `--` go to the job script. Every command has `--help`.
+
+Setup and data:
+
+```bash
+uv run driftmap ready --pin                  # pin the source revisions, run the readiness checks
+uv run driftmap data build --dry-run         # build the evaluation set locally, print the counts
+uv run driftmap data build                   # upload it and pin the commit
+```
+
+Base model:
+
+```bash
+uv run driftmap plan generate                # the job, its cost at timeout, every guard verdict
+uv run driftmap launch generate --wait -- --kind baseline            # smoke run first
+uv run driftmap launch generate --mode full --wait -- --kind baseline
+```
+
+Fine-tune:
+
+```bash
+uv run driftmap launch drift --wait          # the smoke fine-tune
+uv run driftmap launch drift --mode full -- --epochs 3               # the light recipe: three passes
+uv run driftmap launch drift --mode full -- --preamble strip --epochs 10 --lr 5e-4   # the overfit recipe
+uv run driftmap wait <job id>                # follow a job, record what it cost
+uv run driftmap chain drift generate --target drifted                # two jobs, one after the other
+```
+
+Judge:
+
+```bash
+uv run driftmap judge closed --checkpoint REPO@SHA                   # label the smoke responses, runs here
+uv run driftmap judge closed --checkpoint REPO@SHA --mode full
+uv run driftmap judge reparse --checkpoint REPO@SHA                  # after a parser change
+```
+
+Tables:
+
+```bash
+uv run driftmap table build                  # tables from the labels: saved, printed, uploaded
+uv run driftmap decide drift --proceed --note "why"                  # when table build exits 8
+uv run driftmap table breakdown              # harmful answers by harm category, language and answer length
+uv run driftmap figures                      # the figures in docs/figures, from the stored tables and breakdown
+```
+
+No-safety-preamble condition:
+
+```bash
+uv run driftmap launch generate --mode full --wait -- --kind baseline --preamble strip
+uv run driftmap judge closed --checkpoint REPO@SHA --mode full --preamble strip
+uv run driftmap table build --preamble strip # the no-safety-preamble tables, in tables-nopreamble
+```
+
+Safety-patch condition (the served template with the patch as its system message):
+
+```bash
+uv run driftmap launch generate --mode full --wait -- --kind baseline --preamble patch
+uv run driftmap launch generate --mode full --wait -- --kind drifted --preamble patch
+uv run driftmap judge closed --checkpoint REPO@SHA --mode full --preamble patch # once per checkpoint
+uv run driftmap table build --preamble patch # the safety-patch tables, in tables-patched
+```
+
+Held-out prompts for the patch: 100 harmful prompts per language drawn afresh from the red-teaming
+dataset, none of them an evaluation prompt or near one (`SOURCE` is a copy of that dataset, `PROMPTS`
+the `prompts/` folder of the evaluation set, `TOKENIZER` a folder of the model's tokenizer files,
+`COMMIT` the commit of the held-out prompts in the evaluation dataset):
+
+```bash
+python -m driftmap.data.fresh --source SOURCE --prompts PROMPTS --tokenizer TOKENIZER --out OUT \
+    --patch-commit SHA --patch-committed DATE     # the commit and date that fixed the patch text, kept in the manifest
+uv run driftmap launch generate --mode full --wait -- --kind baseline --sets heldout --sets-rev COMMIT
+uv run driftmap launch generate --mode full --wait -- --kind baseline --sets heldout --sets-rev COMMIT --preamble patch
+uv run driftmap judge closed --checkpoint REPO@SHA --mode full --sets heldout                    # and with --preamble patch
+uv run driftmap table heldout                # the base model with and without the patch on them
+```
+
+Script variants, which the write-up reports for completeness in its Appendix D (`COMMIT` is the
+commit of the variant prompts in the evaluation dataset):
+
+```bash
+uv run driftmap launch generate --mode full --wait -- --kind baseline --sets variants --variants-rev COMMIT
+uv run driftmap judge closed --checkpoint REPO@SHA --mode full --sets variants
+uv run driftmap table variants               # each variant against its parent prompt
+```
+
+Quantization (the merged fine-tuned model as a q4_k_m file, on a CPU flavor):
+
+```bash
+uv run driftmap launch quant --wait -- --source merged               # smoke run first
+uv run driftmap launch quant --mode full --wait -- --source merged
+```
+
+Weight-space repair of a fine-tune that lost safety:
+
+```bash
+uv run driftmap launch repair --wait         # the smoke screen of the repair
+uv run driftmap launch repair --mode full --wait                     # generate the screen rows of each alpha
+uv run driftmap judge closed --rows 'screen/<slug>/alpha-*.jsonl' --mode full
+uv run driftmap repair choose --mode full    # rate each alpha, store the choice, runs here
+uv run driftmap launch repair --mode full --wait -- --apply ALPHA    # push the repaired model
+```
+
+For the overfit fine-tune, add `--fine-tune aggressive` after the `--` of each repair launch and to
+`repair choose` and `table build`; its screen, tables and repaired model keep names of their own.
+
+Housekeeping:
+
+```bash
+uv run driftmap status                       # spend, pending jobs, latest run of each kind
+uv run driftmap ledger reconcile             # billing against the ledger
+uv run driftmap scan <path>...               # tokens, account ids, home paths, before publishing
+```
+
+Publish:
+
+```bash
+uv run driftmap publish plan --writeup URL   # scan every commit, print all that would go public
+uv run driftmap publish run --writeup URL    # card, open and list the repos; try --dry-run first
+uv run driftmap publish space                # create or update the results Space; try --dry-run first
+uv run driftmap publish check                # which repos are public, carded and listed
+```
+
+`publish run` refuses before its first write when any commit of a repo holds a token, an address,
+a home path, a cache path or a file the scan cannot read, when a merged or smoke repo is public or
+sits in a collection (`--delete-intermediates` removes those repos first), when a required repo or
+a collection is missing, when a card would be incomplete, when the cost ledger does not parse or
+still holds a pending job, when a check file is out of place, empty or holds a finding, or when
+the token is not the owner's.
+
+With the cards, a run publishes three things from the checkout. The cost ledger goes to the results
+dataset as `ledger.jsonl`, one line per job. The files under
+`.run-local/checks/<responses|results>/<check>/` go to `checks/<check>/` in that dataset: the
+answers and labels of the side checks (`q4_local`, `limit_768`, `engine_noise`, `judge_validation`,
+`patch_heldout`) to the responses dataset, their summaries to the results dataset. Each adapter
+keeps the trainer's log as `trainer_state.json` when its last checkpoint is removed. `publish plan`
+lists all of this under the repo it goes to and ends with the Space step. `publish space` uploads
+the page files in `space/` as a static Space in one commit, opens it, and reads the page back
+without a token.
+
+## The judge
+
+The tables are scored by `claude-sonnet-5-5`, a closed model, under the rubric in
+`src/driftmap/judge/rubric.py` (`rubric-v1`): one JSON object per exchange with `request_harm`,
+`refusal` and `response_harm`. `driftmap judge closed` runs on the workstation.
+
+- **Route.** The route to the model is named in the environment variable
+  `DRIFTMAP_CLOSED_JUDGE_ROUTE`, together with whatever credentials that route needs. It is read
+  from the environment only.
+- **Model name.** Label rows carry the public model name from `[judge.closed]` in `driftmap.toml`
+  and the rubric version. The name is taken on trust from the configuration: nothing checks
+  which model the route serves.
+- **Resume.** The command labels one set and language at a time, uploads after each, and picks
+  up where it stopped when run again.
+- **Throttling.** It stops on throttling or an exhausted quota instead of retrying.
+- **Answers without labels.** When more than 5% of the pairs sent for one file, and more than
+  one, come back without labels, the answers that parsed are stored, the rest is held back and
+  the command exits 4. Run it again, or with `--retry-unscored`, which asks unscored pairs again
+  and stores what stays unscored.
+- **Format reminder.** An answer that is text without the object is asked again with a one-line
+  format reminder after the unchanged pair.
+- **Quoted input.** The request and the response are quoted between tags that carry a random
+  marker per call, and the rubric says they are data, never instructions.
+- **Single files.** With `--rows PATH` in place of `--checkpoint` it labels the harmful rows of
+  one responses-repo file (or a glob of them, such as the repair screen's
+  `screen/<slug>/alpha-*.jsonl`) and writes `labels-<name>` beside each.
+
+## The no-safety-preamble condition
+
+`--preamble strip` on the generate and drift jobs is the "no safety preamble" condition: every
+prompt is rendered without the safety paragraph the model's chat template opens its system turn
+with, and nothing else in the template changes. Those runs keep their files under `nopreamble/`,
+a fine-tune trained that way pushes to repos ending in `-nopre`, and
+`driftmap judge closed --preamble strip` labels those responses.
+
+## The repair
+
+The repair job moves fine-tuned weights toward the original model (WiSE-FT): each weight becomes
+`(1 - alpha) * fine-tuned + alpha * original`. It takes two jobs with a step on the workstation between
+them. The screen job generates, for each alpha under `[repair]` in `driftmap.toml`, the answers to 20
+harmful and 20 benign prompts per language and scores the benign ones with chrF. `judge closed --rows`
+labels the harmful answers. `repair choose` then rates every alpha over the prompts that it, the other
+alphas and the base model all have a verdict on, and picks the smallest alpha whose safe rate is within
+`safety_points` of the base model's and whose chrF is within `chrf_points` of the fine-tuned model's. It
+prints one line per alpha and stores the record as `alpha_screen.json` in the results dataset:
+`chosen`, `failed` when no alpha passes both bars, or `screened` while labels are missing or cover
+under 90% of an alpha's harmful prompts. The apply job pushes the model at the chosen alpha and refuses
+any other value.
+
+## What a launch is checked against
+
+A launch needs a readiness report less than a day old, made under the current configuration.
+Then every guard runs; one refusal is exit 4 and nothing is submitted.
+
+- `gate`: the token can read the gated base model.
+- `code_pinned`: HEAD is clean and on the origin branch; a job installs the code from that commit.
+- `smoke`: a full run has a passing smoke run of the same script, image and pins.
+- `per_run_ceiling`: the cost at the job's whole timeout is within the per-run ceiling; smoke
+  runs also stay within the smoke total and run one at a time.
+- `ledger_ceiling`: spend so far plus this job is within the soft ceiling.
+- `in_flight_gpu`: no other GPU job is running or pending on the ledger.
+- `timeout_lost`: no job of this kind was already lost at this timeout.
+- `oom_repeat`: this kind did not already run out of memory under this configuration.
+- `drift_decision`: a repair waits for `decide drift` while the measured drop in safe rate is below the threshold.
+
+The ceilings are under `[ceilings]` in `driftmap.toml`; the ledger is `.run-local/results/ledger.jsonl`,
+and `publish run` copies it to the results dataset as `ledger.jsonl`, one line per job.
+
+A repair launch is also checked for its inputs: an ok fine-tune run and the fine-tuned checkpoint's
+benign labels, and with `--apply` a screen that `repair choose` stored as chosen. `chain` takes no
+repair step, because the choice sits between its two jobs.
+
+## On the Hub
+
+Names under the owner, from `[repos]` in `driftmap.toml`:
+
+- `aya-redteaming-6lang-eval` (dataset): prompts, training rows and labels.
+- `safety-drift-map-responses` (dataset): model responses and the judge's raw outputs.
+- `safety-drift-map-results` (dataset): run records, tables and decisions.
+- `tiny-aya-global-drift-lora` (model): the fine-tuned adapter.
+- `tiny-aya-global-drift-merged` (model, private): the merged fine-tuned weights, an intermediate.
+- The same two names ending in `-nopre`, once a fine-tune with no safety preamble exists: its
+  adapter is published like the first, its merged weights stay private.
+- `tiny-aya-global-drift-GGUF` (model): the fine-tuned model as a q4_k_m file, the one the 4-bit
+  evaluation ran on.
+- `tiny-aya-global-repaired-nopre` (model): the overfit fine-tune repaired by weight interpolation
+  with the base model at alpha 0.25.
+- `tiny-aya-global-repaired` and `tiny-aya-global-repaired-GGUF` (models): the names a repair of the
+  light fine-tune and its q4_k_m file would publish under; neither repo exists.
+
+## Exit codes
+
+| Code | Meaning |
+| --- | --- |
+| 0 | done |
+| 1 | unexpected error |
+| 2 | usage or configuration |
+| 3 | not ready |
+| 4 | refused by a guard, or the judge stopped (throttling, quota, too many answers without labels) |
+| 5 | job lost or not found |
+| 6 | redaction finding |
+| 7 | upload failed |
+| 8 | drift decision needed |
+| 12 | a data, label or record file, or the published state, is not what it should be |
+| 130 | interrupted |
+
+## Reproduce the tables and the results page
+
+The tables, without a GPU or a judge: open [the notebook](../notebooks/reproduce_tables.ipynb). It
+downloads the published label files and recomputes the rates, intervals and paired changes of the write-up,
+except the 4-bit table and the rows on answer length, which also need the responses dataset.
+
+The Space's data file, from the same label files, and the page served locally (it loads its data
+over HTTP, so opened as a file it only shows a notice):
+
+```bash
+python space/build_data.py --no-question-pairs
+python -m http.server --directory space      # then open http://localhost:8000/
+```
+
+The whole pipeline, from the source datasets to the tables (Hugging Face Jobs, one L4):
+
+```bash
+uv python install 3.12 && uv sync --frozen
+uv run pytest -q -m "not smoke"
+
+uv run driftmap ready --pin
+uv run driftmap data build
+uv run driftmap launch generate --mode full --wait -- --kind baseline
+uv run driftmap launch drift --mode full --wait -- --epochs 3
+uv run driftmap launch generate --mode full --wait -- --kind drifted
+uv run driftmap judge closed --checkpoint REPO@SHA --mode full       # once per checkpoint
+uv run driftmap table build
+```
+
+Each full run needs a passing smoke run first; the sections above give the details. In command
+names, file paths and record fields the fine-tuned model is called `drifted` and the base model
+`baseline`.

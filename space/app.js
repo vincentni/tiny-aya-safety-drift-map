@@ -10,10 +10,24 @@
     f4: 'Harmful answers by harm category',
     f5: 'How verdicts moved between the base model and the fine-tuned model',
     f6: 'Answers cut off at the token limit, and harmful answers among them',
-    f7: 'Harmful answers on native, romanized and code-mixed prompts',
-    f8: 'Harmful answers with a targeted system-prompt patch',
+    f7: 'Harmful answers on native prompts and on their Latin-script and English-mixed variants (for completeness, not part of the claim)',
+    f8: 'Harmful answers with a targeted system-prompt patch, on the prompts it was written against (in-sample)',
+    f9: 'Per language: how often a person is named where the text does not say, and twin accuracy, for the base model ' +
+      'and the attribution fine-tune, with 95% Wilson intervals. A hollow marker is the same rate when a letter written ' +
+      'in the local script is not read as a letter.',
+    f10: 'Base model against attribution fine-tune over all six languages: how often a person is named where the text ' +
+      'does not say, and twin accuracy. The hollow marker is twin accuracy when a letter written in the local script is ' +
+      'not read as a letter.',
   };
   const LEAD_FIGURE = 'f8';
+  // the figures of the question pairs, shown with them in this order
+  const TOP_FIGURES = ['f10', 'f9'];
+  // whether the cards of the system-prompt patch stand before the cards of the map
+  const PATCH_LEADS = true;
+  // the figure of the script variants, shown in their section
+  const VARIANT_FIGURE = 'f7';
+  // the pooled scopes of the choice table
+  const SCOPE_NAMES = { 'non-English': 'Five translated languages', all: 'All six languages' };
   const SMALL = 15;
 
   const $ = (id) => document.getElementById(id);
@@ -64,14 +78,52 @@
       cell.language === language && cell.category === category);
   }
 
+  // the question pairs: one count of the choice table, and the change the table states from the base model to an arm
+  const choiceRate = (found, arm, scope, metric) => found.rates.find((row) => row.arm === arm && row.scope === scope && row.metric === metric);
+  const choiceChange = (found, arm, scope, metric) => found.changes.find((row) => row.arm === arm && row.scope === scope && row.metric === metric);
+
   function numbers(data) {
     const first = data.conditions[0];
     const [base, tuned] = data.models;
-    const box = clear($('numbers'));
-    const card = (strong, text) => box.appendChild(el('div', { class: 'number' }, el('strong', { text: strong }), el('span', { text })));
+    const found = data.attribution;
+    const top = clear($('numbers'));
+    // with the question pairs on the page, the cards of the harmful-request map sit under its own heading
+    const box = found ? clear($('map-numbers')) : top;
+    const put = (where, strong, text) => where.appendChild(el('div', { class: 'number' }, el('strong', { text: strong }), el('span', { text })));
+    const card = (strong, text) => put(box, strong, text);
+    const named = found && ['base', 'tuned'].map((side) => choiceRate(found, found[side], 'all', 'person_pick'));
+    if (named && named[0] && named[1]) {
+      const both = ['base', 'tuned'].map((side) => choiceRate(found, found[side], 'all', 'twin'));
+      const outside = choiceRate(found, found.tuned, 'non-English', 'person_pick');
+      put(top, `${percent(named[0].k, named[0].n)} → ${percent(named[1].k, named[1].n)}`,
+        `of the who-did-it questions a short text cannot answer get a named person, in six languages: ${named[0].k} of ${named[0].n} ` +
+        `from the base model, ${named[1].k} after a LoRA fine-tune on English rows` +
+        (outside ? `, ${outside.k} of them in the five languages it never saw.` : '.'));
+      put(top, `${percent(both[0].k, both[0].n)} → ${percent(both[1].k, both[1].n)}`,
+        `twin accuracy: the question and its answerable twin both right, ${both[0].k}, then ${both[1].k} of ${both[1].n} pairs, ` +
+        `so abstaining on everything scores zero. Under the strict reading of answers: ${percent(both[0].strict, both[0].n)} → ` +
+        `${percent(both[1].strict, both[1].n)}.`);
+      const prompted = found.arms.filter((arm) => !arm.fine_tune && arm.id !== found.base)
+        .map((arm) => [arm, choiceRate(found, arm.id, 'all', 'twin')]).filter(([, cell]) => cell && cell.n)
+        .sort((a, b) => b[1].k / b[1].n - a[1].k / a[1].n)[0];
+      if (prompted) {
+        put(top, `Prompts alone: ${percent(prompted[1].k, prompted[1].n)}`,
+          `twin accuracy of the best arm that changes the prompt and not the weights (${prompted[0].name}), ` +
+          `${prompted[1].k} of ${prompted[1].n} pairs.`);
+      }
+    }
     const byRate = (cells) => cells.filter((cell) => cell.n).sort((a, b) => b.k / b.n - a.k / a.n);
     const pooled = cellOf(data, first.id, base.id, 'all', 'all');
 
+    const held = data.heldout && data.heldout.rows.find((row) => row.scope === 'all');
+    if (held && held.harmful.delta !== null) {
+      const { before, after, ci, p } = held.harmful;
+      card(`${percent(before[0], before[1])} → ${percent(after[0], after[1])}`,
+        `harmful answers of the ${base.name} with five sentences of guidance in its system prompt, on ` +
+        `${data.heldout.prompts} held-out prompts the guidance was not written against (${before[0]} of ${before[1]}, ` +
+        `then ${after[0]} of ${after[1]}; ${points(held.harmful.delta)} points, 95% interval ${points(ci[0])} to ` +
+        `${points(ci[1])}, ${pValue(p)}).`).classList.add('patch');
+    }
     const patched = data.patch.find((entry) => entry.model === base.id);
     if (patched) {
       const [without, withIt] = patched.harmful;
@@ -83,7 +135,7 @@
         `harmful answers of the ${base.name} with five sentences of guidance in its system prompt, on the prompts the ` +
         `guidance was written against (${without}, then ` +
         `${withIt} of ${patched.pairs} prompts, ${pValue(patched.p)}). The price: ${refused.refusal[1]} of ` +
-        `${refused.pairs} safe prompts refused, against ${refused.refusal[0]}.${beside}`);
+        `${refused.pairs} safe prompts refused, against ${refused.refusal[0]}.${beside}`).classList.add('patch');
     }
 
     const ranked = (condition) => byRate(data.languages.map((code) => cellOf(data, condition.id, base.id, code, 'all')));
@@ -94,12 +146,14 @@
     const ranking = second ? ranked(second) : [];
     const safest = ranking[ranking.length - 1];
     if (safest && safest.language === best.language) {
-      // the safest language holds in both conditions; whether the weakest does is said in a clause
-      const weakest = ranking[0].language === worst.language ?
-        `${languageName(worst.language)} is the weakest in both` : 'the weakest language changes with the condition';
+      // lowest in both conditions; called apart from the next language only where the intervals do not overlap
+      const next = ranking[ranking.length - 2];
+      const again = safest.hi < next.lo ? '.' :
+        `, not distinguishable from ${languageName(next.language)} (${next.k} of ${next.n}).`;
       card(`${languageName(best.language)}: ${percent(best.k, best.n)}`,
         `harmful answers of the ${base.name} in ${languageName(best.language)} with the ${first.name} (${best.k} of ` +
-        `${best.n}), its safest language in both prompt conditions; ${weakest}.`);
+        `${best.n}; ${bounds(best)}), the lowest rate of the ${data.languages.length} languages. With ${second.name} ` +
+        `it is lowest again (${safest.k} of ${safest.n})${again}`);
     } else {
       card(`${percent(worst.k, worst.n)} against ${percent(best.k, best.n)}`,
         `harmful answers of the ${base.name} with the ${first.name}, in ${languageName(worst.language)} (${worst.k} of ${worst.n}; ${bounds(worst)}) ` +
@@ -224,6 +278,32 @@
     fill('patch-body', [...rows.map(([, row]) => row), task]);
     $('patch-note').textContent = notes.join(' ');
     $('patch-section').hidden = false;
+    heldOut(data);
+  }
+
+  // the patch on prompts it was not written against: one row per language, the pooled row last
+  function heldOut(data) {
+    if (!data.heldout) return;
+    const interval = (ci) => `${points(ci[0])} to ${points(ci[1])}`;
+    const cell = ([k, n, lo, hi]) => el('td', { class: 'count' }, el('div', { text: counted(k, n) }),
+      el('div', { class: 'interval', text: lo === null ? '' : bounds({ lo, hi }) }));
+    fill('heldout-body', data.heldout.rows.map((row) => {
+      const harmful = row.harmful;
+      const moved = harmful.delta === null ? 'n/a' :
+        `${points(harmful.delta)} points (${interval(harmful.ci)}; ${pValue(harmful.p)}; ${harmful.pairs} pairs)`;
+      return el('tr', {}, el('td', { text: row.scope === 'all' ? 'all' : languageName(row.scope) }),
+        cell(harmful.before), cell(harmful.after), el('td', { text: moved }),
+        el('td', { class: 'count', text: `${counted(row.refusal.before[0], row.refusal.before[1])} → ` +
+          `${counted(row.refusal.after[0], row.refusal.after[1])}` }));
+    }));
+    const pooled = data.heldout.rows.find((row) => row.scope === 'all');
+    const gap = pooled && pooled.harmful.gap;
+    $('heldout-note').textContent = `${data.heldout.prompts} held-out prompts. A change is the rate with the patch ` +
+      'minus the rate without it over the prompts scored both ways, with a paired-bootstrap 95% interval and an ' +
+      'exact sign test.' + (gap ? ` The held-out change minus the change on the prompts the guidance was written ` +
+        `against: ${points(gap.delta)} points (95% interval ${interval(gap.ci)}); an interval that holds 0 does not ` +
+        'tell the two apart.' : '');
+    $('heldout').hidden = false;
   }
 
   function variants(data) {
@@ -274,21 +354,103 @@
   }
 
   function figures(data) {
+    // a figure file is named f<number>_<what>
+    const key = (file) => file.split('_')[0];
     const shown = (file, lazy) => {
-      const title = FIGURE_TITLES[file.slice(0, 2)] || file;
+      const title = FIGURE_TITLES[key(file)] || file;
       const image = el('img', { src: 'figures/' + file, alt: title, ...(lazy ? { loading: 'lazy' } : {}) });
       return el('figure', {}, image, el('figcaption', { text: title }));
     };
-    const lead = data.figures.find((file) => file.startsWith(LEAD_FIGURE));
+    const lead = data.figures.find((file) => key(file) === LEAD_FIGURE);
     if (lead) {
       clear($('lead-figure')).appendChild(shown(lead, false));
       $('lead-figure').hidden = false;
     }
-    const rest = data.figures.filter((file) => file !== lead);
+    const top = data.attribution ? TOP_FIGURES.map((name) => data.figures.find((file) => key(file) === name)).filter(Boolean) : [];
+    if (top.length) {
+      const box = clear($('top-figure'));
+      for (const file of top) box.appendChild(shown(file, false));
+      $('top-figure').hidden = false;
+    }
+    const variant = data.variants.length && data.figures.find((file) => key(file) === VARIANT_FIGURE);
+    if (variant) {
+      clear($('variants-figure')).appendChild(shown(variant, true));
+      $('variants-figure').hidden = false;
+    }
+    const rest = data.figures.filter((file) => file !== lead && file !== variant && !TOP_FIGURES.includes(key(file)));
     if (!rest.length) return;
     const box = clear($('figures'));
     for (const file of rest) box.appendChild(shown(file, true));
     $('figures-section').hidden = false;
+  }
+
+  function attribution(data) {
+    const found = data.attribution;
+    if (!found) return;
+    const scopeName = (scope) => SCOPE_NAMES[scope] || languageName(scope);
+    const nameOf = (id) => found.arms.find((arm) => arm.id === id).name;
+    // the two arms of the headline stand first, side by side
+    const pair = [found.base, found.tuned];
+    const arms = pair.map((id) => found.arms.find((arm) => arm.id === id)).filter(Boolean)
+      .concat(found.arms.filter((arm) => !pair.includes(arm.id)));
+    const table = (id, metric, good) => {
+      fill(`${id}-head`, [el('tr', {}, el('th', { text: 'Language' }), ...arms.map((arm) => el('th', { text: capital(arm.name) })))]);
+      fill(`${id}-body`, found.scopes.map((scope) => el('tr', {}, el('td', { text: scopeName(scope) }),
+        ...arms.map((arm) => {
+          const cell = choiceRate(found, arm.id, scope, metric);
+          const td = rateCell(cell, 1, good);
+          // the strict reading stands beside the count wherever it differs
+          if (cell && cell.strict !== cell.k) {
+            td.appendChild(el('div', { class: 'interval', text: `strict: ${counted(cell.strict, cell.n)}` }));
+          }
+          return td;
+        }))));
+    };
+    const stated = (scope, metric) => {
+      const change = choiceChange(found, found.tuned, scope, metric);
+      return change ? `${scopeName(scope).toLowerCase()} ${points(change.delta)} points (95% interval ${points(change.ci[0])} to ` +
+        `${points(change.ci[1])}, ${pValue(change.p)})` : null;
+    };
+    const changes = (metric) => ['all', 'non-English'].map((scope) => stated(scope, metric)).filter(Boolean).join('; ');
+    table('attr-person', 'person_pick', false);
+    table('attr-twin', 'twin', true);
+    $('attr-person-note').textContent = 'Counts over the ambiguous items, with 95% Wilson intervals; lower is better. ' +
+      `Change from the ${nameOf(found.base)} to the ${nameOf(found.tuned)}, paired by item: ${changes('person_pick')}.`;
+    const right = ['base', 'tuned'].map((side) => choiceRate(found, found[side], 'all', 'accuracy'));
+    // the best arm that changes the prompt and not the weights
+    const prompted = found.arms.filter((arm) => !arm.fine_tune && arm.id !== found.base)
+      .map((arm) => [arm, choiceRate(found, arm.id, 'all', 'twin')]).filter(([, cell]) => cell && cell.n)
+      .sort((a, b) => b[1].k / b[1].n - a[1].k / a[1].n)[0];
+    $('attr-twin-note').textContent = 'A pair counts only when the model says the text does not tell on the ambiguous item ' +
+      'and answers its twin correctly, so abstaining on everything scores zero; higher is better. In Hindi and Arabic an ' +
+      'answer that is only the letter written in the local script is read as that letter; the strict reading leaves that ' +
+      'rule out. ' +
+      `Change from the ${nameOf(found.base)} to the ${nameOf(found.tuned)}, paired by item: ${changes('twin')}. ` +
+      (right[0] && right[1] ? `Answerable twins answered correctly: ${counted(right[0].k, right[0].n)}, then ${counted(right[1].k, right[1].n)}. ` : '') +
+      (prompted ? `The best arm that changes the prompt and not the weights (${prompted[0].name}) reaches ` +
+        `${percent(prompted[1].k, prompted[1].n)} over all six languages.` : '');
+    $('attribution-section').hidden = false;
+    $('map-intro').hidden = false;
+  }
+
+  // the sample question pair: the ambiguous question with both answers, and the twin with the fine-tune's answer
+  function samples(data, shown) {
+    if (!data.attribution || !shown || !shown.samples || !shown.samples.length) return;
+    const found = data.attribution;
+    const nameOf = (id) => capital(found.arms.find((arm) => arm.id === id).name);
+    const answer = (who, badge, label, text) => el('p', {}, el('span', { class: `badge ${badge}`, text: label }),
+      el('span', { class: 'tag', text: who }), el('blockquote', { text }));
+    const box = clear($('attr-sample-cards'));
+    for (const sample of shown.samples) {
+      box.appendChild(el('div', { class: 'system', lang: sample.language },
+        el('p', {}, el('strong', { text: languageName(sample.language) })),
+        el('p', { class: 'tag', text: 'The text does not say:' }), el('blockquote', { text: sample.prompt }),
+        answer(nameOf(found.base), 'named', 'names a person', sample.base),
+        answer(nameOf(found.tuned), 'abstains', 'says the text does not tell', sample.tuned),
+        el('p', { class: 'tag', text: 'The twin, whose text does say:' }), el('blockquote', { text: sample.twin.prompt }),
+        answer(nameOf(found.tuned), 'answered', 'answers', sample.twin.tuned)));
+    }
+    $('attr-samples').hidden = false;
   }
 
   // a table wider than its box scrolls sideways; a line above it says so
@@ -303,14 +465,15 @@
     }
   }
 
-  function rateCell(cell) {
+  // ``full`` is the share at which the bar is at its longest; a ``good`` bar is one where more is better
+  function rateCell(cell, full = 0.4, good = false) {
     const td = el('td', { class: 'count' });
     if (!cell || !cell.n) {
       td.textContent = 'no scored prompts';
       return td;
     }
-    const bar = el('span', { class: 'bar' });
-    bar.style.width = Math.round(Math.min(1, cell.k / cell.n / 0.4) * 60) + 'px';
+    const bar = el('span', { class: good ? 'bar good' : 'bar' });
+    bar.style.width = Math.round(Math.min(1, cell.k / cell.n / full) * 60) + 'px';
     // the count on one line, the bar and the interval below it, so four models fit side by side
     td.appendChild(el('div', { text: counted(cell.k, cell.n) }));
     td.appendChild(el('div', { class: 'interval' }, bar, bounds(cell)));
@@ -353,6 +516,8 @@
 
   function render(data) {
     numbers(data);
+    if (!PATCH_LEADS) for (const node of document.querySelectorAll('.number.patch')) node.parentNode.appendChild(node);
+    attribution(data);
     length(data);
     recipes(data);
     patch(data);
@@ -389,7 +554,14 @@
       if (!response.ok) throw new Error('HTTP ' + response.status);
       return response.json();
     })
-    .then(render, (error) => unavailable(error.message))
+    .then((data) => {
+      render(data);
+      // the sample item is text, so it is not in the data file; without it the section shows its tables only
+      if (data.attribution) {
+        fetch('samples.json').then((response) => (response.ok ? response.json() : null))
+          .then((shown) => samples(data, shown)).then(hints).catch(() => {});
+      }
+    }, (error) => unavailable(error.message))
     .catch((error) => {
       $('status').textContent = 'The page could not be drawn: ' + error.message;
     });

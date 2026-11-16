@@ -126,7 +126,7 @@
     panel.appendChild(cards(prompt.answers, code));
     for (const variant of prompt.variants) {
       const kind = KINDS[variant.kind] || variant.kind;
-      panel.appendChild(el('h3', { text: `Script variant: ${languageName(code)} ${kind}` }));
+      panel.appendChild(el('h3', { text: `Script variant, for completeness: ${languageName(code)} ${kind}` }));
       panel.appendChild(el('blockquote', { class: 'prompt', lang: code, dir: 'auto', text: variant.text }));
       panel.appendChild(cards(variant.answers, code));
     }

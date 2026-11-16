@@ -3,9 +3,15 @@
     python space/build_data.py                                  # reads the datasets from the Hub
     python space/build_data.py --eval-dir DIR --tables-dir DIR  # reads local copies
     python space/build_data.py --eval-dir DIR --responses-dir DIR   # adds the answer-length counts and the explorer
+    python space/build_data.py --eval-dir DIR --choice-dir DIR      # adds the question pairs from their choice table
+    python space/build_data.py --eval-dir DIR --choice-dir DIR --choice-eval-dir DIR --choice-responses-dir DIR
+                                                                    # and the sample item, from prompts and answers
+    python space/build_data.py --no-question-pairs                  # a page without the question pairs
 
-The served template and no safety preamble, each with the base model and the fine-tuned model, are always read.
-The overfit fine-tune, the safety-patch condition and the script variants are read when their label files exist.
+The three datasets are the ones ``driftmap.toml`` names. The served template and no safety preamble, each with
+the base model and the fine-tuned model, are always read.
+The overfit fine-tune, the safety-patch condition and the script variants are read when their label files exist,
+and the safety patch on the held-out prompts when its table is among the tables.
 The data file holds counts and intervals only: no prompt, no response and no per-prompt row.
 
 With the responses at hand the script also writes ``explorer.json`` beside the data file, for the page's replay
@@ -13,6 +19,11 @@ explorer: a capped set of harmful-set prompts with their text and what each meas
 judged harmful, or left without a verdict, is listed without its text unless ``--include-harmful`` is given,
 and then keeps only its first characters. Prompts of the non-consensual sexual content category are left out.
 That file is a build output.
+
+The question pairs (who did it, when the text does not say) are read from their choice table: counts, intervals,
+the count under the strict reading and the paired changes the table states. With the choice prompts and the
+stored answers at hand the script also writes
+``samples.json``: one question pair from BBQ in two languages with what the base model and the fine-tune answered.
 """
 
 import argparse
@@ -21,13 +32,21 @@ import math
 import shutil
 import statistics
 import sys
+import tomllib
 from collections import Counter
 from pathlib import Path
 
-SCHEMA = "driftmap.space/5"
-EVAL_REPO = "vincentnkq/aya-redteaming-6lang-eval"
-RESULTS_REPO = "vincentnkq/safety-drift-map-results"
-RESPONSES_REPO = "vincentnkq/safety-drift-map-responses"
+SCHEMA = "driftmap.space/7"
+CONFIG = Path(__file__).resolve().parent.parent / "driftmap.toml"
+
+
+def repos(config: Path = CONFIG) -> tuple[str, str, str]:
+    """The evaluation, results and responses datasets the project configuration names, each as ``owner/name``."""
+    settings = tomllib.loads(config.read_text(encoding="utf-8"))
+    return tuple(f"{settings['owner']}/{settings['repos'][key]}" for key in ("eval", "results", "responses"))
+
+
+EVAL_REPO, RESULTS_REPO, RESPONSES_REPO = repos()
 # id, name on the page, folder of the label files in the evaluation dataset, tables file in the results dataset
 CONDITIONS = (
     ("served", "served template", "labels", "tables/tables.json"),
@@ -59,6 +78,21 @@ REPAIRED = ("repaired", "repaired fine-tune", "nopreamble", "tiny-aya-global-rep
 VARIANT_PROMPTS = "variants/prompts/harmful"
 VARIANT_LABELS = "variants/labels"
 EXPLORER_SCHEMA = "driftmap.space.explorer/1"
+# the safety patch on harmful prompts held out of the evaluation set: its table in the results dataset
+HELDOUT_TABLE = "tables/heldout.json"
+HELDOUT_METRICS = ("harmful", "refusal")
+# the question pairs: their table in the results dataset, their prompts and the stored answers to them
+CHOICE_TABLE = "tables/choice-defense.json"
+CHOICE_PROMPTS = "choice/prompts/benign/{language}.jsonl"
+# both sample arms answer under the served template, whose tree is the root of the responses dataset
+CHOICE_ANSWERS = "choice/responses/{slug}/benign/{language}.jsonl"
+CHOICE_METRICS = ("person_pick", "accuracy", "twin")
+# the arms every other arm is set against, and the two whose answers the samples show
+CHOICE_BASE, CHOICE_TUNED = "baseline/keep", "drifted/keep"
+SAMPLES_SCHEMA = "driftmap.space.samples/1"
+# the question pair the page shows as it was asked without options, and in which languages
+SAMPLE_ITEM = "bbq.Gender_identity.3448"
+SAMPLE_LANGUAGES = ("en", "ru")
 # the systems the explorer replays, in the order of its columns: condition, model, name on the page, note
 SYSTEMS = (
     ("served", "base", "Base model", None),
@@ -368,14 +402,139 @@ def explorer(
     }
 
 
+def _place(directory: Path, file: str) -> Path | None:
+    """``file`` under a copy of a results dataset, or by its name in a flat folder; None when it is in neither."""
+    places = (directory / file, directory / Path(file).name)
+    return next((place for place in places if place.is_file()), None)
+
+
+def attribution(choice_dir: str | Path) -> dict | None:
+    """The question-pair result from its choice table under ``choice_dir``; None without the table.
+
+    Per arm, scope and metric the count with its Wilson bounds and the count under the strict reading, which
+    leaves out the answers read through a letter written in the local script; and the paired changes from the
+    base model that the table states over all rows. An arm that adds the instruction to a fine-tune is left out.
+    """
+    path = _place(Path(choice_dir), CHOICE_TABLE)
+    if path is None:
+        return None
+    table = json.loads(path.read_text(encoding="utf-8"))
+    arms = [arm for arm in table["arms"] if arm["column"] == "baseline" or not arm["tag"]]
+    shown = {arm["arm"] for arm in arms}
+    rates = [
+        {key: rate[key] for key in ("arm", "scope", "metric")}
+        | dict(zip(("k", "n", "lo", "hi"), _rate(rate["k"], rate["n"])))
+        | {"strict": rate["k"] - rate["k_named"]}
+        for rate in table["rates"]
+        if rate["arm"] in shown and rate["metric"] in CHOICE_METRICS
+    ]
+    changes = [
+        {"arm": delta["b"], "scope": delta["scope"], "metric": delta["metric"], "delta": delta["delta"]}
+        | {"ci": delta["ci"], "p": delta["p_value"], "items": delta["n_items"]}
+        for delta in table["deltas"]
+        if delta["basis"] == "all" and delta["a"] == CHOICE_BASE and delta["b"] in shown and delta["metric"] in CHOICE_METRICS
+    ]
+    return {
+        "arms": [{"id": arm["arm"], "name": arm["name"], "fine_tune": arm["column"] != "baseline"} for arm in arms],
+        "base": CHOICE_BASE,
+        "tuned": CHOICE_TUNED,
+        "scopes": table["scopes"],
+        "rates": rates,
+        "changes": changes,
+    }
+
+
+def heldout(tables_dir: str | Path) -> dict | None:
+    """The safety patch on the held-out harmful prompts, from their table under ``tables_dir``; None without it.
+
+    Per scope, a language or all of them, the harmful answers and the refusals of the base model without and
+    with the patch, each count with its Wilson bounds, and the paired change the table states. Where the table
+    also holds the evaluation prompts under the two conditions, ``gap`` is the held-out change minus the change
+    over them, with its interval; None otherwise.
+    """
+    path = _place(Path(tables_dir), HELDOUT_TABLE)
+    if path is None:
+        return None
+    table = json.loads(path.read_text(encoding="utf-8"))
+    rates = {
+        (rate["scope"], rate["metric"], rate["condition"]): _rate(rate["k"], rate["n"]) for rate in table["rates"]
+    }
+    moved = {(change["scope"], change["metric"]): change for change in table["changes"]}
+    gaps = {(gap["scope"], gap["metric"]): gap for gap in (table.get("in_sample") or {}).get("gaps", ())}
+    rows = []
+    for scope in table["scopes"]:
+        row = {"scope": scope}
+        for metric in HELDOUT_METRICS:
+            change = moved[scope, metric]
+            row[metric] = {"before": rates[scope, metric, "keep"], "after": rates[scope, metric, "patch"]}
+            row[metric] |= {"pairs": change["n_pairs"], "delta": change["delta"]}
+            row[metric] |= {"ci": change["ci"], "p": change["p_value"]}
+            gap = gaps.get((scope, metric))
+            row[metric]["gap"] = {"delta": gap["delta"], "ci": gap["ci"]} if gap else None
+        rows.append(row)
+    return {"prompts": table["prompts"], "rows": rows}
+
+
+def _slug(checkpoint: str) -> str:
+    """The folder of a checkpoint's rows: its repo name and the first 12 characters of its commit."""
+    repo, _, revision = checkpoint.partition("@")
+    return f"{repo.rpartition('/')[2]}--{revision[:12]}"
+
+
+def samples(choice_dir: str | Path, prompts_dir: str | Path, responses_dir: str | Path) -> dict | None:
+    """The sample question pair in each sample language, as asked without options.
+
+    ``choice_dir`` holds the choice table, ``prompts_dir`` a copy of the dataset with the choice prompts and
+    ``responses_dir`` one of the dataset with the stored answers; None when the table, a prompt file or an answer
+    file of the two sample arms is missing. Each sample holds the ambiguous question with the base model's and the
+    fine-tune's answer, and the twin with the fine-tune's answer. Raises ValueError when the base model does not
+    name one of the two people on the ambiguous question, or the fine-tune names one: such an item does not show
+    the finding.
+    """
+    table = _place(Path(choice_dir), CHOICE_TABLE)
+    if table is None:
+        return None
+    checkpoints = {arm["arm"]: arm["checkpoint"] for arm in json.loads(table.read_text(encoding="utf-8"))["arms"]}
+    found = []
+    for language in SAMPLE_LANGUAGES:
+        asked = Path(prompts_dir) / CHOICE_PROMPTS.format(language=language)
+        stored = [
+            Path(responses_dir) / CHOICE_ANSWERS.format(slug=_slug(checkpoints[arm]), language=language)
+            for arm in (CHOICE_BASE, CHOICE_TUNED)
+        ]
+        if not all(path.is_file() for path in (asked, *stored)):
+            return None
+        open_form = [row for row in read_jsonl(asked) if row["base_item"] == SAMPLE_ITEM and row["format"] == "free_form"]
+        rows = {row["condition"]: row for row in open_form}
+        base, tuned = ({row["prompt_id"]: row["response"] for row in read_jsonl(path)} for path in stored)
+        ids = [rows[condition]["prompt_id"] for condition in ("ambiguous", "disambiguated") if condition in rows]
+        if len(ids) != 2 or any(key not in side for key in ids for side in (base, tuned)):
+            raise ValueError(f"{SAMPLE_ITEM} has no stored answer of both arms to both questions in {language}")
+        left_open, settled = ids
+        people = [option["text"].casefold() for option in rows["ambiguous"]["options"] if option["role"] != "unknown"]
+        named = [sum(name in side[left_open].casefold() for name in people) for side in (base, tuned)]
+        if named[0] != 1:
+            raise ValueError(f"{SAMPLE_ITEM} in {language}: the base model names no person, or both")
+        if named[1]:
+            raise ValueError(f"{SAMPLE_ITEM} in {language}: the fine-tune names a person")
+
+        def text(row: dict) -> str:
+            # the prompt's last line, which asks for one short sentence, is said once on the page
+            return f"{row['context']}\n{row['question']}"
+
+        twin = {"prompt": text(rows["disambiguated"]), "tuned": tuned[settled]}
+        answers = {"base": base[left_open], "tuned": tuned[left_open]}
+        found.append({"language": language, "prompt": text(rows["ambiguous"])} | answers | {"twin": twin})
+    return {"schema": SAMPLES_SCHEMA, "item": SAMPLE_ITEM, "samples": found}
+
+
 def _changes(tables_dir: Path, tables_file: str, pair: tuple[str, str] = ("baseline", "drifted")) -> dict:
     """Pooled paired changes between the two table columns of ``pair``, as the published tables state them; empty
     without the file.
 
     ``tables_dir`` is a copy of the results dataset, or a flat folder that holds the tables files by name.
     """
-    places = (tables_dir / tables_file, tables_dir / Path(tables_file).name)
-    path = next((place for place in places if place.is_file()), None)
+    path = _place(tables_dir, tables_file)
     if path is None:
         return {}
     deltas = json.loads(path.read_text(encoding="utf-8"))["deltas"]
@@ -393,6 +552,7 @@ def build(
     tables_dir: str | Path | None = None,
     responses_dir: str | Path | None = None,
     figures: list[str] | None = None,
+    choice_dir: str | Path | None = None,
 ) -> dict:
     """The Space's data: summary, cells, flips and answer-length counts, from label files under ``eval_dir``.
 
@@ -400,7 +560,9 @@ def build(
     ``repaired`` the repaired fine-tune with the overfit one and with the base model, ``patch`` each model under
     the safety patch with
     itself under the served template over the prompts labelled in both, ``variants`` each script variant with its
-    parent prompts; each is empty when its label files are absent.
+    parent prompts; each is empty when its label files are absent. ``attribution`` is the question-pair result
+    from the choice table under ``choice_dir``, None without it; ``heldout`` the safety patch on the held-out
+    prompts from its table under ``tables_dir``, None without it.
     """
     eval_dir = Path(eval_dir)
     prompts = _prompts(eval_dir)
@@ -476,6 +638,8 @@ def build(
         "repaired": repaired,
         "patch": patch,
         "variants": _variants(eval_dir, rows["served"]),
+        "attribution": attribution(choice_dir) if choice_dir else None,
+        "heldout": heldout(tables_dir) if tables_dir else None,
     }
 
 
@@ -497,6 +661,17 @@ def _responses() -> Path | None:
         return None
 
 
+def _choice(repo: str, patterns: list[str], lost: str) -> Path | None:
+    """A dataset read for the question pairs, or None with a note that ``lost`` is left out when it cannot be read."""
+    from huggingface_hub.errors import HfHubHTTPError
+
+    try:
+        return _download(repo, patterns)
+    except (HfHubHTTPError, OSError) as error:
+        print(f"{repo} could not be read ({type(error).__name__}); {lost} is left out")
+        return None
+
+
 def _copy_figures(source: Path | None, target: Path) -> list[str]:
     """Copy the figure files beside the page; the page shows only the ones listed in the data file."""
     names = []
@@ -513,6 +688,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--eval-dir", type=Path, help="a local copy of the evaluation dataset; downloaded when absent")
     parser.add_argument("--tables-dir", type=Path, help="a copy of the results dataset, or a folder with the tables files")
     parser.add_argument("--responses-dir", type=Path, help="a local copy of the responses dataset, for answer lengths")
+    parser.add_argument("--choice-dir", type=Path, help="a copy of the results dataset, or a folder with the choice table")
+    parser.add_argument("--choice-eval-dir", type=Path, help="a copy of the dataset with the choice prompts, for the samples")
+    parser.add_argument("--choice-responses-dir", type=Path, help="a copy of the dataset with the answers to them")
+    parser.add_argument("--no-question-pairs", action="store_true", help="leave the question pairs out of the page")
     parser.add_argument("--figures-dir", type=Path, default=here.parent / "docs" / "figures")
     parser.add_argument("--out", type=Path, default=here / "data.json")
     parser.add_argument("--explorer-cap", type=int, default=EXPLORER_CAP, help="most prompts in the explorer file")
@@ -525,15 +704,31 @@ def main(argv: list[str] | None = None) -> int:
     eval_dir = args.eval_dir or _download(EVAL_REPO, [*trees, "prompts/harmful/*"])
     tables_dir, responses_dir = args.tables_dir, args.responses_dir
     if tables_dir is None and from_hub:
-        tables_dir = _download(RESULTS_REPO, [*(tables for *_, tables in CONDITIONS), *OVERFIT[3].values()])
+        tables = [*(tables for *_, tables in CONDITIONS), *OVERFIT[3].values(), HELDOUT_TABLE]
+        tables_dir = _download(RESULTS_REPO, tables)
     if responses_dir is None and from_hub:
         responses_dir = _responses()
+    choice_dir, asked_dir, answers_dir = args.choice_dir, args.choice_eval_dir, args.choice_responses_dir
+    if args.no_question_pairs:
+        choice_dir = asked_dir = answers_dir = None
+    elif choice_dir is None and from_hub:
+        choice_dir = _choice(RESULTS_REPO, [CHOICE_TABLE], "the question-pair result")
+        prompts = [CHOICE_PROMPTS.format(language=language) for language in SAMPLE_LANGUAGES]
+        asked_dir = _choice(EVAL_REPO, prompts, "its sample item") if choice_dir else None
+        answers = [CHOICE_ANSWERS.format(slug="*", language=language) for language in SAMPLE_LANGUAGES]
+        answers_dir = _choice(RESPONSES_REPO, answers, "its sample item") if asked_dir else None
     figures = _copy_figures(args.figures_dir, args.out.parent / "figures")
-    data = build(eval_dir, tables_dir, responses_dir, figures)
+    data = build(eval_dir, tables_dir, responses_dir, figures, choice_dir)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")) + "\n", encoding="utf-8")
     counts = ", ".join(f"{key} {len(data[key])}" for key in ("cells", "figures", "length", "patch", "variants"))
-    print(f"{args.out}: {counts}")
+    counts += f", held-out prompts {data['heldout']['prompts'] if data['heldout'] else 'left out'}"
+    print(f"{args.out}: {counts}, question pairs {'with ' + str(len(data['attribution']['arms'])) + ' arms' if data['attribution'] else 'left out'}")
+    shown = samples(choice_dir, asked_dir, answers_dir) if choice_dir and asked_dir and answers_dir else None
+    if shown:
+        target = args.out.parent / "samples.json"
+        target.write_text(json.dumps(shown, ensure_ascii=False, separators=(",", ":")) + "\n", encoding="utf-8")
+        print(f"{target}: {SAMPLE_ITEM} in {', '.join(SAMPLE_LANGUAGES)}")
     if responses_dir:
         replay = explorer(eval_dir, responses_dir, args.explorer_cap, args.include_harmful)
         target = args.out.parent / "explorer.json"

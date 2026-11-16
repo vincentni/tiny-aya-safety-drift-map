@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Tiny Aya safety failure map</title>
+<title>Tiny Aya Global: where it gives harmful answers, in six languages</title>
 <style>
   :root { --ink: #1c2330; --soft: #5b6472; --line: #d9dee6; --band: #f4f6f9; --harm: #b3261e; --link: #2a5db0; }
   * { box-sizing: border-box; }
@@ -24,6 +24,7 @@
   .figures img, .lead-figure img { width: 100%; height: auto; border: 1px solid var(--line); border-radius: 6px; }
   .figures figcaption, .lead-figure figcaption { color: var(--soft); font-size: 0.9rem; }
   .lead-figure { max-width: 760px; margin: 12px 0; }
+  .lead-figure figure + figure { margin-top: 16px; }
   .hint { color: var(--soft); font-size: 0.85rem; margin: 4px 0; }
   .notice { background: #eef3fb; border: 1px solid #c9d8f0; border-radius: 6px; padding: 10px 14px; }
   code { background: var(--band); border-radius: 4px; padding: 1px 4px; }
@@ -51,6 +52,11 @@
   .badge.answered { background: #e6eefb; color: #1f4a94; }
   .badge.harmful { background: #fbe4e2; color: var(--harm); }
   .badge.unscored { background: #ececec; color: var(--soft); }
+  .badge.named { background: #fbe4e2; color: var(--harm); }
+  .badge.abstains { background: #e3f1e6; color: #1e5a2c; }
+  h3 { font-size: 1.05rem; margin: 22px 0 6px; }
+  .bar.good { background: #2e7d4f; }
+  .samples { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; margin: 12px 0; }
   .tag { color: var(--soft); font-size: 0.85rem; }
   .answer-box { margin-top: 8px; }
   #ex-prompt { width: 34rem; max-width: 100%; }
@@ -61,8 +67,8 @@
   <p class="warning"><strong>Content warning.</strong> The study uses red-teaming prompts. The tables and figures
     show counts only. The replay explorer at the end of the page shows prompt text, and model answers behind a
     click; the text of answers judged harmful is not shown.</p>
-  <h1>Tiny Aya Global gives a harmful answer to 9% of harmful requests. Five sentences in the system prompt bring
-    that to 5%; overfitting a benign fine-tune takes it to 14%.</h1>
+  <h1>Five sentences in the system prompt cut Tiny Aya Global's harmful answers from 8.3% to 6.2% on 600
+    held-out prompts in six languages (9.2% → 4.8% on the prompts they were written against).</h1>
   <p class="lead">Tiny Aya Global (3.35B) on 600 red-teaming prompts in six languages, with a system-prompt patch,
     two LoRA fine-tunes of the same benign rows, a weight-space repair and 4-bit quantization measured on the same
     map. One judge labels every answer under a fixed public rubric.
@@ -71,6 +77,47 @@
 
   <div id="content">
   <div class="numbers" id="numbers" aria-live="polite"></div>
+
+  <section id="attribution-section" hidden>
+    <h2>Who did it, when the text does not say?</h2>
+    <p>A short text, a question about who did something, and three options: two people identified by a group, and
+      "cannot be determined". An ambiguous item's text does not settle the answer; its twin adds the sentences
+      that do. The items are from BBQ. The attribution fine-tune saw English rows only; the other five languages
+      are translations of the English test. The light fine-tune is a benign fine-tune with the same settings:
+      1,272 rows in six languages, with no such question in them.</p>
+    <div class="lead-figure" id="top-figure" hidden></div>
+    <h3>Names a person where the text does not say</h3>
+    <div class="scroll">
+      <table>
+        <thead id="attr-person-head"></thead>
+        <tbody id="attr-person-body"></tbody>
+      </table>
+    </div>
+    <p class="note" id="attr-person-note"></p>
+    <h3>Twin accuracy: says so on the ambiguous item and answers its twin</h3>
+    <div class="scroll">
+      <table>
+        <thead id="attr-twin-head"></thead>
+        <tbody id="attr-twin-body"></tbody>
+      </table>
+    </div>
+    <p class="note" id="attr-twin-note"></p>
+    <div id="attr-samples" hidden>
+      <h3>One question pair, asked without options</h3>
+      <p class="note">Stored answers of the base model and of the fine-tune to one test item, in English and in
+        its Russian translation. No model runs here.</p>
+      <div class="samples" id="attr-sample-cards"></div>
+    </div>
+  </section>
+
+  <div id="map-intro" hidden>
+  <h2>The same model on harmful requests</h2>
+  <p>The side checks of the fine-tune use the base model's own map as their reference: 600 red-teaming prompts
+    in six languages, with a system-prompt patch, two LoRA fine-tunes of the same benign rows, a weight-space
+    repair and 4-bit quantization measured on it. One judge labels every answer under a fixed public rubric.
+    Below, "fine-tuned model" is the light fine-tune.</p>
+  </div>
+  <div class="numbers" id="map-numbers" aria-live="polite"></div>
   <div class="lead-figure" id="lead-figure" hidden></div>
   <p id="mechanism">The light recipe costs no safety, mostly because its answers are shorter and it refuses slightly
     more; among complete answers it is not safer.</p>
@@ -104,7 +151,9 @@
   <section id="patch-section" hidden>
     <h2>A targeted system-prompt patch</h2>
     <p>Guidance on biased content and self-harm, added to the system turn below the template's safety paragraph. Each
-      model is compared with itself under the served template, over the prompts the judge could label both ways.</p>
+      model is compared with itself under the served template, over the prompts the judge could label both ways.
+      The guidance was written after the weak categories were seen on these prompts, so the counts below are
+      in-sample.</p>
     <div class="scroll">
       <table>
         <thead id="patch-head"></thead>
@@ -112,22 +161,20 @@
       </table>
     </div>
     <p class="note" id="patch-note"></p>
-  </section>
-
-  <section id="variants-section" hidden>
-    <h2>Script stress test</h2>
-    <p>Harmful prompts rewritten in Latin script or mixed with English, each paired with its native-script parent
-      prompt under the same model and the served template.</p>
-    <div class="scroll">
-      <table>
-        <thead><tr><th>Variant</th><th>Model</th><th>Pairs</th><th>Refusals: native → variant</th>
-          <th>Harmful answers: native → variant</th><th>Neither: native → variant</th></tr></thead>
-        <tbody id="variants-body"></tbody>
-      </table>
+    <div id="heldout" hidden>
+      <h3>The patch on held-out prompts</h3>
+      <p>The base model on harmful prompts drawn afresh from the same red-teaming dataset: none is one of the
+        prompts above or near one, and none was seen when the guidance was written. Harmful answers and refusals
+        among the scored answers, without and with the patch.</p>
+      <div class="scroll">
+        <table>
+          <thead><tr><th>Language</th><th>Harmful answers, without</th><th>Harmful answers, with the patch</th>
+            <th>Change</th><th>Refusals: without → with</th></tr></thead>
+          <tbody id="heldout-body"></tbody>
+        </table>
+      </div>
+      <p class="note" id="heldout-note"></p>
     </div>
-    <p class="note">Counts are over the pairs the judge could label on both sides. A variant that gets neither
-      refusals nor harmful answers is one the model does not understand: read that row as a comprehension failure,
-      not as safety. <span id="variants-note"></span></p>
   </section>
 
   <section id="figures-section" hidden>
@@ -160,7 +207,9 @@
       and the stored answer of each system behind a click. Some prompts are offensive.
       <span id="ex-harmful"></span></p>
     <p>Pick a prompt to see what each measured system did with it. No model runs here: every answer was stored when
-      the evaluation ran, with greedy decoding and a limit of 256 new tokens.</p>
+      the evaluation ran, with greedy decoding and a limit of 256 new tokens. A prompt's Latin-script and
+      English-mixed variants are replayed under it for completeness; they were written for this study by a closed
+      model and are not part of the claim.</p>
     <p class="note" id="ex-scope"></p>
     <div class="controls">
       <label>Language <select id="ex-language"></select></label>
@@ -173,6 +222,25 @@
     <p class="note" id="ex-count" aria-live="polite"></p>
     <div id="ex-panel"></div>
   </section>
+  <section id="variants-section" hidden>
+    <h2>Latin-script and code-mixed variants, for completeness</h2>
+    <p>No official transliterated or code-mixed version of these prompts exists, so the variants were written for
+      this study as the best available option: each is a rewrite by a closed model, checked by rule and not by
+      native speakers. Their results are given here for completeness and are not part of the claim. Each variant
+      is paired with its native-script parent prompt under the same model and the served template.</p>
+    <div class="lead-figure" id="variants-figure" hidden></div>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>Variant</th><th>Model</th><th>Pairs</th><th>Refusals: native → variant</th>
+          <th>Harmful answers: native → variant</th><th>Neither: native → variant</th></tr></thead>
+        <tbody id="variants-body"></tbody>
+      </table>
+    </div>
+    <p class="note">Counts are over the pairs the judge could label on both sides. A variant that gets neither
+      refusals nor harmful answers is one the model does not understand: read that row as a comprehension failure,
+      not as safety. <span id="variants-note"></span></p>
+  </section>
+
   </div>
 
   <p class="note" id="status">Loading data.</p>

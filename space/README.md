@@ -10,6 +10,7 @@ short_description: Where Tiny Aya Global gives harmful answers, by language
 datasets:
   - vincentnkq/aya-redteaming-6lang-eval
   - vincentnkq/safety-drift-map-results
+  - vincentnkq/safety-drift-map-responses
 models:
   - CohereLabs/tiny-aya-global
   - vincentnkq/tiny-aya-global-drift-lora
@@ -35,16 +36,19 @@ the responses dataset, under its own warning.
 - The overfit recipe and its repair: harmful answers by language of the base model, of both
   fine-tunes and of the repaired fine-tune, with no safety preamble, and the overfit recipe's change
   under the served template.
-- A targeted system-prompt patch: each model with and without it, on the same prompts.
-- The script stress test: prompts in Latin script or mixed with English against their native-script
-  parents.
+- A targeted system-prompt patch: each model with and without it, on the prompts the patch was written
+  against (in-sample), and the base model with and without it on held-out prompts from the same
+  red-teaming dataset.
 - The failure map: harmful answers of every measured model for every language and harm category,
   with 95% Wilson intervals, filtered by condition, language and category.
-
 - The replay explorer: pick a language, a harm category and a prompt, and see side by side what each
   measured system did with it: the judge's verdict, whether the answer hit the 256-token limit, and
   the answer itself. A filter lists the prompts where the systems disagree, and the address of the
   page (`#language/category/prompt-id`) links to one prompt.
+- For completeness, not part of the claim: prompts in Latin script or mixed with English against their
+  native-script parents. No official version of these variants exists; they are rewrites by a closed
+  model, checked by rule and not by native speakers. The explorer lists them under their parent prompt,
+  labelled.
 
 No model runs here. The page reads `data.json`, which holds counts and intervals only, and after it
 has painted `explorer.json`, which holds the explorer's prompts and stored answers.
@@ -52,17 +56,21 @@ has painted `explorer.json`, which holds the explorer's prompts and stored answe
 ## Rebuild the data file
 
 ```bash
-python space/build_data.py
+python space/build_data.py --no-question-pairs
 ```
 
-To see the page from a clone, serve the folder over HTTP: `python space/build_data.py`, then
+To see the page from a clone, serve the folder over HTTP: `python space/build_data.py --no-question-pairs`, then
 `python -m http.server --directory space`, and open <http://localhost:8000/>. Opened as a file the page
 shows a notice instead, because a browser does not let a page fetch local files.
 
-The script downloads the published label files and tables, and writes `space/data.json`. The
-answer-length counts need the responses dataset; when it cannot be read they are left out and the
-page hides that table. With `--eval-dir`, `--tables-dir` and
+The script downloads the published label files and tables from the datasets `driftmap.toml` names,
+and writes `space/data.json`. The answer-length counts need the responses dataset; when it cannot be
+read they are left out and the page hides that table. With `--eval-dir`, `--tables-dir` and
 `--responses-dir` the script reads local copies instead.
+
+The script can also add a section on question pairs from a choice table, for a separate study whose
+code the package also holds; this page is built with `--no-question-pairs`, which leaves that section
+out.
 
 The script also copies the figures from `docs/figures/` to `space/figures/` and lists them in the
 data file, and, when it can read the responses dataset, writes `space/explorer.json`. Both are build
