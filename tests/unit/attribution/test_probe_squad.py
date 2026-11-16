@@ -42,6 +42,7 @@ def sources(tmp_path, monkeypatch):
     }
     monkeypatch.setattr(probe_squad, "FILES", files)
     samples = {"dev": (reading.SQUAD_FILE, 20), "train": (probe_squad.TRAIN_FILE, 40)}
+    samples["dev2"] = (reading.SQUAD_FILE, 20)
     monkeypatch.setattr(probe_squad, "SAMPLES", samples)
     return folder
 
@@ -80,6 +81,7 @@ def test_the_two_samples_are_written_with_their_counts_and_hashes_from_checked_f
 
     assert sorted(path.name for path in out.iterdir()) == [
         "squad_build.json",
+        "squad_dev2_in.jsonl",
         "squad_dev_in.jsonl",
         "squad_train_in.jsonl",
     ]
@@ -101,9 +103,17 @@ def test_the_two_samples_are_written_with_their_counts_and_hashes_from_checked_f
     )
     assert (summary["passages_in_both_samples"], summary["articles_in_both_samples"]) == (0, 0)
     assert summary["dev_rows_also_in_the_reading_check"] == 3
+    # the second sample of the validation file asks none of the first one's questions
+    second = read_jsonl(out / "squad_dev2_in.jsonl")
+    assert len(second) == 40 and not {row["id"] for row in second} & {row["id"] for row in dev}
+    assert summary["dev2"]["after"] == "dev" and summary["dev2"]["questions_also_in_the_first_sample"] == 0
+    shared = len({row["context"] for row in second} & {row["context"] for row in dev})
+    assert summary["dev2"]["passages_also_in_the_first_sample"] == shared == 0
+    assert summary["dev2"]["passages_not_in_the_first_sample"] == 40
+    assert (summary["passages_in_dev2_and_train"], summary["articles_in_dev2_and_train"]) == (0, 0)
     assert summary["files_sha256"] == {
         name: hashlib.sha256((out / name).read_bytes()).hexdigest()
-        for name in ("squad_dev_in.jsonl", "squad_train_in.jsonl")
+        for name in ("squad_dev_in.jsonl", "squad_train_in.jsonl", "squad_dev2_in.jsonl")
     }
     # the counts hold no text of the source
     said = json.dumps(summary)
@@ -132,8 +142,29 @@ def test_a_missing_file_is_downloaded_at_the_pinned_revision_and_a_changed_one_i
     assert not (tmp_path / "three").exists()
 
 
+def test_a_later_sample_takes_none_of_the_earlier_questions_and_an_earlier_passage_only_when_it_must(sources):
+    source = sources / reading.SQUAD_FOLDER / reading.SQUAD_FILE
+    first = probe_squad.draw(source, 100, "a seed")
+
+    second = probe_squad.draw(source, 30, "another seed", first)
+
+    assert [row["condition"] for row in second] == ["unanswerable", "answerable"] * 30
+    assert not {row["id"] for row in second} & {row["id"] for row in first}
+    assert len({row["context"] for row in second}) == 60
+    # the first sample left 40 of the 240 short passages unused: they are all taken before a used one is
+    shared = {row["context"] for row in second} & {row["context"] for row in first}
+    assert len(shared) == 20
+    assert probe_squad.draw(source, 30, "another seed", first) == second
+    assert probe_squad.draw(source, 30, "another seed", ()) != second
+
+
 def test_the_recorded_files_and_sample_sizes_are_those_of_the_study():
-    assert probe_squad.SAMPLES == {"dev": (reading.SQUAD_FILE, 500), "train": (probe_squad.TRAIN_FILE, 1000)}
+    assert probe_squad.SAMPLES == {
+        "dev": (reading.SQUAD_FILE, 500),
+        "train": (probe_squad.TRAIN_FILE, 1000),
+        "dev2": (reading.SQUAD_FILE, 500),
+    }
+    assert probe_squad.AFTER == {"dev2": "dev"}
     assert set(probe_squad.FILES) == {reading.SQUAD_FILE, probe_squad.TRAIN_FILE}
     assert all(len(sha) == 64 and set(sha) <= set("0123456789abcdef") for sha in probe_squad.FILES.values())
     assert probe_squad.FILES[reading.SQUAD_FILE] == reading.SQUAD_FILES[reading.SQUAD_FILE]

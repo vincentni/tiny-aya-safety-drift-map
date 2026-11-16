@@ -106,6 +106,19 @@ with its command in the module: the probe served inside a running model against 
 and two runs of the same prompts compared row for row (``identity``). Each writes ``probe-squad-<part>.json``,
 the same as Markdown and rows without text.
 
+A fine-tune trained on the probe's own train questions, as a trained arm on the same benchmark:
+
+    python -I -m driftmap.attribution.squad_train --train OUT/squad_train_in.jsonl \
+        --passed CURATED/squad_passed.json --benign DATA/sft_train_defense --out DATA
+    python -I -m driftmap.attribution.squad_prompts --split train=OUT/squad_train_in.jsonl \
+        --split dev=OUT/squad_dev_in.jsonl --split dev2=OUT/squad_dev2_in.jsonl \
+        --passed CURATED/squad_passed.json --out DATA
+
+``squad_train`` writes the training set ``squad`` (``driftmap launch drift -- --train-set squad``): each gated
+train question with a gold answer or one fixed abstention sentence as its target. ``squad_prompts`` writes the
+prompt group ``squad`` (``driftmap launch generate -- --sets squad``): the questions of the three samples as
+prompt files. ``probe_checks fine-tune`` and ``job-identity`` read the job's answers.
+
 A side check on the evaluation prompts, from a copy of the responses dataset:
 
     python -I -m driftmap.attribution.answer_lengths RESPONSES_DIR OUT.json --model "base model=FOLDER" \

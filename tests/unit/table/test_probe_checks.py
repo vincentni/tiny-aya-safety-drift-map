@@ -117,6 +117,35 @@ def test_a_scored_part_gives_the_rules_table_and_with_a_judge_the_judges_and_the
     assert set(probe_checks.RENDER) == set(probe_checks.SCHEMAS)
 
 
+def test_a_fine_tune_part_says_which_fine_tune_it_is_of_and_on_which_sample():
+    counts = COUNTS | {"wrong_answers": 6}
+    moved = {key: MOVED[key] for key in MOVED if not key.startswith("questions_")} | {"questions": 100}
+    found = {
+        "base": COUNTS,
+        "base_plus_squad_probe": GATED,
+        "fine_tuned": counts,
+        "fine_tuned_answers": {"wording": {"trained sentence": 30, "no abstention wording": 70}},
+        "base_to_fine_tuned_wrong_answers": moved,
+        "base_plus_squad_probe_to_fine_tuned_wrong_answers": moved,
+    }
+    record = {"probe": {"layer": 20, "C": 0.001, "threshold": 0.7}, "word_match": found}
+
+    plain = probe_checks.RENDER["squad-fine-tune"](record)
+    trained = probe_checks.RENDER["squad-trained-replication"](record)
+
+    assert plain.startswith("# SQuAD 2.0: the fine-tune beside the base model and the probe\n")
+    assert "The fine-tune answered the questions of the dev sample;" in plain
+    assert trained.startswith(
+        "# SQuAD 2.0: a fine-tune trained on the train sample, second dev sample beside the base model and the probe\n"
+    )
+    assert "one fixed abstention sentence, answered the questions of the second dev sample;" in trained
+    assert "| fine-tune | 6.0% (6/100) |" in trained
+    assert "The fine-tune's answers by wording: trained sentence 30, no abstention wording 70." in trained
+    assert "- Change in wrong answers, fine-tune minus base model: -27.4 points" in trained and (
+        "100 questions" in trained
+    )
+
+
 def test_the_identity_part_is_one_line_of_counts():
     record = {"rows": 1000, "equal_text": 1000, "equal_token_count": 1000, "equal_stop_reason": 999}
     record |= {"equal_on_all_three": 999, "auditkit_rows_with_an_error": 0}

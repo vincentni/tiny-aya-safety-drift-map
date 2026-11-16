@@ -101,6 +101,11 @@ def test_every_answer_with_text_is_judged_once_and_the_verdicts_hold_no_reason(t
     assert (tmp_path / "judge" / "again.jsonl").read_bytes() == (tmp_path / "judge" / "verdicts.jsonl").read_bytes()
     assert probe_judge.main([*argv, "--limit", "2", "--out", str(tmp_path / "judge" / "two.jsonl")], complete) == 0
     assert [row["id"] for row in read_jsonl(tmp_path / "judge" / "two.jsonl")] == ["squad.q1", "squad.q2"]
+    # the response rows of a generate job name a question under the prompt group's id
+    job = [{"prompt_id": f"squad.dev.q{at}", "response": text} for at, text in enumerate(said, 1)]
+    put(tmp_path / "answers.jsonl", job)
+    assert probe_judge.main([*argv, "--out", str(tmp_path / "judge" / "job.jsonl")], complete) == 0
+    assert (tmp_path / "judge" / "job.jsonl").read_bytes() == (tmp_path / "judge" / "verdicts.jsonl").read_bytes()
     put(tmp_path / "answers.jsonl", [{"id": "squad.q1", "response": "It is the Elbe."}])
     with pytest.raises(SystemExit, match="3 rows of in.jsonl have no answer in answers.jsonl"):
         probe_judge.main([*argv, "--out", str(tmp_path / "judge" / "short.jsonl")], complete)

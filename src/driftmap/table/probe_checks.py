@@ -17,6 +17,8 @@ SCHEMAS = {
     "squad-pooled": "driftmap.probe-squad-scored/1",
     "squad-fine-tune": "driftmap.probe-squad-fine-tune/1",
     "squad-fine-tune-replication": "driftmap.probe-squad-fine-tune/1",
+    "squad-trained": "driftmap.probe-squad-fine-tune/1",
+    "squad-trained-replication": "driftmap.probe-squad-fine-tune/1",
     "squad-job-identity": "driftmap.probe-squad-job-identity/1",
     "squad-identity": "driftmap.probe-squad-identity/1",
 }
@@ -210,13 +212,33 @@ def _arms(found: Mapping[str, Any]) -> list[str]:
     ]
 
 
-def render_fine_tune(record: Mapping[str, Any]) -> str:
-    """The fine-tune beside the base model and the base model gated by the probe."""
+# which fine-tune a part is of, and on which sample
+TUNED = {
+    "squad-fine-tune": ("the fine-tune", "The fine-tune", "the dev sample"),
+    "squad-fine-tune-replication": ("the fine-tune, second dev sample", "The fine-tune", "the second dev sample"),
+    "squad-trained": (
+        "a fine-tune trained on the train sample",
+        "A fine-tune trained on the questions of the train sample, to answer an answerable one with a gold answer "
+        "and an unanswerable one with one fixed abstention sentence,",
+        "the dev sample",
+    ),
+    "squad-trained-replication": (
+        "a fine-tune trained on the train sample, second dev sample",
+        "A fine-tune trained on the questions of the train sample, to answer an answerable one with a gold answer "
+        "and an unanswerable one with one fixed abstention sentence,",
+        "the second dev sample",
+    ),
+}
+
+
+def render_fine_tune(record: Mapping[str, Any], part: str = "squad-fine-tune") -> str:
+    """The fine-tune of ``part`` beside the base model and the base model gated by the probe."""
     probe = record["probe"]
+    title, who, sample = TUNED[part]
     out = [
-        "# SQuAD 2.0: the fine-tune beside the base model and the probe",
+        f"# SQuAD 2.0: {title} beside the base model and the probe",
         "",
-        "The fine-tune answered the questions of the dev sample; its answers are classed by the same rules as the "
+        f"{who} answered the questions of {sample}; its answers are classed by the same rules as the "
         f"base model's. The probe (layer {probe['layer']}, C {probe['C']:g}, threshold {probe['threshold']:g}) "
         "is the one frozen on the train sample and reads the base model alone; its gate is computed on stored "
         "answers. A change is the fine-tune's wrong-answer rate minus the other system's on the same questions, "
@@ -286,8 +308,7 @@ def render_identity(record: Mapping[str, Any]) -> str:
 
 RENDER: dict[str, Callable[[Mapping[str, Any]], str]] = {
     "squad-served": render_served,
-    "squad-fine-tune": render_fine_tune,
-    "squad-fine-tune-replication": render_fine_tune,
+    **{part: (lambda record, part=part: render_fine_tune(record, part)) for part in TUNED},
     "squad-job-identity": render_job_identity,
     "squad-identity": render_identity,
 } | {part: _render_scored(part) for part in TITLES}

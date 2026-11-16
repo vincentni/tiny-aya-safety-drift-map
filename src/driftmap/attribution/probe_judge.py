@@ -7,7 +7,8 @@ One call per answer through the cached client of ``translate``: the route is rea
 stored or printed; three attempts with backoff; throttling stops the run; every reply that was used is kept in
 ``--cache``, so the same command continues a stopped run and a second run makes no call. The judge sees the
 passage, the question, the reference answers (or the word UNANSWERABLE) and the answer given; not which system
-wrote it, not the word-match labels, not the probe. An answer without text is not sent.
+wrote it, not the word-match labels, not the probe. An answer without text is not sent. ``--answers`` is an
+answers file of this study's runs or a file of a generate job's responses to the prompt group ``squad``.
 
 ``--out`` holds a row per question: its id, ``status`` (ok, empty_response, unparsed or unavailable) and the two
 verdicts ``abstains`` and ``correct``. The judge's one-sentence reason speaks of the passage and stays in the
@@ -19,7 +20,7 @@ import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
-from driftmap.attribution import probe, translate
+from driftmap.attribution import probe, probe_squad, translate
 from driftmap.judge import closed
 
 KIND = "reading"
@@ -71,7 +72,7 @@ def main(argv: Sequence[str] | None = None, complete: Callable[[list[dict[str, s
     parser.add_argument("--limit", type=int, help="only the first rows, for a first look at the route")
     args = parser.parse_args(argv)
     rows = probe.read_jsonl(args.input)[: args.limit]
-    said = {row["id"]: row["response"] for row in probe.read_jsonl(args.answers)}
+    said = {name: row["response"] for name, row in probe_squad.answers_of(args.answers).items()}
     lacking = [row["id"] for row in rows if row["id"] not in said]
     if lacking:
         raise SystemExit(f"{len(lacking)} rows of {args.input.name} have no answer in {args.answers.name}")

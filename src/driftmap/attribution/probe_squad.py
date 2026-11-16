@@ -8,8 +8,10 @@ SQuAD 2.0 are fetched there at the revision ``reading`` pins and checked by sha2
 is the reading check's rule with seeds and sizes of its own: passages under 250 words; the articles in a seeded
 order, taken in turn; every drawn question on a passage no other drawn question uses; unanswerable first, then
 answerable. Written under ``--out``: ``squad_dev_in.jsonl`` (500 + 500 questions of the validation file),
-``squad_train_in.jsonl`` (1,000 + 1,000 of the train file) and ``squad_build.json`` (counts and hashes). The two
-prompt files hold SQuAD text and stay where they are written; no other output of the study holds any.
+``squad_train_in.jsonl`` (1,000 + 1,000 of the train file), ``squad_dev2_in.jsonl`` (a second 500 + 500 of the
+validation file: none of the first sample's questions, and one of its passages only where an article has no other
+left) and ``squad_build.json`` (counts and hashes). The prompt files hold SQuAD text and stay where they are
+written; no other output of the study holds any.
 
 The base model's answer is classed by the reading check's rule: it abstains when its wording class is an
 abstention, and an answerable question is answered correctly when the answer contains a gold answer, case aside.
@@ -39,7 +41,9 @@ FILES = {
     TRAIN_FILE: "f6da32ffb482ff463ad056477740d1bb284b96a45db3a08bee6a225ca6abf291",
 }
 # sample to its source file and the questions drawn per condition
-SAMPLES = {"dev": (reading.SQUAD_FILE, 500), "train": (TRAIN_FILE, 1000)}
+SAMPLES = {"dev": (reading.SQUAD_FILE, 500), "train": (TRAIN_FILE, 1000), "dev2": (reading.SQUAD_FILE, 500)}
+# a sample drawn after another one of the same file, apart from its questions
+AFTER = {"dev2": "dev"}
 CONDITIONS = ("unanswerable", "answerable")
 NO_ABSTENTION = "no abstention wording"
 WORDINGS = ("trained sentence", "trained style", "wider wording", NO_ABSTENTION)
@@ -55,13 +59,20 @@ def fetch(sources: Path, get: Callable[[str], bytes] = pinned.download) -> dict[
     return reading._fetch(sources, reading.SQUAD, reading.SQUAD_REVISION, reading.SQUAD_FOLDER, FILES, get)
 
 
-def draw(source: Path, per_condition: int, seed: str) -> list[dict]:
-    """``per_condition`` unanswerable and as many answerable questions of the file, as prompt rows."""
+def draw(source: Path, per_condition: int, seed: str, earlier: Sequence[Mapping[str, Any]] = ()) -> list[dict]:
+    """``per_condition`` unanswerable and as many answerable questions of the file, as prompt rows.
+
+    ``earlier`` holds the rows of a sample drawn from the same file before: none of its questions is drawn, and
+    one of its passages is taken only when the article in turn has no other unused passage left.
+    """
     import pyarrow.parquet as pq
 
     rng = random.Random(seed)
     rows = sorted(pq.read_table(source).to_pylist(), key=lambda row: row["id"])
-    short = [row for row in rows if len(row["context"].split()) < reading.MAX_WORDS]
+    asked, seen = ({row[key] for row in earlier} for key in ("id", "context"))
+    short = [
+        row for row in rows if len(row["context"].split()) < reading.MAX_WORDS and f"squad.{row['id']}" not in asked
+    ]
     titles = sorted({row["title"] for row in short})
     rng.shuffle(titles)
     used, drawn = set(), {}
@@ -76,7 +87,7 @@ def draw(source: Path, per_condition: int, seed: str) -> list[dict]:
             for title in titles:
                 left = [row for row in pool[title] if row["context"] not in used]
                 if left and len(picked) < per_condition:
-                    row = rng.choice(left)
+                    row = rng.choice([row for row in left if row["context"] not in seen] or left)
                     used.add(row["context"])
                     picked.append(row)
             if len(picked) == before:
@@ -336,7 +347,8 @@ def main(argv: Sequence[str] | None = None, download: Callable[[str], bytes] = p
     summary = {"revision": reading.SQUAD_REVISION, "licence": reading.LICENCE, "max_passage_words": reading.MAX_WORDS}
     drawn = {}
     for name, (file, per_condition) in SAMPLES.items():
-        rows = drawn[name] = draw(args.sources / reading.SQUAD_FOLDER / file, per_condition, seed_of(name))
+        first = drawn.get(AFTER.get(name), [])
+        rows = drawn[name] = draw(args.sources / reading.SQUAD_FOLDER / file, per_condition, seed_of(name), first)
         probe.write_jsonl(args.out / f"squad_{name}_in.jsonl", rows)
         summary[name] = {
             "file_sha256": hashes[file],
@@ -346,9 +358,25 @@ def main(argv: Sequence[str] | None = None, download: Callable[[str], bytes] = p
             "distinct_passages": len({row["context"] for row in rows}),
             "distinct_ids": len({row["id"] for row in rows}),
         }
+        if first:
+            passages = {row["context"]: row["condition"] for row in first}
+            shared = [row for row in rows if row["context"] in passages]
+            summary[name] |= {
+                "after": AFTER[name],
+                "questions_also_in_the_first_sample": len({row["id"] for row in first} & {row["id"] for row in rows}),
+                "passages_also_in_the_first_sample": len(shared),
+                "of_those_with_the_same_condition_as_the_first_sample_question": sum(
+                    passages[row["context"]] == row["condition"] for row in shared
+                ),
+                "passages_not_in_the_first_sample": len(rows) - len(shared),
+            }
     for key, name in (("context", "passages"), ("title", "articles")):
         shared = {row[key] for row in drawn["dev"]} & {row[key] for row in drawn["train"]}
         summary[f"{name}_in_both_samples"] = len(shared)
+        for later in AFTER:
+            if later in drawn:
+                both = {row[key] for row in drawn[later]} & {row[key] for row in drawn["train"]}
+                summary[f"{name}_in_{later}_and_train"] = len(both)
     if args.reading:
         old = {row["id"] for row in probe.read_jsonl(args.reading)}
         summary["dev_rows_also_in_the_reading_check"] = len(old & {row["id"] for row in drawn["dev"]})

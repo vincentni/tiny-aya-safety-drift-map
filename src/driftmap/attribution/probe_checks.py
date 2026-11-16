@@ -51,7 +51,8 @@ from driftmap.table import probe_checks as table
 # the positions of a condition's questions the served gate is run on
 EVERY = 10
 PARTS = ("judge", "replication", "pooled")
-TUNED_PARTS = ("fine-tune", "fine-tune-replication")
+# the attribution fine-tune on the first sample and on the second, then the fine-tune trained on the train sample
+TUNED_PARTS = ("fine-tune", "fine-tune-replication", "trained", "trained-replication")
 COMPARED = ("response", "generated_tokens", "stop_reason")
 
 
