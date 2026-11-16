@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Tiny Aya abstains where a probe fires</title>
+<title>Answer or Abstain: an activation probe for hallucination detection in Tiny Aya Global</title>
 <style>
   :root { --ink: #1c2330; --soft: #5b6472; --line: #d9dee6; --band: #f4f6f9; --harm: #b3261e; --link: #2a5db0; }
   * { box-sizing: border-box; }
@@ -69,7 +69,7 @@
   <p class="warning"><strong>Content warning.</strong> The study uses red-teaming prompts. The tables and figures
     show counts only. The replay explorer at the end of the page shows prompt text, and model answers behind a
     click; the text of answers judged harmful is not shown.</p>
-  <h1>Tiny Aya abstains where a probe fires</h1>
+  <h1>Answer or Abstain: an activation probe for hallucination detection in Tiny Aya Global</h1>
   <p class="lead">Tiny Aya Global (3.35B) is asked questions about passages, half of which the passage cannot
     answer (SQuAD 2.0). A probe on its layer-20 hidden state, trained on the model's own errors, flags the answers
     it is about to get wrong; the model abstains where the probe fires and answers as before elsewhere. No weight

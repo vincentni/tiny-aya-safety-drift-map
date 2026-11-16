@@ -1,5 +1,5 @@
 ---
-title: Tiny Aya abstains where a probe fires
+title: Answer or Abstain
 colorFrom: indigo
 colorTo: gray
 sdk: static
@@ -21,7 +21,7 @@ models:
   - vincentnkq/tiny-aya-global-drift-GGUF
 ---
 
-# Tiny Aya abstains where a probe fires
+# Answer or Abstain: an activation probe for hallucination detection in Tiny Aya Global
 
 A static results page for the study in <https://github.com/vincentni/tiny-aya-safety-drift-map>. Tiny Aya Global is
 asked questions about passages, half of which the passage cannot answer (SQuAD 2.0); a probe on its layer-20
