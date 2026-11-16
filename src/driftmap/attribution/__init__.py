@@ -92,6 +92,20 @@ computed afterwards (``served``) and a probe fitted on the train sample and scor
 (``squad``). Each part writes ``probe-<part>.json``, the same as Markdown and rows without text;
 ``probe_gates`` and ``probe_baselines`` hold the counts, intervals and baselines the steps share.
 
+Checks on the SQuAD probe once it is frozen:
+
+    DRIFTMAP_CLOSED_JUDGE_ROUTE=... python -m driftmap.attribution.probe_judge --input OUT/squad_dev_in.jsonl \
+        --answers OUT/squad_dev_base.jsonl --cache JUDGE/score_cache.jsonl --out JUDGE/dev_verdicts.jsonl
+    python -I -m driftmap.attribution.probe_checks scored --part judge --dev OUT/squad_dev_in.jsonl ... \
+        --verdicts JUDGE/dev_verdicts.jsonl --passed CURATED/squad_passed.json --out RESULTS
+
+``probe_judge`` asks the closed model, answer by answer, whether a SQuAD answer abstains and whether it states a
+gold answer, and writes the verdicts without the judge's reasons; ``probe_checks`` has a step per check, listed
+with its command in the module: the probe served inside a running model against the gate computed afterwards
+(``served``), the probe's table on a sample again by the word-match rules and by the judge's labels (``scored``),
+and two runs of the same prompts compared row for row (``identity``). Each writes ``probe-squad-<part>.json``,
+the same as Markdown and rows without text.
+
 A side check on the evaluation prompts, from a copy of the responses dataset:
 
     python -I -m driftmap.attribution.answer_lengths RESPONSES_DIR OUT.json --model "base model=FOLDER" \

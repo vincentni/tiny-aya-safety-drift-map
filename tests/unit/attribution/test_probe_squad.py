@@ -304,3 +304,76 @@ def test_a_gate_is_read_at_its_threshold_and_along_the_whole_grid_of_thresholds(
         0.625,
     )
     assert [point["coverage"] for point in found["curve"]] == sorted(point["coverage"] for point in found["curve"])
+
+
+def test_a_judges_verdicts_relabel_the_rows_it_judged_and_its_reasons_are_not_read(tmp_path):
+    rows = [
+        dict(row, id=f"q{at}", holds_gold=row["correct"] and not row["unanswerable"])
+        for at, row in enumerate(eight_rows())
+    ]
+    verdicts = [
+        {"id": "q0", "status": "ok", "abstains": "yes", "correct": "n/a", "why": "a reason"},
+        {"id": "q1", "status": "ok", "abstains": "yes", "correct": "n/a", "why": "a reason"},
+        {"id": "q2", "status": "ok", "abstains": "no", "correct": "no", "why": "a reason"},
+        {"id": "q3", "status": "unparsed", "why": "no usable answer"},
+        {"id": "q4", "status": "ok", "abstains": "no", "correct": "yes", "why": "a reason"},
+        {"id": "q5", "status": "empty_response"},
+        {"id": "q6", "status": "ok", "abstains": "no", "correct": "yes", "why": "a reason"},
+    ]
+    put(tmp_path / "verdicts.jsonl", verdicts)
+
+    read = probe_squad.read_verdicts(tmp_path / "verdicts.jsonl")
+    kept = probe_squad.judged(rows, read)
+
+    assert read["q0"] == {"status": "ok", "abstains": "yes", "correct": "n/a"}
+    assert read["q5"] == {"status": "empty_response", "abstains": None, "correct": None}
+    # the unparsed row and the row without a verdict are left out; an answer without text is not right
+    assert [row["id"] for row in kept] == ["q0", "q1", "q2", "q4", "q5", "q6"]
+    assert [row["abstained"] for row in kept] == [True, True, False, False, False, False]
+    assert [row["base_wrong"] for row in kept] == [False, False, True, False, True, False]
+    assert [row["hallucination"] for row in kept] == [False] * 6
+    assert [row["rule_wrong"] for row in kept] == [False, True, False, True, True, False]
+    assert [row["rule_abstained"] for row in kept] == [True, False, False, False, True, False]
+    assert kept[3]["judge_says_gold"] is True and kept[3]["rule_holds_gold"] is False
+    agreed = probe_squad.agreement(kept)
+    assert agreed["abstains"] == {
+        "rows": 6,
+        "rule_judge": {"yes_yes": 1, "yes_no": 1, "no_yes": 1, "no_no": 3},
+        "agree": 4,
+        "kappa": 0.25,
+    }
+    assert agreed["gold_answer_on_answerable"]["rule_judge"] == {"yes_yes": 1, "yes_no": 1, "no_yes": 1, "no_no": 1}
+    assert (agreed["answer_is_wrong"]["rows"], agreed["answer_is_wrong"]["agree"]) == (6, 3)
+
+
+def test_two_readings_of_the_same_rows_are_counted_cell_by_cell_with_kappa():
+    found = probe_squad.two_by_two([True, True, False, False], [True, False, False, False])
+
+    assert found == {
+        "rows": 4,
+        "rule_judge": {"yes_yes": 1, "yes_no": 1, "no_yes": 0, "no_no": 2},
+        "agree": 3,
+        "kappa": 0.5,
+    }
+    assert probe_squad.two_by_two([True, True], [True, True])["kappa"] is None
+    with pytest.raises(ValueError):
+        probe_squad.two_by_two([True], [True, False])
+
+
+def test_two_systems_on_the_same_questions_are_compared_per_article():
+    rows = [dict(row, id=f"q{at}") for at, row in enumerate(eight_rows())]
+    other = [dict(row) for row in rows[:-1]]
+    other[1]["base_wrong"], other[6]["base_wrong"] = False, True
+
+    found = probe_squad.against(rows, other)
+
+    # the last question has no answer of the other system; wrong answers per article go 1, 3, 0 -> 0, 3, 1
+    assert found == {
+        "questions": 7,
+        "articles": 3,
+        "change": 0.0,
+        "ci95": probe_gates.interval(np.array([-1.0, 0.0, 1.0]), np.array([3.0, 3.0, 1.0])),
+        "articles_better": 1,
+        "articles_worse": 1,
+        "sign_test_p": 1.0,
+    }

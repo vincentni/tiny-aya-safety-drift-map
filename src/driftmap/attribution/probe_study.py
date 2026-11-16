@@ -68,14 +68,15 @@ SQUAD_TAIL = 2
 EVERY = {"bbq_test_en": 5, "mbbq": 10}
 
 
-def write(out: Path, part: str, record: dict, rows: Sequence[dict] | None = None, suffix: str = "answers") -> None:
-    """Write a part's record, its Markdown and, where given, its row file under ``out``."""
+def write(out: Path, part: str, record: dict, rows: Sequence[dict] | None = None, tables=table) -> None:
+    """Write a part's record, its Markdown and, where given, its row file under ``out``; ``tables`` is the
+    module that holds the part's schema name and its Markdown."""
     out.mkdir(parents=True, exist_ok=True)
-    record = {"schema": table.SCHEMAS[part]} | record
+    record = {"schema": tables.SCHEMAS[part]} | record
     (out / f"probe-{part}.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
-    (out / f"probe-{part}.md").write_text(table.RENDER[part](record), encoding="utf-8")
+    (out / f"probe-{part}.md").write_text(tables.RENDER[part](record), encoding="utf-8")
     if rows is not None:
-        probe.write_jsonl(out / f"probe-{part}-{suffix}.jsonl", rows)
+        probe.write_jsonl(out / f"probe-{part}-answers.jsonl", rows)
 
 
 def named(pairs: Sequence[str]) -> dict[str, Path]:

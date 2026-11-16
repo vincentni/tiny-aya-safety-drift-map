@@ -219,6 +219,97 @@ def read_gate(rows: Sequence[Mapping[str, Any]], scores: np.ndarray, threshold: 
     }
 
 
+def read_verdicts(path: Path) -> dict[str, dict]:
+    """A judge's verdicts by question id: ``status``, ``abstains`` and ``correct``; its reasons are not read."""
+    kept = ("status", "abstains", "correct")
+    return {row["id"]: {key: row.get(key) for key in kept} for row in probe.read_jsonl(path)}
+
+
+def judged(rows: Sequence[Mapping[str, Any]], verdicts: Mapping[str, Mapping[str, Any]]) -> list[dict]:
+    """The rows the judge gave a verdict on (or that had no answer text), labelled by the judge instead of the
+    word match: abstained when its ``abstains`` is yes; an unanswerable question right when abstained; an
+    answerable one right when not abstained and its ``correct`` is yes. The word-match labels stay under
+    ``rule_abstained``, ``rule_holds_gold`` and ``rule_wrong``."""
+    kept = []
+    for row in rows:
+        verdict = verdicts.get(row["id"])
+        if verdict is None or verdict["status"] not in ("ok", "empty_response"):
+            continue
+        abstained = verdict.get("abstains") == "yes"
+        says_gold = not abstained and verdict.get("correct") == "yes"
+        correct = abstained if row["unanswerable"] else says_gold
+        kept.append(
+            dict(
+                row,
+                rule_abstained=row["abstained"],
+                rule_holds_gold=row["holds_gold"],
+                rule_wrong=row["base_wrong"],
+                judge_says_gold=says_gold,
+                abstained=abstained,
+                correct=correct,
+                base_wrong=not correct,
+                hallucination=row["unanswerable"] and not abstained,
+            )
+        )
+    return kept
+
+
+def two_by_two(first: Sequence[bool], second: Sequence[bool]) -> dict:
+    """Counts of two yes / no readings of the same rows and Cohen's kappa between them."""
+    from sklearn.metrics import cohen_kappa_score
+
+    table = {
+        f"{'yes' if a else 'no'}_{'yes' if b else 'no'}": sum(
+            x == a and y == b for x, y in zip(first, second, strict=True)
+        )
+        for a in (True, False)
+        for b in (True, False)
+    }
+    varies = len(set(first)) > 1 or len(set(second)) > 1
+    return {
+        "rows": len(first),
+        "rule_judge": table,
+        "agree": table["yes_yes"] + table["no_no"],
+        "kappa": round(float(cohen_kappa_score(first, second)), 4) if varies else None,
+    }
+
+
+def agreement(rows: Sequence[Mapping[str, Any]]) -> dict:
+    """The word-match rules against the judge on judged rows; in a cell's name the rule comes first."""
+    answerable = [row for row in rows if not row["unanswerable"]]
+    return {
+        "abstains": two_by_two([row["rule_abstained"] for row in rows], [row["abstained"] for row in rows]),
+        "gold_answer_on_answerable": two_by_two(
+            [row["rule_holds_gold"] for row in answerable], [row["judge_says_gold"] for row in answerable]
+        ),
+        "answer_is_wrong": two_by_two([row["rule_wrong"] for row in rows], [row["base_wrong"] for row in rows]),
+    }
+
+
+def against(rows: Sequence[Mapping[str, Any]], other: Sequence[Mapping[str, Any]]) -> dict:
+    """Wrong-answer rate of ``other`` minus that of ``rows``, the same questions under two systems: interval over
+    resampled articles, sign test over articles."""
+    wrong = {row["id"]: row["base_wrong"] for row in other}
+    before, after, size = defaultdict(int), defaultdict(int), defaultdict(int)
+    for row in rows:
+        if row["id"] in wrong:
+            before[row["title"]] += row["base_wrong"]
+            after[row["title"]] += wrong[row["id"]]
+            size[row["title"]] += 1
+    titles = sorted(size)
+    first, second, n = (np.array([held[title] for title in titles], dtype=float) for held in (before, after, size))
+    difference = second - first
+    return {
+        "questions": int(n.sum()),
+        "articles": len(titles),
+        "change": round(float(difference.sum() / n.sum()), 4),
+        "ci95": probe_gates.interval(difference, n),
+        "articles_better": int((difference < 0).sum()),
+        "articles_worse": int((difference > 0).sum()),
+        "sign_test_p": stats.sign_test(difference),
+    }
+
+
 def main(argv: Sequence[str] | None = None, download: Callable[[str], bytes] = pinned.download) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--sources", type=Path, required=True, help="folder of the source files; fetched and checked")

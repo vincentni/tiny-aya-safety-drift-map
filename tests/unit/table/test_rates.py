@@ -292,14 +292,17 @@ def test_a_train_prompt_among_the_evaluation_prompts_is_refused(tmp_path, settin
 def test_later_stage_features_are_absent(tmp_path, settings):
     """Over-refusal is English only, the tables hold no kappa, spot check or ROI, and one module calls LiteLLM.
 
-    Kappa is the judge validation's alone (TS-TBL-14).
+    Kappa is the judge validation's and, between the probe study's word-match rules and its judge, the probe
+    checks' (TS-TBL-14).
     """
     tables = built(tmp_path, settings, column_rows("baseline") + column_rows("drifted"))
 
     assert {row.row for row in tables.over_refusal} == {"en"}
     assert not {"kappa", "roi", "spot_check"} & set(json.loads(tables.model_dump_json()))
-    sources = {path: path.read_text() for path in Path(driftmap.__file__).parent.rglob("*.py")}
-    assert [path.name for path, text in sources.items() if "kappa" in text] == ["validate.py"]
+    root = Path(driftmap.__file__).parent
+    sources = {path: path.read_text() for path in root.rglob("*.py")}
+    kappa = sorted(str(path.relative_to(root)) for path, text in sources.items() if "kappa" in text)
+    assert kappa == ["attribution/probe_squad.py", "judge/validate.py", "table/probe_checks.py"]
     assert [path.name for path, text in sources.items() if "litellm" in text.lower()] == ["closed.py"]
     assert not [path for path in sources if "spot" in path.name]
 
