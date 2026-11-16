@@ -596,9 +596,21 @@ PROBE_TABLES = {
         "the frozen probe on both samples of the SQuAD dev split together; `tables/probe-squad-pooled.md` is the "
         f"same as Markdown, and the rows of `tables/probe-squad-pooled-answers.jsonl` {_SQUAD_LABELS}"
     ),
+    "squad-trained": (
+        "a fine-tune trained on the questions of the SQuAD train sample, to answer an answerable one with a gold "
+        "answer and an unanswerable one with one fixed abstention sentence, beside the base model and the base "
+        "model gated by the probe on the dev sample: wrong answers of each and the paired changes over articles; "
+        "`tables/probe-squad-trained.md` is the same as Markdown, and the rows of "
+        f"`tables/probe-squad-trained-answers.jsonl` {_SQUAD_LABELS}"
+    ),
+    "squad-trained-replication": (
+        "the fine-tune trained on the SQuAD train sample on the second sample of the dev split, beside the base "
+        "model and the base model gated by the probe; `tables/probe-squad-trained-replication.md` is the same as "
+        f"Markdown, and the rows of `tables/probe-squad-trained-replication-answers.jsonl` {_SQUAD_LABELS}"
+    ),
     "squad-fine-tune": (
-        "a fine-tune that answered the questions of the SQuAD dev sample, beside the base model and the base model "
-        "gated by the probe: wrong answers of each and the paired changes over articles; "
+        "the fine-tune on question pairs, asked the questions of the SQuAD dev sample, beside the base model and "
+        "the base model gated by the probe: wrong answers of each and the paired changes over articles; "
         "`tables/probe-squad-fine-tune.md` is the same as Markdown, and the rows of "
         f"`tables/probe-squad-fine-tune-answers.jsonl` {_SQUAD_LABELS}"
     ),
@@ -646,6 +658,10 @@ PROBE_TABLES = {
         f"as Markdown, and the rows of `tables/probe-served-answers.jsonl` {_PROBE_ROWS}"
     ),
 }
+# the probe study's SQuAD questions in the evaluation dataset: named by id, their text never republished
+SQUAD_SET = "squad"
+SQUAD_TREE = ids.tree("full", variants=SQUAD_SET)
+SQUAD_TRAINING = f"{ids.training_folder(SQUAD_SET)}/"
 # a part of the probe study that has no line of its own above
 PROBE_OTHER = (
     "- `tables/probe-{part}.json`: a further part of the probe study; `tables/probe-{part}.md` is the same as "
@@ -782,6 +798,26 @@ LAYOUT = {
             "the rows the attribution adapter was fine-tuned on: training data, not evaluation prompts; in English, "
             'ambiguous BBQ items answered with their "unknown" option, their twins answered with the stated answer, '
             "and the English rows of `sft_train/`",
+            (),
+            False,
+        ),
+        (
+            SQUAD_TRAINING,
+            False,
+            "the questions of SQuAD 2.0 (Rajpurkar and others, 2018; CC BY-SA 4.0) that the fine-tune of the probe "
+            f"study was trained on, named by id: `{SQUAD_TRAINING}en.meta.jsonl` holds each question's id, its "
+            f"condition and hashes of its article and passage, and `{SQUAD_TRAINING}manifest.json` the revision of "
+            "SQuAD, the counts and the sha256 of the row file. The rows themselves hold SQuAD's passages, questions "
+            "and answers and are not republished",
+            (),
+            False,
+        ),
+        (
+            SQUAD_TREE,
+            False,
+            "the questions of SQuAD 2.0 that the probe study asks, as prompts: their text is not republished. "
+            f"`{SQUAD_TREE}manifest.json` records the revision of SQuAD and, per sample, the counts and the sha256 of "
+            "its prompt file; the tables of the results dataset name each question by its id",
             (),
             False,
         ),

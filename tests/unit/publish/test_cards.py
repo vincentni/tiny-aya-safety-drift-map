@@ -1382,7 +1382,7 @@ def test_the_later_parts_of_the_squad_probe_study_have_lines_of_their_own(settin
     said = {
         "replication": "applied to a second sample of the SQuAD dev split, with nothing fitted",
         "pooled": "on both samples of the SQuAD dev split together",
-        "fine-tune": "a fine-tune that answered the questions of the SQuAD dev sample",
+        "fine-tune": "the fine-tune on question pairs, asked the questions of the SQuAD dev sample",
         "prompt": "asked with one added instruction line",
         "prompt-probe": "an exploratory part added after the instruction's numbers were known",
         "confidence": "the base model's own output confidence as a sign of an error",
@@ -1406,3 +1406,39 @@ def test_the_circuitkit_reading_of_the_probes_states_has_a_line_of_its_own(setti
     assert "`tables/probe-squad-circuitkit.md` is the same as Markdown" in line
     assert "`tables/probe-squad-circuitkit-rows.jsonl` name each question by its id in SQuAD" in line
     assert line.endswith("and no passage, question or answer text.")
+
+
+def test_the_trained_arm_of_the_squad_probe_study_is_listed_with_its_questions_by_id(settings):
+    parts = ("trained", "trained-replication", "fine-tune")
+    held = {
+        "eval": [
+            "manifest.json",
+            "sft_train_squad/en.meta.jsonl",
+            "sft_train_squad/manifest.json",
+            "squad/manifest.json",
+        ],
+        "results": [
+            "runs/drift-None.json",
+            "tables/tables.json",
+            *(f"tables/probe-squad-{part}{end}" for part in parts for end in (".json", ".md", "-answers.jsonl")),
+        ],
+    }
+
+    rendered = render_cards(settings, manifest=manifest(), files=held)
+
+    lines = rendered[RESULTS].splitlines()
+    trained = next(line for line in lines if line.startswith("- `tables/probe-squad-trained.json`: "))
+    assert "a fine-tune trained on the questions of the SQuAD train sample" in trained
+    assert "one fixed abstention sentence" in trained and trained.endswith("and no passage, question or answer text.")
+    again = next(line for line in lines if line.startswith("- `tables/probe-squad-trained-replication.json`: "))
+    assert "on the second sample of the dev split" in again
+    other = next(line for line in lines if line.startswith("- `tables/probe-squad-fine-tune.json`: "))
+    assert "the fine-tune on question pairs, asked the questions of the SQuAD dev sample" in other
+    data = rendered[EVAL].splitlines()
+    rows = next(line for line in data if line.startswith("- `sft_train_squad/` (2 files): "))
+    assert "named by id: `sft_train_squad/en.meta.jsonl` holds each question's id" in rows
+    assert "CC BY-SA 4.0" in rows and rows.endswith("and are not republished.")
+    asked = next(line for line in data if line.startswith("- `squad/` (1 file): "))
+    assert "their text is not republished. `squad/manifest.json` records the revision of SQuAD" in asked
+    plain = render_cards(settings, manifest=manifest())
+    assert not any("squad" in text.lower() for repo, text in plain.items() if repo in DATASETS)
