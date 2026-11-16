@@ -1,4 +1,6 @@
-# Tiny Aya Global answers 97% of questions its passage cannot answer. A probe on its activations cuts wrong answers from 56% to 29% with no weight changes, 8 points better than one instruction line (36%); a LoRA fine-tune on the same 2,000 questions reaches 17%.
+# Answer or Abstain: an activation probe for hallucination detection in Tiny Aya Global
+
+A probe on the model's activations cuts wrong answers on SQuAD 2.0 from 56% to 29% with no weight changes; a LoRA fine-tune on the same questions reaches 17%.
 
 [![tests](https://github.com/vincentni/tiny-aya-safety-drift-map/actions/workflows/tests.yml/badge.svg)](https://github.com/vincentni/tiny-aya-safety-drift-map/actions/workflows/tests.yml)
 [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/vincentni/tiny-aya-safety-drift-map/blob/main/notebooks/reproduce_tables.ipynb)

@@ -1,6 +1,6 @@
 # Abstract
 
-**Tiny Aya Global answers 97% of questions its passage cannot answer. A probe on its activations cuts wrong answers from 56% to 29% with no weight changes, 8 points better than one instruction line (36%); a LoRA fine-tune on the same 2,000 questions reaches 17%.**
+**Answer or Abstain: an activation probe for hallucination detection in Tiny Aya Global**
 
 A small multilingual assistant is asked questions about passages that often do not hold the answer; answering anyway is a hallucination. This study trains a probe on Tiny Aya Global's internal activations to flag the answers it is about to get wrong, makes the model abstain where the probe fires, and sets the result beside a prompt instruction and a fine-tune.
 
