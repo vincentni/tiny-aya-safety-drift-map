@@ -42,8 +42,8 @@ SETS = (("harmful", "harmful"), ("xstest", "xstest"), ("benign", "benign_heldout
 PROMPT_FILES = ["prompts/*", "manifest.json"]
 # what --sets names: the three evaluation sets, or in their place the script variants of the harmful and the benign
 # prompts, or the multiple-choice prompts or those drawn from MBBQ, which are answered and scored by rule, never
-# judged, or the harmful prompts held out of the evaluation set
-STANDARD, VARIANTS, CHOICE, HELDOUT, MBBQ = "standard", *ids.EXTRA_SETS
+# judged, or the harmful prompts held out of the evaluation set, or the SQuAD questions of the probe study
+STANDARD, VARIANTS, CHOICE, HELDOUT, MBBQ, SQUAD = "standard", *ids.EXTRA_SETS
 # safety first here too; the variant files are found at the commit --variants-rev names
 VARIANT_SETS = ("harmful", "benign")
 # per group read in place of the evaluation sets: its sets, and the option that names the commit its files are at
@@ -52,12 +52,15 @@ EXTRA = {
     CHOICE: (("benign",), "sets_rev"),
     HELDOUT: (("harmful",), "sets_rev"),
     MBBQ: (("benign",), "sets_rev"),
+    SQUAD: (("benign",), "sets_rev"),
 }
-# the groups answered with one letter, where a run may lower the cap on new tokens
+# the groups answered with one letter
 LETTER_SETS = (CHOICE, MBBQ)
+# the groups where a run may lower the cap on new tokens: a letter, or one short sentence
+CAPPED_SETS = (*LETTER_SETS, SQUAD)
 PAIRED = "--sets variants goes with --variants-rev SHA, the evaluation dataset commit to read, and only with it"
 PAIRED_CHOICE = PAIRED.replace("variants goes with --variants-rev", "choice goes with --sets-rev")
-CAPPED = "--max-new-tokens goes with --sets choice or mbbq: every other set is answered under the configured cap"
+CAPPED = "--max-new-tokens goes with --sets choice, mbbq or squad: every other set is answered under the configured cap"
 DTYPE = "bfloat16"
 PROBE = "hello"
 # this job's marker stage; "start" means no usable marker
@@ -74,6 +77,7 @@ COMPARED = {
     "choice_revision": "choice prompts",
     "heldout_revision": "held-out prompts",
     "mbbq_revision": "MBBQ prompts",
+    "squad_revision": "SQuAD prompts",
 }
 
 
@@ -114,7 +118,7 @@ def _paired(parser: argparse.ArgumentParser) -> None:
         named = known.sets in EXTRA and EXTRA[known.sets][1] == "sets_rev"
         if named != (known.sets_rev is not None):
             parser.error(PAIRED_CHOICE.replace(CHOICE, known.sets) if named else PAIRED_CHOICE)
-        if known.max_new_tokens is not None and known.sets not in LETTER_SETS:
+        if known.max_new_tokens is not None and known.sets not in CAPPED_SETS:
             parser.error(CAPPED)
         return known, rest
 
@@ -132,22 +136,23 @@ def _arguments(parser: argparse.ArgumentParser) -> None:
     preamble_option(parser, ids.CONDITIONS)
     parser.add_argument(
         "--sets",
-        choices=(STANDARD, VARIANTS, CHOICE, HELDOUT, MBBQ),
+        choices=(STANDARD, VARIANTS, CHOICE, HELDOUT, MBBQ, SQUAD),
         default=STANDARD,
         help="in place of the evaluation sets. variants: the script variants of the prompts, files go under "
         "variants/. choice: the multiple-choice prompts, files go under choice/. heldout: harmful prompts held out "
         "of the evaluation set, files go under heldout/. mbbq: the multiple-choice prompts drawn from MBBQ, files "
-        "go under mbbq/",
+        "go under mbbq/. squad: the SQuAD questions of the probe study, files go under squad/",
     )
     parser.add_argument("--variants-rev", type=_commit, metavar="SHA", help="with --sets variants: the commit to read")
     parser.add_argument(
-        "--sets-rev", type=_commit, metavar="SHA", help="with --sets choice, heldout or mbbq: the commit to read"
+        "--sets-rev", type=_commit, metavar="SHA", help="with --sets choice, heldout, mbbq or squad: the commit to read"
     )
     parser.add_argument(
         "--max-new-tokens",
         type=_cap,
         metavar="N",
-        help="with --sets choice or mbbq: new tokens per answer, at most the configured cap; the rows and the record "
+        help="with --sets choice, mbbq or squad: new tokens per answer, at most the configured cap; the rows and the "
+        "record "
         "say so",
     )
     _paired(parser)

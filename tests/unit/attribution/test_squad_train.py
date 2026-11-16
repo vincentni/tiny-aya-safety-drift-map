@@ -41,7 +41,17 @@ def test_a_gated_question_becomes_a_row_that_answers_with_a_gold_answer_or_the_a
     # the question's own prompt, unchanged; unanswerable first, then the answerable one of the pair
     assert written[0] == squad_train.turns(rows[0]["prompt"], "It cannot be determined from the text.")
     assert written[1] == squad_train.turns(rows[1]["prompt"], rows[1]["gold_answers"][0])
-    assert notes[0] == {"kind": "squad", "id": rows[0]["id"], "split": "train", "condition": "unanswerable"}
+    assert notes[0] == {
+        "kind": "squad",
+        "id": rows[0]["id"],
+        "split": "train",
+        "condition": "unanswerable",
+        "article": hashlib.sha256(rows[0]["title"].encode()).hexdigest()[:16],
+        "passage": hashlib.sha256(rows[0]["context"].encode()).hexdigest()[:16],
+    }
+    # two questions of one article share its hash, and no title is written
+    assert notes[0]["article"] == notes[1]["article"] != notes[6]["article"]
+    assert notes[0]["passage"] != notes[1]["passage"]
     assert [note["id"] for note in notes[:11]] == [row["id"] for row in rows[:11]]
     # the benign rows of the other set follow as they are, told by its sidecar
     assert written[11:] == [held[1], held[3]] and notes[11:] == [{"kind": "benign"}] * 2
@@ -66,7 +76,7 @@ def test_a_gated_question_becomes_a_row_that_answers_with_a_gold_answer_or_the_a
     # the sidecar and the manifest hold no passage, question or answer
     for name in ("en.meta.jsonl", "manifest.json"):
         said = (folder / name).read_text(encoding="utf-8")
-        assert not any(text in said for row in rows for text in (row["context"], row["question"])), name
+        assert not any(text in said for row in rows for text in (row["context"], row["question"], row["title"])), name
         assert not any(answer in said for row in rows for answer in row["gold_answers"]), name
     assert '"squad": 11' in capsys.readouterr().out
 

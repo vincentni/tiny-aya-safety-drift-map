@@ -25,7 +25,7 @@ CONDITIONS = ("keep", "strip", "patch")
 # the ones a fine-tune is trained under
 PREAMBLES = CONDITIONS[:2]
 # a fine-tune by the condition it was trained under, which its repos are named after
-FINE_TUNES = {"standard": "keep", "aggressive": "strip", "defense": "keep"}
+FINE_TUNES = {"standard": "keep", "aggressive": "strip", "defense": "keep", "squad": "keep"}
 # the training sets beside sft_train/, by name: the rows of one are in sft_train_<name>/ of the evaluation dataset,
 # and the fine-tune trained on it shares the name, as do its repos
 TRAIN_SETS = ("defense", "squad")
@@ -33,9 +33,10 @@ _TREES = {"keep": "", "strip": "nopreamble/", "patch": "patched/"}
 _PREAMBLE_NOTE = "preamble: "
 _TRAIN_SET_NOTE = "training set: "
 # the prompts beside the evaluation sets, by name: the script variants of the evaluation prompts, multiple-choice
-# prompts, harmful prompts held out of the evaluation set, and multiple-choice prompts drawn from MBBQ. The files
-# of each sit in a folder of its own inside a run's tree, where no table of the evaluation sets reads
-EXTRA_SETS = ("variants", "choice", "heldout", "mbbq")
+# prompts, harmful prompts held out of the evaluation set, multiple-choice prompts drawn from MBBQ, and the
+# questions of the probe study's SQuAD samples. The files of each sit in a folder of its own inside a run's
+# tree, where no table of the evaluation sets reads
+EXTRA_SETS = ("variants", "choice", "heldout", "mbbq", "squad")
 _VARIANTS = "variants/"
 _EXTRA_NOTE = "sets: "
 # the record note of a run over the variant files in place of the evaluation sets

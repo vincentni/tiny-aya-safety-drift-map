@@ -10,7 +10,8 @@ is one fixed sentence, a trained abstention sentence of the attribution fine-tun
 set under ``--benign`` are added after them as they are, told by its sidecar, so the set is built as that one is.
 
 Written under ``--out`` in ``sft_train_squad/``: ``en.jsonl`` (a user prompt and an assistant completion per row),
-``en.meta.jsonl`` (what each row is, line by line: the question's id, split and condition, or ``benign``) and
+``en.meta.jsonl`` (what each row is, line by line: the question's id, split and condition and a hash that names
+its article and one that names its passage, or ``benign``) and
 ``manifest.json`` (counts, hashes, the gate's counts). ``en.jsonl`` holds SQuAD passages, questions and answers and
 belongs in the working copy of the dataset only; the sidecar and the manifest hold no text of SQuAD.
 """
@@ -36,6 +37,14 @@ SCHEMA = "driftmap.squad-train/1"
 def target(row: dict) -> str:
     """What the fine-tune is to answer: a gold answer, or the abstention sentence for an unanswerable question."""
     return ABSTENTION if row["condition"] == probe_squad.CONDITIONS[0] else row["gold_answers"][0]
+
+
+def places(row: dict) -> dict[str, str]:
+    """The article and the passage of a question, each named by a hash and not by its text."""
+    return {
+        "article": hashlib.sha256(row["title"].encode()).hexdigest()[:16],
+        "passage": hashlib.sha256(row["context"].encode()).hexdigest()[:16],
+    }
 
 
 def turns(prompt: str, completion: str) -> dict:
@@ -72,7 +81,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise SystemExit(f"{len(lacking)} answerable questions of {args.train.name} have no gold answer")
     added = benign(args.benign)
     rows = [turns(row["prompt"], target(row)) for row in asked] + [row for row, _ in added]
-    notes = [{"kind": NAME, "id": row["id"], "split": "train", "condition": row["condition"]} for row in asked]
+    notes = [
+        {"kind": NAME, "id": row["id"], "split": "train", "condition": row["condition"]} | places(row) for row in asked
+    ]
     notes += [note for _, note in added]
     folder = args.out / ids.training_folder(NAME)
     folder.mkdir(parents=True, exist_ok=True)
@@ -100,7 +111,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "files": {name: sha256(folder / name) for name in ("en.jsonl", f"en{META}")},
         "text": {
             "en.jsonl": "holds SQuAD passages, questions and answers; kept in the working copy of the dataset only",
-            f"en{META}": "ids, split and condition, no text; the public form of the set",
+            f"en{META}": "ids, split, condition and hashes of article and passage, no text; the public form of the set",
         },
     }
     (folder / MANIFEST).write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")

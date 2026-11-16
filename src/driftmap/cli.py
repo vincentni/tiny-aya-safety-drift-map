@@ -520,6 +520,8 @@ def launch(
         missing += _choice_missing(parsed, settings, deps.hub)
     if kind.value == "generate" and parsed.sets == "heldout":
         missing += _heldout_missing(parsed, settings, deps.hub)
+    if kind.value == "generate" and parsed.sets == "squad":
+        missing += _squad_missing(parsed, settings, deps.hub)
     if missing:
         typer.echo(f"{kind.value} cannot run yet; missing: {'; '.join(missing)}")
         if not dry_run:
@@ -754,6 +756,66 @@ def _choice_missing(parsed: argparse.Namespace, settings: Settings, hub: Hub) ->
     if group == generate.MBBQ:
         described = f"the {len(notes)} training rows described at that commit"
         typer.echo(f"{'unseen':<10}none of the {len(asked)} rows is of a base item or a template of {described}")
+    return []
+
+
+def _squad_missing(parsed: argparse.Namespace, settings: Settings, hub: Hub) -> list[str]:
+    """What a generate job over the SQuAD questions would stop on; prints the rows it would read, per file.
+
+    Read as the job reads them: the files of the commit named, each row filed under its own set and split. The
+    sidecar of the training set ``squad`` at that commit names the article and the passage of every question
+    that was trained on. A question of another split than ``train`` that sits on one of those articles or passages
+    is refused, and so is a commit without that sidecar.
+    """
+    from driftmap.scripts import drift, generate
+
+    group, commit = generate.extra_sets(parsed)
+    repo, folder = f"{settings.owner}/{settings.repos.eval}", ids.training_folder(group)
+    wanted = [ids.extra_prompts(group, name) for name in generate.EXTRA[group][0]]
+    wanted.append(f"{folder}/*{drift.META}")
+    with tempfile.TemporaryDirectory(prefix="driftmap-prompts-") as scratch:
+        try:
+            found = hub.snapshot_download(f"{repo}@{commit}", scratch, repo_type="dataset", allow_patterns=wanted)
+        except RepositoryNotFoundError:
+            return [f"{repo}, the evaluation dataset"]
+        except RevisionNotFoundError:
+            return [f"commit {commit[:12]} of {repo}"]
+        except (httpx2.HTTPError, LocalEntryNotFoundError) as error:
+            raise _unreadable(repo, error) from error
+        try:
+            # the checkpoint and the tree only name where answers go
+            units = generate.read_variant_units(Path(found), "checkpoint", "full", None, extra=group)
+        except DriftmapError as error:
+            return [f"{group} prompts the job can read: {error}"]
+        notes = [
+            note
+            for path in sorted((Path(found) / folder).glob(f"*{drift.META}"))
+            for note in _jsonl(path, dict)
+            if note.get("kind") == group
+        ]
+    apart = f"{group} questions apart from the articles and passages of {folder}"
+    if not notes:
+        return [f"{apart}: no training sidecar at that commit says what was trained on"]
+    try:
+        articles, passages = ({note[key] for note in notes} for key in ("article", "passage"))
+        shared = {
+            unit.language: [
+                at for at, row in enumerate(unit.rows, 1) if row["article"] in articles or row["passage"] in passages
+            ]
+            for unit in units
+        }
+    except LookupError:
+        return [f"{apart}: a row at that commit does not name its article and its passage"]
+    for split, rows in shared.items():
+        if rows and split != "train":
+            file = ids.extra_prompts(group, generate.EXTRA[group][0][0], split)
+            held = f"{len(rows)} rows of {file} are on an article or a passage that was trained on"
+            return [f"{apart}: {held}, the first is row {rows[0]}"]
+    per_file = ", ".join(f"{unit.set}/{unit.language} {len(unit.rows)}" for unit in units)
+    typer.echo(f"{group} prompts at {commit[:12]}: {sum(len(unit.rows) for unit in units)} rows ({per_file})")
+    others = sum(len(unit.rows) for unit in units if unit.language != "train")
+    described = f"the {len(notes)} questions of {folder} at that commit"
+    typer.echo(f"{'held out':<10}none of the {others} rows outside train is on an article or a passage of {described}")
     return []
 
 

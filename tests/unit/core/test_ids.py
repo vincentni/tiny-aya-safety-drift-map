@@ -165,12 +165,13 @@ def test_runs_without_the_preamble_get_a_tree_and_repos_of_their_own():
 
 def test_a_fine_tune_on_a_named_training_set_shares_its_name_and_names_its_repos_after_it():
     assert ids.FINE_TUNES["defense"] == "keep"
-    assert [ids.train_set_of(name) for name in ids.FINE_TUNES] == [None, None, "defense"]
+    assert [ids.train_set_of(name) for name in ids.FINE_TUNES] == [None, None, "defense", "squad"]
     suffixes = {name: [ids.fine_tune_suffix(mode, name) for mode in ("full", "smoke")] for name in ids.FINE_TUNES}
     assert suffixes == {
         "standard": ["", "-smoke"],
         "aggressive": ["-nopre", "-nopre-smoke"],
         "defense": ["-defense", "-defense-smoke"],
+        "squad": ["-squad", "-squad-smoke"],
     }
     note = ids.train_set_note("defense", "c" * 40)
     assert note == f"training set: defense at {'c' * 40}"
@@ -201,7 +202,11 @@ def test_runs_under_the_safety_patch_get_a_tree_of_their_own_and_no_repos():
 
 def test_multiple_choice_prompts_sit_in_a_folder_of_their_own_beside_the_variants():
     slug = "tiny-aya-global--0123456789ab"
-    assert ids.EXTRA_SETS == ("variants", "choice", "heldout", "mbbq")
+    assert ids.EXTRA_SETS == ("variants", "choice", "heldout", "mbbq", "squad")
+    assert ids.extra_prompts("squad", "benign", "dev2") == "squad/prompts/benign/dev2.jsonl"
+    assert ids.responses_path(slug, "benign", "dev", "full", variants="squad") == (
+        f"squad/responses/{slug}/benign/dev.jsonl"
+    )
     assert ids.extra_prompts("mbbq", "benign", "tr") == "mbbq/prompts/benign/tr.jsonl"
     assert ids.responses_path(slug, "benign", "nl", "full", "patch", "mbbq") == (
         f"patched/mbbq/responses/{slug}/benign/nl.jsonl"
