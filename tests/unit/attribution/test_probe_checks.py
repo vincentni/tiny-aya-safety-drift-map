@@ -268,3 +268,75 @@ def test_two_runs_of_the_same_prompts_are_compared_row_for_row(sample):
     put(folder / "kit.jsonl", kit[:-1])
     with pytest.raises(SystemExit, match="47 answers to compare with 48 stored ones"):
         probe_checks.main([*run, "--out", str(folder / "short")])
+
+
+def test_the_fine_tune_is_set_beside_the_base_model_and_the_gated_base_model_on_the_same_questions(sample, capsys):
+    folder, rows, asked = sample
+    # the fine-tune abstains on every unanswerable question and on one answerable question in eight
+    tuned = []
+    for at, row in enumerate(rows):
+        abstains = row["open"] or at % 8 == 1
+        said = TRAINED if abstains else f"It is {row['gold_answers'][0]}."
+        tuned.append(dict(row, said=said, wrong=abstains and not row["open"]))
+    put(folder / "squad_dev_ft.jsonl", [{"id": r["id"], "response": r["said"], "stop_reason": "eos"} for r in tuned])
+    run = ["fine-tune", *asked, "--tuned-answers", str(folder / "squad_dev_ft.jsonl")]
+
+    assert probe_checks.main([*run, "--out", str(folder / "results")]) == 0
+
+    record = read_json(folder / "results" / "probe-squad-fine-tune.json")
+    assert list(record) == ["schema", "probe", "word_match"] and record["schema"] == "driftmap.probe-squad-fine-tune/1"
+    found = record["word_match"]
+    wrong = {name: found[name]["wrong_answers"] for name in ("base", "base_plus_squad_probe", "fine_tuned")}
+    assert wrong == {"base": 18, "base_plus_squad_probe": 6, "fine_tuned": 6}
+    assert (found["fine_tuned"]["answered"], found["fine_tuned"]["hallucinations"]) == (18, 0)
+    assert found["fine_tuned_answers"]["wording"]["trained sentence"] == 30
+    # per article the base model has three wrong answers, the gated one and the fine-tune one each
+    assert found["base_to_fine_tuned_wrong_answers"] == {
+        "questions": 48,
+        "articles": 6,
+        "change": -0.25,
+        "ci95": [-0.25, -0.25],
+        "articles_better": 6,
+        "articles_worse": 0,
+        "sign_test_p": 0.03125,
+    }
+    against_gated = found["base_plus_squad_probe_to_fine_tuned_wrong_answers"]
+    assert (against_gated["change"], against_gated["ci95"], against_gated["articles_better"]) == (0.0, [0.0, 0.0], 0)
+    public = read_jsonl(folder / "results" / "probe-squad-fine-tune-answers.jsonl")
+    assert len(public) == 48 and public[1] == {
+        "id": rows[1]["id"],
+        "condition": "answerable",
+        "rule_wording": "trained sentence",
+        "rule_holds_gold": False,
+        "rule_wrong": True,
+        "judge_abstains": None,
+        "judge_says_gold": None,
+        "judge_wrong": None,
+    }
+    said = (folder / "results" / "probe-squad-fine-tune.md").read_text(encoding="utf-8")
+    assert said == table.RENDER["squad-fine-tune"](record) and "By the judge's labels" not in said
+    assert (
+        "| fine-tune | 12.5% (6/48) | 37.5% (18/48) | 0.0% (0/18) | 0.0% (0/24) | 75.0% (18/24) | 75.0% (18/24) |"
+        in said
+    )
+    assert "- Change in wrong answers, fine-tune minus base model: -25.0 points (95% CI -25.0 to -25.0;" in said
+
+    # with verdicts on both models' answers the tables are given again on the rows judged in both
+    put(folder / "base_verdicts.jsonl", verdicts_of(rows, {}))
+    unjudged = {tuned[7]["id"]: {"status": "unparsed", "abstains": None, "correct": None}}
+    put(folder / "ft_verdicts.jsonl", verdicts_of(tuned, unjudged))
+    seen = ["--verdicts", str(folder / "base_verdicts.jsonl"), "--tuned-verdicts", str(folder / "ft_verdicts.jsonl")]
+    assert probe_checks.main([*run, *seen, "--out", str(folder / "judged")]) == 0
+    judge = read_json(folder / "judged" / "probe-squad-fine-tune.json")["judge"]
+    assert judge["rows_judged_in_both_arms"] == 47
+    assert judge["agreement_of_the_rules_with_the_judge_on_the_fine_tune"]["answer_is_wrong"]["agree"] == 47
+    assert (judge["base"]["rows"], judge["fine_tuned"]["rows"], judge["fine_tuned"]["wrong_answers"]) == (47, 47, 6)
+    assert judge["base_to_fine_tuned_wrong_answers"]["questions"] == 47
+    rows_out = read_jsonl(folder / "judged" / "probe-squad-fine-tune-answers.jsonl")
+    assert rows_out[1]["judge_wrong"] is True and rows_out[7]["judge_wrong"] is None
+    for path in (folder / "judged").iterdir():
+        written = path.read_text(encoding="utf-8")
+        assert REASON not in written and not any(text in written for text in hidden(rows) | hidden(tuned)), path.name
+    with pytest.raises(SystemExit):
+        probe_checks.main([*run, seen[0], seen[1], "--out", str(folder / "x")])
+    assert "--verdicts and --tuned-verdicts are given together or not at all" in capsys.readouterr().err

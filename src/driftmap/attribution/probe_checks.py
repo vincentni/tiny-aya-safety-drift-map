@@ -8,6 +8,10 @@
     python -I -m driftmap.attribution.probe_checks scored --part judge --dev DEV_IN --dev-answers DEV_ANSWERS \
         --dev-states ACTS/squad_dev --verdicts JUDGE/dev_verdicts.jsonl --passed CURATED/squad_passed.json \
         --probe OUT/probe_squad --out RESULTS
+    python -I -m driftmap.attribution.probe_checks fine-tune --dev DEV_IN --dev-answers DEV_ANSWERS \
+        --dev-states ACTS/squad_dev --tuned-answers TUNED_ANSWERS --verdicts JUDGE/dev_verdicts.jsonl \
+        --tuned-verdicts JUDGE/ft_verdicts.jsonl --passed CURATED/squad_passed.json --probe OUT/probe_squad \
+        --out RESULTS
     python -I -m driftmap.attribution.probe_checks identity --stored DEV_ANSWERS --kit KIT_ANSWERS --out RESULTS
 
 ``served-sample`` takes every tenth unanswerable and every tenth answerable question of the dev sample, in its
@@ -16,6 +20,9 @@ afterwards from the stored answers and hidden states, and scores the served answ
 ``scored`` applies the frozen probe to the stored hidden states of one sample, or of several given one after the
 other, and gives the table of ``probe_study squad`` for it; with the verdicts ``probe_judge`` wrote for the
 answers, it gives the table again under the judge's labels and how far the word-match rules agree with the judge.
+``fine-tune`` sets a fine-tune's answers to the same questions beside the base model and the base model gated
+by the probe, by the word-match rules and, with the verdicts on both models' answers, by the judge's labels on
+the rows judged in both.
 ``identity`` compares two answer files of the same prompts row for row: text, token count and stop reason.
 
 Nothing is fitted and no threshold is moved. Every step reads only the rows that passed the CuratorKIT gate and
@@ -171,6 +178,65 @@ def scored(
     return found, public
 
 
+def arms(base: Sequence[Mapping[str, Any]], tuned: Sequence[Mapping[str, Any]], gate: np.ndarray) -> dict:
+    """The base model, the base model gated where ``gate`` and the fine-tune on the same questions, and the
+    fine-tune's change in wrong answers against each of the two."""
+    gated = [
+        dict(row, base_wrong=(not row["unanswerable"]) if hit else row["base_wrong"])
+        for row, hit in zip(base, gate, strict=True)
+    ]
+    return {
+        "base": probe_squad.measured(base, np.zeros(len(base), dtype=bool)),
+        "base_plus_squad_probe": probe_squad.measured(base, gate),
+        "fine_tuned": probe_squad.measured(tuned, np.zeros(len(tuned), dtype=bool)),
+        "fine_tuned_answers": probe_squad.base_counts(tuned),
+        "base_to_fine_tuned_wrong_answers": probe_squad.against(base, tuned),
+        "base_plus_squad_probe_to_fine_tuned_wrong_answers": probe_squad.against(gated, tuned),
+    }
+
+
+def fine_tune(
+    base: Sequence[Mapping[str, Any]],
+    tuned: Sequence[Mapping[str, Any]],
+    scores: Mapping[str, float],
+    frozen: probe.Probe,
+    seen_base: Mapping[str, Mapping[str, Any]] | None,
+    seen_tuned: Mapping[str, Mapping[str, Any]] | None,
+) -> tuple[dict, list[dict]]:
+    """The record of the fine-tune beside the base model and the gated base model, by the word-match rules and,
+    with both models' verdicts, by the judge's labels on the rows judged in both; and a row per answer of the
+    fine-tune without text."""
+    found = {"probe": {"layer": frozen.layer, "C": frozen.c, "threshold": frozen.threshold}}
+    found["word_match"] = arms(base, tuned, np.array([scores[row["id"]] >= frozen.threshold for row in base]))
+    if seen_base is not None and seen_tuned is not None:
+        kept_base, kept_tuned = probe_squad.judged(base, seen_base), probe_squad.judged(tuned, seen_tuned)
+        both = {row["id"] for row in kept_base} & {row["id"] for row in kept_tuned}
+        kept_base = [row for row in kept_base if row["id"] in both]
+        kept_tuned = [row for row in kept_tuned if row["id"] in both]
+        gate = np.array([scores[row["id"]] >= frozen.threshold for row in kept_base])
+        found["judge"] = {
+            "rows_judged_in_both_arms": len(both),
+            "agreement_of_the_rules_with_the_judge_on_the_fine_tune": probe_squad.agreement(kept_tuned),
+        } | arms(kept_base, kept_tuned, gate)
+    by_judge = {row["id"]: row for row in probe_squad.judged(tuned, seen_tuned)} if seen_tuned is not None else {}
+    public = []
+    for row in tuned:
+        seen = by_judge.get(row["id"])
+        public.append(
+            {
+                "id": row["id"],
+                "condition": row["condition"],
+                "rule_wording": row["wording"],
+                "rule_holds_gold": row["holds_gold"],
+                "rule_wrong": row["base_wrong"],
+                "judge_abstains": seen["abstained"] if seen else None,
+                "judge_says_gold": seen["judge_says_gold"] if seen else None,
+                "judge_wrong": seen["base_wrong"] if seen else None,
+            }
+        )
+    return found, public
+
+
 def identity(stored: Mapping[str, Mapping[str, Any]], kit: Mapping[str, Mapping[str, Any]]) -> dict:
     """How many answers of two runs over the same prompts are equal in text, token count and stop reason."""
     if set(stored) != set(kit):
@@ -201,6 +267,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "served-sample": ("dev", "passed", "out"),
         "served": ("sample", "served", "served-states", "dev", "dev-answers", "dev-states", "passed", "probe", "out"),
         "scored": ("passed", "probe", "out"),
+        "fine-tune": ("dev", "dev-answers", "dev-states", "tuned-answers", "passed", "probe", "out"),
         "identity": ("stored", "kit", "out"),
     }
     for step, wanted in paths.items():
@@ -214,6 +281,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             for name in ("dev", "dev-answers", "dev-states"):
                 sub.add_argument(f"--{name}", type=Path, action="append", required=True)
             sub.add_argument("--verdicts", type=Path, action="append", default=[], help="a judge's verdicts")
+        if step == "fine-tune":
+            sub.add_argument("--verdicts", type=Path, help="a judge's verdicts on the base model's answers")
+            sub.add_argument("--tuned-verdicts", type=Path, help="and on the fine-tune's answers")
     args = parser.parse_args(argv)
     if args.step == "served-sample":
         rows, _ = probe_curator.passing(probe.read_jsonl(args.dev), args.dev, args.passed)
@@ -258,6 +328,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                 verdicts |= probe_squad.read_verdicts(args.verdicts[number])
         record, public = scored(rows, scores, frozen, verdicts)
         probe_study.write(args.out, f"squad-{args.part}", record, public, tables=table)
+    elif args.step == "fine-tune":
+        if bool(args.verdicts) != bool(args.tuned_verdicts):
+            parser.error("--verdicts and --tuned-verdicts are given together or not at all")
+        frozen = probe.load(args.probe)
+        base, states, layers = _sample(args, args.dev, args.dev_answers, args.dev_states)
+        tuned, _ = probe_curator.passing(probe_squad.rows_of(args.dev, args.tuned_answers), args.dev, args.passed)
+        read = frozen.probability(np.stack([states[row["id"]][layers.index(frozen.layer)] for row in base]))
+        scores = dict(zip([row["id"] for row in base], map(float, read), strict=True))
+        seen = [probe_squad.read_verdicts(path) if path else None for path in (args.verdicts, args.tuned_verdicts)]
+        record, public = fine_tune(base, tuned, scores, frozen, *seen)
+        probe_study.write(args.out, "squad-fine-tune", record, public, tables=table)
     else:
         stored = {row["id"]: row for row in probe.read_jsonl(args.stored)}
         kit = {row["id"]: row for row in probe.read_jsonl(args.kit)}

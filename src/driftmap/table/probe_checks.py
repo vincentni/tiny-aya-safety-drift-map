@@ -15,6 +15,7 @@ SCHEMAS = {
     "squad-judge": "driftmap.probe-squad-scored/1",
     "squad-replication": "driftmap.probe-squad-scored/1",
     "squad-pooled": "driftmap.probe-squad-scored/1",
+    "squad-fine-tune": "driftmap.probe-squad-fine-tune/1",
     "squad-identity": "driftmap.probe-squad-identity/1",
 }
 TITLES = {
@@ -114,6 +115,23 @@ def _reading(found: Mapping[str, Any]) -> list[str]:
     ]
 
 
+def _agreement(agreed: Mapping[str, Mapping[str, Any]]) -> list[str]:
+    """A line per reading: the two-by-two count of the rule against the judge, their agreement and kappa."""
+    head = ["reading", "rows", "rule yes, judge yes", "rule yes, judge no", "rule no, judge yes"]
+    head += ["rule no, judge no", "agree", "Cohen's kappa"]
+    lines = [
+        [
+            AGREEMENT.get(name, name),
+            str(found["rows"]),
+            *(str(found["rule_judge"][cell]) for cell in ("yes_yes", "yes_no", "no_yes", "no_no")),
+            _share(found["agree"], found["rows"]),
+            _number(found["kappa"]),
+        ]
+        for name, found in agreed.items()
+    ]
+    return _table(head, lines)
+
+
 def _render_scored(part: str) -> Callable[[Mapping[str, Any]], str]:
     def render(record: Mapping[str, Any]) -> str:
         probe = record["probe"]
@@ -145,25 +163,82 @@ def _render_scored(part: str) -> Callable[[Mapping[str, Any]], str]:
                 "## The word-match rules against the judge",
                 "",
             ]
-            head = ["reading", "rows", "rule yes, judge yes", "rule yes, judge no", "rule no, judge yes"]
-            head += ["rule no, judge no", "agree", "Cohen's kappa"]
-            lines = [
-                [
-                    AGREEMENT.get(name, name),
-                    str(found["rows"]),
-                    *(str(found["rule_judge"][cell]) for cell in ("yes_yes", "yes_no", "no_yes", "no_no")),
-                    _share(found["agree"], found["rows"]),
-                    _number(found["kappa"]),
-                ]
-                for name, found in judge["agreement_of_the_rules_with_the_judge"].items()
-            ]
-            out += _table(head, lines)
+            out += _agreement(judge["agreement_of_the_rules_with_the_judge"])
             if judge["rows_unjudged"]:
                 out += ["## By the word-match rules, on the judged rows alone", ""]
                 out += _reading(record["word_match_on_the_judged_rows"])
         return "\n".join(out)
 
     return render
+
+
+def _arms(found: Mapping[str, Any]) -> list[str]:
+    """The three systems on the same questions, and the fine-tune's change against the other two."""
+    names = {"base": "base model", "base_plus_squad_probe": "base model + probe", "fine_tuned": "fine-tune"}
+    head = ["system", "wrong answers", "answered (coverage)", "wrong among answered (risk)"]
+    head += ["unanswerable answered", "answerable still answered", "answerable answered with a gold answer"]
+    lines = [
+        [
+            said,
+            _share(counts["wrong_answers"], counts["rows"]),
+            _share(counts["answered"], counts["rows"]),
+            _share(counts["wrong_among_answered"], counts["answered"]),
+            _share(counts["hallucinations"], counts["rows"] - counts["answerable_rows"]),
+            _share(counts["answerable_answered"], counts["answerable_rows"]),
+            _share(counts["answerable_correct"], counts["answerable_rows"]),
+        ]
+        for name, said in names.items()
+        for counts in [found[name]]
+    ]
+    wording = ", ".join(f"{kind} {count}" for kind, count in found["fine_tuned_answers"]["wording"].items())
+    moves = {
+        "base_to_fine_tuned_wrong_answers": "fine-tune minus base model",
+        "base_plus_squad_probe_to_fine_tuned_wrong_answers": "fine-tune minus base model + probe",
+    }
+    return [
+        *_table(head, lines),
+        f"The fine-tune's answers by wording: {wording}.",
+        "",
+        *(
+            f"- Change in wrong answers, {said}: {_points(found[key], 'articles', 'articles')}, "
+            f"{found[key]['questions']} questions"
+            for key, said in moves.items()
+        ),
+        "",
+    ]
+
+
+def render_fine_tune(record: Mapping[str, Any]) -> str:
+    """The fine-tune beside the base model and the base model gated by the probe."""
+    probe = record["probe"]
+    out = [
+        "# SQuAD 2.0: the fine-tune beside the base model and the probe",
+        "",
+        "The fine-tune answered the questions of the dev sample; its answers are classed by the same rules as the "
+        f"base model's. The probe (layer {probe['layer']}, C {probe['C']:g}, threshold {probe['threshold']:g}) "
+        "is the one frozen on the train sample and reads the base model alone; its gate is computed on stored "
+        "answers. A change is the fine-tune's wrong-answer rate minus the other system's on the same questions, "
+        "with a percentile 95% interval from resampling articles and an exact sign test over articles.",
+        "",
+        "## By the word-match rules",
+        "",
+        *_arms(record["word_match"]),
+    ]
+    judge = record.get("judge")
+    if judge:
+        agreed = judge["agreement_of_the_rules_with_the_judge_on_the_fine_tune"]
+        out += [
+            "## By the judge's labels",
+            "",
+            f"On the {judge['rows_judged_in_both_arms']} questions on which the judge gave a verdict for both "
+            "models' answers.",
+            "",
+            *_arms(judge),
+            "## The word-match rules against the judge on the fine-tune's answers",
+            "",
+            *_agreement(agreed),
+        ]
+    return "\n".join(out)
 
 
 def render_identity(record: Mapping[str, Any]) -> str:
@@ -186,5 +261,6 @@ def render_identity(record: Mapping[str, Any]) -> str:
 
 RENDER: dict[str, Callable[[Mapping[str, Any]], str]] = {
     "squad-served": render_served,
+    "squad-fine-tune": render_fine_tune,
     "squad-identity": render_identity,
 } | {part: _render_scored(part) for part in TITLES}
