@@ -2,7 +2,7 @@
 
 // Reads data.json (counts and intervals only) and fills the page. No dependencies, no network beyond that file.
 (function () {
-  const LANGUAGE_NAMES = { en: 'English', fr: 'French', es: 'Spanish', ru: 'Russian', hi: 'Hindi', ar: 'Arabic' };
+  const LANGUAGE_NAMES = { en: 'English', fr: 'French', es: 'Spanish', ru: 'Russian', hi: 'Hindi', ar: 'Arabic', nl: 'Dutch', tr: 'Turkish' };
   const FIGURE_TITLES = {
     f1: 'Harmful answers by language, base model and fine-tuned model',
     f2: 'Harmful answers of the base model by harm category and language',
@@ -10,25 +10,28 @@
     f4: 'Harmful answers by harm category',
     f5: 'How verdicts moved between the base model and the fine-tuned model',
     f6: 'Answers cut off at the token limit, and harmful answers among them',
-    f7: 'Harmful answers on native prompts and on their Latin-script and English-mixed variants (for completeness, not part of the claim)',
-    f8: 'Harmful answers with a targeted system-prompt patch, on the prompts it was written against (in-sample)',
-    f9: 'Per language: how often a person is named where the text does not say, and twin accuracy, for the base model ' +
-      'and the attribution fine-tune, with 95% Wilson intervals. A hollow marker is the same rate when a letter written ' +
-      'in the local script is not read as a letter.',
-    f10: 'Base model against attribution fine-tune over all six languages: how often a person is named where the text ' +
-      'does not say, and twin accuracy. The hollow marker is twin accuracy when a letter written in the local script is ' +
-      'not read as a letter.',
+    f7: 'Harmful answers on native, romanized and code-mixed prompts',
+    f8: 'Harmful answers with a targeted system-prompt patch',
+    f9: 'Per language on official items, with BBQ\'s English test set apart in the last column: how often a person is ' +
+      'named where the text does not say, and twin accuracy, for the base model and the attribution fine-tune, with 95% ' +
+      'Wilson intervals. The fine-tune saw English rows only.',
+    f10: 'Base model against attribution fine-tune: how often a person is named where the text does not say, and twin ' +
+      'accuracy, on official items in four languages (top) and on BBQ\'s English test (bottom), which is not pooled with them.',
   };
   const LEAD_FIGURE = 'f8';
   // the figures of the question pairs, shown with them in this order
   const TOP_FIGURES = ['f10', 'f9'];
-  // whether the cards of the system-prompt patch stand before the cards of the map
-  const PATCH_LEADS = true;
-  // the figure of the script variants, shown in their section
-  const VARIANT_FIGURE = 'f7';
   // the pooled scopes of the choice table
-  const SCOPE_NAMES = { 'non-English': 'Five translated languages', all: 'All six languages' };
+  const SCOPE_NAMES = { 'non-English': 'Spanish, Dutch and Turkish', all: 'All four languages' };
   const SMALL = 15;
+  const PROBE_NAMES = { squad_probe: 'Probe', length: 'Passage length', tfidf: 'TF-IDF of the prompt',
+    probe_1: 'Answerability probe fitted on question pairs', error_probe: 'Error probe fitted on question pairs' };
+  const PROBE_TEXT = { length: 'passage length', tfidf: 'TF-IDF of the prompt' };
+  const CONFIDENCE_NAMES = { mean_log_probability: 'Mean log-probability of the answer as the gate',
+    first_token_probability: 'Probability of the answer\'s first token as the gate' };
+  const CONFIDENCE_TEXT = { mean_log_probability: 'the mean log-probability of the answer',
+    first_token_probability: 'the probability of its first token' };
+  const SAMPLE_NAMES = { first: 'First sample', replication: 'Second sample', pooled: 'Both samples' };
 
   const $ = (id) => document.getElementById(id);
 
@@ -86,23 +89,59 @@
     const first = data.conditions[0];
     const [base, tuned] = data.models;
     const found = data.attribution;
-    const top = clear($('numbers'));
+    const cards = clear($('numbers'));
+    // with the probe on the page its cards stand first, and those of the question pairs under their own heading
+    const top = data.probe ? clear($('pair-numbers')) : cards;
     // with the question pairs on the page, the cards of the harmful-request map sit under its own heading
     const box = found ? clear($('map-numbers')) : top;
     const put = (where, strong, text) => where.appendChild(el('div', { class: 'number' }, el('strong', { text: strong }), el('span', { text })));
     const card = (strong, text) => put(box, strong, text);
+    if (data.probe) {
+      const probed = data.probe;
+      const answerable = probed.questions - probed.unanswerable;
+      put(cards, `${probed.base.wrong} → ${probed.gated.wrong}`,
+        `wrong answers on ${probed.questions} SQuAD 2.0 questions, ${probed.unanswerable} of which their passage cannot answer, ` +
+        `when the model abstains where the probe fires` +
+        (probed.judge ? ` (${probed.judge.base.wrong} → ${probed.judge.gated.wrong} as a closed judge reads the answers)` : '') +
+        `. Abstaining on every question gives ${probed.always_abstain}.`);
+      if (probed.instructed) {
+        put(cards, `${probed.instructed.counts.wrong} with one instruction line`,
+          `in the prompt and no probe: about two thirds of the reduction for free. The probe is ` +
+          `${(100 * probed.instructed.behind_the_gate.delta).toFixed(1)} points better than it.`);
+      } else {
+        put(cards, `${probed.base.hallucinations} → ${probed.gated.hallucinations}`,
+          `of the ${probed.unanswerable} unanswerable questions are answered: the base model answers ` +
+          `${percent(probed.base.hallucinations, probed.unanswerable)} of the questions it should not.`);
+      }
+      put(cards, `${probed.gated.kept} of ${answerable}`,
+        `answerable questions are still answered (${percent(probed.gated.kept, answerable)}); ${probed.gated.correct} correctly, ` +
+        `against the base model's ${probed.base.correct}.`);
+      const [own, ...texts] = probed.scores;
+      put(cards, `AUC ${own.auc_error.toFixed(2)}`,
+        `of the probe against the model's own error; ${texts.map((score) => `${PROBE_TEXT[score.id]} ` +
+          `${score.auc_error.toFixed(2)}`).join(', ')}: the text alone does not predict it.`);
+    }
     const named = found && ['base', 'tuned'].map((side) => choiceRate(found, found[side], 'all', 'person_pick'));
     if (named && named[0] && named[1]) {
       const both = ['base', 'tuned'].map((side) => choiceRate(found, found[side], 'all', 'twin'));
       const outside = choiceRate(found, found.tuned, 'non-English', 'person_pick');
       put(top, `${percent(named[0].k, named[0].n)} → ${percent(named[1].k, named[1].n)}`,
-        `of the who-did-it questions a short text cannot answer get a named person, in six languages: ${named[0].k} of ${named[0].n} ` +
-        `from the base model, ${named[1].k} after a LoRA fine-tune on English rows` +
-        (outside ? `, ${outside.k} of them in the five languages it never saw.` : '.'));
+        `of the who-did-it questions a short text cannot answer get a named person, on official items in four languages: ` +
+        `${named[0].k} of ${named[0].n} from the base model, ${named[1].k} after a LoRA fine-tune on English rows` +
+        (outside ? `, ${outside.k === named[1].k ? 'all' : outside.k} of them in the three languages it never trained on.` : '.'));
+      const apart = found.scopes.filter((scope) => !SCOPE_NAMES[scope])
+        .map((scope) => [scope, choiceRate(found, found.tuned, scope, 'twin')]).filter(([, cell]) => cell && cell.n)
+        .map(([scope, cell]) => `${percent(cell.k, cell.n)} in ${languageName(scope)}`).join(', ');
       put(top, `${percent(both[0].k, both[0].n)} → ${percent(both[1].k, both[1].n)}`,
         `twin accuracy: the question and its answerable twin both right, ${both[0].k}, then ${both[1].k} of ${both[1].n} pairs, ` +
-        `so abstaining on everything scores zero. Under the strict reading of answers: ${percent(both[0].strict, both[0].n)} → ` +
-        `${percent(both[1].strict, both[1].n)}.`);
+        `so abstaining on everything scores zero. After the fine-tune: ${apart}.`);
+      const test = data.bbq && ['base', 'tuned'].map((side) => ['person_pick', 'twin'].map((metric) => choiceRate(data.bbq, data.bbq[side], 'en', metric)));
+      if (test && test.flat().every(Boolean)) {
+        put(top, `${test[0][0].k} → ${test[1][0].k} of ${test[1][0].n}`,
+          `cases with a named person on BBQ's English test, the benchmark the training rows come from; twin accuracy ` +
+          `${percent(test[0][1].k, test[0][1].n)} → ${percent(test[1][1].k, test[1][1].n)}. It stands beside the four-language ` +
+          `result and is not pooled with it.`);
+      }
       const prompted = found.arms.filter((arm) => !arm.fine_tune && arm.id !== found.base)
         .map((arm) => [arm, choiceRate(found, arm.id, 'all', 'twin')]).filter(([, cell]) => cell && cell.n)
         .sort((a, b) => b[1].k / b[1].n - a[1].k / a[1].n)[0];
@@ -115,15 +154,6 @@
     const byRate = (cells) => cells.filter((cell) => cell.n).sort((a, b) => b.k / b.n - a.k / a.n);
     const pooled = cellOf(data, first.id, base.id, 'all', 'all');
 
-    const held = data.heldout && data.heldout.rows.find((row) => row.scope === 'all');
-    if (held && held.harmful.delta !== null) {
-      const { before, after, ci, p } = held.harmful;
-      card(`${percent(before[0], before[1])} → ${percent(after[0], after[1])}`,
-        `harmful answers of the ${base.name} with five sentences of guidance in its system prompt, on ` +
-        `${data.heldout.prompts} held-out prompts the guidance was not written against (${before[0]} of ${before[1]}, ` +
-        `then ${after[0]} of ${after[1]}; ${points(held.harmful.delta)} points, 95% interval ${points(ci[0])} to ` +
-        `${points(ci[1])}, ${pValue(p)}).`).classList.add('patch');
-    }
     const patched = data.patch.find((entry) => entry.model === base.id);
     if (patched) {
       const [without, withIt] = patched.harmful;
@@ -135,7 +165,7 @@
         `harmful answers of the ${base.name} with five sentences of guidance in its system prompt, on the prompts the ` +
         `guidance was written against (${without}, then ` +
         `${withIt} of ${patched.pairs} prompts, ${pValue(patched.p)}). The price: ${refused.refusal[1]} of ` +
-        `${refused.pairs} safe prompts refused, against ${refused.refusal[0]}.${beside}`).classList.add('patch');
+        `${refused.pairs} safe prompts refused, against ${refused.refusal[0]}.${beside}`);
     }
 
     const ranked = (condition) => byRate(data.languages.map((code) => cellOf(data, condition.id, base.id, code, 'all')));
@@ -146,14 +176,12 @@
     const ranking = second ? ranked(second) : [];
     const safest = ranking[ranking.length - 1];
     if (safest && safest.language === best.language) {
-      // lowest in both conditions; called apart from the next language only where the intervals do not overlap
-      const next = ranking[ranking.length - 2];
-      const again = safest.hi < next.lo ? '.' :
-        `, not distinguishable from ${languageName(next.language)} (${next.k} of ${next.n}).`;
+      // the safest language holds in both conditions; whether the weakest does is said in a clause
+      const weakest = ranking[0].language === worst.language ?
+        `${languageName(worst.language)} is the weakest in both` : 'the weakest language changes with the condition';
       card(`${languageName(best.language)}: ${percent(best.k, best.n)}`,
         `harmful answers of the ${base.name} in ${languageName(best.language)} with the ${first.name} (${best.k} of ` +
-        `${best.n}; ${bounds(best)}), the lowest rate of the ${data.languages.length} languages. With ${second.name} ` +
-        `it is lowest again (${safest.k} of ${safest.n})${again}`);
+        `${best.n}), its safest language in both prompt conditions; ${weakest}.`);
     } else {
       card(`${percent(worst.k, worst.n)} against ${percent(best.k, best.n)}`,
         `harmful answers of the ${base.name} with the ${first.name}, in ${languageName(worst.language)} (${worst.k} of ${worst.n}; ${bounds(worst)}) ` +
@@ -278,32 +306,6 @@
     fill('patch-body', [...rows.map(([, row]) => row), task]);
     $('patch-note').textContent = notes.join(' ');
     $('patch-section').hidden = false;
-    heldOut(data);
-  }
-
-  // the patch on prompts it was not written against: one row per language, the pooled row last
-  function heldOut(data) {
-    if (!data.heldout) return;
-    const interval = (ci) => `${points(ci[0])} to ${points(ci[1])}`;
-    const cell = ([k, n, lo, hi]) => el('td', { class: 'count' }, el('div', { text: counted(k, n) }),
-      el('div', { class: 'interval', text: lo === null ? '' : bounds({ lo, hi }) }));
-    fill('heldout-body', data.heldout.rows.map((row) => {
-      const harmful = row.harmful;
-      const moved = harmful.delta === null ? 'n/a' :
-        `${points(harmful.delta)} points (${interval(harmful.ci)}; ${pValue(harmful.p)}; ${harmful.pairs} pairs)`;
-      return el('tr', {}, el('td', { text: row.scope === 'all' ? 'all' : languageName(row.scope) }),
-        cell(harmful.before), cell(harmful.after), el('td', { text: moved }),
-        el('td', { class: 'count', text: `${counted(row.refusal.before[0], row.refusal.before[1])} → ` +
-          `${counted(row.refusal.after[0], row.refusal.after[1])}` }));
-    }));
-    const pooled = data.heldout.rows.find((row) => row.scope === 'all');
-    const gap = pooled && pooled.harmful.gap;
-    $('heldout-note').textContent = `${data.heldout.prompts} held-out prompts. A change is the rate with the patch ` +
-      'minus the rate without it over the prompts scored both ways, with a paired-bootstrap 95% interval and an ' +
-      'exact sign test.' + (gap ? ` The held-out change minus the change on the prompts the guidance was written ` +
-        `against: ${points(gap.delta)} points (95% interval ${interval(gap.ci)}); an interval that holds 0 does not ` +
-        'tell the two apart.' : '');
-    $('heldout').hidden = false;
   }
 
   function variants(data) {
@@ -372,12 +374,7 @@
       for (const file of top) box.appendChild(shown(file, false));
       $('top-figure').hidden = false;
     }
-    const variant = data.variants.length && data.figures.find((file) => key(file) === VARIANT_FIGURE);
-    if (variant) {
-      clear($('variants-figure')).appendChild(shown(variant, true));
-      $('variants-figure').hidden = false;
-    }
-    const rest = data.figures.filter((file) => file !== lead && file !== variant && !TOP_FIGURES.includes(key(file)));
+    const rest = data.figures.filter((file) => file !== lead && !TOP_FIGURES.includes(key(file)));
     if (!rest.length) return;
     const box = clear($('figures'));
     for (const file of rest) box.appendChild(shown(file, true));
@@ -388,6 +385,8 @@
     const found = data.attribution;
     if (!found) return;
     const scopeName = (scope) => SCOPE_NAMES[scope] || languageName(scope);
+    // inside a sentence the pooled scope is lower case, a list of languages keeps its capitals
+    const scopeText = (scope) => (scope === 'all' ? scopeName(scope).toLowerCase() : scopeName(scope));
     const nameOf = (id) => found.arms.find((arm) => arm.id === id).name;
     // the two arms of the headline stand first, side by side
     const pair = [found.base, found.tuned];
@@ -408,13 +407,15 @@
     };
     const stated = (scope, metric) => {
       const change = choiceChange(found, found.tuned, scope, metric);
-      return change ? `${scopeName(scope).toLowerCase()} ${points(change.delta)} points (95% interval ${points(change.ci[0])} to ` +
+      return change ? `${scopeText(scope)} ${points(change.delta)} points (95% interval ${points(change.ci[0])} to ` +
         `${points(change.ci[1])}, ${pValue(change.p)})` : null;
     };
     const changes = (metric) => ['all', 'non-English'].map((scope) => stated(scope, metric)).filter(Boolean).join('; ');
     table('attr-person', 'person_pick', false);
     table('attr-twin', 'twin', true);
     $('attr-person-note').textContent = 'Counts over the ambiguous items, with 95% Wilson intervals; lower is better. ' +
+      'The intervals treat rows as independent; the pooled rows hold the same 150 items in several languages, so theirs ' +
+      'are somewhat narrow. ' +
       `Change from the ${nameOf(found.base)} to the ${nameOf(found.tuned)}, paired by item: ${changes('person_pick')}.`;
     const right = ['base', 'tuned'].map((side) => choiceRate(found, found[side], 'all', 'accuracy'));
     // the best arm that changes the prompt and not the weights
@@ -422,15 +423,215 @@
       .map((arm) => [arm, choiceRate(found, arm.id, 'all', 'twin')]).filter(([, cell]) => cell && cell.n)
       .sort((a, b) => b[1].k / b[1].n - a[1].k / a[1].n)[0];
     $('attr-twin-note').textContent = 'A pair counts only when the model says the text does not tell on the ambiguous item ' +
-      'and answers its twin correctly, so abstaining on everything scores zero; higher is better. In Hindi and Arabic an ' +
-      'answer that is only the letter written in the local script is read as that letter; the strict reading leaves that ' +
-      'rule out. ' +
+      'and answers its twin correctly, so abstaining on everything scores zero; higher is better. ' +
       `Change from the ${nameOf(found.base)} to the ${nameOf(found.tuned)}, paired by item: ${changes('twin')}. ` +
       (right[0] && right[1] ? `Answerable twins answered correctly: ${counted(right[0].k, right[0].n)}, then ${counted(right[1].k, right[1].n)}. ` : '') +
       (prompted ? `The best arm that changes the prompt and not the weights (${prompted[0].name}) reaches ` +
-        `${percent(prompted[1].k, prompted[1].n)} over all six languages.` : '');
+        `${percent(prompted[1].k, prompted[1].n)} over ${scopeText('all')}.` : '');
+    englishTest(data.bbq);
     $('attribution-section').hidden = false;
-    $('map-intro').hidden = false;
+  }
+
+  // a risk-coverage curve as an inline SVG: one point per threshold, the chosen one filled, the base model a square
+  function curve(found) {
+    const ns = 'http://www.w3.org/2000/svg';
+    const svg = (tag, attrs, text) => {
+      const node = document.createElementNS(ns, tag);
+      for (const [name, value] of Object.entries(attrs)) node.setAttribute(name, value);
+      if (text) node.textContent = text;
+      return node;
+    };
+    const [width, height, left, bottom, top, right] = [560, 320, 52, 44, 12, 14];
+    const x = (coverage) => left + coverage * (width - left - right);
+    const top_risk = 0.6;
+    const y = (risk) => height - bottom - (risk / top_risk) * (height - bottom - top);
+    const root = svg('svg', { viewBox: `0 0 ${width} ${height}`, role: 'img', 'aria-label': 'Risk among the answered questions against the share of questions answered, by threshold' });
+    for (const tick of [0, 0.2, 0.4, 0.6, 0.8, 1]) {
+      root.appendChild(svg('line', { x1: x(tick), x2: x(tick), y1: y(0), y2: y(top_risk), stroke: '#e6e9ee' }));
+      root.appendChild(svg('text', { x: x(tick), y: height - bottom + 16, 'text-anchor': 'middle', 'font-size': 12, fill: '#5b6472' }, `${100 * tick}%`));
+    }
+    for (const tick of [0, 0.2, 0.4, 0.6]) {
+      root.appendChild(svg('line', { x1: x(0), x2: x(1), y1: y(tick), y2: y(tick), stroke: '#e6e9ee' }));
+      root.appendChild(svg('text', { x: left - 8, y: y(tick) + 4, 'text-anchor': 'end', 'font-size': 12, fill: '#5b6472' }, `${Math.round(100 * tick)}%`));
+    }
+    root.appendChild(svg('text', { x: x(0.5), y: height - 6, 'text-anchor': 'middle', 'font-size': 12, fill: '#1c2330' }, 'Questions answered (coverage)'));
+    root.appendChild(svg('text', { x: 14, y: y(top_risk / 2), 'text-anchor': 'middle', 'font-size': 12, fill: '#1c2330', transform: `rotate(-90 14 ${y(top_risk / 2)})` }, 'Wrong among the answered (risk)'));
+    const drawn = found.curve.filter((row) => row.risk !== null);
+    root.appendChild(svg('polyline', { points: drawn.map((row) => `${x(row.coverage)},${y(row.risk)}`).join(' '), fill: 'none', stroke: '#2a5db0', 'stroke-width': 2 }));
+    for (const row of drawn) {
+      const chosen = row.threshold === found.threshold;
+      root.appendChild(svg('circle', { cx: x(row.coverage), cy: y(row.risk), r: chosen ? 6 : 3, fill: chosen ? '#2a5db0' : '#fff', stroke: '#2a5db0', 'stroke-width': 1.5 }));
+    }
+    const base = [found.base.answered / found.questions, found.base.wrong_answered / found.base.answered];
+    root.appendChild(svg('rect', { x: x(base[0]) - 5, y: y(base[1]) - 5, width: 10, height: 10, fill: '#b3261e' }));
+    clear($('probe-curve')).appendChild(root);
+    const chosen = found.curve.find((row) => row.threshold === found.threshold);
+    $('probe-curve-note').textContent = 'Each point is one threshold of the grid. The filled point is the threshold chosen on the ' +
+      `probe's dev split (${found.threshold}): ${(100 * chosen.coverage).toFixed(1)}% of the questions answered, ` +
+      `${(100 * chosen.risk).toFixed(1)}% of them wrong. The square is the base model: ${(100 * base[0]).toFixed(1)}% answered, ` +
+      `${(100 * base[1]).toFixed(1)}% of them wrong. Half of the questions should not be answered, so coverage near 50% is the bound.`;
+  }
+
+  // the probe on SQuAD 2.0: the base model, the gated model and abstaining on every question, side by side
+  function probe(data) {
+    const found = data.probe;
+    if (!found) return;
+    const answerable = found.questions - found.unanswerable;
+    const always = { wrong: found.always_abstain, answered: 0, wrong_answered: 0, hallucinations: 0, kept: 0, correct: 0 };
+    const systems = [['Base model', found.base]];
+    if (found.instructed) systems.push(['One instruction line, no probe', found.instructed.counts]);
+    systems.push(['Base model + probe', found.gated]);
+    if (found.combined) systems.push(['Probe gate, else the instructed answer (exploratory)', found.combined.counts]);
+    systems.push(['Abstaining on every question', always]);
+    const rows = [
+      ['Wrong answers', (counts) => counted(counts.wrong, found.questions)],
+      ['Unanswerable questions answered (hallucinations)', (counts) => counted(counts.hallucinations, found.unanswerable)],
+      ['Answerable questions still answered', (counts) => counted(counts.kept, answerable)],
+      ['Answerable questions answered correctly', (counts) => counted(counts.correct, answerable)],
+      ['Questions answered (coverage)', (counts) => counted(counts.answered, found.questions)],
+      ['Wrong among the answered (risk)', (counts) => (counts.answered ? counted(counts.wrong_answered, counts.answered) : 'none answered')],
+    ];
+    const count = (text) => el('td', { class: 'count', text });
+    $('probe-lead').textContent = `${found.questions} questions of the official SQuAD 2.0 validation file, each asked with its ` +
+      `passage: ${found.unanswerable} that the passage cannot answer and ${answerable} that it can. The probe is a logistic ` +
+      `regression on the layer-${found.layer} hidden state at the last prompt token, trained on the model's own errors on questions ` +
+      'of the train file. Where it fires the answer becomes an abstention: right on an unanswerable question, wrong on an answerable one.';
+    fill('probe-head', [el('tr', {}, el('th', { text: '' }), ...systems.map(([name]) => el('th', { text: name })))]);
+    fill('probe-body', rows.map(([title, cell]) => el('tr', {}, el('td', { text: title }), ...systems.map(([, counts]) => count(cell(counts))))));
+    const change = found.change;
+    $('probe-note').textContent = `Scored by word match. Change in wrong answers ${points(change.delta)} points (95% interval over ` +
+      `${change.articles} articles ${points(change.ci[0])} to ${points(change.ci[1])}; ${change.better} of ${change.articles} articles ` +
+      `better; ${pValue(change.p)}). The gate fixes ${change.fixed} of the ${found.unanswerable} unanswerable questions and breaks ` +
+      `${change.broken} of the ${answerable} answerable ones: at these rates it cuts wrong answers only where more than ` +
+      `${(100 * found.break_even).toFixed(1)}% of the questions are unanswerable.`;
+    const checks = [];
+    if (found.served) {
+      checks.push(`Served through a forward hook during generation, the gate gives the offline gate's answers on ` +
+        `${found.served.equal} of ${found.served.prompts} prompts (${found.served.fired} fired).`);
+    }
+    if (found.identity) {
+      checks.push(`The ${found.identity.rows} scored answers, generated again through AuditKIT, equal the stored ones on ` +
+        `${found.identity.equal} of ${found.identity.rows} rows.`);
+    }
+    $('probe-checks').textContent = checks.join(' ');
+    $('probe-checks').hidden = !checks.length;
+    // a table may state a bound with four decimals: shown as stated, not rounded again
+    const exact = (value) => (value >= 0 ? '+' : '') + (100 * value).toFixed(2).replace(/0$/, '');
+    if (found.instructed) {
+      const behind = found.instructed.behind_the_gate;
+      $('probe-note').textContent += ` One instruction line in the prompt, with no probe, takes wrong answers to ` +
+        `${found.instructed.counts.wrong} (${found.instructed.judge_wrong} as a closed judge reads the answers); the probe is ` +
+        `${exact(behind.delta).slice(1)} points better (95% interval over ${behind.articles} articles ${exact(behind.ci[0]).slice(1)} to ` +
+        `${exact(behind.ci[1]).slice(1)}; ${pValue(behind.p)}).` +
+        (found.combined ? ' The gate with the instructed answer where it does not fire is an exploratory computation, added after the other columns.' : '');
+    }
+    if (found.samples.length) {
+      const first = { id: 'first', questions: found.questions, base: found.base, gated: found.gated, change: found.change,
+        judge: found.judge && { base: found.judge.base.wrong, gated: found.judge.gated.wrong } };
+      const shown = [first, ...found.samples];
+      const title = (sample) => `${SAMPLE_NAMES[sample.id]}, ${sample.questions} questions`;
+      const lines = [['Wrong answers', (sample) => `${sample.base.wrong} → ${sample.gated.wrong}`],
+        ['Wrong answers as read by the judge', (sample) => (sample.judge ? `${sample.judge.base} → ${sample.judge.gated}` : 'not read')],
+        ['Unanswerable questions answered (hallucinations)', (sample) => `${sample.base.hallucinations} → ${sample.gated.hallucinations}`],
+        ['Answerable questions still answered', (sample) => `${sample.base.kept} → ${sample.gated.kept}`]];
+      fill('probe-samples-head', [el('tr', {}, el('th', { text: 'Base model → base model + probe' }),
+        ...shown.map((sample) => el('th', { text: title(sample) })))]);
+      fill('probe-samples-body', lines.map(([name, cell]) => el('tr', {}, el('td', { text: name }),
+        ...shown.map((sample) => count(cell(sample))))));
+      $('probe-samples-note').textContent = 'Change in wrong answers, in points, with its 95% interval over articles: ' +
+        shown.map((sample) => `${SAMPLE_NAMES[sample.id].toLowerCase()} ${exact(sample.change.delta)} (${exact(sample.change.ci[0])} to ` +
+          `${exact(sample.change.ci[1])})`).join('; ') + '.';
+      $('probe-samples').hidden = false;
+    }
+    if (found.judge) {
+      const judged = found.judge;
+      const metrics = [['Wrong answers', 'wrong'], ['Unanswerable questions answered (hallucinations)', 'hallucinations'],
+        ['Answerable questions still answered', 'kept'], ['Answerable questions answered correctly', 'correct']];
+      const pair = (base, gated, key) => `${base[key]} → ${gated[key]}`;
+      fill('probe-judge-head', [el('tr', {}, el('th', { text: 'Base model → base model + probe' }),
+        el('th', { text: 'By word match' }), el('th', { text: 'As read by the judge' }))]);
+      fill('probe-judge-body', metrics.map(([title, key]) => el('tr', {}, el('td', { text: title }),
+        count(pair(found.base, found.gated, key)), count(pair(judged.base, judged.gated, key)))));
+      const stated = judged.change;
+      $('probe-judge-note').textContent = `Under the judge's labels the change in wrong answers is ${exact(stated.delta)} points ` +
+        `(95% interval over ${stated.articles} articles ${exact(stated.ci[0])} to ${exact(stated.ci[1])}; ${stated.better} of ` +
+        `${stated.articles} articles better), and the gate breaks ${stated.broken} answerable questions against ${change.broken} by ` +
+        `word match. The two readings agree on ${judged.agree.wrong[0]} of ${judged.agree.wrong[1]} error labels, on ` +
+        `${judged.agree.abstains[0]} of ${judged.agree.abstains[1]} abstentions and, on the answerable questions, on ` +
+        `${judged.agree.gold[0]} of ${judged.agree.gold[1]} answers.`;
+      $('probe-judge').hidden = false;
+    }
+    // one system per row: the instruction line and a fine-tune on the first sample, the model's own confidence on the second
+    const beside = [];
+    const notes = [];
+    const system = (name, sample, counts, judged, auc) => beside.push([name, sample, `${counts.wrong}`,
+      judged === null ? 'not read' : `${judged}`, `${counts.hallucinations}`, `${counts.kept}`, auc === null ? '' : auc.toFixed(4)]);
+    if (found.instructed || found.fine_tuned) {
+      system('Base model', 'first', found.base, found.judge ? found.judge.base.wrong : null, null);
+      system('Base model + probe', 'first', found.gated, found.judge ? found.judge.gated.wrong : null, found.scores[0].auc_error);
+      if (found.instructed) system('One instruction line in the prompt, no probe', 'first', found.instructed.counts, found.instructed.judge_wrong, null);
+      if (found.fine_tuned) {
+        const tuned = found.fine_tuned;
+        system('Fine-tune on question pairs, no probe', 'first', tuned.counts, tuned.judge_wrong, null);
+        const stated = (change) => `${exact(change.delta)} points (95% interval ${exact(change.ci[0])} to ${exact(change.ci[1])})`;
+        notes.push(`The fine-tune's change in wrong answers from the base model is ${stated(tuned.from_base.word_match)} by word match and ` +
+          `${stated(tuned.from_base.judge)} as the judge reads the answers` +
+          (tuned.from_base.judge.ci[0] < 0 && tuned.from_base.judge.ci[1] > 0 ? ', an interval that includes no change.' : '.'));
+      }
+    }
+    if (found.confidence) {
+      const sure = found.confidence;
+      system('Base model', 'second', sure.base.counts, sure.base.judge_wrong, null);
+      system('Base model + probe', 'second', sure.gated.counts, sure.gated.judge_wrong, sure.gated.auc_error);
+      for (const score of sure.scores) system(CONFIDENCE_NAMES[score.id], 'second', score.counts, score.judge_wrong, score.auc_error);
+      notes.push('On the second sample the probe\'s AUC against the model\'s error is ' + sure.scores.map((score) =>
+        `${score.probe_ahead.difference.toFixed(4)} above ${CONFIDENCE_TEXT[score.id]} (95% interval ` +
+        `${score.probe_ahead.ci[0].toFixed(4)} to ${score.probe_ahead.ci[1].toFixed(4)})`).join(' and ') + '.');
+    }
+    if (beside.length) {
+      const titles = ['System', 'Sample', 'Wrong answers', 'Wrong answers as read by the judge', 'Unanswerable questions answered',
+        'Answerable questions still answered', 'AUC against the model\'s error'];
+      fill('probe-beside-head', [el('tr', {}, ...titles.map((text) => el('th', { text })))]);
+      fill('probe-beside-body', beside.map(([name, sample, ...cells]) => el('tr', {}, el('td', { text: name }), el('td', { text: sample }),
+        ...cells.map((text) => count(text)))));
+      $('probe-beside-note').textContent = [`Each sample holds ${found.questions} questions, ${found.unanswerable} of them unanswerable.`,
+        ...notes, 'An instruction line and a fine-tune are not scores, so they have no AUC.'].join(' ');
+      $('probe-beside').hidden = false;
+    }
+    const gateRow = (name, score) => el('tr', {}, el('td', { text: name }), count(score.auc_error.toFixed(4)),
+      count(score.auc_unanswerable.toFixed(4)), count(`${score.fired[0]} of ${score.fired[1]}`),
+      count(`${found.base.wrong} → ${score.wrong}`), count(`${score.kept} of ${answerable}`));
+    const columns = ['AUC against the model\'s error', 'AUC against "unanswerable"', 'Fires on', 'Wrong answers', 'Answerable still answered'];
+    fill('probe-scores-head', [el('tr', {}, el('th', { text: 'Score' }), ...columns.map((text) => el('th', { text })))]);
+    fill('probe-scores-body', found.scores.map((score) => gateRow(score.id === found.scores[0].id ? `Probe on layer ${found.layer}` : PROBE_NAMES[score.id], score)));
+    $('probe-scores-note').textContent = found.ahead.map((gap) => `The probe's AUC against the model's error is ` +
+      `${gap.difference.toFixed(4)} above ${PROBE_TEXT[gap.of]} (95% interval ${gap.ci[0].toFixed(4)} to ${gap.ci[1].toFixed(4)}).`).join(' ') +
+      ' A text score that fires on every question abstains on everything. The probe\'s AUC against "unanswerable" is above its AUC ' +
+      'against the model\'s error: trained on an error label, it mostly learns which questions are unanswerable.';
+    fill('probe-elsewhere-head', [el('tr', {}, el('th', { text: 'Probe' }), ...columns.map((text) => el('th', { text })))]);
+    fill('probe-elsewhere-body', [gateRow('Fitted on SQuAD (the probe above)', found.scores[0]),
+      ...found.elsewhere.map((score) => gateRow(PROBE_NAMES[score.id], score))]);
+    curve(found);
+    $('probe-section').hidden = false;
+  }
+
+  // BBQ's English test beside the official items: one row per arm, never pooled with them
+  function englishTest(found) {
+    if (!found) return;
+    const columns = [['person_pick', 'Names a person where the text does not say', false],
+      ['accuracy', 'Answerable twins answered correctly', true], ['twin', 'Twin accuracy', true]];
+    const pair = [found.base, found.tuned];
+    const arms = pair.map((id) => found.arms.find((arm) => arm.id === id)).filter(Boolean)
+      .concat(found.arms.filter((arm) => !pair.includes(arm.id)));
+    fill('attr-bbq-head', [el('tr', {}, el('th', { text: 'Arm' }), ...columns.map(([, title]) => el('th', { text: title })))]);
+    fill('attr-bbq-body', arms.map((arm) => el('tr', {}, el('td', { text: capital(arm.name) }),
+      ...columns.map(([metric, , good]) => rateCell(choiceRate(found, arm.id, 'en', metric), 1, good)))));
+    const stated = columns.map(([metric, title]) => [title, choiceChange(found, found.tuned, 'en', metric)]).filter(([, change]) => change)
+      .map(([title, change]) => `${title.toLowerCase()} ${points(change.delta)} points (95% interval ${points(change.ci[0])} to ` +
+        `${points(change.ci[1])}, ${pValue(change.p)})`).join('; ');
+    $('attr-bbq-note').textContent = 'Counts over 150 question pairs, with 95% Wilson intervals. Change from the base model to ' +
+      `the attribution fine-tune, paired by item: ${stated}.`;
+    $('attr-bbq').hidden = false;
   }
 
   // the sample question pair: the ambiguous question with both answers, and the twin with the fine-tune's answer
@@ -516,7 +717,7 @@
 
   function render(data) {
     numbers(data);
-    if (!PATCH_LEADS) for (const node of document.querySelectorAll('.number.patch')) node.parentNode.appendChild(node);
+    probe(data);
     attribution(data);
     length(data);
     recipes(data);

@@ -14,8 +14,7 @@ OVERFIT = "tiny-aya-global-drift-merged-nopre--d845b23452bb"
 REPAIRED = "tiny-aya-global-repaired-nopre--ba1563a2e8c8"
 SECRET = "text of a harmful request that must stay out of the page"
 KEYS = {"schema", "eval_repo", "conditions", "models", "languages", "categories", "figures"}
-KEYS |= {"summary", "changes", "flips", "length", "cells", "overfit", "repaired", "patch", "variants", "attribution"}
-KEYS |= {"heldout"}
+KEYS |= {"summary", "changes", "flips", "length", "cells", "overfit", "repaired", "patch", "variants", "attribution", "bbq", "probe"}
 
 
 def _load():
@@ -184,77 +183,6 @@ def test_tables_are_found_where_the_results_dataset_keeps_them(eval_dir, tmp_pat
     data = build_data.build(eval_dir, results)
 
     assert data["changes"]["served"]["safe"]["pairs"] == data["changes"]["nopreamble"]["safe"]["pairs"] == 597
-
-
-# the held-out table of the results dataset, cut to one language and the pooled row: (without, with) the patch
-HELDOUT_COUNTS = {
-    ("en", "harmful"): ((9, 100), (5, 99)),
-    ("all", "harmful"): ((50, 598), (30, 597)),
-    ("en", "refusal"): ((70, 100), (74, 99)),
-    ("all", "refusal"): ((400, 598), (430, 597)),
-}
-
-
-def _heldout_table() -> dict:
-    rates, changes = [], []
-    for (scope, metric), sides in HELDOUT_COUNTS.items():
-        for condition, (k, n) in zip(("keep", "patch"), sides, strict=True):
-            rates.append({"condition": condition, "scope": scope, "metric": metric, "k": k, "n": n, "rate": k / n})
-        change = {"scope": scope, "metric": metric, "n_pairs": sides[1][1]}
-        changes.append(change | {"delta": -0.0335, "ci": [-0.0553, -0.0134], "p_value": 0.0004})
-    table = {"schema": "driftmap.heldout/1", "prompts": 600, "scopes": ["en", "all"]}
-    table |= {"rates": rates, "changes": changes, "unscored": {"keep": 2, "patch": 3}}
-    table |= {"in_sample": {"gaps": [{"scope": "all", "metric": "harmful", "delta": 0.0217, "ci": [-0.0051, 0.0468]}]}}
-    return table | {"categories": [{"harm_category": SECRET, "k": 1, "n": 2}]}
-
-
-@pytest.fixture
-def heldout_dir(tmp_path):
-    """A copy of the results dataset that holds the held-out table where ``table heldout`` uploads it."""
-    path = tmp_path / "results" / "tables" / "heldout.json"
-    path.parent.mkdir(parents=True)
-    path.write_text(json.dumps(_heldout_table()), encoding="utf-8")
-    return tmp_path / "results"
-
-
-def test_the_held_out_prompts_keep_both_conditions_and_the_change_the_table_states(heldout_dir):
-    found = build_data.heldout(heldout_dir)
-
-    assert found["prompts"] == 600 and [row["scope"] for row in found["rows"]] == ["en", "all"]
-    pooled = found["rows"][1]
-    low, high = reference_wilson(30, 597)
-    assert pooled["harmful"]["before"][:2] == [50, 598]
-    assert pooled["harmful"]["after"] == [30, 597, round(low, 6), round(high, 6)]
-    assert {key: pooled["harmful"][key] for key in ("pairs", "delta", "ci", "p")} == {
-        "pairs": 597, "delta": -0.0335, "ci": [-0.0553, -0.0134], "p": 0.0004
-    }  # fmt: skip
-    assert pooled["refusal"]["before"][:2] == [400, 598] and pooled["refusal"]["after"][:2] == [430, 597]
-    # the held-out change minus the change on the evaluation prompts, where the table states it
-    assert pooled["harmful"]["gap"] == {"delta": 0.0217, "ci": [-0.0051, 0.0468]}
-    assert found["rows"][0]["harmful"]["gap"] is None and pooled["refusal"]["gap"] is None
-    # counts only: the table's own rows by harm category are not copied
-    assert SECRET not in json.dumps(found)
-
-
-def test_the_held_out_table_is_also_found_by_its_name_in_a_flat_folder(heldout_dir, tmp_path):
-    flat = tmp_path / "flat"
-    flat.mkdir()
-    (heldout_dir / "tables" / "heldout.json").rename(flat / "heldout.json")
-
-    assert build_data.heldout(flat)["prompts"] == 600
-    assert build_data.heldout(heldout_dir) is None
-
-
-def test_a_held_out_table_without_the_evaluation_prompts_beside_it_states_no_gap(heldout_dir):
-    path = heldout_dir / "tables" / "heldout.json"
-    path.write_text(json.dumps(_heldout_table() | {"in_sample": None}), encoding="utf-8")
-
-    assert build_data.heldout(heldout_dir)["rows"][1]["harmful"]["gap"] is None
-
-
-def test_without_a_held_out_table_the_data_has_no_held_out_prompts(eval_dir, heldout_dir):
-    assert build_data.build(eval_dir)["heldout"] is None
-    assert build_data.build(eval_dir, heldout_dir)["heldout"]["rows"][0]["scope"] == "en"
 
 
 def test_only_the_measured_conditions_and_models_are_listed(eval_dir):
@@ -434,13 +362,13 @@ def test_main_writes_the_same_bytes_twice(eval_dir, tmp_path):
     assert build_data.main(["--eval-dir", str(eval_dir), "--out", str(out)]) == 0
     first = out.read_bytes()
     assert build_data.main(["--eval-dir", str(eval_dir), "--out", str(out)]) == 0
-    assert out.read_bytes() == first and json.loads(first)["schema"] == "driftmap.space/7"
+    assert out.read_bytes() == first and json.loads(first)["schema"] == "driftmap.space/8"
 
 
 def test_the_committed_data_file_holds_counts_only():
     data = json.loads((ROOT / "space" / "data.json").read_text(encoding="utf-8"))
 
-    assert data["schema"] == "driftmap.space/7" and set(data) == KEYS and data["cells"]
+    assert data["schema"] == "driftmap.space/8" and set(data) == KEYS and data["cells"]
     assert all(set(cell) == {"condition", "model", "language", "category", "k", "n", "lo", "hi"} for cell in data["cells"])
     # no cell names a prompt: the only strings are ids of conditions, models, languages and categories
     names = {"all", *data["languages"], *data["categories"]} | {row["id"] for row in data["conditions"] + data["models"]}
@@ -711,9 +639,11 @@ def _answers_file(folder: Path, checkpoint: str, language: str = "en") -> Path:
 
 @pytest.fixture
 def choice_dir(tmp_path):
-    """Copies of the three datasets of the question pairs in one folder: the table, the choice prompts, the stored answers."""
+    """Copies of the three datasets of the question pairs in one folder: the table of the official items in four
+    languages, the table of the English test, the choice prompts and the stored answers."""
     folder = tmp_path / "choice"
     folder.mkdir()
+    (folder / "choice-mbbq-defense.json").write_text(json.dumps(_choice_table()), encoding="utf-8")
     (folder / "choice-defense.json").write_text(json.dumps(_choice_table()), encoding="utf-8")
     for language in ANSWERS[CHOICE_BASE]:
         _jsonl(folder / "choice" / "prompts" / "benign" / f"{language}.jsonl", _choice_prompts(language))
@@ -762,10 +692,22 @@ def test_changes_from_the_base_model_are_the_ones_the_table_states_over_all_rows
 def test_the_choice_table_is_found_where_the_results_dataset_keeps_it(choice_dir, tmp_path):
     results = tmp_path / "results" / "tables"
     results.mkdir(parents=True)
-    (choice_dir / "choice-defense.json").rename(results / "choice-defense.json")
+    (choice_dir / "choice-mbbq-defense.json").rename(results / "choice-mbbq-defense.json")
 
     assert build_data.attribution(results.parent)["arms"][0]["id"] == "baseline/keep"
     assert build_data.attribution(choice_dir) is None
+
+
+def test_the_english_test_stands_beside_the_official_items_in_its_own_key(eval_dir, choice_dir):
+    data = build_data.build(eval_dir, choice_dir=choice_dir)
+
+    # the table of the English test holds translated languages too; the page takes its English rows alone
+    assert data["bbq"]["scopes"] == ["en"]
+    assert {row["scope"] for row in data["bbq"]["rates"] + data["bbq"]["changes"]} == {"en"}
+    assert [arm["id"] for arm in data["bbq"]["arms"]] == [arm["id"] for arm in data["attribution"]["arms"]]
+    (choice_dir / "choice-defense.json").unlink()
+    again = build_data.build(eval_dir, choice_dir=choice_dir)
+    assert again["bbq"] is None and again["attribution"]["scopes"] == ["en", "ar"]
 
 
 def test_without_a_choice_table_the_data_has_no_question_pairs(eval_dir, choice_dir):
@@ -777,7 +719,7 @@ def test_the_samples_are_one_item_the_base_model_names_a_person_on_and_the_fine_
     found = build_data.samples(choice_dir, choice_dir, choice_dir)
 
     assert found["schema"] == "driftmap.space.samples/1" and found["item"] == ITEM
-    english, russian = found["samples"]
+    (english,) = found["samples"]
     assert english == {
         "language": "en",
         "prompt": QUESTION,
@@ -785,7 +727,13 @@ def test_the_samples_are_one_item_the_base_model_names_a_person_on_and_the_fine_
         "tuned": "It is not answerable from the text.",
         "twin": {"prompt": TWIN, "tuned": "The answer is Robert."},
     }
-    assert russian["language"] == "ru" and russian["base"] == "Дженнифер хочет уйти." and russian["twin"]["tuned"] == "Ответ: Роберт."
+
+
+def test_the_samples_take_their_checkpoints_from_the_table_of_the_english_test(choice_dir):
+    (choice_dir / "choice-mbbq-defense.json").unlink()
+    assert build_data.samples(choice_dir, choice_dir, choice_dir)["samples"][0]["language"] == "en"
+    (choice_dir / "choice-defense.json").unlink()
+    assert build_data.samples(choice_dir, choice_dir, choice_dir) is None
 
 
 @pytest.mark.parametrize(
@@ -824,38 +772,248 @@ def test_main_writes_the_samples_beside_the_data_file_only_from_the_choice_answe
     assert build_data.main(args) == 0
     first = (out.parent / "samples.json").read_bytes()
     assert build_data.main(args) == 0
-    assert (out.parent / "samples.json").read_bytes() == first and len(json.loads(first)["samples"]) == 2
+    assert (out.parent / "samples.json").read_bytes() == first and len(json.loads(first)["samples"]) == 1
     # the data file still holds counts only
     assert "Jennifer" not in out.read_text(encoding="utf-8")
 
 
-def test_main_leaves_the_question_pairs_out_when_told_to(eval_dir, choice_dir, tmp_path, monkeypatch):
-    out = tmp_path / "page" / "data.json"
-    args = ["--eval-dir", str(eval_dir), "--choice-dir", str(choice_dir), "--out", str(out)]
-    args += ["--choice-eval-dir", str(choice_dir), "--choice-responses-dir", str(choice_dir), "--no-question-pairs"]
-
-    assert build_data.main(args) == 0
-
-    assert json.loads(out.read_text(encoding="utf-8"))["attribution"] is None
-    assert not (out.parent / "samples.json").exists()
-
-    # read from the Hub, the results dataset is not asked for the choice table either
-    asked = []
-    monkeypatch.setattr(build_data, "_download", lambda repo, patterns: asked.append((repo, patterns)) or eval_dir)
-    monkeypatch.setattr(build_data, "_responses", lambda: None)
-    assert build_data.main(["--no-question-pairs", "--out", str(out)]) == 0
-    assert not any("choice" in pattern for _, patterns in asked for pattern in patterns)
-    assert build_data.main(["--out", str(out)]) == 0
-    assert any(build_data.CHOICE_TABLE in patterns for _, patterns in asked)
-
-
-def test_the_committed_samples_are_the_two_languages_of_one_item():
-    path = ROOT / "space" / "samples.json"
-    if json.loads((ROOT / "space" / "data.json").read_text(encoding="utf-8"))["attribution"] is None:
-        assert not path.exists()  # a page without the question pairs carries no sample of them
-        return
-    found = json.loads(path.read_text(encoding="utf-8"))
+def test_the_committed_sample_is_one_english_item():
+    found = json.loads((ROOT / "space" / "samples.json").read_text(encoding="utf-8"))
 
     assert found["schema"] == "driftmap.space.samples/1"
-    assert [sample["language"] for sample in found["samples"]] == ["en", "ru"]
+    assert [sample["language"] for sample in found["samples"]] == ["en"]
     assert all(set(sample) == {"language", "prompt", "base", "tuned", "twin"} for sample in found["samples"])
+
+
+def _probe_counts(wrong: int, answered: int, wrong_answered: int, hallucinations: int, kept: int, correct: int) -> dict:
+    counts = {"rows": 20, "wrong_answers": wrong, "wrong_answer_rate": wrong / 20, "answered": answered}
+    risk = wrong_answered / answered if answered else None
+    counts |= {"coverage": answered / 20, "wrong_among_answered": wrong_answered, "risk": risk}
+    counts |= {"hallucinations": hallucinations, "unanswerable_abstained": 10 - hallucinations, "answerable_rows": 10}
+    return counts | {"answerable_answered": kept, "answerable_answered_rate": kept / 10, "answerable_correct": correct}
+
+
+def _probe_gate(auc: float, fired: tuple[int, int], gated: dict, fixed: int, broken: int) -> dict:
+    change = {"articles": 4, "change": (gated["wrong_answers"] - 12) / 20, "ci95": [-0.3, -0.1], "articles_better": 4}
+    change |= {"articles_worse": 0, "sign_test_p": 0.125, "questions_wrong_to_right": fixed, "questions_right_to_wrong": broken}
+    curve = [{"threshold": 0.7, "coverage": gated["coverage"], "risk": gated["risk"], "hallucinations": gated["hallucinations"]}]
+    curve[0] |= {"wrong_answer_rate": gated["wrong_answer_rate"], "answerable_answered_rate": gated["answerable_answered_rate"]}
+    return {
+        "layer": 20, "C": 0.001, "threshold": 0.7, "auc_base_error": auc, "auc_unanswerable": auc + 0.03,
+        "fired_on_unanswerable": [fired[0], 10], "fired_on_answerable": [fired[1], 10],
+        "gated": gated, "base_to_gated_wrong_answers": change, "curve": curve,
+    }
+
+
+def _probe_table() -> dict:
+    """20 questions, 10 of them unanswerable: the base model answers 9 of those and misses 3 answerable ones; the
+    probe fires on 6 answered unanswerable questions and on 2 answerable ones the base model had right."""
+    base = _probe_counts(wrong=12, answered=19, wrong_answered=12, hallucinations=9, kept=10, correct=7)
+    gated = _probe_counts(wrong=8, answered=11, wrong_answered=6, hallucinations=3, kept=8, correct=5)
+    silent = _probe_counts(wrong=10, answered=0, wrong_answered=0, hallucinations=0, kept=0, correct=0)
+    weak = _probe_counts(wrong=11, answered=17, wrong_answered=10, hallucinations=8, kept=9, correct=7)
+    ahead = {"difference": 0.33, "ci95": [0.28, 0.38], "clusters": 4}
+    return {
+        "schema": "driftmap.probe-squad/1",
+        "base": base,
+        "in_domain": {
+            "squad_probe": _probe_gate(0.82, (6, 2), gated, 6, 2),
+            "length": _probe_gate(0.5, (10, 10), silent, 9, 7),
+            "tfidf": _probe_gate(0.55, (10, 10), silent, 9, 7),
+        },
+        "zero_shot": {"probe_1": _probe_gate(0.63, (2, 1), weak, 1, 0), "error_probe": _probe_gate(0.52, (1, 0), weak, 1, 0)},
+        "in_domain_auc_differences": {"squad_probe minus length": ahead, "squad_probe minus tfidf": ahead | {"difference": 0.27}},
+    }
+
+
+@pytest.fixture
+def probe_dir(tmp_path):
+    folder = tmp_path / "results"
+    (folder / "tables").mkdir(parents=True)
+    (folder / "tables" / "probe-squad.json").write_text(json.dumps(_probe_table()), encoding="utf-8")
+    return folder
+
+
+def test_the_probe_keeps_the_counts_of_the_base_model_and_of_the_gated_model(probe_dir):
+    found = build_data.probe(probe_dir)
+
+    assert (found["questions"], found["unanswerable"], found["layer"], found["threshold"]) == (20, 10, 20, 0.7)
+    assert found["base"] == {"wrong": 12, "answered": 19, "wrong_answered": 12, "hallucinations": 9, "kept": 10, "correct": 7}
+    assert found["gated"] == {"wrong": 8, "answered": 11, "wrong_answered": 6, "hallucinations": 3, "kept": 8, "correct": 5}
+    assert found["change"] == {"delta": -0.2, "ci": [-0.3, -0.1], "articles": 4, "better": 4, "p": 0.125, "fixed": 6, "broken": 2}
+
+
+def test_abstaining_on_every_question_and_the_break_even_share_follow_from_the_counts(probe_dir):
+    found = build_data.probe(probe_dir)
+
+    # every answerable question becomes wrong; 2 of 10 answerable broken against 6 of 10 unanswerable fixed
+    assert found["always_abstain"] == 10
+    assert found["break_even"] == pytest.approx(0.25)
+
+
+def test_the_text_baselines_and_the_probes_fitted_on_question_pairs_stand_beside_the_probe(probe_dir):
+    found = build_data.probe(probe_dir)
+
+    assert [score["id"] for score in found["scores"]] == ["squad_probe", "length", "tfidf"]
+    assert found["scores"][0] == {"id": "squad_probe", "auc_error": 0.82, "auc_unanswerable": 0.85, "fired": [8, 20], "wrong": 8, "kept": 8}
+    assert found["scores"][1]["fired"] == [20, 20] and found["scores"][1]["wrong"] == found["always_abstain"]
+    assert found["ahead"] == [{"of": "length", "difference": 0.33, "ci": [0.28, 0.38]}, {"of": "tfidf", "difference": 0.27, "ci": [0.28, 0.38]}]
+    assert [(row["id"], row["wrong"], row["kept"]) for row in found["elsewhere"]] == [("probe_1", 11, 9), ("error_probe", 11, 9)]
+    assert found["curve"] == [{"threshold": 0.7, "coverage": 0.55, "risk": 6 / 11, "wrong": 0.4, "kept": 0.8, "hallucinations": 3}]
+
+
+def test_the_probe_table_is_found_in_a_flat_folder_and_is_optional(eval_dir, probe_dir, tmp_path):
+    flat = tmp_path / "flat"
+    flat.mkdir()
+    (flat / "probe-squad.json").write_text(json.dumps(_probe_table()), encoding="utf-8")
+
+    assert build_data.probe(flat) == build_data.probe(probe_dir)
+    assert build_data.probe(tmp_path / "missing") is None
+    assert build_data.build(eval_dir, choice_dir=probe_dir)["probe"] == build_data.probe(probe_dir)
+    assert build_data.build(eval_dir)["probe"] is None
+
+
+def test_the_probe_holds_no_text_of_a_question(probe_dir):
+    text = json.dumps(build_data.probe(probe_dir))
+
+    assert "squad." not in text and all(not isinstance(value, str) or len(value) < 16 for value in json.loads(text)["base"].values())
+
+
+@pytest.fixture
+def probe_checks_dir(probe_dir):
+    """The probe's table with the three tables that stand beside it: the judge's reading of the same answers, the
+    gate served inside generation, and the scored answers generated again through AuditKIT."""
+    table = _probe_table()
+    base = _probe_counts(wrong=11, answered=19, wrong_answered=11, hallucinations=9, kept=10, correct=8)
+    gated = _probe_counts(wrong=7, answered=11, wrong_answered=5, hallucinations=3, kept=8, correct=6)
+    agree = {"abstains": {"rows": 20, "agree": 19, "kappa": 0.77}, "answer_is_wrong": {"rows": 20, "agree": 18, "kappa": 0.87}}
+    agree["gold_answer_on_answerable"] = {"rows": 10, "agree": 9, "kappa": 0.36}
+    judge = {"rows_judged": 20, "rows_unjudged": 0, "agreement_of_the_rules_with_the_judge": agree, "base": base}
+    judge["squad_probe"] = _probe_gate(0.83, (6, 2), gated, 6, 2)
+    judged = {"schema": "driftmap.probe-squad-scored/1", "word_match": {"base": table["base"]}, "judge": judge}
+    served = {"schema": "driftmap.probe-squad-served/1", "counts": {"prompts": 10, "served_equals_offline_gate": 10, "fired": 4}}
+    identity = {"schema": "driftmap.probe-squad-identity/1", "rows": 20, "equal_on_all_three": 20}
+    for name, content in (("judge", judged), ("served", served), ("identity", identity)):
+        (probe_dir / "tables" / f"probe-squad-{name}.json").write_text(json.dumps(content), encoding="utf-8")
+    return probe_dir
+
+
+def test_the_judges_reading_of_the_same_answers_stands_beside_the_word_match_counts(probe_checks_dir):
+    found = build_data.probe(probe_checks_dir)["judge"]
+
+    assert found["base"] == {"wrong": 11, "answered": 19, "wrong_answered": 11, "hallucinations": 9, "kept": 10, "correct": 8}
+    assert found["gated"] == {"wrong": 7, "answered": 11, "wrong_answered": 5, "hallucinations": 3, "kept": 8, "correct": 6}
+    assert found["change"] == {"delta": -0.25, "ci": [-0.3, -0.1], "articles": 4, "better": 4, "p": 0.125, "fixed": 6, "broken": 2}
+    assert found["agree"] == {"abstains": [19, 20], "gold": [9, 10], "wrong": [18, 20]}
+    assert (found["judged"], found["unjudged"], found["auc_error"]) == (20, 0, 0.83)
+
+
+def test_the_served_gate_and_the_answers_generated_again_are_counts_beside_the_probe(probe_checks_dir):
+    found = build_data.probe(probe_checks_dir)
+
+    assert found["served"] == {"prompts": 10, "equal": 10, "fired": 4}
+    assert found["identity"] == {"rows": 20, "equal": 20}
+
+
+def test_without_their_tables_the_probe_has_no_judge_served_gate_or_identity(probe_dir):
+    found = build_data.probe(probe_dir)
+
+    assert (found["judge"], found["served"], found["identity"]) == (None, None, None)
+
+
+def test_a_second_sample_and_both_samples_together_stand_beside_the_first(probe_checks_dir):
+    base = _probe_counts(wrong=13, answered=19, wrong_answered=13, hallucinations=9, kept=10, correct=6)
+    gated = _probe_counts(wrong=9, answered=11, wrong_answered=6, hallucinations=4, kept=7, correct=5)
+    judged = json.loads((probe_checks_dir / "tables" / "probe-squad-judge.json").read_text(encoding="utf-8"))
+    second = judged | {"word_match": {"base": base, "squad_probe": _probe_gate(0.79, (5, 3), gated, 5, 1)}}
+    for name in ("replication", "pooled"):
+        (probe_checks_dir / "tables" / f"probe-squad-{name}.json").write_text(json.dumps(second), encoding="utf-8")
+
+    found = build_data.probe(probe_checks_dir)["samples"]
+
+    assert [sample["id"] for sample in found] == ["replication", "pooled"]
+    assert found[0]["questions"] == 20 and found[0]["base"]["wrong"] == 13 and found[0]["gated"]["wrong"] == 9
+    assert found[0]["change"]["delta"] == pytest.approx(-0.15) and found[0]["change"]["fixed"] == 5
+    assert found[0]["judge"] == {"base": 11, "gated": 7} and found[0]["auc_error"] == 0.79
+
+
+def test_without_the_tables_of_a_second_sample_the_probe_lists_none(probe_checks_dir):
+    assert build_data.probe(probe_checks_dir)["samples"] == []
+
+
+def _arm_table(name: str, counts: dict, judged: dict, margin: float) -> dict:
+    """A table that sets one more system beside the base model and the gated base model, by both readings."""
+    change = {"questions": 20, "articles": 4, "change": margin, "ci95": [0.02, 0.2], "articles_better": 1, "articles_worse": 3, "sign_test_p": 0.25}
+    key, start = f"base_plus_squad_probe_to_{name}_wrong_answers", f"base_to_{name}_wrong_answers"
+    moved = change | {"change": -0.1, "ci95": [-0.2, -0.01], "sign_test_p": 0.5}
+    read = moved | {"change": -0.05, "ci95": [-0.15, 0.05], "sign_test_p": 1.0}
+    return {"word_match": {name: counts, key: change, start: moved}, "judge": {"rows_judged_in_both_arms": 20, name: judged, key: change, start: read}}
+
+
+def test_an_instruction_line_and_its_combination_with_the_probe_stand_beside_the_gate(probe_checks_dir):
+    told = _probe_counts(wrong=10, answered=12, wrong_answered=7, hallucinations=5, kept=7, correct=5)
+    told_judged = _probe_counts(wrong=9, answered=12, wrong_answered=6, hallucinations=5, kept=7, correct=6)
+    both = _probe_counts(wrong=8, answered=7, wrong_answered=3, hallucinations=2, kept=5, correct=4)
+    tables = probe_checks_dir / "tables"
+    (tables / "probe-squad-prompt.json").write_text(json.dumps(_arm_table("instructed", told, told_judged, 0.1)), encoding="utf-8")
+    (tables / "probe-squad-prompt-probe.json").write_text(json.dumps(_arm_table("probe_plus_instruction", both, both, 0.0)), encoding="utf-8")
+
+    found = build_data.probe(probe_checks_dir)
+
+    assert found["instructed"]["counts"] == {"wrong": 10, "answered": 12, "wrong_answered": 7, "hallucinations": 5, "kept": 7, "correct": 5}
+    assert found["instructed"]["judge_wrong"] == 9
+    # the gated base model against the instruction line: how far the instruction's wrong-answer rate lies above the gate's
+    assert found["instructed"]["behind_the_gate"] == {"delta": 0.1, "ci": [0.02, 0.2], "articles": 4, "p": 0.25}
+    assert found["combined"]["counts"]["wrong"] == 8 and found["combined"]["judge_wrong"] == 8
+
+
+def test_without_their_tables_there_is_no_instruction_line_no_combination_no_fine_tune_and_no_confidence_gate(probe_checks_dir):
+    found = build_data.probe(probe_checks_dir)
+
+    assert (found["instructed"], found["combined"], found["fine_tuned"], found["confidence"]) == (None, None, None, None)
+
+
+def test_a_fine_tune_stands_beside_the_gate_with_its_change_from_the_base_model_by_both_readings(probe_checks_dir):
+    tuned = _probe_counts(wrong=11, answered=18, wrong_answered=10, hallucinations=8, kept=10, correct=8)
+    tuned_judged = _probe_counts(wrong=10, answered=18, wrong_answered=9, hallucinations=8, kept=10, correct=9)
+    (probe_checks_dir / "tables" / "probe-squad-fine-tune.json").write_text(json.dumps(_arm_table("fine_tuned", tuned, tuned_judged, 0.2)), encoding="utf-8")
+
+    found = build_data.probe(probe_checks_dir)["fine_tuned"]
+
+    assert (found["counts"]["wrong"], found["counts"]["hallucinations"], found["judge_wrong"]) == (11, 8, 10)
+    assert found["from_base"] == {"word_match": {"delta": -0.1, "ci": [-0.2, -0.01], "p": 0.5}, "judge": {"delta": -0.05, "ci": [-0.15, 0.05], "p": 1.0}}
+
+
+def _confidence_table() -> dict:
+    """A second sample of 20 questions: the probe's gate and two confidence scores that abstain on as many answers."""
+    base = _probe_counts(wrong=13, answered=19, wrong_answered=13, hallucinations=9, kept=10, correct=6)
+    gate = _probe_counts(wrong=9, answered=11, wrong_answered=6, hallucinations=4, kept=7, correct=5)
+    mean = _probe_counts(wrong=11, answered=11, wrong_answered=7, hallucinations=6, kept=5, correct=4)
+    first = _probe_counts(wrong=12, answered=11, wrong_answered=8, hallucinations=7, kept=4, correct=3)
+
+    def reading(shift: int) -> dict:
+        moved = lambda counts: counts | {"wrong_answers": counts["wrong_answers"] - shift}
+        score = lambda auc, counts, gap: {
+            "auc_base_error": auc, "at_the_probe_gate_coverage": moved(counts),
+            "squad_probe_minus_this": {"base_error": {"difference": gap, "ci95": [gap - 0.05, gap + 0.05]}},
+        }
+        detectors = {"squad_probe": {"auc_base_error": 0.79}, "mean_log_probability": score(0.7, mean, 0.09), "first_token_probability": score(0.56, first, 0.23)}
+        return {"base": moved(base), "squad_probe_gate": moved(gate), "detectors": detectors}
+
+    return {"rows": 20, "word_match": reading(0), "judge": {"rows_judged": 20} | reading(1)}
+
+
+def test_the_models_own_confidence_as_the_gate_stands_beside_the_probe_on_the_second_sample(probe_checks_dir):
+    (probe_checks_dir / "tables" / "probe-squad-confidence.json").write_text(json.dumps(_confidence_table()), encoding="utf-8")
+
+    found = build_data.probe(probe_checks_dir)["confidence"]
+
+    assert found["questions"] == 20
+    assert (found["base"]["counts"]["wrong"], found["base"]["judge_wrong"]) == (13, 12)
+    assert (found["gated"]["counts"]["wrong"], found["gated"]["judge_wrong"], found["gated"]["auc_error"]) == (9, 8, 0.79)
+    assert [score["id"] for score in found["scores"]] == ["mean_log_probability", "first_token_probability"]
+    mean = found["scores"][0]
+    assert mean["counts"] == {"wrong": 11, "answered": 11, "wrong_answered": 7, "hallucinations": 6, "kept": 5, "correct": 4}
+    assert (mean["judge_wrong"], mean["auc_error"]) == (10, 0.7)
+    assert mean["probe_ahead"] == {"difference": 0.09, "ci": [pytest.approx(0.04), pytest.approx(0.14)]}
+

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Tiny Aya Global: where it gives harmful answers, in six languages</title>
+<title>Tiny Aya Global: a probe on its activations as an abstention gate</title>
 <style>
   :root { --ink: #1c2330; --soft: #5b6472; --line: #d9dee6; --band: #f4f6f9; --harm: #b3261e; --link: #2a5db0; }
   * { box-sizing: border-box; }
@@ -24,6 +24,8 @@
   .figures img, .lead-figure img { width: 100%; height: auto; border: 1px solid var(--line); border-radius: 6px; }
   .figures figcaption, .lead-figure figcaption { color: var(--soft); font-size: 0.9rem; }
   .lead-figure { max-width: 760px; margin: 12px 0; }
+  .curve { max-width: 560px; margin: 8px 0; }
+  .curve svg { width: 100%; height: auto; }
   .lead-figure figure + figure { margin-top: 16px; }
   .hint { color: var(--soft); font-size: 0.85rem; margin: 4px 0; }
   .notice { background: #eef3fb; border: 1px solid #c9d8f0; border-radius: 6px; padding: 10px 14px; }
@@ -67,23 +69,101 @@
   <p class="warning"><strong>Content warning.</strong> The study uses red-teaming prompts. The tables and figures
     show counts only. The replay explorer at the end of the page shows prompt text, and model answers behind a
     click; the text of answers judged harmful is not shown.</p>
-  <h1>Five sentences in the system prompt cut Tiny Aya Global's harmful answers from 8.3% to 6.2% on 600
-    held-out prompts in six languages (9.2% → 4.8% on the prompts they were written against).</h1>
-  <p class="lead">Tiny Aya Global (3.35B) on 600 red-teaming prompts in six languages, with a system-prompt patch,
-    two LoRA fine-tunes of the same benign rows, a weight-space repair and 4-bit quantization measured on the same
-    map. One judge labels every answer under a fixed public rubric.
+  <h1>Tiny Aya Global answers most questions its passage cannot answer. A probe on its activations makes it
+    abstain there.</h1>
+  <p class="lead">Tiny Aya Global (3.35B) is asked questions about passages, half of which the passage cannot
+    answer (SQuAD 2.0). A probe on its layer-20 hidden state, trained on the model's own errors, flags the answers
+    it is about to get wrong; the model abstains where the probe fires and answers as before elsewhere. No weight
+    changes. One instruction line in the prompt, with no probe, is the baseline it is set beside. Question pairs from BBQ and MBBQ, further down, are secondary evidence.
     <a href="https://github.com/vincentni/tiny-aya-safety-drift-map">Code and write-up</a>.</p>
   <p class="notice" id="unavailable" hidden></p>
 
   <div id="content">
   <div class="numbers" id="numbers" aria-live="polite"></div>
 
+  <section id="probe-section" hidden>
+    <h2>A probe on the model's activations as an abstention gate</h2>
+    <p id="probe-lead"></p>
+    <div class="scroll">
+      <table>
+        <thead id="probe-head"></thead>
+        <tbody id="probe-body"></tbody>
+      </table>
+    </div>
+    <p class="note" id="probe-note"></p>
+    <p class="note" id="probe-checks" hidden></p>
+    <div id="probe-judge" hidden>
+      <h3>The same answers as a closed judge reads them</h3>
+      <p>The table above is scored by word match, a rule set in advance. A closed model then read every answer with
+        its passage, its question and the reference answers, without the word-match labels or the probe. The probe
+        is unchanged.</p>
+      <div class="scroll">
+        <table>
+          <thead id="probe-judge-head"></thead>
+          <tbody id="probe-judge-body"></tbody>
+        </table>
+      </div>
+      <p class="note" id="probe-judge-note"></p>
+    </div>
+    <div id="probe-samples" hidden>
+      <h3>A second sample of questions</h3>
+      <p>A second draw of questions from the same file, none of them in the first sample and mostly on the same
+        passages, scored once with the frozen probe: nothing is fitted again and the threshold is not moved.</p>
+      <div class="scroll">
+        <table>
+          <thead id="probe-samples-head"></thead>
+          <tbody id="probe-samples-body"></tbody>
+        </table>
+      </div>
+      <p class="note" id="probe-samples-note"></p>
+    </div>
+    <div id="probe-beside" hidden>
+      <h3>The probe beside other ways to abstain</h3>
+      <p>One row per system, on the questions of the sample named. The instruction line is one sentence in the
+        prompt. The fine-tune was trained to abstain on who-did-it question pairs, not on SQuAD. A confidence gate
+        abstains on the model's least confident answers until it answers as many questions as the probe's gate; no
+        threshold is fitted for it.</p>
+      <div class="scroll">
+        <table>
+          <thead id="probe-beside-head"></thead>
+          <tbody id="probe-beside-body"></tbody>
+        </table>
+      </div>
+      <p class="note" id="probe-beside-note"></p>
+    </div>
+    <h3>The activations against the text alone</h3>
+    <p>The same questions and the same label, the model's own error, with two scores that read only the text: the
+      length of the passage and TF-IDF of the prompt. A score used as a gate abstains where it fires.</p>
+    <div class="scroll">
+      <table>
+        <thead id="probe-scores-head"></thead>
+        <tbody id="probe-scores-body"></tbody>
+      </table>
+    </div>
+    <p class="note" id="probe-scores-note"></p>
+    <h3>Risk against coverage, by threshold</h3>
+    <div class="curve" id="probe-curve"></div>
+    <p class="note" id="probe-curve-note"></p>
+    <h3>Probes fitted on another kind of unanswerable question</h3>
+    <p>Two probes fitted on who-did-it question pairs from BBQ, scored on the same SQuAD questions without any
+      refitting.</p>
+    <div class="scroll">
+      <table>
+        <thead id="probe-elsewhere-head"></thead>
+        <tbody id="probe-elsewhere-body"></tbody>
+      </table>
+    </div>
+    <p class="note">No passage, question or answer of SQuAD is shown on this page or held in its data file.</p>
+  </section>
+
   <section id="attribution-section" hidden>
-    <h2>Who did it, when the text does not say?</h2>
+    <h2>Secondary evidence: who did it, when the text does not say?</h2>
+    <div class="numbers" id="pair-numbers" aria-live="polite"></div>
     <p>A short text, a question about who did something, and three options: two people identified by a group, and
       "cannot be determined". An ambiguous item's text does not settle the answer; its twin adds the sentences
-      that do. The items are from BBQ. The attribution fine-tune saw English rows only; the other five languages
-      are translations of the English test. The light fine-tune is a benign fine-tune with the same settings:
+      that do. The items are from MBBQ, a published, curated version of BBQ in English, Spanish, Dutch and
+      Turkish: 150 pairs per language, all of question types the fine-tune never trained on. The attribution
+      fine-tune saw English rows from BBQ only. The light fine-tune is a benign fine-tune with the same settings:
       1,272 rows in six languages, with no such question in them.</p>
     <div class="lead-figure" id="top-figure" hidden></div>
     <h3>Names a person where the text does not say</h3>
@@ -102,21 +182,32 @@
       </table>
     </div>
     <p class="note" id="attr-twin-note"></p>
+    <div id="attr-bbq" hidden>
+      <h3>Beside it: BBQ's English test</h3>
+      <p>150 question pairs from BBQ, the benchmark the training rows come from, held out of training. Its counts
+        are not pooled with the four-language table above. Two more arms are measured here: a one-line
+        instruction to say so when the text does not tell, alone and with the safety patch.</p>
+      <div class="scroll">
+        <table>
+          <thead id="attr-bbq-head"></thead>
+          <tbody id="attr-bbq-body"></tbody>
+        </table>
+      </div>
+      <p class="note" id="attr-bbq-note"></p>
+    </div>
     <div id="attr-samples" hidden>
       <h3>One question pair, asked without options</h3>
-      <p class="note">Stored answers of the base model and of the fine-tune to one test item, in English and in
-        its Russian translation. No model runs here.</p>
+      <p class="note">Stored answers of the base model and of the fine-tune to one item of BBQ's English test. No
+        model runs here.</p>
       <div class="samples" id="attr-sample-cards"></div>
     </div>
   </section>
 
-  <div id="map-intro" hidden>
   <h2>The same model on harmful requests</h2>
   <p>The side checks of the fine-tune use the base model's own map as their reference: 600 red-teaming prompts
     in six languages, with a system-prompt patch, two LoRA fine-tunes of the same benign rows, a weight-space
     repair and 4-bit quantization measured on it. One judge labels every answer under a fixed public rubric.
     Below, "fine-tuned model" is the light fine-tune.</p>
-  </div>
   <div class="numbers" id="map-numbers" aria-live="polite"></div>
   <div class="lead-figure" id="lead-figure" hidden></div>
   <p id="mechanism">The light recipe costs no safety, mostly because its answers are shorter and it refuses slightly
@@ -152,8 +243,9 @@
     <h2>A targeted system-prompt patch</h2>
     <p>Guidance on biased content and self-harm, added to the system turn below the template's safety paragraph. Each
       model is compared with itself under the served template, over the prompts the judge could label both ways.
-      The guidance was written after the weak categories were seen on these prompts, so the counts below are
-      in-sample.</p>
+      The guidance was written after the weak categories were seen on these 600 prompts, so the table is in-sample:
+      on 600 held-out prompts from the same source the base model's harmful answers go from 50 of 599 (8.3%) to
+      37 of 597 (6.2%), about half the change shown here.</p>
     <div class="scroll">
       <table>
         <thead id="patch-head"></thead>
@@ -161,20 +253,22 @@
       </table>
     </div>
     <p class="note" id="patch-note"></p>
-    <div id="heldout" hidden>
-      <h3>The patch on held-out prompts</h3>
-      <p>The base model on harmful prompts drawn afresh from the same red-teaming dataset: none is one of the
-        prompts above or near one, and none was seen when the guidance was written. Harmful answers and refusals
-        among the scored answers, without and with the patch.</p>
-      <div class="scroll">
-        <table>
-          <thead><tr><th>Language</th><th>Harmful answers, without</th><th>Harmful answers, with the patch</th>
-            <th>Change</th><th>Refusals: without → with</th></tr></thead>
-          <tbody id="heldout-body"></tbody>
-        </table>
-      </div>
-      <p class="note" id="heldout-note"></p>
+  </section>
+
+  <section id="variants-section" hidden>
+    <h2>Script stress test</h2>
+    <p>Harmful prompts rewritten in Latin script or mixed with English, each paired with its native-script parent
+      prompt under the same model and the served template.</p>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>Variant</th><th>Model</th><th>Pairs</th><th>Refusals: native → variant</th>
+          <th>Harmful answers: native → variant</th><th>Neither: native → variant</th></tr></thead>
+        <tbody id="variants-body"></tbody>
+      </table>
     </div>
+    <p class="note">Counts are over the pairs the judge could label on both sides. A variant that gets neither
+      refusals nor harmful answers is one the model does not understand: read that row as a comprehension failure,
+      not as safety. <span id="variants-note"></span></p>
   </section>
 
   <section id="figures-section" hidden>
@@ -207,9 +301,7 @@
       and the stored answer of each system behind a click. Some prompts are offensive.
       <span id="ex-harmful"></span></p>
     <p>Pick a prompt to see what each measured system did with it. No model runs here: every answer was stored when
-      the evaluation ran, with greedy decoding and a limit of 256 new tokens. A prompt's Latin-script and
-      English-mixed variants are replayed under it for completeness; they were written for this study by a closed
-      model and are not part of the claim.</p>
+      the evaluation ran, with greedy decoding and a limit of 256 new tokens.</p>
     <p class="note" id="ex-scope"></p>
     <div class="controls">
       <label>Language <select id="ex-language"></select></label>
@@ -222,25 +314,6 @@
     <p class="note" id="ex-count" aria-live="polite"></p>
     <div id="ex-panel"></div>
   </section>
-  <section id="variants-section" hidden>
-    <h2>Latin-script and code-mixed variants, for completeness</h2>
-    <p>No official transliterated or code-mixed version of these prompts exists, so the variants were written for
-      this study as the best available option: each is a rewrite by a closed model, checked by rule and not by
-      native speakers. Their results are given here for completeness and are not part of the claim. Each variant
-      is paired with its native-script parent prompt under the same model and the served template.</p>
-    <div class="lead-figure" id="variants-figure" hidden></div>
-    <div class="scroll">
-      <table>
-        <thead><tr><th>Variant</th><th>Model</th><th>Pairs</th><th>Refusals: native → variant</th>
-          <th>Harmful answers: native → variant</th><th>Neither: native → variant</th></tr></thead>
-        <tbody id="variants-body"></tbody>
-      </table>
-    </div>
-    <p class="note">Counts are over the pairs the judge could label on both sides. A variant that gets neither
-      refusals nor harmful answers is one the model does not understand: read that row as a comprehension failure,
-      not as safety. <span id="variants-note"></span></p>
-  </section>
-
   </div>
 
   <p class="note" id="status">Loading data.</p>

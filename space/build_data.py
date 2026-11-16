@@ -3,15 +3,13 @@
     python space/build_data.py                                  # reads the datasets from the Hub
     python space/build_data.py --eval-dir DIR --tables-dir DIR  # reads local copies
     python space/build_data.py --eval-dir DIR --responses-dir DIR   # adds the answer-length counts and the explorer
-    python space/build_data.py --eval-dir DIR --choice-dir DIR      # adds the question pairs from their choice table
+    python space/build_data.py --eval-dir DIR --choice-dir DIR      # adds the question pairs from their choice tables
     python space/build_data.py --eval-dir DIR --choice-dir DIR --choice-eval-dir DIR --choice-responses-dir DIR
                                                                     # and the sample item, from prompts and answers
-    python space/build_data.py --no-question-pairs                  # a page without the question pairs
 
 The three datasets are the ones ``driftmap.toml`` names. The served template and no safety preamble, each with
 the base model and the fine-tuned model, are always read.
-The overfit fine-tune, the safety-patch condition and the script variants are read when their label files exist,
-and the safety patch on the held-out prompts when its table is among the tables.
+The overfit fine-tune, the safety-patch condition and the script variants are read when their label files exist.
 The data file holds counts and intervals only: no prompt, no response and no per-prompt row.
 
 With the responses at hand the script also writes ``explorer.json`` beside the data file, for the page's replay
@@ -20,10 +18,10 @@ judged harmful, or left without a verdict, is listed without its text unless ``-
 and then keeps only its first characters. Prompts of the non-consensual sexual content category are left out.
 That file is a build output.
 
-The question pairs (who did it, when the text does not say) are read from their choice table: counts, intervals,
-the count under the strict reading and the paired changes the table states. With the choice prompts and the
-stored answers at hand the script also writes
-``samples.json``: one question pair from BBQ in two languages with what the base model and the fine-tune answered.
+The question pairs (who did it, when the text does not say) are read from two choice tables, the official items
+in four languages and the English test: counts, intervals, the count under the strict reading and the paired
+changes each table states. With the choice prompts of the English test and the stored answers at hand the script
+also writes ``samples.json``: one English question pair with what the base model and the fine-tune answered.
 """
 
 import argparse
@@ -36,7 +34,7 @@ import tomllib
 from collections import Counter
 from pathlib import Path
 
-SCHEMA = "driftmap.space/7"
+SCHEMA = "driftmap.space/8"
 CONFIG = Path(__file__).resolve().parent.parent / "driftmap.toml"
 
 
@@ -78,11 +76,28 @@ REPAIRED = ("repaired", "repaired fine-tune", "nopreamble", "tiny-aya-global-rep
 VARIANT_PROMPTS = "variants/prompts/harmful"
 VARIANT_LABELS = "variants/labels"
 EXPLORER_SCHEMA = "driftmap.space.explorer/1"
-# the safety patch on harmful prompts held out of the evaluation set: its table in the results dataset
-HELDOUT_TABLE = "tables/heldout.json"
-HELDOUT_METRICS = ("harmful", "refusal")
-# the question pairs: their table in the results dataset, their prompts and the stored answers to them
-CHOICE_TABLE = "tables/choice-defense.json"
+# the question pairs: the table of the official items in four languages and the table of the English test, both in
+# the results dataset; the prompts of the English test and the stored answers to them
+CHOICE_TABLE = "tables/choice-mbbq-defense.json"
+BBQ_TABLE = "tables/choice-defense.json"
+BBQ_SCOPES = ("en",)
+# the probe on SQuAD 2.0: its table in the results dataset, the counts the page shows and the name it gives each
+PROBE_TABLE = "tables/probe-squad.json"
+# beside it: the same answers as a closed judge reads them, the gate served inside generation, and the scored
+# answers generated again through AuditKIT
+PROBE_JUDGE, PROBE_SERVED, PROBE_IDENTITY = (f"tables/probe-squad-{name}.json" for name in ("judge", "served", "identity"))
+PROBE_AGREE = {"abstains": "abstains", "gold": "gold_answer_on_answerable", "wrong": "answer_is_wrong"}
+# the frozen probe on a second sample of questions, and on both samples together
+PROBE_SAMPLES = ("replication", "pooled")
+# one more system beside the gate: table part and the name its counts carry there. An instruction line in the
+# prompt with no probe, and the gate with the instructed answer where it does not fire
+PROBE_ARMS = {"instructed": ("prompt", "instructed"), "combined": ("prompt-probe", "probe_plus_instruction"), "fine_tuned": ("fine-tune", "fine_tuned")}
+PROBE_CONFIDENCE = "tables/probe-squad-confidence.json"
+PROBE_CONFIDENT = ("mean_log_probability", "first_token_probability")
+PROBE_COUNTS = {"wrong": "wrong_answers", "answered": "answered", "wrong_answered": "wrong_among_answered"}
+PROBE_COUNTS |= {"hallucinations": "hallucinations", "kept": "answerable_answered", "correct": "answerable_correct"}
+PROBE_SCORES = ("squad_probe", "length", "tfidf")
+PROBE_ELSEWHERE = ("probe_1", "error_probe")
 CHOICE_PROMPTS = "choice/prompts/benign/{language}.jsonl"
 # both sample arms answer under the served template, whose tree is the root of the responses dataset
 CHOICE_ANSWERS = "choice/responses/{slug}/benign/{language}.jsonl"
@@ -90,9 +105,9 @@ CHOICE_METRICS = ("person_pick", "accuracy", "twin")
 # the arms every other arm is set against, and the two whose answers the samples show
 CHOICE_BASE, CHOICE_TUNED = "baseline/keep", "drifted/keep"
 SAMPLES_SCHEMA = "driftmap.space.samples/1"
-# the question pair the page shows as it was asked without options, and in which languages
+# the question pair of the English test the page shows as it was asked without options
 SAMPLE_ITEM = "bbq.Gender_identity.3448"
-SAMPLE_LANGUAGES = ("en", "ru")
+SAMPLE_LANGUAGES = ("en",)
 # the systems the explorer replays, in the order of its columns: condition, model, name on the page, note
 SYSTEMS = (
     ("served", "base", "Base model", None),
@@ -408,17 +423,19 @@ def _place(directory: Path, file: str) -> Path | None:
     return next((place for place in places if place.is_file()), None)
 
 
-def attribution(choice_dir: str | Path) -> dict | None:
-    """The question-pair result from its choice table under ``choice_dir``; None without the table.
+def attribution(choice_dir: str | Path, file: str = CHOICE_TABLE, scopes: tuple[str, ...] | None = None) -> dict | None:
+    """The question-pair result from the choice table ``file`` under ``choice_dir``; None without the table.
 
     Per arm, scope and metric the count with its Wilson bounds and the count under the strict reading, which
     leaves out the answers read through a letter written in the local script; and the paired changes from the
     base model that the table states over all rows. An arm that adds the instruction to a fine-tune is left out.
+    ``scopes`` keeps those scopes of the table alone; by default all of them.
     """
-    path = _place(Path(choice_dir), CHOICE_TABLE)
+    path = _place(Path(choice_dir), file)
     if path is None:
         return None
     table = json.loads(path.read_text(encoding="utf-8"))
+    kept = [scope for scope in table["scopes"] if scopes is None or scope in scopes]
     arms = [arm for arm in table["arms"] if arm["column"] == "baseline" or not arm["tag"]]
     shown = {arm["arm"] for arm in arms}
     rates = [
@@ -426,53 +443,182 @@ def attribution(choice_dir: str | Path) -> dict | None:
         | dict(zip(("k", "n", "lo", "hi"), _rate(rate["k"], rate["n"])))
         | {"strict": rate["k"] - rate["k_named"]}
         for rate in table["rates"]
-        if rate["arm"] in shown and rate["metric"] in CHOICE_METRICS
+        if rate["arm"] in shown and rate["metric"] in CHOICE_METRICS and rate["scope"] in kept
     ]
     changes = [
         {"arm": delta["b"], "scope": delta["scope"], "metric": delta["metric"], "delta": delta["delta"]}
         | {"ci": delta["ci"], "p": delta["p_value"], "items": delta["n_items"]}
         for delta in table["deltas"]
-        if delta["basis"] == "all" and delta["a"] == CHOICE_BASE and delta["b"] in shown and delta["metric"] in CHOICE_METRICS
+        if delta["basis"] == "all" and delta["a"] == CHOICE_BASE and delta["b"] in shown
+        if delta["metric"] in CHOICE_METRICS and delta["scope"] in kept
     ]
     return {
         "arms": [{"id": arm["arm"], "name": arm["name"], "fine_tune": arm["column"] != "baseline"} for arm in arms],
         "base": CHOICE_BASE,
         "tuned": CHOICE_TUNED,
-        "scopes": table["scopes"],
+        "scopes": kept,
         "rates": rates,
         "changes": changes,
     }
 
 
-def heldout(tables_dir: str | Path) -> dict | None:
-    """The safety patch on the held-out harmful prompts, from their table under ``tables_dir``; None without it.
+def _gate(name: str, gate: dict) -> dict:
+    """One score used as a gate: its two AUCs, how many questions it fires on and what the gated model then counts."""
+    fired = [gate["fired_on_unanswerable"], gate["fired_on_answerable"]]
+    return {
+        "id": name,
+        "auc_error": gate["auc_base_error"],
+        "auc_unanswerable": gate["auc_unanswerable"],
+        "fired": [sum(k for k, _ in fired), sum(n for _, n in fired)],
+        "wrong": gate["gated"]["wrong_answers"],
+        "kept": gate["gated"]["answerable_answered"],
+    }
 
-    Per scope, a language or all of them, the harmful answers and the refusals of the base model without and
-    with the patch, each count with its Wilson bounds, and the paired change the table states. Where the table
-    also holds the evaluation prompts under the two conditions, ``gap`` is the held-out change minus the change
-    over them, with its interval; None otherwise.
-    """
-    path = _place(Path(tables_dir), HELDOUT_TABLE)
+
+def _stated(change: dict) -> dict:
+    """The change in wrong answers a table states over articles, and the questions the gate fixes and breaks."""
+    return {
+        "delta": change["change"],
+        "ci": change["ci95"],
+        "articles": change["articles"],
+        "better": change["articles_better"],
+        "p": change["sign_test_p"],
+        "fixed": change["questions_wrong_to_right"],
+        "broken": change["questions_right_to_wrong"],
+    }
+
+
+def _beside(tables_dir: Path) -> dict:
+    """What stands beside the probe's table, each None without its file: ``judge``, the same answers under a closed
+    judge's labels with how often the word-match rules agree with it; ``served``, the prompts on which the gate
+    served inside generation gives the offline gate's answer; ``identity``, the scored answers that equal the
+    ones generated again through AuditKIT. ``samples`` lists the frozen probe on a second sample of questions and on
+    both samples together, for the tables that exist. ``instructed`` is the base model with one instruction line in
+    its prompt and no probe, ``combined`` the gate with the instructed answer where it does not fire, ``fine_tuned``
+    a fine-tune with no probe: the counts of each, its wrong answers under the judge's labels, how far its
+    wrong-answer rate lies above the gate's, and its change from the base model by both readings. ``confidence``
+    is what ``_confidence`` reads."""
+    read = {name: _place(tables_dir, file) for name, file in (("judge", PROBE_JUDGE), ("served", PROBE_SERVED), ("identity", PROBE_IDENTITY))}
+    read = {name: json.loads(path.read_text(encoding="utf-8")) if path else None for name, path in read.items()}
+    judge, served, identity = (read[name] for name in ("judge", "served", "identity"))
+    if judge:
+        found, gate = judge["judge"], judge["judge"][PROBE_SCORES[0]]
+        agree = found["agreement_of_the_rules_with_the_judge"]
+        judge = {
+            "judged": found["rows_judged"],
+            "unjudged": found["rows_unjudged"],
+            "base": {key: found["base"][field] for key, field in PROBE_COUNTS.items()},
+            "gated": {key: gate["gated"][field] for key, field in PROBE_COUNTS.items()},
+            "change": _stated(gate["base_to_gated_wrong_answers"]),
+            "agree": {key: [agree[field]["agree"], agree[field]["rows"]] for key, field in PROBE_AGREE.items()},
+            "auc_error": gate["auc_base_error"],
+        }
+    if served:
+        counts = served["counts"]
+        served = {"prompts": counts["prompts"], "equal": counts["served_equals_offline_gate"], "fired": counts["fired"]}
+    if identity:
+        identity = {"rows": identity["rows"], "equal": identity["equal_on_all_three"]}
+    samples = []
+    for name in PROBE_SAMPLES:
+        path = _place(tables_dir, f"tables/probe-squad-{name}.json")
+        if path is None:
+            continue
+        table = json.loads(path.read_text(encoding="utf-8"))
+        base, gate = table["word_match"]["base"], table["word_match"][PROBE_SCORES[0]]
+        read = table.get("judge")
+        samples.append({
+            "id": name,
+            "questions": base["rows"],
+            "base": {key: base[field] for key, field in PROBE_COUNTS.items()},
+            "gated": {key: gate["gated"][field] for key, field in PROBE_COUNTS.items()},
+            "change": _stated(gate["base_to_gated_wrong_answers"]),
+            "judge": {"base": read["base"]["wrong_answers"], "gated": read[PROBE_SCORES[0]]["gated"]["wrong_answers"]} if read else None,
+            "auc_error": gate["auc_base_error"],
+        })
+    arms = {}
+    for key, (part, name) in PROBE_ARMS.items():
+        path = _place(tables_dir, f"tables/probe-squad-{part}.json")
+        arms[key] = None
+        if path is not None:
+            table = json.loads(path.read_text(encoding="utf-8"))
+            behind = table["word_match"][f"base_plus_squad_probe_to_{name}_wrong_answers"]
+            moved = {reading: table[reading][f"base_to_{name}_wrong_answers"] for reading in ("word_match", "judge")}
+            arms[key] = {
+                "counts": {short: table["word_match"][name][field] for short, field in PROBE_COUNTS.items()},
+                "judge_wrong": table["judge"][name]["wrong_answers"],
+                "behind_the_gate": {"delta": behind["change"], "ci": behind["ci95"], "articles": behind["articles"], "p": behind["sign_test_p"]},
+                "from_base": {reading: {"delta": change["change"], "ci": change["ci95"], "p": change["sign_test_p"]} for reading, change in moved.items()},
+            }
+    return {"judge": judge, "served": served, "identity": identity, "samples": samples, "confidence": _confidence(tables_dir)} | arms
+
+
+def _confidence(tables_dir: Path) -> dict | None:
+    """The model's own confidence in its answer as the gate, from its table; None without it. On the table's
+    sample: the base model, the probe's gate, and each confidence score abstaining on its least confident answers
+    until it answers as many questions as the probe's gate. Each system carries its counts and its wrong answers
+    under the judge's labels; a score carries its AUC against the model's error and how far the probe's lies above."""
+    path = _place(tables_dir, PROBE_CONFIDENCE)
     if path is None:
         return None
     table = json.loads(path.read_text(encoding="utf-8"))
-    rates = {
-        (rate["scope"], rate["metric"], rate["condition"]): _rate(rate["k"], rate["n"]) for rate in table["rates"]
-    }
-    moved = {(change["scope"], change["metric"]): change for change in table["changes"]}
-    gaps = {(gap["scope"], gap["metric"]): gap for gap in (table.get("in_sample") or {}).get("gaps", ())}
-    rows = []
-    for scope in table["scopes"]:
-        row = {"scope": scope}
-        for metric in HELDOUT_METRICS:
-            change = moved[scope, metric]
-            row[metric] = {"before": rates[scope, metric, "keep"], "after": rates[scope, metric, "patch"]}
-            row[metric] |= {"pairs": change["n_pairs"], "delta": change["delta"]}
-            row[metric] |= {"ci": change["ci"], "p": change["p_value"]}
-            gap = gaps.get((scope, metric))
-            row[metric]["gap"] = {"delta": gap["delta"], "ci": gap["ci"]} if gap else None
-        rows.append(row)
-    return {"prompts": table["prompts"], "rows": rows}
+    word, judge = table["word_match"], table["judge"]
+
+    def system(counts: dict, judged: dict) -> dict:
+        return {"counts": {short: counts[field] for short, field in PROBE_COUNTS.items()}, "judge_wrong": judged["wrong_answers"]}
+
+    scores = []
+    for name in PROBE_CONFIDENT:
+        found, gap = word["detectors"][name], word["detectors"][name]["squad_probe_minus_this"]["base_error"]
+        at = "at_the_probe_gate_coverage"
+        scores.append({"id": name} | system(found[at], judge["detectors"][name][at])
+                      | {"auc_error": found["auc_base_error"], "probe_ahead": {"difference": gap["difference"], "ci": gap["ci95"]}})
+    gated = system(word["squad_probe_gate"], judge["squad_probe_gate"]) | {"auc_error": word["detectors"][PROBE_SCORES[0]]["auc_base_error"]}
+    return {"questions": table["rows"], "base": system(word["base"], judge["base"]), "gated": gated, "scores": scores}
+
+
+def probe(tables_dir: str | Path, file: str = PROBE_TABLE) -> dict | None:
+    """The probe on SQuAD 2.0 from its table ``file`` under ``tables_dir``; None without the table.
+
+    Counts of the base model and of the model that abstains where the probe fires, the change the table states
+    over articles, the wrong answers of abstaining on every question, the share of unanswerable questions above
+    which the gate cuts wrong answers at its rates, each score's AUCs with the text baselines beside the probe,
+    the probes fitted on question pairs, the risk against coverage by threshold, and what ``_beside`` reads.
+    No text of a question.
+    """
+    path = _place(Path(tables_dir), file)
+    if path is None:
+        return None
+    table = json.loads(path.read_text(encoding="utf-8"))
+    base, gate = table["base"], table["in_domain"][PROBE_SCORES[0]]
+    change = gate["base_to_gated_wrong_answers"]
+    unanswerable = base["rows"] - base["answerable_rows"]
+    fix_rate = change["questions_wrong_to_right"] / unanswerable
+    break_rate = change["questions_right_to_wrong"] / base["answerable_rows"]
+    ahead = [
+        {"of": name, "difference": found["difference"], "ci": found["ci95"]}
+        for name in PROBE_SCORES[1:]
+        for found in [table["in_domain_auc_differences"][f"{PROBE_SCORES[0]} minus {name}"]]
+    ]
+    curve = [
+        {"threshold": row["threshold"], "coverage": row["coverage"], "risk": row["risk"], "wrong": row["wrong_answer_rate"]}
+        | {"kept": row["answerable_answered_rate"], "hallucinations": row["hallucinations"]}
+        for row in gate["curve"]
+    ]
+    return {
+        "questions": base["rows"],
+        "unanswerable": unanswerable,
+        "layer": gate["layer"],
+        "threshold": gate["threshold"],
+        "base": {key: base[field] for key, field in PROBE_COUNTS.items()},
+        "gated": {key: gate["gated"][field] for key, field in PROBE_COUNTS.items()},
+        "change": _stated(change),
+        "always_abstain": base["answerable_rows"],
+        "break_even": break_rate / (fix_rate + break_rate),
+        "scores": [_gate(name, table["in_domain"][name]) for name in PROBE_SCORES],
+        "ahead": ahead,
+        "elsewhere": [_gate(name, table["zero_shot"][name]) for name in PROBE_ELSEWHERE],
+        "curve": curve,
+    } | _beside(Path(tables_dir))
 
 
 def _slug(checkpoint: str) -> str:
@@ -482,16 +628,16 @@ def _slug(checkpoint: str) -> str:
 
 
 def samples(choice_dir: str | Path, prompts_dir: str | Path, responses_dir: str | Path) -> dict | None:
-    """The sample question pair in each sample language, as asked without options.
+    """The sample question pair of the English test, as asked without options.
 
-    ``choice_dir`` holds the choice table, ``prompts_dir`` a copy of the dataset with the choice prompts and
+    ``choice_dir`` holds the choice table of that test, ``prompts_dir`` a copy of the dataset with the choice prompts and
     ``responses_dir`` one of the dataset with the stored answers; None when the table, a prompt file or an answer
     file of the two sample arms is missing. Each sample holds the ambiguous question with the base model's and the
     fine-tune's answer, and the twin with the fine-tune's answer. Raises ValueError when the base model does not
     name one of the two people on the ambiguous question, or the fine-tune names one: such an item does not show
     the finding.
     """
-    table = _place(Path(choice_dir), CHOICE_TABLE)
+    table = _place(Path(choice_dir), BBQ_TABLE)
     if table is None:
         return None
     checkpoints = {arm["arm"]: arm["checkpoint"] for arm in json.loads(table.read_text(encoding="utf-8"))["arms"]}
@@ -560,9 +706,9 @@ def build(
     ``repaired`` the repaired fine-tune with the overfit one and with the base model, ``patch`` each model under
     the safety patch with
     itself under the served template over the prompts labelled in both, ``variants`` each script variant with its
-    parent prompts; each is empty when its label files are absent. ``attribution`` is the question-pair result
-    from the choice table under ``choice_dir``, None without it; ``heldout`` the safety patch on the held-out
-    prompts from its table under ``tables_dir``, None without it.
+    parent prompts; each is empty when its label files are absent. ``attribution`` is the question-pair result on
+    the official items in four languages, ``bbq`` the one on the English test and ``probe`` the probe on SQuAD 2.0,
+    each from its table under ``choice_dir`` and None without it.
     """
     eval_dir = Path(eval_dir)
     prompts = _prompts(eval_dir)
@@ -639,7 +785,8 @@ def build(
         "patch": patch,
         "variants": _variants(eval_dir, rows["served"]),
         "attribution": attribution(choice_dir) if choice_dir else None,
-        "heldout": heldout(tables_dir) if tables_dir else None,
+        "bbq": attribution(choice_dir, BBQ_TABLE, BBQ_SCOPES) if choice_dir else None,
+        "probe": probe(choice_dir) if choice_dir else None,
     }
 
 
@@ -688,10 +835,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--eval-dir", type=Path, help="a local copy of the evaluation dataset; downloaded when absent")
     parser.add_argument("--tables-dir", type=Path, help="a copy of the results dataset, or a folder with the tables files")
     parser.add_argument("--responses-dir", type=Path, help="a local copy of the responses dataset, for answer lengths")
-    parser.add_argument("--choice-dir", type=Path, help="a copy of the results dataset, or a folder with the choice table")
+    parser.add_argument("--choice-dir", type=Path, help="a copy of the results dataset, or a folder with the choice tables")
     parser.add_argument("--choice-eval-dir", type=Path, help="a copy of the dataset with the choice prompts, for the samples")
     parser.add_argument("--choice-responses-dir", type=Path, help="a copy of the dataset with the answers to them")
-    parser.add_argument("--no-question-pairs", action="store_true", help="leave the question pairs out of the page")
     parser.add_argument("--figures-dir", type=Path, default=here.parent / "docs" / "figures")
     parser.add_argument("--out", type=Path, default=here / "data.json")
     parser.add_argument("--explorer-cap", type=int, default=EXPLORER_CAP, help="most prompts in the explorer file")
@@ -704,15 +850,12 @@ def main(argv: list[str] | None = None) -> int:
     eval_dir = args.eval_dir or _download(EVAL_REPO, [*trees, "prompts/harmful/*"])
     tables_dir, responses_dir = args.tables_dir, args.responses_dir
     if tables_dir is None and from_hub:
-        tables = [*(tables for *_, tables in CONDITIONS), *OVERFIT[3].values(), HELDOUT_TABLE]
-        tables_dir = _download(RESULTS_REPO, tables)
+        tables_dir = _download(RESULTS_REPO, [*(tables for *_, tables in CONDITIONS), *OVERFIT[3].values()])
     if responses_dir is None and from_hub:
         responses_dir = _responses()
     choice_dir, asked_dir, answers_dir = args.choice_dir, args.choice_eval_dir, args.choice_responses_dir
-    if args.no_question_pairs:
-        choice_dir = asked_dir = answers_dir = None
-    elif choice_dir is None and from_hub:
-        choice_dir = _choice(RESULTS_REPO, [CHOICE_TABLE], "the question-pair result")
+    if choice_dir is None and from_hub:
+        choice_dir = _choice(RESULTS_REPO, [CHOICE_TABLE, BBQ_TABLE, "tables/probe-squad*.json"], "the probe and question-pair result")
         prompts = [CHOICE_PROMPTS.format(language=language) for language in SAMPLE_LANGUAGES]
         asked_dir = _choice(EVAL_REPO, prompts, "its sample item") if choice_dir else None
         answers = [CHOICE_ANSWERS.format(slug="*", language=language) for language in SAMPLE_LANGUAGES]
@@ -722,8 +865,8 @@ def main(argv: list[str] | None = None) -> int:
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")) + "\n", encoding="utf-8")
     counts = ", ".join(f"{key} {len(data[key])}" for key in ("cells", "figures", "length", "patch", "variants"))
-    counts += f", held-out prompts {data['heldout']['prompts'] if data['heldout'] else 'left out'}"
-    print(f"{args.out}: {counts}, question pairs {'with ' + str(len(data['attribution']['arms'])) + ' arms' if data['attribution'] else 'left out'}")
+    pairs = f"with {len(data['attribution']['arms'])} arms" if data["attribution"] else "left out"
+    print(f"{args.out}: {counts}, question pairs {pairs}, probe {'included' if data['probe'] else 'left out'}")
     shown = samples(choice_dir, asked_dir, answers_dir) if choice_dir and asked_dir and answers_dir else None
     if shown:
         target = args.out.parent / "samples.json"
