@@ -130,6 +130,11 @@ def test_a_fine_tune_part_says_which_fine_tune_it_is_of_and_on_which_sample():
     }
     record = {"probe": {"layer": 20, "C": 0.001, "threshold": 0.7}, "word_match": found}
 
+    told = {key.replace("fine_tuned", "instructed"): value for key, value in found.items()}
+    instructed = probe_checks.RENDER["squad-prompt"](record | {"word_match": told})
+    assert instructed.startswith("# SQuAD 2.0: an instruction in the prompt beside the base model and the probe\n")
+    assert "| base model + instruction | 6.0% (6/100) |" in instructed
+    assert "- Change in wrong answers, base model + instruction minus base model + probe: -27.4 points" in instructed
     plain = probe_checks.RENDER["squad-fine-tune"](record)
     trained = probe_checks.RENDER["squad-trained-replication"](record)
 
@@ -140,7 +145,7 @@ def test_a_fine_tune_part_says_which_fine_tune_it_is_of_and_on_which_sample():
     )
     assert "one fixed abstention sentence, answered the questions of the second dev sample;" in trained
     assert "| fine-tune | 6.0% (6/100) |" in trained
-    assert "The fine-tune's answers by wording: trained sentence 30, no abstention wording 70." in trained
+    assert "Its answers by wording: trained sentence 30, no abstention wording 70." in trained
     assert "- Change in wrong answers, fine-tune minus base model: -27.4 points" in trained and (
         "100 questions" in trained
     )

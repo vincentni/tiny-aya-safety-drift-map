@@ -12,6 +12,14 @@
         --dev-states ACTS/squad_dev --tuned-answers TUNED_ANSWERS --verdicts JUDGE/dev_verdicts.jsonl \
         --tuned-verdicts JUDGE/ft_verdicts.jsonl --passed CURATED/squad_passed.json --probe OUT/probe_squad \
         --out RESULTS
+    python -I -m driftmap.attribution.probe_checks instructed-sample --dev DEV_IN \
+        --passed CURATED/squad_passed.json --out INSTRUCTED_IN
+    python -I -m driftmap.attribution.probe_checks fine-tune --part prompt --dev DEV_IN --dev-answers DEV_ANSWERS \
+        --dev-states ACTS/squad_dev --tuned-answers INSTRUCTED_ANSWERS --passed CURATED/squad_passed.json \
+        --probe OUT/probe_squad --out RESULTS
+    python -I -m driftmap.attribution.probe_checks confidence --dev DEV2_IN --dev-answers DEV2_ANSWERS \
+        --dev-states ACTS/squad_dev2 --confidence CONFIDENCE.jsonl --verdicts JUDGE/dev2_verdicts.jsonl \
+        --passed CURATED/squad_passed.json --probe OUT/probe_squad --out RESULTS
     python -I -m driftmap.attribution.probe_checks identity --stored DEV_ANSWERS --kit KIT_ANSWERS --out RESULTS
     python -I -m driftmap.attribution.probe_checks job-identity --name dev --asked DEV_IN \
         --stored DEV_ANSWERS --job RESPONSES/dev.jsonl --passed CURATED/squad_passed.json --out RESULTS
@@ -25,6 +33,11 @@ answers, it gives the table again under the judge's labels and how far the word-
 ``fine-tune`` sets a fine-tune's answers to the same questions beside the base model and the base model gated
 by the probe, by the word-match rules and, with the verdicts on both models' answers, by the judge's labels on
 the rows judged in both.
+``instructed-sample`` writes a sample's prompts with one instruction line added before the closing line, to
+abstain when the text does not say; ``fine-tune --part prompt`` sets the base model's answers to them beside
+the base model and the gated base model as it does a fine-tune's. ``confidence`` takes the base model's own
+confidence in its stored answers, one row per question with the probability of the answer's first token and
+the mean log-probability of its tokens, as a detector of its errors beside the probe.
 ``identity`` compares two answer files of the same prompts row for row: text, token count and stop reason.
 ``job-identity`` does so for the answers a generate job gave to the files of the prompt group ``squad``, a
 split after the other, and counts the rows whose word-match labels differ between the two runs. An answers
@@ -45,14 +58,35 @@ from typing import Any
 
 import numpy as np
 
-from driftmap.attribution import probe, probe_curator, probe_squad, probe_study, reading_scores
+from driftmap.attribution import (
+    build,
+    probe,
+    probe_curator,
+    probe_gates,
+    probe_squad,
+    probe_study,
+    reading_scores,
+)
 from driftmap.table import probe_checks as table
 
 # the positions of a condition's questions the served gate is run on
 EVERY = 10
 PARTS = ("judge", "replication", "pooled")
-# the attribution fine-tune on the first sample and on the second, then the fine-tune trained on the train sample
-TUNED_PARTS = ("fine-tune", "fine-tune-replication", "trained", "trained-replication")
+# the name of the fine-tune's counts in a record, and of the base model's when its prompt carries the instruction
+FINE_TUNED, INSTRUCTED = "fine_tuned", "instructed"
+AGREED = {FINE_TUNED: "the_fine_tune"}
+# the parts of another arm on a dev sample: the attribution fine-tune on the first sample and on the second, the
+# fine-tune trained on the train sample on each, and the base model asked with one instruction line added
+TUNED_PARTS = {
+    "fine-tune": FINE_TUNED,
+    "fine-tune-replication": FINE_TUNED,
+    "trained": FINE_TUNED,
+    "trained-replication": FINE_TUNED,
+    "prompt": INSTRUCTED,
+}
+# the shares of a sample a detector abstains on, most suspicious first
+STEPS = tuple(round(0.1 * step, 1) for step in range(1, 10))
+DETECTORS = ("first_token_probability", "mean_log_probability")
 COMPARED = ("response", "generated_tokens", "stop_reason")
 
 
@@ -191,9 +225,11 @@ def scored(
     return found, public
 
 
-def arms(base: Sequence[Mapping[str, Any]], tuned: Sequence[Mapping[str, Any]], gate: np.ndarray) -> dict:
-    """The base model, the base model gated where ``gate`` and the fine-tune on the same questions, and the
-    fine-tune's change in wrong answers against each of the two."""
+def arms(
+    base: Sequence[Mapping[str, Any]], tuned: Sequence[Mapping[str, Any]], gate: np.ndarray, label: str = FINE_TUNED
+) -> dict:
+    """The base model, the base model gated where ``gate`` and another arm on the same questions, under the
+    name ``label``, and that arm's change in wrong answers against each of the two."""
     gated = [
         dict(row, base_wrong=(not row["unanswerable"]) if hit else row["base_wrong"])
         for row, hit in zip(base, gate, strict=True)
@@ -201,10 +237,10 @@ def arms(base: Sequence[Mapping[str, Any]], tuned: Sequence[Mapping[str, Any]], 
     return {
         "base": probe_squad.measured(base, np.zeros(len(base), dtype=bool)),
         "base_plus_squad_probe": probe_squad.measured(base, gate),
-        "fine_tuned": probe_squad.measured(tuned, np.zeros(len(tuned), dtype=bool)),
-        "fine_tuned_answers": probe_squad.base_counts(tuned),
-        "base_to_fine_tuned_wrong_answers": probe_squad.against(base, tuned),
-        "base_plus_squad_probe_to_fine_tuned_wrong_answers": probe_squad.against(gated, tuned),
+        label: probe_squad.measured(tuned, np.zeros(len(tuned), dtype=bool)),
+        f"{label}_answers": probe_squad.base_counts(tuned),
+        f"base_to_{label}_wrong_answers": probe_squad.against(base, tuned),
+        f"base_plus_squad_probe_to_{label}_wrong_answers": probe_squad.against(gated, tuned),
     }
 
 
@@ -215,12 +251,14 @@ def fine_tune(
     frozen: probe.Probe,
     seen_base: Mapping[str, Mapping[str, Any]] | None,
     seen_tuned: Mapping[str, Mapping[str, Any]] | None,
+    label: str = FINE_TUNED,
 ) -> tuple[dict, list[dict]]:
-    """The record of the fine-tune beside the base model and the gated base model, by the word-match rules and,
-    with both models' verdicts, by the judge's labels on the rows judged in both; and a row per answer of the
-    fine-tune without text."""
+    """The record of another arm beside the base model and the gated base model, by the word-match rules and,
+    with both arms' verdicts, by the judge's labels on the rows judged in both; and a row per answer of the
+    arm without text. ``label`` names the arm in the record: the fine-tune, or the instructed base model."""
     found = {"probe": {"layer": frozen.layer, "C": frozen.c, "threshold": frozen.threshold}}
-    found["word_match"] = arms(base, tuned, np.array([scores[row["id"]] >= frozen.threshold for row in base]))
+    fired = np.array([scores[row["id"]] >= frozen.threshold for row in base])
+    found["word_match"] = arms(base, tuned, fired, label)
     if seen_base is not None and seen_tuned is not None:
         kept_base, kept_tuned = probe_squad.judged(base, seen_base), probe_squad.judged(tuned, seen_tuned)
         both = {row["id"] for row in kept_base} & {row["id"] for row in kept_tuned}
@@ -229,8 +267,8 @@ def fine_tune(
         gate = np.array([scores[row["id"]] >= frozen.threshold for row in kept_base])
         found["judge"] = {
             "rows_judged_in_both_arms": len(both),
-            "agreement_of_the_rules_with_the_judge_on_the_fine_tune": probe_squad.agreement(kept_tuned),
-        } | arms(kept_base, kept_tuned, gate)
+            f"agreement_of_the_rules_with_the_judge_on_{AGREED.get(label, label)}": probe_squad.agreement(kept_tuned),
+        } | arms(kept_base, kept_tuned, gate, label)
     by_judge = {row["id"]: row for row in probe_squad.judged(tuned, seen_tuned)} if seen_tuned is not None else {}
     public, articles = [], probe_squad.article_index(tuned)
     for row in tuned:
@@ -248,6 +286,137 @@ def fine_tune(
                 "judge_wrong": seen["base_wrong"] if seen else None,
             }
         )
+    return found, public
+
+
+def instructed_sample(rows: Sequence[Mapping[str, Any]]) -> list[dict]:
+    """The rows of a sample asked with one instruction line added before the closing line."""
+    line = build.ABSTAIN_INSTRUCTION
+    return [
+        dict(row, prompt="\n".join([row["context"], row["question"], line, build.FREE_INSTRUCTION]), instruction=line)
+        for row in rows
+    ]
+
+
+def gate_of(count: int, order: np.ndarray, k: int) -> np.ndarray:
+    """A gate over ``count`` rows that fires on the first ``k`` of ``order``."""
+    fired = np.zeros(count, dtype=bool)
+    fired[order[:k]] = True
+    return fired
+
+
+def at_matched_coverage(rows: Sequence[Mapping[str, Any]], order: np.ndarray, answered: int) -> tuple[int, dict]:
+    """The smallest k at which abstaining on the first k rows of ``order`` leaves no more than ``answered``
+    questions answered, and the counts there."""
+    for k in range(len(rows) + 1):
+        found = probe_squad.measured(rows, gate_of(len(rows), order, k))
+        if found["answered"] <= answered:
+            return k, found
+    raise SystemExit("no number of abstentions reaches the probe gate's coverage")
+
+
+def detectors_read(rows: Sequence[Mapping[str, Any]], detectors: Mapping[str, np.ndarray], fired: np.ndarray) -> dict:
+    """The probe's gate and every detector under one labelling of ``rows``: AUCs, the probe's AUC minus the
+    detector's, and the counts when the detector abstains on its most suspicious answers."""
+    unanswerable = np.array([row["unanswerable"] for row in rows])
+    wrong = np.array([row["base_wrong"] for row in rows])
+    clustered = [dict(row, cluster=row["title"], prompt=row["id"], ambiguous=row["unanswerable"]) for row in rows]
+    by_id = {
+        name: dict(zip([row["id"] for row in rows], map(float, score), strict=True))
+        for name, score in detectors.items()
+    }
+    probe_gate = probe_squad.measured(rows, fired)
+    kept = ("wrong_answers", "hallucinations", "answerable_answered", "answerable_correct", "coverage", "risk")
+    found = {
+        "base": probe_squad.measured(rows, np.zeros(len(rows), dtype=bool)),
+        "squad_probe_gate": probe_gate,
+        "detectors": {},
+    }
+    for name, score in detectors.items():
+        # the most suspicious first; ties by file order
+        order = np.argsort(-score, kind="stable")
+        entry = {
+            "auc_base_error": probe_gates.auc(wrong, score),
+            "auc_unanswerable": probe_gates.auc(unanswerable, score),
+            "abstaining_on_the_most_suspicious_share": [
+                {"share": share}
+                | {
+                    key: value
+                    for key, value in probe_squad.measured(
+                        rows, gate_of(len(rows), order, round(share * len(rows)))
+                    ).items()
+                    if key in kept
+                }
+                for share in STEPS
+            ],
+        }
+        if name != "squad_probe":
+            entry["squad_probe_minus_this"] = {
+                label: probe_gates.auc_difference(clustered, label, by_id["squad_probe"], by_id[name])
+                for label in probe_gates.LABELS[::-1]
+            }
+            k, counts = at_matched_coverage(rows, order, probe_gate["answered"])
+            entry["at_the_probe_gate_coverage"] = {"abstained_on": k} | counts
+        found["detectors"][name] = entry
+    return found
+
+
+def confidence(
+    rows: Sequence[Mapping[str, Any]],
+    held: Mapping[str, Mapping[str, Any]],
+    scores: Mapping[str, float],
+    frozen: probe.Probe,
+    verdicts: Mapping[str, Mapping[str, Any]] | None,
+) -> tuple[dict, list[dict]]:
+    """The base model's own confidence in its stored answers as a detector of its errors, beside the frozen probe;
+    and a row per question without text.
+
+    ``held`` gives per question the probability of the answer's first token and the mean log-probability of its
+    tokens, None for an answer without text. Low confidence is taken as the sign of an error: the detector scores
+    are 1 - the first and minus the second. No threshold is fitted: a baseline abstains on its k least confident
+    answers, k the smallest number at which it answers no more questions than the probe's gate.
+    """
+    if set(held) != {row["id"] for row in rows}:
+        raise SystemExit(f"{len(held)} confidence rows for {len(rows)} questions")
+
+    def detectors(part: Sequence[Mapping[str, Any]]) -> dict[str, np.ndarray]:
+        # a row without answer text has no confidence: it is ranked as the least suspicious
+        first = np.array([1 - (held[row["id"]]["first_token_probability"] or 1.0) for row in part])
+        mean = np.array([-(held[row["id"]]["mean_log_probability"] or 0.0) for row in part])
+        read = np.array([scores[row["id"]] for row in part])
+        return {"squad_probe": read, DETECTORS[0]: first, DETECTORS[1]: mean}
+
+    fired = np.array([scores[row["id"]] >= frozen.threshold for row in rows])
+    found = {
+        "rows": len(rows),
+        "rows_without_answer_text": sum(held[row["id"]]["first_token_probability"] is None for row in rows),
+        "rows_whose_answer_tokens_are_all_the_argmax": sum(
+            entry["greedy_tokens"] == entry["answer_tokens"] for entry in held.values()
+        ),
+        "answer_tokens_that_are_the_argmax": [
+            sum(entry["greedy_tokens"] for entry in held.values()),
+            sum(entry["answer_tokens"] for entry in held.values()),
+        ],
+        "word_match": detectors_read(rows, detectors(rows), fired),
+    }
+    if verdicts is not None:
+        kept = probe_squad.judged(rows, verdicts)
+        gate = np.array([scores[row["id"]] >= frozen.threshold for row in kept])
+        found["judge"] = {"rows_judged": len(kept)} | detectors_read(kept, detectors(kept), gate)
+    articles = probe_squad.article_index(rows)
+    public = [
+        {
+            "id": row["id"],
+            "condition": row["condition"],
+            "article_index": articles[row["title"]],
+            "rule_wrong": row["base_wrong"],
+            "first_token_probability": held[row["id"]]["first_token_probability"],
+            "mean_log_probability": held[row["id"]]["mean_log_probability"],
+            "answer_tokens": held[row["id"]]["answer_tokens"],
+            "squad_probe_score": round(scores[row["id"]], 6),
+        }
+        for row in rows
+    ]
     return found, public
 
 
@@ -295,6 +464,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "served": ("sample", "served", "served-states", "dev", "dev-answers", "dev-states", "passed", "probe", "out"),
         "scored": ("passed", "probe", "out"),
         "fine-tune": ("dev", "dev-answers", "dev-states", "tuned-answers", "passed", "probe", "out"),
+        "instructed-sample": ("dev", "passed", "out"),
+        "confidence": ("dev", "dev-answers", "dev-states", "confidence", "passed", "probe", "out"),
         "identity": ("stored", "kit", "out"),
         "job-identity": ("passed", "out"),
     }
@@ -312,7 +483,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         if step == "fine-tune":
             sub.add_argument("--verdicts", type=Path, help="a judge's verdicts on the base model's answers")
             sub.add_argument("--tuned-verdicts", type=Path, help="and on the fine-tune's answers")
-            sub.add_argument("--part", choices=TUNED_PARTS, default=TUNED_PARTS[0], help="the record's name")
+            sub.add_argument("--part", choices=tuple(TUNED_PARTS), default="fine-tune", help="the record's name")
+        if step == "confidence":
+            sub.add_argument("--verdicts", type=Path, help="a judge's verdicts on the answers")
         if step == "job-identity":
             sub.add_argument("--name", action="append", required=True, help="a split, once per file given")
             for name in ("asked", "stored", "job"):
@@ -371,8 +544,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         read = frozen.probability(np.stack([states[row["id"]][layers.index(frozen.layer)] for row in base]))
         scores = dict(zip([row["id"] for row in base], map(float, read), strict=True))
         seen = [probe_squad.read_verdicts(path) if path else None for path in (args.verdicts, args.tuned_verdicts)]
-        record, public = fine_tune(base, tuned, scores, frozen, *seen)
+        record, public = fine_tune(base, tuned, scores, frozen, *seen, label=TUNED_PARTS[args.part])
         probe_study.write(args.out, f"squad-{args.part}", record, public, tables=table)
+    elif args.step == "instructed-sample":
+        rows, _ = probe_curator.passing(probe.read_jsonl(args.dev), args.dev, args.passed)
+        probe.write_jsonl(args.out, instructed_sample(rows))
+        print(f"{len(rows)} prompts -> {args.out.name}")
+    elif args.step == "confidence":
+        frozen = probe.load(args.probe)
+        rows, states, layers = _sample(args, args.dev, args.dev_answers, args.dev_states)
+        read = frozen.probability(np.stack([states[row["id"]][layers.index(frozen.layer)] for row in rows]))
+        scores = dict(zip([row["id"] for row in rows], map(float, read), strict=True))
+        held = {row["id"]: row for row in probe.read_jsonl(args.confidence)}
+        verdicts = probe_squad.read_verdicts(args.verdicts) if args.verdicts else None
+        record, public = confidence(rows, held, scores, frozen, verdicts)
+        probe_study.write(args.out, "squad-confidence", record, public, tables=table)
     elif args.step == "job-identity":
         if not len(args.name) == len(args.asked) == len(args.stored) == len(args.job):
             parser.error("--name, --asked, --stored and --job are given once per split")

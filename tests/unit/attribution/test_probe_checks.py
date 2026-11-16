@@ -5,7 +5,7 @@ import json
 import numpy as np
 import pytest
 
-from driftmap.attribution import probe, probe_checks
+from driftmap.attribution import probe, probe_checks, probe_gates
 from driftmap.table import probe_checks as table
 from tests.fakes.squad_probe import LAYERS, TRAINED, gated, put, read_jsonl, squad_sample, states_of
 
@@ -421,3 +421,122 @@ def test_the_fine_tunes_job_answers_are_read_under_the_groups_ids_and_a_second_s
     titles = sorted({row["title"] for row in rows})
     assert [row["article_index"] for row in public] == [titles.index(row["title"]) for row in rows]
     assert [row["id"] for row in public] == [row["id"] for row in rows]
+
+
+def test_the_instructed_sample_adds_one_line_before_the_closing_line_and_its_answers_are_an_arm_of_their_own(sample):
+    folder, rows, asked = sample
+
+    assert probe_checks.main(["instructed-sample", *asked[:2], *asked[6:8], "--out", str(folder / "told.jsonl")]) == 0
+
+    told = read_jsonl(folder / "told.jsonl")
+    line = "If the text does not give enough information to answer, say that it cannot be determined."
+    assert [row["id"] for row in told] == [row["id"] for row in rows] and told[0]["instruction"] == line
+    assert told[0]["prompt"].split("\n") == [
+        rows[0]["context"],
+        rows[0]["question"],
+        line,
+        "Answer in one short sentence.",
+    ]
+    # told so, the base model abstains on every unanswerable question and on one answerable question in eight
+    said = [TRAINED if row["open"] or at % 8 == 1 else row["said"] for at, row in enumerate(rows)]
+    answers = [{"id": row["id"], "response": text, "stop_reason": "eos"} for row, text in zip(rows, said, strict=True)]
+    put(folder / "told_answers.jsonl", answers)
+    run = ["fine-tune", "--part", "prompt", *asked, "--tuned-answers", str(folder / "told_answers.jsonl")]
+    put(folder / "base_verdicts.jsonl", verdicts_of(rows, {}))
+    put(
+        folder / "told_verdicts.jsonl",
+        verdicts_of([dict(row, said=text) for row, text in zip(rows, said, strict=True)], {}),
+    )
+    seen = ["--verdicts", str(folder / "base_verdicts.jsonl"), "--tuned-verdicts", str(folder / "told_verdicts.jsonl")]
+
+    assert probe_checks.main([*run, *seen, "--out", str(folder / "results")]) == 0
+
+    record = read_json(folder / "results" / "probe-squad-prompt.json")
+    assert record["schema"] == "driftmap.probe-squad-arm/1"
+    assert list(record["word_match"]) == [
+        "base",
+        "base_plus_squad_probe",
+        "instructed",
+        "instructed_answers",
+        "base_to_instructed_wrong_answers",
+        "base_plus_squad_probe_to_instructed_wrong_answers",
+    ]
+    assert record["word_match"]["instructed"]["hallucinations"] == 0
+    assert "agreement_of_the_rules_with_the_judge_on_instructed" in record["judge"]
+    text = (folder / "results" / "probe-squad-prompt.md").read_text(encoding="utf-8")
+    assert text == table.RENDER["squad-prompt"](record) and "| base model + instruction |" in text
+    assert "## The word-match rules against the judge on its answers" in text
+
+
+def test_the_models_confidence_is_scored_as_a_detector_beside_the_probe_without_a_fitted_threshold(sample, monkeypatch):
+    monkeypatch.setattr(probe_gates, "AUC_RESAMPLES", 40)
+    folder, rows, asked = sample
+    # wrong answers are the least confident, right answers to answerable questions come next, abstentions last
+    held = []
+    for at, row in enumerate(rows):
+        first = 0.1 if row["wrong"] else (0.9 if row["open"] else 0.5)
+        entry = {"id": row["id"], "answer_tokens": 4, "greedy_tokens": 4 if at % 2 else 3}
+        held.append(entry | {"first_token_probability": first, "mean_log_probability": -(at % 5 + 1) / 10})
+    held[5] |= {"answer_tokens": 0, "greedy_tokens": 0, "first_token_probability": None, "mean_log_probability": None}
+    put(folder / "confidence.jsonl", held[::-1])
+    put(folder / "verdicts.jsonl", verdicts_of(rows, {}))
+    run = ["confidence", *asked, "--confidence", str(folder / "confidence.jsonl")]
+
+    assert (
+        probe_checks.main([*run, "--verdicts", str(folder / "verdicts.jsonl"), "--out", str(folder / "results")]) == 0
+    )
+
+    record = read_json(folder / "results" / "probe-squad-confidence.json")
+    assert record["schema"] == "driftmap.probe-squad-confidence/1"
+    assert (record["rows"], record["rows_without_answer_text"]) == (48, 1)
+    assert record["rows_whose_answer_tokens_are_all_the_argmax"] == 24 + 1 - 1
+    assert record["answer_tokens_that_are_the_argmax"] == [24 * 3 + 23 * 4, 47 * 4]
+    found = record["word_match"]
+    assert list(found["detectors"]) == ["squad_probe", "first_token_probability", "mean_log_probability"]
+    assert (found["base"]["wrong_answers"], found["squad_probe_gate"]["wrong_answers"]) == (18, 6)
+    own, first = found["detectors"]["squad_probe"], found["detectors"]["first_token_probability"]
+    assert own["auc_base_error"] == 1.0 and "squad_probe_minus_this" not in own
+    assert "at_the_probe_gate_coverage" not in own
+    # the first-token confidence ranks every wrong answer first: at the probe's coverage it is the probe's gate
+    assert first["auc_base_error"] == 1.0 and list(first["squad_probe_minus_this"]) == ["base_error", "answerability"]
+    assert first["squad_probe_minus_this"]["base_error"]["difference"] == 0.0
+    assert first["at_the_probe_gate_coverage"] == {"abstained_on": 18} | found["squad_probe_gate"]
+    shares = first["abstaining_on_the_most_suspicious_share"]
+    assert [point["share"] for point in shares] == [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+    # 19 of 48 abstained on: the 18 wrong answers and one right answer, which the abstention makes wrong
+    assert (shares[3]["wrong_answers"], shares[3]["hallucinations"], shares[3]["answerable_correct"]) == (7, 0, 17)
+    assert set(shares[3]) == {
+        "share",
+        "wrong_answers",
+        "hallucinations",
+        "answerable_answered",
+        "answerable_correct",
+        "coverage",
+        "risk",
+    }
+    other = found["detectors"]["mean_log_probability"]
+    assert other["auc_base_error"] < 0.8 and other["at_the_probe_gate_coverage"]["answered"] <= 18
+    assert other["at_the_probe_gate_coverage"]["abstained_on"] > 18
+    assert record["judge"]["rows_judged"] == 48 and record["judge"]["detectors"] == found["detectors"]
+    public = read_jsonl(folder / "results" / "probe-squad-confidence-answers.jsonl")
+    assert public[0] == {
+        "id": rows[0]["id"],
+        "condition": "unanswerable",
+        "article_index": 0,
+        "rule_wrong": True,
+        "first_token_probability": 0.1,
+        "mean_log_probability": -0.1,
+        "answer_tokens": 4,
+        "squad_probe_score": 0.997527,
+    }
+    assert public[5]["first_token_probability"] is None
+    said = (folder / "results" / "probe-squad-confidence.md").read_text(encoding="utf-8")
+    assert said == table.RENDER["squad-confidence"](record)
+    assert "48 questions; 1 without answer text" in said and "## By the judge's labels" in said
+    assert "| base model, abstaining on the lowest first-token probabilities | 18 | 12.5% (6/48) |" in said
+    assert "| 40% | " in said
+    for path in (folder / "results").iterdir():
+        assert not any(text in path.read_text(encoding="utf-8") for text in hidden(rows)), path.name
+    put(folder / "confidence.jsonl", held[:-1])
+    with pytest.raises(SystemExit, match="47 confidence rows for 48 questions"):
+        probe_checks.main([*run, "--out", str(folder / "short")])
