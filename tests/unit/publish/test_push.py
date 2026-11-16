@@ -2391,3 +2391,97 @@ def test_the_code_repo_the_cards_link_to_pins_its_toolkits():
     assert all(pins.get(name) for name in ("safetune", "auditkit", "curatorkit"))
     assert (REPO_ROOT / "uv.lock").is_file()
     assert ".run-local/" in (REPO_ROOT / ".gitignore").read_text(encoding="utf-8").split()
+
+
+def frozen_probe(folder, weight=0.5, **arrays):
+    """A probe over four units as its fit step freezes it, with any further arrays in its weights file."""
+    import hashlib
+
+    import numpy as np
+    from safetensors.numpy import load_file, save_file
+
+    from driftmap.attribution import probe
+
+    flat = np.full(4, weight, dtype=np.float32)
+    probe.save(probe.Probe(20, 0.001, 0.7, np.zeros(4, np.float32), np.ones(4, np.float32), flat, flat[:1]), folder)
+    if arrays:
+        save_file(load_file(folder / probe.WEIGHTS) | arrays, folder / probe.WEIGHTS)
+        settings = json.loads((folder / probe.SETTINGS).read_text(encoding="utf-8"))
+        settings["weights_sha256"] = hashlib.sha256((folder / probe.WEIGHTS).read_bytes()).hexdigest()
+        (folder / probe.SETTINGS).write_text(json.dumps(settings) + "\n", encoding="utf-8")
+    return folder / probe.WEIGHTS
+
+
+def test_the_weights_of_a_frozen_probe_go_to_the_results_dataset_beside_their_settings(tmp_path, settings, fake, said):
+    """Weights are no text for the scan: the check of a probe's files reads them instead."""
+    hub = seed(fake)
+    staged = tmp_path / "staged"
+    weights = frozen_probe(staged / "results" / "probe" / "probe_squad").read_bytes()
+
+    drawn = plan(settings, hub, staged=staged)
+
+    assert drawn.problems == ()
+    card = next(step.card for step in drawn.steps if step.target.key == "results")
+    assert "- `probe/` (2 files): the frozen probes, a folder each" in card
+    assert passed_then_published(tmp_path, settings, hub, said, staged=staged).ok
+    assert fake.repos[RESULTS]["main"]["probe/probe_squad/probe.safetensors"] == weights
+    fake.calls.clear()
+
+    # the weights a run published stop no later run
+    assert plan(settings, hub).problems == ()
+    assert passed_then_published(tmp_path, settings, hub, said, staged=staged).ok
+    assert writes(fake) == []
+
+
+@pytest.mark.parametrize(
+    ("change", "refusal"),
+    [
+        ("no settings", "probe/probe_squad/probe.safetensors: the weights of a probe with no probe.json beside them"),
+        ("settings of no probe", "probe/probe_squad/probe.safetensors: not the file its probe.json records"),
+        ("other weights", "probe/probe_squad/probe.safetensors: not the file its probe.json records"),
+        ("more arrays", "probe/probe_squad/probe.safetensors: not the arrays of a probe and nothing else"),
+        ("no arrays", "probe/probe_squad/probe.safetensors: not the arrays of a probe and nothing else"),
+        ("elsewhere", "tables/probe.safetensors: not text, so the scan cannot read it"),
+        ("deeper", "probe/probe_squad/more/probe.safetensors: the weights of a probe with no probe.json beside them"),
+        ("another repo", "probe/probe_squad/probe.safetensors: not text, so the scan cannot read it"),
+    ],
+)
+def test_weights_that_are_not_a_frozen_probe_with_its_settings_refuse_before_any_write(
+    tmp_path, settings, fake, change, refusal
+):
+    import hashlib
+
+    import numpy as np
+
+    hub = seed(fake)
+    staged = tmp_path / "staged"
+    folder = staged / "results" / "probe" / "probe_squad"
+    more = {"notes": np.zeros(2, np.float32)} if change == "more arrays" else {}
+    weights = frozen_probe(folder, **more)
+    described = folder / "probe.json"
+    if change == "no settings":
+        described.unlink()
+    elif change == "settings of no probe":
+        described.write_text("[]\n", encoding="utf-8")
+    elif change == "other weights":
+        weights.write_bytes(frozen_probe(tmp_path / "other", weight=0.25).read_bytes())
+    elif change == "no arrays":
+        weights.write_bytes(b"\x00\xff no header")
+        settings_of = json.loads(described.read_text(encoding="utf-8"))
+        settings_of["weights_sha256"] = hashlib.sha256(weights.read_bytes()).hexdigest()
+        described.write_text(json.dumps(settings_of) + "\n", encoding="utf-8")
+    elif change == "elsewhere":
+        (staged / "results" / "tables").mkdir()
+        weights.rename(staged / "results" / "tables" / "probe.safetensors")
+    elif change == "deeper":
+        (folder / "more").mkdir()
+        weights.rename(folder / "more" / "probe.safetensors")
+    elif change == "another repo":
+        (staged / "eval" / "probe").mkdir(parents=True)
+        folder.rename(staged / "eval" / "probe" / "probe_squad")
+
+    with pytest.raises(DriftmapError) as refused:
+        publish(settings, hub, staged=staged, echo=lambda line: None)
+
+    assert refused.value.exit_code == ExitCode.INTEGRITY
+    assert refusal in str(refused.value) and writes(fake) == []

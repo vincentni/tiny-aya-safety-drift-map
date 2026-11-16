@@ -75,6 +75,8 @@ ADAPTER_WEIGHTS = "adapter_model.safetensors"
 GATE_FILE = "publish-gate.json"
 # pickles the trainer leaves beside the weights; an adapter is refused while one is left
 PICKLES = (".bin", ".pt", ".pth")
+# the weights of the frozen probes in the results dataset: read by the check of a probe's files, not by the scan
+PROBE_WEIGHTS = f"{cards.PROBE_TREE}*/*.safetensors"
 # never fetched from a model repo; a dataset is read whole
 BINARY = ["*.safetensors", "*.gguf", *WEIGHTS, "*.onnx"]
 # what the cards are rendered from: file, the repo it is in, the record it holds; the tables of the standard
@@ -141,6 +143,7 @@ Problem = tuple[ExitCode, str]
 # file, line or one of the kinds below, rule
 Hit = tuple[str, int, str]
 NAME, UNREADABLE, CACHED = 0, -1, -2
+UNREAD = "not text, so the scan cannot read it"
 SCHEMA_PUBLICATION = "driftmap.publication/1"
 # what a refusal calls a file a run would write
 WRITTEN = {CARD: "card"}
@@ -474,6 +477,41 @@ def _binary(files: tuple[str, ...]) -> list[str]:
     return list(filter_repo_objects(files, allow_patterns=BINARY))
 
 
+def _unscanned(target: Target, paths: list[str]) -> set[str]:
+    """The files of a repo that are weights by nature: a model's, and the frozen probes of the results dataset."""
+    if target.repo_type == "model":
+        return _matching(paths, BINARY)
+    return _matching(paths, [PROBE_WEIGHTS]) if target.key == "results" else set()
+
+
+def _probe_weights(name: str, path: Path, written: Mapping[str, bytes]) -> str | None:
+    """What stands against a staged file as the weights of a frozen probe; None when it is one.
+
+    It is one when the probe's settings lie beside it and record its sha256, and it holds the arrays of a probe
+    and nothing else, no metadata either.
+    """
+    from safetensors import SafetensorError, safe_open
+
+    from driftmap.attribution import probe
+
+    folder, _, file = name.rpartition("/")
+    if file != probe.WEIGHTS:
+        return UNREAD
+    try:
+        settings = json.loads(written[f"{folder}/{probe.SETTINGS}"])
+    except (KeyError, ValueError):
+        return f"the weights of a probe with no {probe.SETTINGS} beside them"
+    recorded = (settings.get("schema"), settings.get("weights_sha256")) if isinstance(settings, dict) else None
+    if recorded != (probe.SCHEMA_WEIGHTS, hashlib.sha256(written[name]).hexdigest()):
+        return f"not the file its {probe.SETTINGS} records"
+    try:
+        with safe_open(path, framework="np") as held:
+            arrays, metadata = sorted(held.keys()), held.metadata()
+    except SafetensorError:
+        arrays, metadata = [], None
+    return None if arrays == sorted(probe.ARRAYS) and not metadata else "not the arrays of a probe and nothing else"
+
+
 def _stale(target: Target, files: tuple[str, ...]) -> list[str]:
     patterns = STALE.get(target.key)
     return list(filter_repo_objects(files, allow_patterns=list(patterns))) if patterns else []
@@ -551,7 +589,7 @@ def _unread(
     """Add to ``wanted`` one place to fetch each blob no scan in this run has read."""
     for sha in shas:
         tree = scans.trees[target.repo, sha]
-        skipped = _matching([path for path, _ in tree], BINARY) if target.repo_type == "model" else set()
+        skipped = _unscanned(target, [path for path, _ in tree])
         for path, blob in tree:
             key = (redact.is_row(path.split("/")), blob)
             if path not in skipped and key not in scans.blobs:
@@ -601,7 +639,7 @@ def _found(target: Target, shas: list[str], scans: Scans, only: set[str] | None 
     for sha in shas:
         tree = [(path, blob) for path, blob in scans.trees[target.repo, sha] if only is None or path in only]
         paths = [path for path, _ in tree]
-        skipped = _matching(paths, BINARY) if target.repo_type == "model" else set()
+        skipped = _unscanned(target, paths)
         # an adapter's checkpoint pickles are bytes by nature and leave with its card
         tolerated = {path for path in _matching(paths, CHECKPOINT) if path.endswith(PICKLES)}
         for path, blob in tree:
@@ -626,7 +664,7 @@ def _found(target: Target, shas: list[str], scans: Scans, only: set[str] | None 
         if line == CACHED:
             other.append(f"{spot}: a cache path{more}")
         elif line == UNREADABLE:
-            other.append(f"{spot}: not text, so the scan cannot read it{more}")
+            other.append(f"{spot}: {UNREAD}{more}")
         else:
             secrets.append(f"{spot}:{line}: {rule}{more}" if line else f"{spot}: {rule} in the file name{more}")
     tokens = any(rule in TOKEN_RULES for (_, line, rule) in held if line >= NAME)
@@ -1150,13 +1188,17 @@ def _drawn(
             _staged(staged.parent, written.items())
             for name, data in written.items():
                 spot, row = f"{target.repo}/{_safe(name)}", redact.is_row(name.split("/"))
-                if not _is_text(data):
-                    other.append((ExitCode.INTEGRITY, f"{spot}: not text, so the scan cannot read it"))
-                    continue
-                found_here = redact.scan([staged.parent / name], data_root=staged.parent)
+                weights = not _is_text(data)
+                if weights:
+                    probe = target.key == "results" and name in _unscanned(target, [name])
+                    against = _probe_weights(name, staged.parent / name, written) if probe else UNREAD
+                    if against:
+                        other.append((ExitCode.INTEGRITY, f"{spot}: {against}"))
+                        continue
+                found_here = [] if weights else redact.scan([staged.parent / name], data_root=staged.parent)
                 hits = [(finding.line, finding.pattern) for finding in found_here]
                 # the rows of a check quote addresses like any other row
-                hits += [] if row else [(number, "email") for number in _addressed(data.decode())]
+                hits += [] if row or weights else [(number, "email") for number in _addressed(data.decode())]
                 what = WRITTEN.get(name, "file")
                 secrets += [(ExitCode.REDACTION, f"{spot}:{line}: {rule} in the new {what}") for line, rule in hits]
                 secrets += [

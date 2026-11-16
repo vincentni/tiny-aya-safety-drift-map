@@ -1310,3 +1310,58 @@ def test_no_card_calls_the_fine_tuned_model_drifted(tmp_path, settings):
         for named in ("tiny-aya-safety-drift-map", "-drift-", "drift-None", "drift_config.json", "`drifted`"):
             prose = prose.replace(named, "")
         assert "drift" not in prose.replace("- drifted:", "").lower(), repo
+
+
+def test_the_results_dataset_lists_the_tables_of_the_probe_study_and_the_frozen_probes(settings):
+    held = {
+        "results": [
+            "runs/drift-None.json",
+            "tables/tables.json",
+            *(
+                f"tables/probe-{part}.{kind}"
+                for part in ("squad", "bbq", "baselines", "served")
+                for kind in ("json", "md")
+            ),
+            "tables/probe-squad-answers-in-domain.jsonl",
+            "tables/probe-squad-answers-zero-shot.jsonl",
+            "tables/probe-bbq-answers.jsonl",
+            *(
+                f"tables/probe-squad-{part}.{kind}"
+                for part in ("judge", "served", "identity")
+                for kind in ("json", "md")
+            ),
+            "tables/probe-squad-judge-answers.jsonl",
+            "tables/probe-squad-served-answers.jsonl",
+            "tables/probe-replication.json",
+            "tables/probe-replication.md",
+            "probe/probe_squad/probe.json",
+            "probe/probe_squad/probe.safetensors",
+            "probe/probe_squad_fit.json",
+        ],
+    }
+
+    lines = render_cards(settings, manifest=manifest(), files=held)[RESULTS].splitlines()
+
+    squad = next(line for line in lines if line.startswith("- `tables/probe-squad.json`: "))
+    assert "SQuAD 2.0 (Rajpurkar and others, 2018; CC BY-SA 4.0)" in squad
+    assert "`tables/probe-squad.md` is the same as Markdown" in squad
+    assert "`tables/probe-squad-answers-*.jsonl` name each question by its id in SQuAD" in squad
+    assert "no passage, question or answer text" in squad
+    for part in ("bbq", "baselines", "served"):
+        line = next(line for line in lines if line.startswith(f"- `tables/probe-{part}.json`: "))
+        assert f"`tables/probe-{part}.md` is the same as Markdown" in line and "no prompt text" in line
+    judged = next(line for line in lines if line.startswith("- `tables/probe-squad-judge.json`: "))
+    assert "labelled by a judge model" in judged and "`tables/probe-squad-judge.md` is the same as Markdown" in judged
+    assert "`tables/probe-squad-judge-answers.jsonl` name each question by its id in SQuAD" in judged
+    served = next(line for line in lines if line.startswith("- `tables/probe-squad-served.json`: "))
+    assert "one fixed abstention sentence" in served and "no passage, question or answer text" in served
+    again = next(line for line in lines if line.startswith("- `tables/probe-squad-identity.json`: "))
+    assert "AuditKIT" in again and "`tables/probe-squad-identity.md` is the same as Markdown" in again
+    # a part with no line of its own is still named, with the file that says what it holds
+    other = "- `tables/probe-replication.json`: a further part of the probe study; `tables/probe-replication.md` "
+    assert other + "is the same as Markdown and says what it holds." in lines
+    assert len([line for line in lines if line.startswith("- `tables/probe-")]) == 8
+    frozen = next(line for line in lines if line.startswith("- `probe/` (3 files): the frozen probes, a folder each"))
+    assert "`probe.safetensors`" in frozen and "`probe.json`" in frozen
+    plain = render_cards(settings, manifest=manifest())
+    assert not any("probe" in text for repo, text in plain.items() if repo in DATASETS)

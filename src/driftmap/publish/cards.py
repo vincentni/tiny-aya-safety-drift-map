@@ -560,6 +560,58 @@ HELDOUT_FILE = "tables/heldout.json"
 # the question pairs drawn from MBBQ: published by id, never as text; their table
 MBBQ_TREE = ids.tree("full", variants="mbbq")
 MBBQ_FILE = f"tables/choice-mbbq-{ATTRIBUTION_SET}.json"
+# the probe study: the frozen probes, a folder each, and what the table of each part holds
+PROBE_TREE = "probe/"
+_PROBE_ROWS = "name each prompt by its id and hold the letters, each score and whether it fired, and no prompt text"
+_SQUAD_ROWS = "name each question by its id in SQuAD and hold"
+_NO_SQUAD_TEXT = "and no passage, question or answer text"
+PROBE_TABLES = {
+    "squad": (
+        "a probe of the base model's own error on free-form answers to SQuAD 2.0 (Rajpurkar and others, 2018; "
+        "CC BY-SA 4.0): wrong answers, coverage and risk of the base model alone and gated by each probe on "
+        "questions of the official dev split, with each probe's AUC; `tables/probe-squad.md` is the same as "
+        f"Markdown, and `tables/probe-squad-answers-*.jsonl` {_SQUAD_ROWS} the class of the base model's answer, "
+        f"each score and whether it fired, {_NO_SQUAD_TEXT}"
+    ),
+    "squad-judge": (
+        "the SQuAD result of the probe with the base model's answers labelled by a judge model beside the word "
+        "match: the counts under both labels and how often the two agree; `tables/probe-squad-judge.md` is the "
+        f"same as Markdown, and the rows of `tables/probe-squad-judge-answers.jsonl` {_SQUAD_ROWS} both labels, the "
+        f"probe's score and whether it fired, {_NO_SQUAD_TEXT}"
+    ),
+    "squad-served": (
+        "the probe fitted on SQuAD served inside the generation call on a sample of the dev questions, where a "
+        "fired row is answered with one fixed abstention sentence: how often the served answer and the firing "
+        "decision equal the gate computed afterwards; `tables/probe-squad-served.md` is the same as Markdown, and "
+        f"the rows of `tables/probe-squad-served-answers.jsonl` {_SQUAD_ROWS} the probabilities, the firing "
+        f"decisions and the class of each answer's wording, {_NO_SQUAD_TEXT}"
+    ),
+    "squad-identity": (
+        "the base model's answers on the SQuAD dev sample generated a second time through AuditKIT's evaluate and "
+        "compared row for row with the answers the probe was scored on; `tables/probe-squad-identity.md` is the "
+        "same as Markdown"
+    ),
+    "bbq": (
+        "the activation probes on the question pairs: wrong answers of the base model alone, gated by each probe, "
+        "and of the fine-tune, per set, with the paired changes; `tables/probe-bbq.md` is the same as Markdown, "
+        f"and the rows of `tables/probe-bbq-answers.jsonl` {_PROBE_ROWS}"
+    ),
+    "baselines": (
+        "baselines that read the prompt's words alone, its length and a TF-IDF bag, fitted and cut by the rule of "
+        "the activation probes, with the AUC of each and the differences; `tables/probe-baselines.md` is the same "
+        f"as Markdown, and the rows of `tables/probe-baselines-answers.jsonl` {_PROBE_ROWS}"
+    ),
+    "served": (
+        "a frozen probe served inside the generation call on a sample of the prompts: how often the served answer "
+        "and the firing decision equal the gate computed on stored answers; `tables/probe-served.md` is the same "
+        f"as Markdown, and the rows of `tables/probe-served-answers.jsonl` {_PROBE_ROWS}"
+    ),
+}
+# a part of the probe study that has no line of its own above
+PROBE_OTHER = (
+    "- `tables/probe-{part}.json`: a further part of the probe study; `tables/probe-{part}.md` is the same as "
+    "Markdown and says what it holds."
+)
 LEDGER = "ledger.jsonl"
 # the trainer's log, kept at the root of an adapter repo when its last checkpoint leaves
 TRAINER_STATE = "trainer_state.json"
@@ -792,6 +844,16 @@ LAYOUT = {
             "the held-out harmful prompts: harmful answers and refusals of the base model as served and under the "
             "safety patch, per language and pooled, with the paired change; `tables/heldout.md` is the same as "
             "Markdown",
+            (),
+            False,
+        ),
+        *((f"tables/probe-{part}.json", False, what, (), False) for part, what in PROBE_TABLES.items()),
+        (
+            PROBE_TREE,
+            False,
+            "the frozen probes, a folder each: `probe.safetensors` holds the standardisation and the logistic "
+            "regression as plain arrays, and `probe.json` the layer it reads, its C, its threshold and the sha256 of "
+            "the arrays; the JSON files beside the folders record how the probes were fitted, picked and checked",
             (),
             False,
         ),
@@ -1889,6 +1951,10 @@ def _files(key: str, paths: Sequence[str] | None) -> list[str]:
         count = f" ({', '.join(counts)})" if under else ""
         shown = f" Fields: {', '.join(f'`{name}`' for name in fields)}." if fields else ""
         lines.append(f"- `{place}`{count}: {what}.{shown}")
+    for path in sorted(main or ()):
+        part = path.removeprefix("tables/probe-").removesuffix(".json")
+        if path == f"tables/probe-{part}.json" and part not in PROBE_TABLES:
+            lines.append(PROBE_OTHER.format(part=part))
     for name, (what, kept) in CHECKS.items():
         under = [path for path in main or () if path.startswith(f"{CHECKS_TREE}{name}/")]
         if under:
