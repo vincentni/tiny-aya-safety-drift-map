@@ -66,6 +66,26 @@ the gated system, which answers with the unknown option where the probe fires an
 answer elsewhere, beside the base model and the fine-tune. The gate is computed on stored answers; nothing is
 served through a hook. ``probe`` holds what the steps share, the frozen probe's file among it.
 
+The probe study in four parts, on the stored answers and hidden states of those steps and on SQuAD 2.0:
+
+    python -I -m driftmap.attribution.probe_squad --sources SOURCES --out OUT
+    python -m driftmap.attribution.probe_generate --model MODEL_DIR --label REPO@REVISION \
+        --manifest EVAL/manifest.json --input OUT/squad_dev_in.jsonl --output OUT/squad_dev_base.jsonl \
+        --states OUT/acts/squad_dev --max-new-tokens 48 --workers 6 --threads 10
+    python -m driftmap.attribution.probe_generate --model MODEL_DIR --label REPO@REVISION \
+        --manifest EVAL/manifest.json --input OUT/served_in.jsonl --output OUT/served.jsonl \
+        --gate PROBE --states OUT/acts/served --max-new-tokens 24
+    python -I -m driftmap.attribution.probe_study squad --dev OUT/squad_dev_in.jsonl ... --out RESULTS
+
+``probe_squad`` draws a dev and a train sample of SQuAD 2.0 at the pinned revision and classes the base
+model's answers; ``probe_generate`` writes a checkpoint's answers and the hidden states of the same run and,
+with ``--gate``, serves a frozen probe inside the run through a forward hook that forces the abstention;
+``probe_study`` has a step per part, listed with its command in the module: a probe of the base model's own
+error beside the first probe (``bbq``), text-only baselines (``baselines``), the served gate against the gate
+computed afterwards (``served``) and a probe fitted on the train sample and scored once on the dev sample
+(``squad``). Each part writes ``probe-<part>.json``, the same as Markdown and rows without text;
+``probe_gates`` and ``probe_baselines`` hold the counts, intervals and baselines the steps share.
+
 A side check on the evaluation prompts, from a copy of the responses dataset:
 
     python -I -m driftmap.attribution.answer_lengths RESPONSES_DIR OUT.json --model "base model=FOLDER" \

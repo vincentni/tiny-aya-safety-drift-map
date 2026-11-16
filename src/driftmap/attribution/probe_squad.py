@@ -1,0 +1,258 @@
+"""SQuAD 2.0 for the probe study: the two samples, the base model's own error on each question, and the counts
+of a system that abstains where a gate fires.
+
+    python -I -m driftmap.attribution.probe_squad --sources SOURCES --out OUT
+
+``--sources`` is the folder of the reading check's source files; the validation file and the train file of
+SQuAD 2.0 are fetched there at the revision ``reading`` pins and checked by sha256 before they are read. The draw
+is the reading check's rule with seeds and sizes of its own: passages under 250 words; the articles in a seeded
+order, taken in turn; every drawn question on a passage no other drawn question uses; unanswerable first, then
+answerable. Written under ``--out``: ``squad_dev_in.jsonl`` (500 + 500 questions of the validation file),
+``squad_train_in.jsonl`` (1,000 + 1,000 of the train file) and ``squad_build.json`` (counts and hashes). The two
+prompt files hold SQuAD text and stay where they are written; no other output of the study holds any.
+
+The base model's answer is classed by the reading check's rule: it abstains when its wording class is an
+abstention, and an answerable question is answered correctly when the answer contains a gold answer, case aside.
+A hallucination is an unanswerable question answered. An error is a hallucination, or an answerable question
+whose answer holds no gold answer. Both rules are word matches. A gated answer is an abstention: right on an
+unanswerable question, wrong on an answerable one.
+"""
+
+import argparse
+import hashlib
+import json
+import random
+import sys
+from collections import Counter, defaultdict
+from collections.abc import Callable, Mapping, Sequence
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+from driftmap.attribution import pinned, probe, probe_gates, reading, reading_scores
+from driftmap.table import stats
+
+TRAIN_FILE = "squad_v2/train-00000-of-00001.parquet"
+FILES = {
+    reading.SQUAD_FILE: reading.SQUAD_FILES[reading.SQUAD_FILE],
+    TRAIN_FILE: "f6da32ffb482ff463ad056477740d1bb284b96a45db3a08bee6a225ca6abf291",
+}
+# sample to its source file and the questions drawn per condition
+SAMPLES = {"dev": (reading.SQUAD_FILE, 500), "train": (TRAIN_FILE, 1000)}
+CONDITIONS = ("unanswerable", "answerable")
+NO_ABSTENTION = "no abstention wording"
+WORDINGS = ("trained sentence", "trained style", "wider wording", NO_ABSTENTION)
+BUILD = "squad_build.json"
+
+
+def seed_of(name: str) -> str:
+    return f"{probe.SEED}-squad-probe-{name}"
+
+
+def fetch(sources: Path, get: Callable[[str], bytes] = pinned.download) -> dict[str, str]:
+    """The sha256 of the two SQuAD files under ``sources``; a missing one is downloaded, each is checked."""
+    return reading._fetch(sources, reading.SQUAD, reading.SQUAD_REVISION, reading.SQUAD_FOLDER, FILES, get)
+
+
+def draw(source: Path, per_condition: int, seed: str) -> list[dict]:
+    """``per_condition`` unanswerable and as many answerable questions of the file, as prompt rows."""
+    import pyarrow.parquet as pq
+
+    rng = random.Random(seed)
+    rows = sorted(pq.read_table(source).to_pylist(), key=lambda row: row["id"])
+    short = [row for row in rows if len(row["context"].split()) < reading.MAX_WORDS]
+    titles = sorted({row["title"] for row in short})
+    rng.shuffle(titles)
+    used, drawn = set(), {}
+    for condition in CONDITIONS:
+        pool = defaultdict(list)
+        for row in short:
+            if (len(row["answers"]["text"]) == 0) == (condition == CONDITIONS[0]):
+                pool[row["title"]].append(row)
+        picked = []
+        while len(picked) < per_condition:
+            before = len(picked)
+            for title in titles:
+                left = [row for row in pool[title] if row["context"] not in used]
+                if left and len(picked) < per_condition:
+                    row = rng.choice(left)
+                    used.add(row["context"])
+                    picked.append(row)
+            if len(picked) == before:
+                raise SystemExit(f"only {len(picked)} {condition} questions on unused passages")
+        drawn[condition] = picked
+    rows_out = []
+    for pair in zip(*(drawn[condition] for condition in CONDITIONS), strict=True):
+        for condition, row in zip(CONDITIONS, pair, strict=True):
+            rows_out.append(
+                {
+                    "id": f"squad.{row['id']}",
+                    "condition": condition,
+                    "context": row["context"],
+                    "question": row["question"],
+                    "gold_answers": sorted(set(row["answers"]["text"])),
+                    "title": row["title"],
+                    "prompt": "\n".join([row["context"], row["question"], reading.FREE]),
+                    "set": "benign",
+                    "language": "en",
+                }
+            )
+    return rows_out
+
+
+def rows_of(asked: Path, answers: Path) -> list[dict]:
+    """The rows of a sample with the base model's answer classed: ``abstained``, ``correct``, ``base_wrong`` and
+    ``hallucination``; stops when the answers are not those of the sample's rows."""
+    rows = probe.read_jsonl(asked)
+    said = {row["id"]: row for row in probe.read_jsonl(answers)}
+    if set(said) != {row["id"] for row in rows}:
+        raise SystemExit(f"{len(said)} answers for {len(rows)} rows of {asked.name}")
+    for row in rows:
+        row["response"] = said[row["id"]]["response"]
+        row["stop_reason"] = said[row["id"]]["stop_reason"]
+        row["wording"] = reading_scores.abstains(row["response"] or "")
+        row["unanswerable"] = row["condition"] == CONDITIONS[0]
+        row["abstained"] = row["wording"] != NO_ABSTENTION
+        row["holds_gold"] = reading_scores.holds_gold(row)
+        row["correct"] = row["abstained"] if row["unanswerable"] else row["holds_gold"]
+        row["base_wrong"] = not row["correct"]
+        row["hallucination"] = row["unanswerable"] and not row["abstained"]
+    return rows
+
+
+def states_of(folder: Path, rows: Sequence[Mapping[str, Any]]) -> tuple[dict[str, np.ndarray], list[int]]:
+    states, layers = probe.load_states(folder)
+    if set(states) != {row["id"] for row in rows}:
+        raise SystemExit(f"{len(states)} hidden states for {len(rows)} rows under {folder.name}")
+    return states, layers
+
+
+def base_counts(rows: Sequence[Mapping[str, Any]]) -> dict:
+    return {
+        "rows": len(rows),
+        "unanswerable": sum(row["unanswerable"] for row in rows),
+        "base_wrong": sum(row["base_wrong"] for row in rows),
+        "hallucinations": sum(row["hallucination"] for row in rows),
+        "answerable_without_gold": sum(row["base_wrong"] and not row["unanswerable"] for row in rows),
+        "answerable_abstained": sum(row["abstained"] and not row["unanswerable"] for row in rows),
+        "wording": {kind: sum(row["wording"] == kind for row in rows) for kind in WORDINGS},
+        "cut_at_the_token_limit": sum(row["stop_reason"] == "length" for row in rows),
+    }
+
+
+def measured(rows: Sequence[Mapping[str, Any]], fired: np.ndarray) -> dict:
+    """The counts of the system that abstains where ``fired`` and gives the base model's answer elsewhere."""
+    share = probe_gates.share
+    abstained = np.array([row["abstained"] for row in rows]) | fired
+    correct = np.where(fired, [row["unanswerable"] for row in rows], [row["correct"] for row in rows])
+    unanswerable = np.array([row["unanswerable"] for row in rows])
+    answered, wrong = ~abstained, ~correct
+    return {
+        "rows": len(rows),
+        "wrong_answers": int(wrong.sum()),
+        "wrong_answer_rate": share(int(wrong.sum()), len(rows)),
+        "answered": int(answered.sum()),
+        "coverage": share(int(answered.sum()), len(rows)),
+        "wrong_among_answered": int((wrong & answered).sum()),
+        "risk": share(int((wrong & answered).sum()), int(answered.sum())),
+        "hallucinations": int((unanswerable & answered).sum()),
+        "unanswerable_abstained": int((unanswerable & abstained).sum()),
+        "answerable_rows": int((~unanswerable).sum()),
+        "answerable_answered": int((~unanswerable & answered).sum()),
+        "answerable_answered_rate": share(int((~unanswerable & answered).sum()), int((~unanswerable).sum())),
+        "answerable_correct": int((~unanswerable & correct).sum()),
+    }
+
+
+def change(rows: Sequence[Mapping[str, Any]], fired: np.ndarray) -> dict:
+    """Base to gated change in the wrong-answer rate: interval over resampled articles, sign test over articles."""
+    before, after, size = defaultdict(int), defaultdict(int), defaultdict(int)
+    for row, gate in zip(rows, fired, strict=True):
+        before[row["title"]] += row["base_wrong"]
+        after[row["title"]] += (not row["unanswerable"]) if gate else row["base_wrong"]
+        size[row["title"]] += 1
+    titles = sorted(size)
+    first, second, n = (np.array([held[title] for title in titles], dtype=float) for held in (before, after, size))
+    difference = second - first
+    both = list(zip(rows, fired, strict=True))
+    return {
+        "articles": len(titles),
+        "change": round(float(difference.sum() / n.sum()), 4),
+        "ci95": probe_gates.interval(difference, n),
+        "articles_better": int((difference < 0).sum()),
+        "articles_worse": int((difference > 0).sum()),
+        "sign_test_p": stats.sign_test(difference),
+        "questions_wrong_to_right": int(sum(row["base_wrong"] and gate and row["unanswerable"] for row, gate in both)),
+        "questions_right_to_wrong": int(
+            sum(not row["base_wrong"] and gate and not row["unanswerable"] for row, gate in both)
+        ),
+    }
+
+
+def read_gate(rows: Sequence[Mapping[str, Any]], scores: np.ndarray, threshold: float) -> dict:
+    """A gate's reading of a sample: AUCs, firing, the gated counts, the change, and risk against coverage at
+    every threshold of the grid."""
+    unanswerable = np.array([row["unanswerable"] for row in rows])
+    wrong = np.array([row["base_wrong"] for row in rows])
+    fired = scores >= threshold
+
+    def counted(mask: np.ndarray) -> list[int]:
+        return [int(fired[mask].sum()), int(mask.sum())]
+
+    kept = ("wrong_answer_rate", "coverage", "risk", "answerable_answered_rate", "hallucinations")
+    return {
+        "threshold": threshold,
+        "auc_unanswerable": probe_gates.auc(unanswerable, scores),
+        "auc_base_error": probe_gates.auc(wrong, scores),
+        "fired_on_unanswerable": counted(unanswerable),
+        "fired_on_answerable": counted(~unanswerable),
+        "fired_on_base_wrong": counted(wrong),
+        "fired_on_base_right": counted(~wrong),
+        "gated": measured(rows, fired),
+        "base_to_gated_wrong_answers": change(rows, fired),
+        "curve": [
+            {"threshold": value} | {key: found[key] for key in kept}
+            for value in probe.THRESHOLDS
+            for found in [measured(rows, scores >= value)]
+        ],
+    }
+
+
+def main(argv: Sequence[str] | None = None, download: Callable[[str], bytes] = pinned.download) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    parser.add_argument("--sources", type=Path, required=True, help="folder of the source files; fetched and checked")
+    parser.add_argument("--out", type=Path, required=True, help="folder for the two prompt files and their counts")
+    parser.add_argument("--reading", type=Path, help="squad_in.jsonl of the reading check, to count shared questions")
+    args = parser.parse_args(argv)
+    hashes = fetch(args.sources, download)
+    summary = {"revision": reading.SQUAD_REVISION, "licence": reading.LICENCE, "max_passage_words": reading.MAX_WORDS}
+    drawn = {}
+    for name, (file, per_condition) in SAMPLES.items():
+        rows = drawn[name] = draw(args.sources / reading.SQUAD_FOLDER / file, per_condition, seed_of(name))
+        probe.write_jsonl(args.out / f"squad_{name}_in.jsonl", rows)
+        summary[name] = {
+            "file_sha256": hashes[file],
+            "rows": len(rows),
+            "by_condition": dict(Counter(row["condition"] for row in rows)),
+            "articles": len({row["title"] for row in rows}),
+            "distinct_passages": len({row["context"] for row in rows}),
+            "distinct_ids": len({row["id"] for row in rows}),
+        }
+    for key, name in (("context", "passages"), ("title", "articles")):
+        shared = {row[key] for row in drawn["dev"]} & {row[key] for row in drawn["train"]}
+        summary[f"{name}_in_both_samples"] = len(shared)
+    if args.reading:
+        old = {row["id"] for row in probe.read_jsonl(args.reading)}
+        summary["dev_rows_also_in_the_reading_check"] = len(old & {row["id"] for row in drawn["dev"]})
+    files = {
+        f"squad_{name}_in.jsonl": hashlib.sha256((args.out / f"squad_{name}_in.jsonl").read_bytes()).hexdigest()
+        for name in SAMPLES
+    }
+    (args.out / BUILD).write_text(json.dumps(summary | {"files_sha256": files}, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps(summary, indent=1))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
